@@ -3,6 +3,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     ops::Range,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -21,6 +22,29 @@ use crate::{Error, Result, error::IoResultExt};
 pub struct RecordMetadata {
     pub header: RecordHeader,
     pub key: BlobKey,
+}
+
+/// Temporary per-record read timings for benchmark diagnosis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentReadProfile {
+    pub fixed_header: Duration,
+    pub buffer_alloc: Duration,
+    pub record_body: Duration,
+    pub decode: Duration,
+}
+
+/// Options for reading and decoding one full segment record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentReadOptions {
+    pub verify_checksum: bool,
+}
+
+impl Default for SegmentReadOptions {
+    fn default() -> Self {
+        Self {
+            verify_checksum: true,
+        }
+    }
 }
 
 /// Blocking stream over a payload range in one segment file.
@@ -86,6 +110,40 @@ impl SegmentReader {
     }
 
     pub fn read_record(&mut self, record_ref: RecordRef) -> Result<DecodedRecord> {
+        self.read_record_with_options(record_ref, SegmentReadOptions::default())
+    }
+
+    pub fn read_record_with_options(
+        &mut self,
+        record_ref: RecordRef,
+        options: SegmentReadOptions,
+    ) -> Result<DecodedRecord> {
+        self.read_record_inner(record_ref, options, None)
+    }
+
+    pub fn read_record_profiled(
+        &mut self,
+        record_ref: RecordRef,
+    ) -> Result<(DecodedRecord, SegmentReadProfile)> {
+        self.read_record_profiled_with_options(record_ref, SegmentReadOptions::default())
+    }
+
+    pub fn read_record_profiled_with_options(
+        &mut self,
+        record_ref: RecordRef,
+        options: SegmentReadOptions,
+    ) -> Result<(DecodedRecord, SegmentReadProfile)> {
+        let mut profile = SegmentReadProfile::default();
+        let record = self.read_record_inner(record_ref, options, Some(&mut profile))?;
+        Ok((record, profile))
+    }
+
+    fn read_record_inner(
+        &mut self,
+        record_ref: RecordRef,
+        options: SegmentReadOptions,
+        mut profile: Option<&mut SegmentReadProfile>,
+    ) -> Result<DecodedRecord> {
         if record_ref.segment_id != self.segment_id {
             return Err(Error::WrongSegment {
                 expected_segment_id: self.segment_id,
@@ -93,11 +151,51 @@ impl SegmentReader {
             });
         }
 
-        let header = self.read_header(record_ref)?;
-        let record_len = header.encoded_record_len()?;
-        let mut record = vec![0; usize::try_from(record_len).map_err(|_| Error::RangeOverflow)?];
-        read_exact_at(&mut self.file, &self.path, record_ref.offset, &mut record)?;
-        Ok(DecodedRecord::decode(&record)?)
+        let started = Instant::now();
+        let (header, fixed_header) = self.read_fixed_header(record_ref)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.fixed_header = started.elapsed();
+        }
+
+        let started = Instant::now();
+        let payload_len = usize::try_from(header.payload_len).map_err(|_| Error::RangeOverflow)?;
+        let key_len = header.key_len as usize;
+        let body_len = payload_len
+            .checked_add(key_len)
+            .ok_or(Error::RangeOverflow)?;
+        let mut body = vec![0; body_len];
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.buffer_alloc = started.elapsed();
+        }
+
+        let started = Instant::now();
+        if !body.is_empty() {
+            read_exact_at(
+                &mut self.file,
+                &self.path,
+                header.payload_offset(record_ref.offset)?,
+                &mut body,
+            )?;
+        }
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record_body = started.elapsed();
+        }
+
+        let key = body.split_off(payload_len);
+        let payload = body;
+
+        let started = Instant::now();
+        let decoded = DecodedRecord::from_parts_with_checksum_verification(
+            header,
+            &fixed_header,
+            payload,
+            key,
+            options.verify_checksum,
+        )?;
+        if let Some(profile) = profile {
+            profile.decode = started.elapsed();
+        }
+        Ok(decoded)
     }
 
     pub fn read_payload(&mut self, record_ref: RecordRef) -> Result<Vec<u8>> {
@@ -108,7 +206,7 @@ impl SegmentReader {
     /// Reads only the requested payload byte range.
     ///
     /// This validates the fixed header, `RecordRef` length, and range bounds. It does not verify
-    /// the full-record checksum because the v1 checksum covers the whole payload and key trailer.
+    /// the full-record checksum because the record checksum covers the whole payload and key trailer.
     pub fn read_payload_range(
         &mut self,
         record_ref: RecordRef,
@@ -118,7 +216,7 @@ impl SegmentReader {
         validate_payload_range(header, payload_range.clone())?;
         let range_len = payload_range.end - payload_range.start;
         let mut payload = vec![0; usize::try_from(range_len).map_err(|_| Error::RangeOverflow)?];
-        let offset = payload_range_offset(record_ref.offset, payload_range.start)?;
+        let offset = payload_range_offset(header, record_ref.offset, payload_range.start)?;
         read_exact_at(&mut self.file, &self.path, offset, &mut payload)?;
         Ok(payload)
     }
@@ -138,6 +236,26 @@ impl SegmentReader {
     /// Opens a blocking stream over the requested payload byte range.
     ///
     /// The returned stream reads directly from the segment file after the range has been validated.
+    pub fn open_payload_stream(
+        &mut self,
+        record_ref: RecordRef,
+        payload_range: Range<u64>,
+    ) -> Result<SegmentPayloadStream> {
+        let header = self.read_header(record_ref)?;
+        validate_payload_range(header, payload_range.clone())?;
+        let offset = payload_range_offset(header, record_ref.offset, payload_range.start)?;
+        let mut file = self.file.try_clone().at_path(&self.path)?;
+        file.seek(SeekFrom::Start(offset)).at_path(&self.path)?;
+        Ok(SegmentPayloadStream {
+            path: self.path.clone(),
+            file,
+            remaining: payload_range.end - payload_range.start,
+        })
+    }
+
+    /// Opens a blocking stream over the requested payload byte range.
+    ///
+    /// The returned stream reads directly from the segment file after the range has been validated.
     pub fn into_payload_stream(
         mut self,
         record_ref: RecordRef,
@@ -145,7 +263,7 @@ impl SegmentReader {
     ) -> Result<SegmentPayloadStream> {
         let header = self.read_header(record_ref)?;
         validate_payload_range(header, payload_range.clone())?;
-        let offset = payload_range_offset(record_ref.offset, payload_range.start)?;
+        let offset = payload_range_offset(header, record_ref.offset, payload_range.start)?;
         self.file
             .seek(SeekFrom::Start(offset))
             .at_path(&self.path)?;
@@ -157,6 +275,13 @@ impl SegmentReader {
     }
 
     pub fn read_header(&mut self, record_ref: RecordRef) -> Result<RecordHeader> {
+        self.read_fixed_header(record_ref).map(|(header, _)| header)
+    }
+
+    fn read_fixed_header(
+        &mut self,
+        record_ref: RecordRef,
+    ) -> Result<(RecordHeader, [u8; FIXED_RECORD_HEADER_LEN])> {
         if record_ref.segment_id != self.segment_id {
             return Err(Error::WrongSegment {
                 expected_segment_id: self.segment_id,
@@ -164,11 +289,11 @@ impl SegmentReader {
             });
         }
 
-        let mut fixed = vec![0; FIXED_RECORD_HEADER_LEN];
+        let mut fixed = [0; FIXED_RECORD_HEADER_LEN];
         read_exact_at(&mut self.file, &self.path, record_ref.offset, &mut fixed)?;
         let header = DecodedRecord::peek_fixed_header(&fixed)?;
         validate_record_ref_len(record_ref, header)?;
-        Ok(header)
+        Ok((header, fixed))
     }
 
     pub fn segment_id(&self) -> SegmentId {
@@ -202,8 +327,13 @@ fn validate_payload_range(header: RecordHeader, payload_range: Range<u64>) -> Re
     Ok(())
 }
 
-fn payload_range_offset(record_offset: u64, payload_range_start: u64) -> Result<u64> {
-    RecordHeader::payload_offset(record_offset)?
+fn payload_range_offset(
+    header: RecordHeader,
+    record_offset: u64,
+    payload_range_start: u64,
+) -> Result<u64> {
+    header
+        .payload_offset(record_offset)?
         .checked_add(payload_range_start)
         .ok_or(Error::RangeOverflow)
 }

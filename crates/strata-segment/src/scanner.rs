@@ -326,7 +326,7 @@ mod tests {
         drop(writer);
 
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let payload_offset = RecordHeader::payload_offset(outcome.record_ref.offset).unwrap();
+        let payload_offset = outcome.record_ref.offset + FIXED_RECORD_HEADER_LEN as u64;
         file.seek(SeekFrom::Start(payload_offset)).unwrap();
         file.write_all(b"X").unwrap();
         drop(file);
