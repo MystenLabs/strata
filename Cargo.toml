@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/strata-bench",
+    "crates/strata-core",
+    "crates/strata-index",
+    "crates/strata-segment",
+    "crates/strata-store",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/walrus-foundation/strata"
+
+[workspace.dependencies]
+crc32fast = "1.5"
+rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "multi-threaded-cf", "snappy", "zlib", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+strata-core = { path = "crates/strata-core" }
+strata-index = { path = "crates/strata-index" }
+strata-segment = { path = "crates/strata-segment" }
+strata-store = { path = "crates/strata-store" }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }
+typed-store = { path = "/Users/sadhansood/dev/walrus/crates/typed-store" }
+
+[patch.crates-io]
+rocksdb = { path = "/Users/sadhansood/dev/walrus/crates/rocksdb" }
