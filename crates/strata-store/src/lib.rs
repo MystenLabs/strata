@@ -981,6 +981,7 @@ fn recover_unsealed_segments(config: &StrataStoreConfig, index: &StrataIndex) ->
         }
     }
     rollback_lost_operations(index)?;
+    advance_recovered_durable_lsn(index)?;
     Ok(())
 }
 
@@ -1084,31 +1085,61 @@ fn recover_unsealed_segment(
         });
     }
 
-    if prefix.file_len != recovered_write_offset {
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
-        file.set_len(recovered_write_offset)
-            .map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
-    }
+    let recovered_durable_offset = persist_recovered_segment_prefix(
+        &path,
+        prefix.file_len,
+        durable_offset,
+        recovered_write_offset,
+    )?;
 
     apply_recovered_segment_prefix(
         config,
         index,
         segment_id,
         existing_state,
-        durable_offset,
+        recovered_durable_offset,
         recovered_write_offset,
         &prefix.records,
     )?;
     Ok(SegmentRecovery { is_complete })
+}
+
+fn persist_recovered_segment_prefix(
+    path: &Path,
+    file_len: u64,
+    durable_offset: u64,
+    recovered_write_offset: u64,
+) -> Result<u64> {
+    let needs_truncate = file_len != recovered_write_offset;
+    let promotes_recovered_bytes = recovered_write_offset > durable_offset;
+    if !needs_truncate && !promotes_recovered_bytes {
+        return Ok(durable_offset);
+    }
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if needs_truncate {
+        file.set_len(recovered_write_offset)
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    file.sync_data().map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    if promotes_recovered_bytes {
+        Ok(recovered_write_offset)
+    } else {
+        Ok(durable_offset)
+    }
 }
 
 fn recover_missing_unsealed_segment(
@@ -1292,6 +1323,17 @@ fn rollback_lost_operations(index: &StrataIndex) -> Result<()> {
 
     let mut store_state = store_state;
     store_state.next_lsn = rollback_from;
+    batch
+        .insert_batch(index.store_state(), [((), &store_state)])
+        .map_err(strata_index::Error::from)?;
+    batch.write().map_err(strata_index::Error::from)?;
+    index.flush_wal(true)?;
+    Ok(())
+}
+
+fn advance_recovered_durable_lsn(index: &StrataIndex) -> Result<()> {
+    let mut batch = index.batch();
+    let store_state = store_state_with_advanced_durable_lsn(index, None, &mut batch)?;
     batch
         .insert_batch(index.store_state(), [((), &store_state)])
         .map_err(strata_index::Error::from)?;
@@ -2283,8 +2325,9 @@ mod tests {
             .get_segment_state(FIRST_SEGMENT_ID)
             .unwrap()
             .unwrap();
-        assert_eq!(state.durable_offset, 0);
         assert!(state.write_offset > 0);
+        assert_eq!(state.durable_offset, state.write_offset);
+        assert_eq!(store.durable_lsn().unwrap(), 1);
     }
 
     #[tokio::test]
