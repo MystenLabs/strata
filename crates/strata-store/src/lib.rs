@@ -67,146 +67,57 @@
 //!   -> return a blocking file-range stream
 //! ```
 
+mod config;
+mod durability;
 mod error;
+mod integrity;
+mod layout;
+mod read;
+mod reader_cache;
+mod stats;
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::BTreeSet,
     fs,
-    io::Read,
-    ops::Range,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    path::Path,
+    sync::{Arc, mpsc},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use sha2::{Digest, Sha256};
 use strata_core::{
-    BlobEntry, BlobKey, BlobLifecycle, BlobState, BlobVersionKey, DecodedRecord, Epoch,
-    PlacementClass, RecordRef, SegmentFileState, SegmentId, SegmentState, SegmentStats, StrataLsn,
-    StrataStoreState,
+    BlobEntry, BlobKey, BlobLifecycle, BlobState, BlobVersionKey, Epoch, PlacementClass,
+    SegmentFileState, SegmentId, SegmentState, SegmentStats, StrataLsn, StrataStoreState,
 };
 use strata_index::StrataIndex;
 use strata_segment::Error as SegmentError;
-use strata_segment::{
-    RecordMetadata, SegmentPayloadStream, SegmentReadOptions, SegmentReadProfile, SegmentReader,
-    SegmentScanner, SegmentWriter,
+use strata_segment::{SegmentScanner, SegmentWriter};
+
+pub use config::{
+    DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
+    StrataStoreConfig,
 };
-use typed_store::Map;
-
+use durability::{active_segment_durable_offset, store_state_with_advanced_durable_lsn};
 pub use error::{Error, Result};
+use integrity::{sha256_file_prefix, verify_sealed_segments};
+use layout::{parse_segment_file_name, relative_segment_path, segment_path};
+pub use read::{ReadOptions, StoreGetProfile};
+use reader_cache::SegmentReaderCache;
+use stats::{add_live_lifecycle_stats, update_live_lifecycle_stats};
 
-const INGEST_DIR: &str = "ingest";
-const INDEX_DIR: &str = "index";
 const FIRST_SEGMENT_ID: SegmentId = 1;
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
-pub const DEFAULT_SEGMENT_READER_CACHE_CAPACITY: usize = 64;
-
-/// Runtime configuration for one Strata store namespace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StrataStoreConfig {
-    pub root_dir: PathBuf,
-    pub namespace: String,
-    pub segment_max_bytes: u64,
-    pub write_queue_capacity: usize,
-    pub max_unsealed_segments: usize,
-    pub segment_reader_cache_capacity: usize,
-    pub recovery_policy: StrataRecoveryPolicy,
-    pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
-}
-
-/// Options for point reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReadOptions {
-    pub verify_checksum: bool,
-}
-
-impl ReadOptions {
-    pub const fn verify_checksums() -> Self {
-        Self {
-            verify_checksum: true,
-        }
-    }
-
-    pub const fn skip_checksum_verification() -> Self {
-        Self {
-            verify_checksum: false,
-        }
-    }
-}
-
-impl Default for ReadOptions {
-    fn default() -> Self {
-        Self::verify_checksums()
-    }
-}
-
-impl From<ReadOptions> for SegmentReadOptions {
-    fn from(options: ReadOptions) -> Self {
-        Self {
-            verify_checksum: options.verify_checksum,
-        }
-    }
-}
-
-/// Temporary get-path timings for benchmark diagnosis.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StoreGetProfile {
-    pub record_lookup: Duration,
-    pub reader_acquire: Duration,
-    pub fixed_header: Duration,
-    pub buffer_alloc: Duration,
-    pub record_body: Duration,
-    pub decode: Duration,
-    pub key_validate: Duration,
-}
-
-/// Policy used when recovering unsealed ingest segments after a crash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StrataRecoveryPolicy {
-    /// Recover the longest globally ordered prefix of unsealed segment data.
-    PointInTime,
-    /// Fail store open if unsealed segment files do not exactly match indexed offsets.
-    AbsoluteConsistency,
-}
-
-/// Policy used when verifying sealed segment files during store open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealedSegmentIntegrityPolicy {
-    /// Verify each sealed segment file exists and has the indexed sealed length.
-    MetadataOnly,
-    /// Verify metadata and recompute the sealed segment SHA-256 digest.
-    Checksum,
-}
-
-impl StrataStoreConfig {
-    pub fn namespace_dir(&self) -> PathBuf {
-        self.root_dir.join(&self.namespace)
-    }
-
-    pub fn ingest_dir(&self) -> PathBuf {
-        self.namespace_dir().join(INGEST_DIR)
-    }
-
-    pub fn standalone_index_dir(&self) -> PathBuf {
-        self.namespace_dir().join(INDEX_DIR)
-    }
-
-    pub fn index_cf_prefix(&self) -> String {
-        format!("strata/{}", self.namespace)
-    }
-}
 
 /// Single-namespace Strata store.
 #[derive(Debug)]
 pub struct StrataStore {
-    config: StrataStoreConfig,
-    index: StrataIndex,
+    pub(crate) config: StrataStoreConfig,
+    pub(crate) index: StrataIndex,
     write_tx: Option<mpsc::SyncSender<WriteCommand>>,
     writer_handle: Option<JoinHandle<()>>,
     seal_tx: Option<mpsc::Sender<SealCommand>>,
     seal_handle: Option<JoinHandle<()>>,
-    reader_cache: SegmentReaderCache,
+    pub(crate) reader_cache: SegmentReaderCache,
 }
 
 impl StrataStore {
@@ -312,130 +223,6 @@ impl StrataStore {
             .map_err(|_| Error::WriteResponseDropped)?
     }
 
-    pub fn get(&self, key: &BlobKey) -> Result<Option<Vec<u8>>> {
-        self.get_sliver(key)
-    }
-
-    pub fn get_with_options(&self, key: &BlobKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
-        self.get_sliver_with_options(key, options)
-    }
-
-    pub fn get_sliver(&self, key: &BlobKey) -> Result<Option<Vec<u8>>> {
-        self.get_sliver_with_options(key, ReadOptions::default())
-    }
-
-    pub fn get_sliver_with_options(
-        &self,
-        key: &BlobKey,
-        options: ReadOptions,
-    ) -> Result<Option<Vec<u8>>> {
-        let Some(record_ref) = self.live_record_ref(key)? else {
-            return Ok(None);
-        };
-
-        let record =
-            self.reader_cache
-                .read_record_with_options(&self.config, record_ref, options.into())?;
-        if &record.key != key {
-            return Err(Error::KeyMismatch {
-                requested: key.clone(),
-                found: record.key,
-            });
-        }
-
-        Ok(Some(record.payload))
-    }
-
-    pub fn get_sliver_profiled(&self, key: &BlobKey) -> Result<(Option<Vec<u8>>, StoreGetProfile)> {
-        self.get_sliver_profiled_with_options(key, ReadOptions::default())
-    }
-
-    pub fn get_sliver_profiled_with_options(
-        &self,
-        key: &BlobKey,
-        options: ReadOptions,
-    ) -> Result<(Option<Vec<u8>>, StoreGetProfile)> {
-        let mut profile = StoreGetProfile::default();
-
-        let started = Instant::now();
-        let Some(record_ref) = self.live_record_ref(key)? else {
-            profile.record_lookup = started.elapsed();
-            return Ok((None, profile));
-        };
-        profile.record_lookup = started.elapsed();
-
-        let (record, reader_profile) = self.reader_cache.read_record_profiled(
-            &self.config,
-            record_ref,
-            options.into(),
-            &mut profile.reader_acquire,
-        )?;
-        profile.fixed_header = reader_profile.fixed_header;
-        profile.buffer_alloc = reader_profile.buffer_alloc;
-        profile.record_body = reader_profile.record_body;
-        profile.decode = reader_profile.decode;
-
-        let started = Instant::now();
-        if &record.key != key {
-            return Err(Error::KeyMismatch {
-                requested: key.clone(),
-                found: record.key,
-            });
-        }
-        profile.key_validate = started.elapsed();
-
-        Ok((Some(record.payload), profile))
-    }
-
-    pub fn get_sliver_range(
-        &self,
-        key: &BlobKey,
-        payload_range: Range<u64>,
-    ) -> Result<Option<Vec<u8>>> {
-        let Some(mut stream) = self.stream_sliver(key, payload_range)? else {
-            return Ok(None);
-        };
-
-        let mut payload = Vec::new();
-        stream
-            .read_to_end(&mut payload)
-            .map_err(|source| Error::Io {
-                path: stream.path().to_path_buf(),
-                source,
-            })?;
-        Ok(Some(payload))
-    }
-
-    pub fn stream_sliver(
-        &self,
-        key: &BlobKey,
-        payload_range: Range<u64>,
-    ) -> Result<Option<SegmentPayloadStream>> {
-        let Some(record_ref) = self.live_record_ref(key)? else {
-            return Ok(None);
-        };
-
-        let metadata = self
-            .reader_cache
-            .read_record_metadata(&self.config, record_ref)?;
-        if metadata.key != *key {
-            return Err(Error::KeyMismatch {
-                requested: key.clone(),
-                found: metadata.key,
-            });
-        }
-
-        Ok(Some(self.reader_cache.open_payload_stream(
-            &self.config,
-            record_ref,
-            payload_range,
-        )?))
-    }
-
-    pub fn contains(&self, key: &BlobKey) -> Result<bool> {
-        Ok(self.live_record_ref(key)?.is_some())
-    }
-
     /// Drops the cached file descriptor for a segment.
     ///
     /// Segment cleanup must call this before unlinking or reusing a segment path. The read path
@@ -494,222 +281,6 @@ impl StrataStore {
             .get_store_state()?
             .unwrap_or_default()
             .durable_lsn)
-    }
-
-    fn live_record_ref(&self, key: &BlobKey) -> Result<Option<RecordRef>> {
-        let Some(entry) = self.index.get_blob_entry(key)? else {
-            return Ok(None);
-        };
-        if entry.state == BlobState::Tombstoned {
-            return Ok(None);
-        }
-        let Some(record_ref) = entry.record_ref else {
-            return Ok(None);
-        };
-        if !self.segment_is_readable(record_ref.segment_id)? {
-            self.evict_segment_reader(record_ref.segment_id);
-            return Ok(None);
-        }
-        Ok(Some(record_ref))
-    }
-
-    fn segment_is_readable(&self, segment_id: SegmentId) -> Result<bool> {
-        Ok(self
-            .index
-            .get_segment_state(segment_id)?
-            .is_some_and(|state| segment_state_is_readable(state.state)))
-    }
-
-    #[cfg(test)]
-    fn reader_cache_len(&self) -> usize {
-        self.reader_cache.len()
-    }
-}
-
-#[derive(Debug)]
-struct SegmentReaderCache {
-    capacity: usize,
-    inner: Mutex<SegmentReaderCacheInner>,
-}
-
-#[derive(Debug, Default)]
-struct SegmentReaderCacheInner {
-    readers: HashMap<SegmentId, Arc<Mutex<SegmentReader>>>,
-    lru: VecDeque<SegmentId>,
-}
-
-impl SegmentReaderCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            inner: Mutex::new(SegmentReaderCacheInner::default()),
-        }
-    }
-
-    fn read_record_with_options(
-        &self,
-        config: &StrataStoreConfig,
-        record_ref: RecordRef,
-        options: SegmentReadOptions,
-    ) -> Result<DecodedRecord> {
-        self.with_reader(config, record_ref.segment_id, |reader| {
-            reader.read_record_with_options(record_ref, options)
-        })
-    }
-
-    fn read_record_profiled(
-        &self,
-        config: &StrataStoreConfig,
-        record_ref: RecordRef,
-        options: SegmentReadOptions,
-        reader_acquire: &mut Duration,
-    ) -> Result<(DecodedRecord, SegmentReadProfile)> {
-        if self.capacity == 0 {
-            let path = segment_path(config, record_ref.segment_id);
-            let started = Instant::now();
-            let mut reader = SegmentReader::open(&path, record_ref.segment_id)?;
-            *reader_acquire = started.elapsed();
-            return Ok(reader.read_record_profiled_with_options(record_ref, options)?);
-        }
-
-        let started = Instant::now();
-        let reader = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let reader = if let Some(reader) = inner.readers.get(&record_ref.segment_id) {
-                Arc::clone(reader)
-            } else {
-                let path = segment_path(config, record_ref.segment_id);
-                let reader = Arc::new(Mutex::new(SegmentReader::open(
-                    &path,
-                    record_ref.segment_id,
-                )?));
-                inner
-                    .readers
-                    .insert(record_ref.segment_id, Arc::clone(&reader));
-                reader
-            };
-            inner.touch(record_ref.segment_id);
-            inner.enforce_capacity(self.capacity);
-            reader
-        };
-        let result = {
-            let mut reader = reader
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *reader_acquire = started.elapsed();
-            reader.read_record_profiled_with_options(record_ref, options)
-        };
-        if result.is_err() {
-            self.evict(record_ref.segment_id);
-        }
-        Ok(result?)
-    }
-
-    fn read_record_metadata(
-        &self,
-        config: &StrataStoreConfig,
-        record_ref: RecordRef,
-    ) -> Result<RecordMetadata> {
-        self.with_reader(config, record_ref.segment_id, |reader| {
-            reader.read_record_metadata(record_ref)
-        })
-    }
-
-    fn open_payload_stream(
-        &self,
-        config: &StrataStoreConfig,
-        record_ref: RecordRef,
-        payload_range: Range<u64>,
-    ) -> Result<SegmentPayloadStream> {
-        self.with_reader(config, record_ref.segment_id, |reader| {
-            reader.open_payload_stream(record_ref, payload_range)
-        })
-    }
-
-    fn evict(&self, segment_id: SegmentId) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.remove(segment_id);
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .readers
-            .len()
-    }
-
-    fn with_reader<T>(
-        &self,
-        config: &StrataStoreConfig,
-        segment_id: SegmentId,
-        read: impl FnOnce(&mut SegmentReader) -> strata_segment::Result<T>,
-    ) -> Result<T> {
-        if self.capacity == 0 {
-            let path = segment_path(config, segment_id);
-            let mut reader = SegmentReader::open(&path, segment_id)?;
-            return Ok(read(&mut reader)?);
-        }
-
-        let reader = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let reader = if let Some(reader) = inner.readers.get(&segment_id) {
-                Arc::clone(reader)
-            } else {
-                let path = segment_path(config, segment_id);
-                let reader = Arc::new(Mutex::new(SegmentReader::open(&path, segment_id)?));
-                inner.readers.insert(segment_id, Arc::clone(&reader));
-                reader
-            };
-            inner.touch(segment_id);
-            inner.enforce_capacity(self.capacity);
-            reader
-        };
-        let result = {
-            let mut reader = reader
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            read(&mut reader)
-        };
-        if result.is_err() {
-            self.evict(segment_id);
-        }
-        Ok(result?)
-    }
-}
-
-impl SegmentReaderCacheInner {
-    fn touch(&mut self, segment_id: SegmentId) {
-        if let Some(position) = self.lru.iter().position(|cached| *cached == segment_id) {
-            self.lru.remove(position);
-        }
-        self.lru.push_back(segment_id);
-    }
-
-    fn enforce_capacity(&mut self, capacity: usize) {
-        while self.readers.len() > capacity {
-            let Some(evicted) = self.lru.pop_front() else {
-                break;
-            };
-            self.readers.remove(&evicted);
-        }
-    }
-
-    fn remove(&mut self, segment_id: SegmentId) {
-        self.readers.remove(&segment_id);
-        if let Some(position) = self.lru.iter().position(|cached| *cached == segment_id) {
-            self.lru.remove(position);
-        }
     }
 }
 
@@ -1309,61 +880,6 @@ fn recover_unsealed_segments(config: &StrataStoreConfig, index: &StrataIndex) ->
     Ok(())
 }
 
-fn verify_sealed_segments(config: &StrataStoreConfig, index: &StrataIndex) -> Result<()> {
-    for (_, state) in index.iter_segment_states()? {
-        if state.state == SegmentFileState::Sealed {
-            verify_sealed_segment(config, &state)?;
-        }
-    }
-    Ok(())
-}
-
-fn verify_sealed_segment(config: &StrataStoreConfig, state: &SegmentState) -> Result<()> {
-    let segment_id = state.segment_id;
-    let path = segment_path(config, segment_id);
-    let expected_len = state
-        .sealed_len
-        .ok_or(Error::SealedSegmentMissingLength { segment_id })?;
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Error::SealedSegmentMissing { segment_id, path });
-        }
-        Err(source) => {
-            return Err(Error::Io {
-                path: path.clone(),
-                source,
-            });
-        }
-    };
-    let actual_len = metadata.len();
-    if actual_len != expected_len {
-        return Err(Error::SealedSegmentLengthMismatch {
-            segment_id,
-            path,
-            expected_len,
-            actual_len,
-        });
-    }
-
-    if config.sealed_segment_integrity_policy == SealedSegmentIntegrityPolicy::Checksum {
-        let expected = state
-            .sealed_sha256
-            .ok_or(Error::SealedSegmentMissingChecksum { segment_id })?;
-        let actual = sha256_file_prefix(&path, expected_len)?;
-        if actual != expected {
-            return Err(Error::SealedSegmentChecksumMismatch {
-                segment_id,
-                path,
-                expected,
-                actual,
-            });
-        }
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegmentRecovery {
     is_complete: bool,
@@ -1781,12 +1297,7 @@ fn active_segment_state_from_path(
     SegmentState {
         segment_id,
         volume_id: 0,
-        path: path
-            .as_path()
-            .strip_prefix(config.namespace_dir())
-            .unwrap_or(path.as_path())
-            .to_string_lossy()
-            .into_owned(),
+        path: relative_segment_path(config, path),
         placement_class: PlacementClass::Ingest,
         state: SegmentFileState::Open,
         write_offset,
@@ -1796,45 +1307,6 @@ fn active_segment_state_from_path(
         sealed_len: None,
         sealed_sha256: None,
     }
-}
-
-fn sha256_file_prefix(path: &Path, len: u64) -> Result<[u8; 32]> {
-    let mut file = fs::File::open(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut remaining = len;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-
-    while remaining > 0 {
-        let to_read = remaining.min(buffer.len() as u64) as usize;
-        let read = file
-            .read(&mut buffer[..to_read])
-            .map_err(|source| Error::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if read == 0 {
-            return Err(Error::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "segment ended before sealed length",
-                ),
-            });
-        }
-        hasher.update(&buffer[..read]);
-        remaining -= read as u64;
-    }
-
-    Ok(hasher.finalize().into())
-}
-
-fn active_segment_durable_offset(index: &StrataIndex, segment_id: SegmentId) -> Result<u64> {
-    Ok(index
-        .get_segment_state(segment_id)?
-        .map_or(0, |state| state.durable_offset))
 }
 
 fn validate_config(config: &StrataStoreConfig) -> Result<()> {
@@ -1898,102 +1370,6 @@ fn unsealed_ingest_segment_count(index: &StrataIndex) -> Result<usize> {
     Ok(unsealed_ingest_segment_ids(index)?.len())
 }
 
-fn store_state_with_advanced_durable_lsn(
-    index: &StrataIndex,
-    override_state: Option<&SegmentState>,
-    batch: &mut typed_store::rocks::DBBatch,
-) -> Result<StrataStoreState> {
-    let mut store_state = index.get_store_state()?.unwrap_or_default();
-    store_state.durable_lsn =
-        compute_durable_lsn(index, store_state.durable_lsn, override_state, batch)?;
-    Ok(store_state)
-}
-
-fn compute_durable_lsn(
-    index: &StrataIndex,
-    current_durable_lsn: StrataLsn,
-    override_state: Option<&SegmentState>,
-    batch: &mut typed_store::rocks::DBBatch,
-) -> Result<StrataLsn> {
-    let states = segment_states_with_override(index, override_state)?;
-    let mut durable_lsn = current_durable_lsn;
-
-    loop {
-        let Some(next_lsn) = durable_lsn.checked_add(1) else {
-            break;
-        };
-        let Some(key) = index
-            .pending_lsn_ops()
-            .get(&next_lsn)
-            .map_err(strata_index::Error::from)?
-        else {
-            break;
-        };
-        if !pending_lsn_is_durable(index, next_lsn, &key, &states)? {
-            break;
-        }
-        batch
-            .delete_batch(index.pending_lsn_ops(), [&next_lsn])
-            .map_err(strata_index::Error::from)?;
-        durable_lsn = next_lsn;
-    }
-
-    Ok(durable_lsn)
-}
-
-fn segment_states_with_override(
-    index: &StrataIndex,
-    override_state: Option<&SegmentState>,
-) -> Result<Vec<(SegmentId, SegmentState)>> {
-    let mut states = index.iter_segment_states()?;
-    if let Some(override_state) = override_state {
-        let mut replaced = false;
-        for (_, state) in &mut states {
-            if state.segment_id == override_state.segment_id {
-                *state = override_state.clone();
-                replaced = true;
-                break;
-            }
-        }
-        if !replaced {
-            states.push((override_state.segment_id, override_state.clone()));
-        }
-    }
-    Ok(states)
-}
-
-fn pending_lsn_is_durable(
-    index: &StrataIndex,
-    lsn: StrataLsn,
-    key: &BlobKey,
-    states: &[(SegmentId, SegmentState)],
-) -> Result<bool> {
-    let Some(entry) = index.get_blob_version(&BlobVersionKey {
-        key: key.clone(),
-        lsn,
-    })?
-    else {
-        return Ok(false);
-    };
-    let Some(record_ref) = entry.record_ref else {
-        return Ok(true);
-    };
-    let Some(record_end_offset) = record_ref.end_offset() else {
-        return Err(strata_segment::Error::RangeOverflow.into());
-    };
-    Ok(states
-        .iter()
-        .find(|(candidate, _)| *candidate == record_ref.segment_id)
-        .is_some_and(|(_, state)| {
-            !matches!(
-                state.state,
-                SegmentFileState::SealFailed
-                    | SegmentFileState::Deleting
-                    | SegmentFileState::Deleted
-            ) && state.durable_offset >= record_end_offset
-        }))
-}
-
 fn first_seal_failed_segment(index: &StrataIndex) -> Result<Option<SegmentId>> {
     Ok(index
         .iter_segment_states()?
@@ -2011,125 +1387,6 @@ fn is_unsealed_state(state: SegmentFileState) -> bool {
         state,
         SegmentFileState::Open | SegmentFileState::Sealing | SegmentFileState::SealFailed
     )
-}
-
-fn segment_state_is_readable(state: SegmentFileState) -> bool {
-    !matches!(
-        state,
-        SegmentFileState::Deleting | SegmentFileState::Deleted
-    )
-}
-
-fn segment_path(config: &StrataStoreConfig, segment_id: SegmentId) -> PathBuf {
-    config.ingest_dir().join(segment_file_name(segment_id))
-}
-
-fn segment_file_name(segment_id: SegmentId) -> String {
-    format!("{segment_id:012}.data")
-}
-
-fn parse_segment_file_name(file_name: &std::ffi::OsStr) -> Option<SegmentId> {
-    let stem = file_name.to_str()?.strip_suffix(".data")?;
-    if stem.len() != 12 || !stem.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    stem.parse().ok()
-}
-
-fn add_live_lifecycle_stats(
-    stats: &mut SegmentStats,
-    placement_class: PlacementClass,
-    record_len: u64,
-    lifecycle: BlobLifecycle,
-) {
-    increment_histogram(
-        &mut stats.future_epoch_histogram,
-        lifecycle.logical_end_epoch,
-    );
-    increment_histogram(
-        &mut stats.extension_count_histogram,
-        lifecycle.extension_count,
-    );
-    if lifecycle_is_pinned(placement_class, lifecycle) {
-        stats.pinned_bytes = stats.pinned_bytes.saturating_add(record_len);
-    }
-    refresh_live_epoch_bounds(stats);
-}
-
-fn update_live_lifecycle_stats(
-    stats: &mut SegmentStats,
-    placement_class: PlacementClass,
-    record_len: u64,
-    old_lifecycle: BlobLifecycle,
-    new_lifecycle: BlobLifecycle,
-) {
-    if old_lifecycle.logical_end_epoch != new_lifecycle.logical_end_epoch {
-        decrement_histogram(
-            &mut stats.future_epoch_histogram,
-            old_lifecycle.logical_end_epoch,
-        );
-        increment_histogram(
-            &mut stats.future_epoch_histogram,
-            new_lifecycle.logical_end_epoch,
-        );
-        refresh_live_epoch_bounds(stats);
-    }
-
-    if old_lifecycle.extension_count != new_lifecycle.extension_count {
-        decrement_histogram(
-            &mut stats.extension_count_histogram,
-            old_lifecycle.extension_count,
-        );
-        increment_histogram(
-            &mut stats.extension_count_histogram,
-            new_lifecycle.extension_count,
-        );
-    }
-
-    match (
-        lifecycle_is_pinned(placement_class, old_lifecycle),
-        lifecycle_is_pinned(placement_class, new_lifecycle),
-    ) {
-        (false, true) => {
-            stats.pinned_bytes = stats.pinned_bytes.saturating_add(record_len);
-        }
-        (true, false) => {
-            stats.pinned_bytes = stats.pinned_bytes.saturating_sub(record_len);
-        }
-        _ => {}
-    }
-}
-
-fn lifecycle_is_pinned(placement_class: PlacementClass, lifecycle: BlobLifecycle) -> bool {
-    match placement_class {
-        PlacementClass::ExactEpoch(physical_epoch) => lifecycle.logical_end_epoch > physical_epoch,
-        PlacementClass::Ingest | PlacementClass::Spillover => false,
-    }
-}
-
-fn increment_histogram<K>(histogram: &mut std::collections::BTreeMap<K, u64>, key: K)
-where
-    K: Ord,
-{
-    *histogram.entry(key).or_default() += 1;
-}
-
-fn decrement_histogram<K>(histogram: &mut std::collections::BTreeMap<K, u64>, key: K)
-where
-    K: Ord,
-{
-    match histogram.get_mut(&key) {
-        Some(count) if *count > 1 => *count -= 1,
-        Some(_) => {
-            histogram.remove(&key);
-        }
-        None => {}
-    }
-}
-
-fn refresh_live_epoch_bounds(stats: &mut SegmentStats) {
-    stats.min_live_end_epoch = stats.future_epoch_histogram.keys().next().copied();
-    stats.max_live_end_epoch = stats.future_epoch_histogram.keys().next_back().copied();
 }
 
 #[cfg(test)]
