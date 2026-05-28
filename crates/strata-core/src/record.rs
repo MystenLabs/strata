@@ -1,14 +1,17 @@
 use serde::{Deserialize, Serialize};
+use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::{BlobKey, Error, Generation, Result};
+use crate::{BlobKey, Checksum, ChecksumAlgorithm, Error, Generation, Result};
 
 pub const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"STR0");
-pub const RECORD_VERSION: u16 = 1;
-pub const FIXED_RECORD_HEADER_LEN: usize = 40;
+pub const RECORD_VERSION: u16 = 2;
+pub const FIXED_RECORD_HEADER_LEN: usize = 56;
 const MAX_PAYLOAD_LEN: u64 = 1 << 40;
 const RECORD_CHECKSUM_OFFSET: usize = 36;
+const RECORD_CHECKSUM_LEN: usize = 16;
+const RECORD_CHECKSUM_ALGORITHM_OFFSET: usize = RECORD_CHECKSUM_OFFSET + RECORD_CHECKSUM_LEN;
 
-/// Logical fields needed to build a v1 Strata record header.
+/// Logical fields needed to build a Strata record header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordHeaderFields {
     pub key_len: u32,
@@ -27,7 +30,7 @@ pub struct RecordHeader {
     pub logical_end_epoch: u64,
     pub generation: Generation,
     pub payload_len: u64,
-    pub record_checksum: u32,
+    pub record_checksum: Checksum,
 }
 
 impl RecordHeader {
@@ -41,7 +44,7 @@ impl RecordHeader {
             logical_end_epoch: fields.logical_end_epoch,
             generation: fields.generation,
             payload_len: fields.payload_len,
-            record_checksum: 0,
+            record_checksum: Checksum::xxh3_128_value(0),
         })
     }
 
@@ -53,20 +56,24 @@ impl RecordHeader {
     }
 
     pub fn encoded_record_len(self) -> Result<u64> {
-        (FIXED_RECORD_HEADER_LEN as u64)
+        u64::from(self.header_len)
             .checked_add(self.payload_len)
             .and_then(|len| len.checked_add(u64::from(self.key_len)))
             .ok_or(Error::RecordLengthOverflow)
     }
 
-    pub fn payload_offset(record_offset: u64) -> Result<u64> {
+    pub fn header_len_usize(self) -> usize {
+        self.header_len as usize
+    }
+
+    pub fn payload_offset(self, record_offset: u64) -> Result<u64> {
         record_offset
-            .checked_add(FIXED_RECORD_HEADER_LEN as u64)
+            .checked_add(u64::from(self.header_len))
             .ok_or(Error::RecordLengthOverflow)
     }
 
     pub fn key_offset(self, record_offset: u64) -> Result<u64> {
-        Self::payload_offset(record_offset)?
+        self.payload_offset(record_offset)?
             .checked_add(self.payload_len)
             .ok_or(Error::RecordLengthOverflow)
     }
@@ -79,13 +86,16 @@ impl RecordHeader {
         output[12..20].copy_from_slice(&self.logical_end_epoch.to_le_bytes());
         output[20..28].copy_from_slice(&self.generation.to_le_bytes());
         output[28..36].copy_from_slice(&self.payload_len.to_le_bytes());
-        output[36..40].copy_from_slice(&self.record_checksum.to_le_bytes());
+        output[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + RECORD_CHECKSUM_LEN]
+            .copy_from_slice(&self.record_checksum.value.to_le_bytes());
+        output[RECORD_CHECKSUM_ALGORITHM_OFFSET..RECORD_CHECKSUM_ALGORITHM_OFFSET + 4]
+            .copy_from_slice(&self.record_checksum.algorithm.code().to_le_bytes());
     }
 }
 
 /// Borrowed encoded record pieces.
 ///
-/// The checksum is computed over `header(checksum=0) || payload || key`, then patched into the
+/// The checksum is computed over `header(xxh3_128_checksum=0) || payload || key`, then patched into the
 /// returned fixed header. This avoids copying large payloads into a temporary full-record buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedRecordParts<'a> {
@@ -111,9 +121,9 @@ impl<'a> EncodedRecordParts<'a> {
         let record_len = header.encoded_record_len()?;
         let mut encoded_header = header.encode_fixed();
 
-        header.record_checksum = record_checksum_parts(&encoded_header, payload, key.as_bytes());
-        encoded_header[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + 4]
-            .copy_from_slice(&header.record_checksum.to_le_bytes());
+        header.record_checksum =
+            record_checksum_parts_for_header(header, &encoded_header, payload, key.as_bytes());
+        encoded_header = header.encode_fixed();
 
         Ok(Self {
             header: encoded_header,
@@ -179,6 +189,14 @@ impl DecodedRecord {
             });
         }
 
+        let algorithm_code = read_u32(input, RECORD_CHECKSUM_ALGORITHM_OFFSET);
+        let algorithm = ChecksumAlgorithm::from_code(algorithm_code)
+            .ok_or(Error::UnsupportedChecksumAlgorithm(algorithm_code))?;
+        if algorithm != ChecksumAlgorithm::Xxh3_128 {
+            return Err(Error::UnsupportedChecksumAlgorithm(algorithm_code));
+        }
+        let record_checksum = Checksum::new(algorithm, read_u128(input, RECORD_CHECKSUM_OFFSET));
+
         let header = RecordHeader {
             magic,
             version,
@@ -187,7 +205,7 @@ impl DecodedRecord {
             logical_end_epoch: read_u64(input, 12),
             generation: read_u64(input, 20),
             payload_len: read_u64(input, 28),
-            record_checksum: read_u32(input, RECORD_CHECKSUM_OFFSET),
+            record_checksum,
         };
         validate_lengths(header.key_len as usize, header.payload_len)?;
         Ok(header)
@@ -203,7 +221,15 @@ impl DecodedRecord {
             });
         }
 
-        let actual = record_checksum(&input[..record_len]);
+        let payload_start = header.header_len_usize();
+        let payload_end = payload_start + header.payload_len as usize;
+        let key_end = payload_end + header.key_len as usize;
+        let actual = record_checksum_parts_for_header(
+            header,
+            &input[..payload_start],
+            &input[payload_start..payload_end],
+            &input[payload_end..key_end],
+        );
         if actual != header.record_checksum {
             return Err(Error::RecordChecksumMismatch {
                 expected: header.record_checksum,
@@ -211,40 +237,94 @@ impl DecodedRecord {
             });
         }
 
-        let payload_start = FIXED_RECORD_HEADER_LEN;
-        let payload_end = payload_start + header.payload_len as usize;
-        let key_end = payload_end + header.key_len as usize;
         Ok(Self {
             header,
             payload: input[payload_start..payload_end].to_vec(),
             key: BlobKey::try_from(&input[payload_end..key_end])?,
         })
     }
+
+    pub fn from_parts(
+        header: RecordHeader,
+        fixed_header: &[u8; FIXED_RECORD_HEADER_LEN],
+        payload: Vec<u8>,
+        key: Vec<u8>,
+    ) -> Result<Self> {
+        Self::from_parts_with_checksum_verification(header, fixed_header, payload, key, true)
+    }
+
+    pub fn from_parts_with_checksum_verification(
+        header: RecordHeader,
+        fixed_header: &[u8; FIXED_RECORD_HEADER_LEN],
+        payload: Vec<u8>,
+        key: Vec<u8>,
+        verify_checksum: bool,
+    ) -> Result<Self> {
+        let payload_len =
+            usize::try_from(header.payload_len).map_err(|_| Error::RecordLengthOverflow)?;
+        if payload.len() != payload_len {
+            return Err(Error::BufferTooShort {
+                needed: payload_len,
+                actual: payload.len(),
+            });
+        }
+        if key.len() != header.key_len as usize {
+            return Err(Error::BufferTooShort {
+                needed: header.key_len as usize,
+                actual: key.len(),
+            });
+        }
+
+        if verify_checksum {
+            let actual = record_checksum_parts_for_header(header, fixed_header, &payload, &key);
+            if actual != header.record_checksum {
+                return Err(Error::RecordChecksumMismatch {
+                    expected: header.record_checksum,
+                    actual,
+                });
+            }
+        }
+
+        Ok(Self {
+            header,
+            payload,
+            key: BlobKey::try_from(key)?,
+        })
+    }
 }
 
-fn record_checksum(record: &[u8]) -> u32 {
-    let mut header = [0; FIXED_RECORD_HEADER_LEN];
-    header.copy_from_slice(&record[..FIXED_RECORD_HEADER_LEN]);
-    header[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + 4].fill(0);
-
-    let payload_start = FIXED_RECORD_HEADER_LEN;
-    let header_for_lengths = DecodedRecord::peek_fixed_header(record)
-        .expect("record checksum is only called after fixed header validation");
-    let payload_end = payload_start + header_for_lengths.payload_len as usize;
-    let key_end = payload_end + header_for_lengths.key_len as usize;
+fn record_checksum_parts_for_header(
+    header: RecordHeader,
+    fixed_header: &[u8],
+    payload: &[u8],
+    key: &[u8],
+) -> Checksum {
+    let mut header_bytes = [0; FIXED_RECORD_HEADER_LEN];
+    header_bytes.copy_from_slice(fixed_header);
+    header_bytes[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + RECORD_CHECKSUM_LEN].fill(0);
     record_checksum_parts(
-        &header,
-        &record[payload_start..payload_end],
-        &record[payload_end..key_end],
+        header.record_checksum.algorithm,
+        &header_bytes,
+        payload,
+        key,
     )
 }
 
-fn record_checksum_parts(header_with_zero_checksum: &[u8], payload: &[u8], key: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(header_with_zero_checksum);
-    hasher.update(payload);
-    hasher.update(key);
-    hasher.finalize()
+fn record_checksum_parts(
+    algorithm: ChecksumAlgorithm,
+    header_with_zero_checksum: &[u8],
+    payload: &[u8],
+    key: &[u8],
+) -> Checksum {
+    match algorithm {
+        ChecksumAlgorithm::Xxh3_128 => {
+            let mut hasher = Xxh3Default::new();
+            hasher.update(header_with_zero_checksum);
+            hasher.update(payload);
+            hasher.update(key);
+            Checksum::xxh3_128_value(hasher.digest128())
+        }
+    }
 }
 
 fn validate_lengths(key_len: usize, payload_len: u64) -> Result<()> {
@@ -269,6 +349,10 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(input[offset..offset + 8].try_into().expect("slice length"))
 }
 
+fn read_u128(input: &[u8], offset: usize) -> u128 {
+    u128::from_le_bytes(input[offset..offset + 16].try_into().expect("slice length"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,13 +375,44 @@ mod tests {
         assert_eq!(decoded.header.generation, 7);
         assert_eq!(decoded.header.payload_len, payload.len() as u64);
         assert_eq!(decoded.header.key_len, key.len() as u32);
+        assert_eq!(decoded.header.version, RECORD_VERSION);
+        assert_eq!(decoded.header.header_len_usize(), FIXED_RECORD_HEADER_LEN);
+        assert_eq!(
+            decoded.header.record_checksum.algorithm,
+            ChecksumAlgorithm::Xxh3_128
+        );
+    }
+
+    #[test]
+    fn round_trips_record_from_parts_without_payload_copy_source() {
+        let (key, payload, encoded) = encoded_record();
+        let header = DecodedRecord::peek_fixed_header(&encoded).unwrap();
+        let fixed_header: &[u8; FIXED_RECORD_HEADER_LEN] = encoded[..FIXED_RECORD_HEADER_LEN]
+            .try_into()
+            .expect("fixed header length");
+        let payload_start = FIXED_RECORD_HEADER_LEN;
+        let payload_end = payload_start + header.payload_len as usize;
+        let key_end = payload_end + header.key_len as usize;
+
+        let decoded = DecodedRecord::from_parts(
+            header,
+            fixed_header,
+            encoded[payload_start..payload_end].to_vec(),
+            encoded[payload_end..key_end].to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(decoded.key, key);
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.header, header);
     }
 
     #[test]
     fn rejects_partial_fixed_header() {
-        let input = vec![0; FIXED_RECORD_HEADER_LEN - 1];
+        let (_, _, encoded) = encoded_record();
+        let input = &encoded[..FIXED_RECORD_HEADER_LEN - 1];
         assert_eq!(
-            DecodedRecord::decode(&input),
+            DecodedRecord::decode(input),
             Err(Error::BufferTooShort {
                 needed: FIXED_RECORD_HEADER_LEN,
                 actual: FIXED_RECORD_HEADER_LEN - 1,
@@ -330,12 +445,38 @@ mod tests {
     #[test]
     fn rejects_corrupt_payload() {
         let (_, _, mut encoded) = encoded_record();
-        encoded[FIXED_RECORD_HEADER_LEN] ^= 0x01;
+        let header = DecodedRecord::peek_fixed_header(&encoded).unwrap();
+        encoded[header.header_len_usize()] ^= 0x01;
 
         assert!(matches!(
             DecodedRecord::decode(&encoded),
             Err(Error::RecordChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn can_decode_parts_without_checksum_verification() {
+        let (key, payload, mut encoded) = encoded_record();
+        let header = DecodedRecord::peek_fixed_header(&encoded).unwrap();
+        encoded[FIXED_RECORD_HEADER_LEN] ^= 0x01;
+        let fixed_header: &[u8; FIXED_RECORD_HEADER_LEN] = encoded[..FIXED_RECORD_HEADER_LEN]
+            .try_into()
+            .expect("fixed header length");
+        let payload_start = FIXED_RECORD_HEADER_LEN;
+        let payload_end = payload_start + header.payload_len as usize;
+        let key_end = payload_end + header.key_len as usize;
+
+        let decoded = DecodedRecord::from_parts_with_checksum_verification(
+            header,
+            fixed_header,
+            encoded[payload_start..payload_end].to_vec(),
+            encoded[payload_end..key_end].to_vec(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.key, key);
+        assert_ne!(decoded.payload, payload);
     }
 
     #[test]

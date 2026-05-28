@@ -16,6 +16,7 @@ const DEFAULT_NAMESPACE: &str = "default";
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1 << 40;
 const DEFAULT_MAX_UNSEALED_SEGMENTS: usize = 8;
+const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READER_CACHE_CAPACITY;
 const DEFAULT_MAX_PRINT_BYTES: usize = 4096;
 const DEFAULT_END_EPOCH: Epoch = 42;
 
@@ -50,6 +51,7 @@ struct Config {
     queue_capacity: usize,
     segment_max_bytes: u64,
     max_unsealed_segments: usize,
+    reader_cache_capacity: usize,
     recovery_policy: StrataRecoveryPolicy,
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     max_print_bytes: usize,
@@ -65,6 +67,7 @@ impl Config {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             max_unsealed_segments: DEFAULT_MAX_UNSEALED_SEGMENTS,
+            reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             max_print_bytes: DEFAULT_MAX_PRINT_BYTES,
@@ -89,6 +92,10 @@ impl Config {
                 "--max-unsealed-segments" => {
                     config.max_unsealed_segments =
                         parse_nonzero_usize(&next_value(&mut args, "--max-unsealed-segments")?)?
+                }
+                "--reader-cache-capacity" => {
+                    config.reader_cache_capacity =
+                        parse_usize(&next_value(&mut args, "--reader-cache-capacity")?)?
                 }
                 "--recovery-policy" => {
                     config.recovery_policy =
@@ -130,6 +137,7 @@ impl Config {
             segment_max_bytes: self.segment_max_bytes,
             write_queue_capacity: self.queue_capacity,
             max_unsealed_segments: self.max_unsealed_segments,
+            segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: self.recovery_policy,
             sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
         }
@@ -344,6 +352,7 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
             println!("segment_max_bytes={}", config.segment_max_bytes);
             println!("queue_capacity={}", config.queue_capacity);
             println!("max_unsealed_segments={}", config.max_unsealed_segments);
+            println!("reader_cache_capacity={}", config.reader_cache_capacity);
             println!("recovery_policy={:?}", config.recovery_policy);
             println!(
                 "sealed_integrity={:?}",
@@ -562,6 +571,7 @@ options:
   --queue-capacity <count>
   --segment-max-bytes <bytes|KiB|MiB|GiB>
   --max-unsealed-segments <count>
+  --reader-cache-capacity <count>       cached segment readers; 0 disables
   --recovery-policy <point-in-time|absolute-consistency>
   --sealed-integrity <metadata-only|checksum>
   --default-end-epoch <epoch>

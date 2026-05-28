@@ -11,8 +11,8 @@ strata-core.workspace = true
 strata-index.workspace = true
 strata-segment.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 typed-store.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true

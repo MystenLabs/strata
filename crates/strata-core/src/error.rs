@@ -1,4 +1,4 @@
-use crate::BlobKeyError;
+use crate::{BlobKeyError, Checksum};
 
 /// Result type used by `strata-core`.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -21,6 +21,9 @@ pub enum Error {
     #[error("invalid record header length: expected {expected}, got {actual}")]
     InvalidHeaderLength { expected: u16, actual: u16 },
 
+    #[error("unsupported checksum algorithm code: {0}")]
+    UnsupportedChecksumAlgorithm(u32),
+
     #[error("record key length exceeds limit: {0}")]
     KeyTooLarge(u32),
 
@@ -33,6 +36,9 @@ pub enum Error {
     #[error("record length overflow")]
     RecordLengthOverflow,
 
-    #[error("record checksum mismatch: expected {expected:#x}, actual {actual:#x}")]
-    RecordChecksumMismatch { expected: u32, actual: u32 },
+    #[error("record checksum mismatch: expected {expected:?}, actual {actual:?}")]
+    RecordChecksumMismatch {
+        expected: Checksum,
+        actual: Checksum,
+    },
 }

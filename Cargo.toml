@@ -14,7 +14,6 @@ license = "Apache-2.0"
 repository = "https://github.com/walrus-foundation/strata"
 
 [workspace.dependencies]
-crc32fast = "1.5"
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "multi-threaded-cf", "snappy", "zlib", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
@@ -26,6 +25,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }
 typed-store = { path = "/Users/sadhansood/dev/walrus/crates/typed-store" }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [patch.crates-io]
 rocksdb = { path = "/Users/sadhansood/dev/walrus/crates/rocksdb" }

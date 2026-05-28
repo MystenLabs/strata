@@ -35,6 +35,8 @@ mod scanner;
 mod writer;
 
 pub use error::{Error, Result};
-pub use reader::{RecordMetadata, SegmentPayloadStream, SegmentReader};
+pub use reader::{
+    RecordMetadata, SegmentPayloadStream, SegmentReadOptions, SegmentReadProfile, SegmentReader,
+};
 pub use scanner::{ScannedRecord, SegmentScanner, ValidPrefix};
 pub use writer::{AppendOutcome, SegmentWriter};

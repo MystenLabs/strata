@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum encoded blob key length accepted by the v1 record format.
+/// Maximum encoded blob key length accepted by the record format.
 pub const MAX_BLOB_KEY_LEN: usize = 4 * 1024;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
