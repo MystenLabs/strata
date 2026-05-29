@@ -31,7 +31,7 @@ use strata_core::{BlobKey, BlobLifecycle, PlacementClass};
 use strata_segment::SegmentWriter;
 use strata_store::{
     ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile, StrataRecoveryPolicy, StrataStore,
-    StrataStoreConfig,
+    StrataStoreConfig, StrataStoreMetrics,
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -386,7 +386,7 @@ fn run_segment_append(config: &Config) -> Result<(), Box<dyn std::error::Error>>
 
 fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
-    let store = StrataStore::open_standalone(config.store_config())?;
+    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
     let mut timings = Vec::with_capacity(config.ops);
     let started = Instant::now();
 
@@ -406,7 +406,7 @@ fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload: Arc<[u8]> = Arc::from(payload(config.payload_size));
-    let store = StrataStore::open_standalone(config.store_config())?;
+    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
     let mut timings = Vec::with_capacity(config.ops);
     let started = Instant::now();
 
@@ -426,7 +426,7 @@ fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
 
 fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
-    let store = StrataStore::open_standalone(config.store_config())?;
+    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
     let read_set_size = config.read_set_size.min(config.ops.max(1));
     let keys = (0..read_set_size)
         .map(|op| bench_key(b"read-key-", op))
@@ -454,7 +454,7 @@ fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             StoreGetMode::Payload => {
                 if let Some(profile_summary) = &mut profile_summary {
                     let (value, profile) =
-                        store.get_sliver_profiled_with_options(key, read_options)?;
+                        store.get_blob_profiled_with_options(key, read_options)?;
                     hint::black_box(value.as_deref());
                     let op_elapsed = op_started.elapsed();
                     profile_summary.add(op_elapsed, profile);

@@ -54,13 +54,13 @@
 //! Read path:
 //!
 //! ```text
-//! get_sliver
+//! get_blob
 //!   -> blob index lookup
 //!   -> SegmentReader::read_record
 //!   -> verify record key
 //!   -> verify full-record checksum unless ReadOptions disables it
 //!
-//! stream_sliver
+//! stream_blob
 //!   -> blob index lookup
 //!   -> read record header and key trailer
 //!   -> validate requested payload range
@@ -72,6 +72,7 @@ mod durability;
 mod error;
 mod integrity;
 mod layout;
+mod metrics;
 mod read;
 mod reader_cache;
 mod stats;
@@ -82,7 +83,7 @@ use std::{
     path::Path,
     sync::{Arc, mpsc},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use strata_core::{
@@ -101,6 +102,8 @@ use durability::{active_segment_durable_offset, store_state_with_advanced_durabl
 pub use error::{Error, Result};
 use integrity::{sha256_file_prefix, verify_sealed_segments};
 use layout::{parse_segment_file_name, relative_segment_path, segment_path};
+use metrics::PutMetric;
+pub use metrics::StrataStoreMetrics;
 pub use read::{ReadOptions, StoreGetProfile};
 use reader_cache::SegmentReaderCache;
 use stats::{add_live_lifecycle_stats, update_live_lifecycle_stats};
@@ -118,6 +121,7 @@ pub struct StrataStore {
     seal_tx: Option<mpsc::Sender<SealCommand>>,
     seal_handle: Option<JoinHandle<()>>,
     pub(crate) reader_cache: SegmentReaderCache,
+    metrics: StrataStoreMetrics,
 }
 
 impl StrataStore {
@@ -125,38 +129,50 @@ impl StrataStore {
     ///
     /// Segment files are stored at `root_dir/namespace/ingest`, and the index RocksDB lives at
     /// `root_dir/namespace/index`.
-    pub fn open_standalone(config: StrataStoreConfig) -> Result<Self> {
+    pub fn open_standalone(config: StrataStoreConfig, metrics: StrataStoreMetrics) -> Result<Self> {
         let index =
             StrataIndex::open_path(config.standalone_index_dir(), config.index_cf_prefix())?;
-        Self::from_index(config, index)
+        Self::from_index(config, index, metrics)
     }
 
     /// Opens a store using a caller-provided index.
     ///
     /// This mode creates only segment directories. It does not create a local index directory.
-    pub fn from_index(config: StrataStoreConfig, index: StrataIndex) -> Result<Self> {
+    pub fn from_index(
+        config: StrataStoreConfig,
+        index: StrataIndex,
+        metrics: StrataStoreMetrics,
+    ) -> Result<Self> {
         validate_config(&config)?;
         ensure_ingest_dir(&config)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
-        recover_unsealed_segments(&config, &index)?;
+        recover_unsealed_segments(&config, &index, &metrics)?;
         verify_sealed_segments(&config, &index)?;
         let active_segment_id = choose_active_segment_id(&index)?;
         let active_writer = open_active_writer(&config, active_segment_id)?;
         let durable_offset = active_segment_durable_offset(&index, active_writer.segment_id())?;
         let store_state = index.get_store_state()?.unwrap_or_default();
         publish_active_segment_state(&config, &index, &active_writer, durable_offset)?;
+        metrics.set_active_segment(
+            active_writer.segment_id(),
+            active_writer.write_offset(),
+            durable_offset,
+        );
+        metrics.set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
+        metrics.set_unsealed_segments(unsealed_ingest_segment_count(&index)?);
 
         let (seal_tx, seal_rx) = mpsc::channel();
         let seal_worker = SealWorker {
             config: config.clone(),
             index: index.clone(),
             seal_rx,
+            metrics: metrics.clone(),
         };
         let seal_handle = thread::Builder::new()
             .name(format!("strata-sealer-{}", config.namespace))
             .spawn(move || seal_worker.run())
             .map_err(|source| Error::SealThreadSpawn { source })?;
-        enqueue_unsealed_segments_for_sealing(&index, active_segment_id, &seal_tx)?;
+        enqueue_unsealed_segments_for_sealing(&index, active_segment_id, &seal_tx, &metrics)?;
 
         let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
         let coordinator = WriteCoordinator {
@@ -167,6 +183,7 @@ impl StrataStore {
             next_lsn: store_state.next_lsn,
             seal_tx: seal_tx.clone(),
             write_rx,
+            metrics: metrics.clone(),
         };
         let writer_handle = thread::Builder::new()
             .name(format!("strata-writer-{}", config.namespace))
@@ -181,6 +198,7 @@ impl StrataStore {
             writer_handle: Some(writer_handle),
             seal_tx: Some(seal_tx),
             seal_handle: Some(seal_handle),
+            metrics,
         })
     }
 
@@ -190,6 +208,10 @@ impl StrataStore {
 
     pub fn index(&self) -> &StrataIndex {
         &self.index
+    }
+
+    pub fn metrics(&self) -> &StrataStoreMetrics {
+        &self.metrics
     }
 
     pub fn put(
@@ -208,16 +230,13 @@ impl StrataStore {
         payload: Arc<[u8]>,
     ) -> Result<StrataLsn> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.write_tx
-            .as_ref()
-            .ok_or(Error::WriteQueueClosed)?
-            .send(WriteCommand::Put(WriteRequest {
-                key,
-                lifecycle,
-                payload,
-                response_tx,
-            }))
-            .map_err(|_| Error::WriteQueueClosed)?;
+        let command = WriteCommand::Put(WriteRequest {
+            key,
+            lifecycle,
+            payload,
+            response_tx,
+        });
+        self.send_write_command(command)?;
         response_rx
             .recv()
             .map_err(|_| Error::WriteResponseDropped)?
@@ -230,18 +249,15 @@ impl StrataStore {
     /// a published `Deleting` or `Deleted` state.
     pub fn evict_segment_reader(&self, segment_id: SegmentId) {
         self.reader_cache.evict(segment_id);
+        self.metrics.record_reader_cache_eviction();
     }
 
     pub fn tombstone(&self, key: &BlobKey) -> Result<StrataLsn> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.write_tx
-            .as_ref()
-            .ok_or(Error::WriteQueueClosed)?
-            .send(WriteCommand::Tombstone(TombstoneRequest {
-                key: key.clone(),
-                response_tx,
-            }))
-            .map_err(|_| Error::WriteQueueClosed)?;
+        self.send_write_command(WriteCommand::Tombstone(TombstoneRequest {
+            key: key.clone(),
+            response_tx,
+        }))?;
         response_rx
             .recv()
             .map_err(|_| Error::WriteResponseDropped)?
@@ -249,15 +265,11 @@ impl StrataStore {
 
     pub fn extend(&self, key: &BlobKey, new_logical_end_epoch: Epoch) -> Result<Option<StrataLsn>> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.write_tx
-            .as_ref()
-            .ok_or(Error::WriteQueueClosed)?
-            .send(WriteCommand::Extend(ExtendRequest {
-                key: key.clone(),
-                new_logical_end_epoch,
-                response_tx,
-            }))
-            .map_err(|_| Error::WriteQueueClosed)?;
+        self.send_write_command(WriteCommand::Extend(ExtendRequest {
+            key: key.clone(),
+            new_logical_end_epoch,
+            response_tx,
+        }))?;
         response_rx
             .recv()
             .map_err(|_| Error::WriteResponseDropped)?
@@ -265,11 +277,7 @@ impl StrataStore {
 
     pub fn sync(&self) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.write_tx
-            .as_ref()
-            .ok_or(Error::WriteQueueClosed)?
-            .send(WriteCommand::Sync(response_tx))
-            .map_err(|_| Error::WriteQueueClosed)?;
+        self.send_write_command(WriteCommand::Sync(response_tx))?;
         response_rx
             .recv()
             .map_err(|_| Error::WriteResponseDropped)?
@@ -281,6 +289,19 @@ impl StrataStore {
             .get_store_state()?
             .unwrap_or_default()
             .durable_lsn)
+    }
+
+    fn send_write_command(&self, command: WriteCommand) -> Result<()> {
+        self.metrics.enqueue_write_command();
+        let result = self
+            .write_tx
+            .as_ref()
+            .ok_or(Error::WriteQueueClosed)
+            .and_then(|write_tx| write_tx.send(command).map_err(|_| Error::WriteQueueClosed));
+        if result.is_err() {
+            self.metrics.dequeue_write_command();
+        }
+        result
     }
 }
 
@@ -340,6 +361,7 @@ struct WriteCoordinator {
     next_lsn: StrataLsn,
     seal_tx: mpsc::Sender<SealCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
+    metrics: StrataStoreMetrics,
 }
 
 #[derive(Debug)]
@@ -359,11 +381,16 @@ struct SealWorker {
     config: StrataStoreConfig,
     index: StrataIndex,
     seal_rx: mpsc::Receiver<SealCommand>,
+    metrics: StrataStoreMetrics,
 }
 
 impl WriteCoordinator {
     fn run(mut self) {
         while let Ok(command) = self.write_rx.recv() {
+            if matches!(command, WriteCommand::Shutdown) {
+                break;
+            }
+            self.metrics.dequeue_write_command();
             match command {
                 WriteCommand::Put(request) => {
                     let result =
@@ -382,7 +409,7 @@ impl WriteCoordinator {
                     let result = self.sync_data();
                     let _ = response_tx.send(result);
                 }
-                WriteCommand::Shutdown => break,
+                WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
             }
         }
     }
@@ -393,6 +420,7 @@ impl WriteCoordinator {
         lifecycle: BlobLifecycle,
         payload: &[u8],
     ) -> Result<StrataLsn> {
+        let started = Instant::now();
         loop {
             match self.try_process_put(key, lifecycle, payload) {
                 Err(Error::Segment(SegmentError::SegmentFull { .. }))
@@ -400,7 +428,20 @@ impl WriteCoordinator {
                 {
                     self.rollover_active_segment()?;
                 }
-                result => return result,
+                Ok((lsn, record_bytes)) => {
+                    self.metrics.record_put(
+                        Ok(PutMetric {
+                            payload_bytes: payload.len() as u64,
+                            record_bytes,
+                        }),
+                        started.elapsed(),
+                    );
+                    return Ok(lsn);
+                }
+                Err(error) => {
+                    self.metrics.record_put(Err(()), started.elapsed());
+                    return Err(error);
+                }
             }
         }
     }
@@ -410,7 +451,7 @@ impl WriteCoordinator {
         key: &BlobKey,
         lifecycle: BlobLifecycle,
         payload: &[u8],
-    ) -> Result<StrataLsn> {
+    ) -> Result<(StrataLsn, u64)> {
         let lsn = self.next_lsn;
         let generation = lsn;
         let next_lsn = lsn
@@ -477,11 +518,19 @@ impl WriteCoordinator {
             .map_err(strata_index::Error::from)?;
         batch.write().map_err(strata_index::Error::from)?;
         self.next_lsn = next_lsn;
+        self.metrics.set_active_segment(
+            self.active_writer.segment_id(),
+            self.active_writer.write_offset(),
+            self.durable_offset,
+        );
+        self.metrics
+            .set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
 
-        Ok(lsn)
+        Ok((lsn, outcome.record_len))
     }
 
     fn process_tombstone(&mut self, key: &BlobKey) -> Result<StrataLsn> {
+        let started = Instant::now();
         let lsn = self.next_lsn;
         let generation = lsn;
         let next_lsn = lsn
@@ -511,8 +560,15 @@ impl WriteCoordinator {
         batch
             .insert_batch(self.index.pending_lsn_ops(), [(&lsn, key)])
             .map_err(strata_index::Error::from)?;
-        batch.write().map_err(strata_index::Error::from)?;
+        let result = batch.write().map_err(strata_index::Error::from);
+        if let Err(error) = result {
+            self.metrics.record_tombstone(false, started.elapsed());
+            return Err(error.into());
+        }
         self.next_lsn = next_lsn;
+        self.metrics
+            .set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
+        self.metrics.record_tombstone(true, started.elapsed());
 
         Ok(lsn)
     }
@@ -522,10 +578,13 @@ impl WriteCoordinator {
         key: &BlobKey,
         new_logical_end_epoch: Epoch,
     ) -> Result<Option<StrataLsn>> {
+        let started = Instant::now();
         let Some(existing_entry) = self.index.get_blob_entry(key)? else {
+            self.metrics.record_extend(Ok(false), started.elapsed());
             return Ok(None);
         };
         if existing_entry.state == BlobState::Tombstoned {
+            self.metrics.record_extend(Ok(false), started.elapsed());
             return Ok(None);
         }
 
@@ -584,8 +643,14 @@ impl WriteCoordinator {
         batch
             .insert_batch(self.index.pending_lsn_ops(), [(&lsn, key)])
             .map_err(strata_index::Error::from)?;
-        batch.write().map_err(strata_index::Error::from)?;
+        if let Err(error) = batch.write().map_err(strata_index::Error::from) {
+            self.metrics.record_extend(Err(()), started.elapsed());
+            return Err(error.into());
+        }
         self.next_lsn = next_lsn;
+        self.metrics
+            .set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
+        self.metrics.record_extend(Ok(true), started.elapsed());
 
         Ok(Some(lsn))
     }
@@ -653,8 +718,16 @@ impl WriteCoordinator {
                 sealed_len: old_write_offset,
             }))
             .map_err(|_| Error::SealQueueClosed)?;
+        self.metrics.record_seal_enqueued();
         self.active_writer = new_writer;
         self.durable_offset = 0;
+        self.metrics.set_active_segment(
+            self.active_writer.segment_id(),
+            self.active_writer.write_offset(),
+            self.durable_offset,
+        );
+        self.metrics
+            .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
         Ok(())
     }
 
@@ -671,8 +744,13 @@ impl WriteCoordinator {
     }
 
     fn sync_data(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let previous_durable_offset = self.durable_offset;
         let durable_offset = self.active_writer.write_offset();
-        self.active_writer.sync_data()?;
+        if let Err(error) = self.active_writer.sync_data() {
+            self.metrics.record_sync(Err(()), started.elapsed());
+            return Err(error.into());
+        }
 
         let existing_state = self
             .index
@@ -693,9 +771,26 @@ impl WriteCoordinator {
         batch
             .insert_batch(self.index.store_state(), [((), &store_state)])
             .map_err(strata_index::Error::from)?;
-        batch.write().map_err(strata_index::Error::from)?;
-        self.index.flush_wal(true)?;
+        if let Err(error) = batch.write().map_err(strata_index::Error::from) {
+            self.metrics.record_sync(Err(()), started.elapsed());
+            return Err(error.into());
+        }
+        if let Err(error) = self.index.flush_wal(true) {
+            self.metrics.record_sync(Err(()), started.elapsed());
+            return Err(error.into());
+        }
         self.durable_offset = durable_offset;
+        self.metrics.set_active_segment(
+            self.active_writer.segment_id(),
+            self.active_writer.write_offset(),
+            self.durable_offset,
+        );
+        self.metrics
+            .set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
+        self.metrics.record_sync(
+            Ok(durable_offset.saturating_sub(previous_durable_offset)),
+            started.elapsed(),
+        );
         Ok(())
     }
 }
@@ -706,6 +801,7 @@ impl SealWorker {
             match command {
                 SealCommand::Seal(task) => {
                     if self.seal_segment(task).is_err() {
+                        self.metrics.record_seal_error();
                         let _ = self.mark_seal_failed(task.segment_id);
                     }
                 }
@@ -763,6 +859,11 @@ impl SealWorker {
             .map_err(strata_index::Error::from)?;
         batch.write().map_err(strata_index::Error::from)?;
         self.index.flush_wal(true)?;
+        self.metrics.record_segment_sealed();
+        self.metrics
+            .set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
+        self.metrics
+            .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
         Ok(())
     }
 
@@ -862,21 +963,26 @@ fn reconcile_orphan_ingest_segment_files(
     Ok(())
 }
 
-fn recover_unsealed_segments(config: &StrataStoreConfig, index: &StrataIndex) -> Result<()> {
+fn recover_unsealed_segments(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+    metrics: &StrataStoreMetrics,
+) -> Result<()> {
     let mut discard_later_segments = false;
     for segment_id in unsealed_ingest_segment_ids(index)? {
         if discard_later_segments {
-            discard_unsealed_segment(config, index, segment_id)?;
+            discard_unsealed_segment(config, index, segment_id, metrics)?;
             continue;
         }
 
-        let recovered = recover_unsealed_segment(config, index, segment_id)?;
+        let recovered = recover_unsealed_segment(config, index, segment_id, metrics)?;
+        metrics.record_recovered_segment(recovered.is_complete);
         if !recovered.is_complete {
             discard_later_segments = true;
         }
     }
-    rollback_lost_operations(index)?;
-    advance_recovered_durable_lsn(index)?;
+    rollback_lost_operations(index, metrics)?;
+    advance_recovered_durable_lsn(index, metrics)?;
     Ok(())
 }
 
@@ -889,6 +995,7 @@ fn recover_unsealed_segment(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     segment_id: SegmentId,
+    metrics: &StrataStoreMetrics,
 ) -> Result<SegmentRecovery> {
     let path = segment_path(config, segment_id);
     let existing_state = index.get_segment_state(segment_id)?;
@@ -908,6 +1015,7 @@ fn recover_unsealed_segment(
             segment_id,
             expected_write_offset,
             durable_offset,
+            metrics,
         );
     }
 
@@ -936,10 +1044,13 @@ fn recover_unsealed_segment(
         config,
         index,
         segment_id,
-        existing_state,
-        recovered_durable_offset,
-        recovered_write_offset,
-        &prefix.records,
+        RecoveredSegmentPrefix {
+            existing_state,
+            durable_offset: recovered_durable_offset,
+            recovered_write_offset,
+            records: &prefix.records,
+        },
+        metrics,
     )?;
     Ok(SegmentRecovery { is_complete })
 }
@@ -988,6 +1099,7 @@ fn recover_missing_unsealed_segment(
     segment_id: SegmentId,
     expected_write_offset: u64,
     durable_offset: u64,
+    metrics: &StrataStoreMetrics,
 ) -> Result<SegmentRecovery> {
     if durable_offset > 0 {
         return Err(Error::RecoveryInconsistent {
@@ -1003,22 +1115,31 @@ fn recover_missing_unsealed_segment(
             recovered_write_offset: 0,
         });
     }
-    discard_unsealed_segment(config, index, segment_id)?;
+    discard_unsealed_segment(config, index, segment_id, metrics)?;
     Ok(SegmentRecovery { is_complete: false })
+}
+
+struct RecoveredSegmentPrefix<'a> {
+    existing_state: Option<SegmentState>,
+    durable_offset: u64,
+    recovered_write_offset: u64,
+    records: &'a [strata_segment::ScannedRecord],
 }
 
 fn apply_recovered_segment_prefix(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     segment_id: SegmentId,
-    existing_state: Option<SegmentState>,
-    durable_offset: u64,
-    recovered_write_offset: u64,
-    records: &[strata_segment::ScannedRecord],
+    prefix: RecoveredSegmentPrefix<'_>,
+    metrics: &StrataStoreMetrics,
 ) -> Result<()> {
-    let mut state =
-        active_segment_state_from_path(config, segment_id, recovered_write_offset, durable_offset);
-    if let Some(existing) = existing_state {
+    let mut state = active_segment_state_from_path(
+        config,
+        segment_id,
+        prefix.recovered_write_offset,
+        prefix.durable_offset,
+    );
+    if let Some(existing) = prefix.existing_state {
         state.volume_id = existing.volume_id;
         state.placement_class = existing.placement_class;
         state.state = existing.state;
@@ -1029,17 +1150,18 @@ fn apply_recovered_segment_prefix(
 
     let mut batch = index.batch();
     let mut recovered_stats = SegmentStats {
-        total_bytes: recovered_write_offset,
+        total_bytes: prefix.recovered_write_offset,
         ..Default::default()
     };
+    let mut recovered_record_count = 0_u64;
 
-    for record in records {
+    for record in prefix.records {
         let record_end = record
             .record_ref
             .offset
             .checked_add(record.record_len)
             .ok_or(strata_segment::Error::RangeOverflow)?;
-        if record_end > recovered_write_offset {
+        if record_end > prefix.recovered_write_offset {
             continue;
         }
         let version_key = BlobVersionKey {
@@ -1052,6 +1174,7 @@ fn apply_recovered_segment_prefix(
         if entry.record_ref != Some(record.record_ref) {
             continue;
         }
+        recovered_record_count = recovered_record_count.saturating_add(1);
 
         state.min_lsn = Some(
             state
@@ -1084,6 +1207,7 @@ fn apply_recovered_segment_prefix(
 
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
+    metrics.record_recovered_records(recovered_record_count, prefix.recovered_write_offset);
     Ok(())
 }
 
@@ -1091,6 +1215,7 @@ fn discard_unsealed_segment(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     segment_id: SegmentId,
+    metrics: &StrataStoreMetrics,
 ) -> Result<()> {
     let mut state = active_segment_state_from_path(config, segment_id, 0, 0);
     if let Some(existing) = index.get_segment_state(segment_id)? {
@@ -1119,8 +1244,14 @@ fn discard_unsealed_segment(
 
     let path = segment_path(config, segment_id);
     match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => {
+            metrics.record_discarded_segment();
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            metrics.record_discarded_segment();
+            Ok(())
+        }
         Err(source) => Err(Error::Io {
             path: path.clone(),
             source,
@@ -1128,7 +1259,7 @@ fn discard_unsealed_segment(
     }
 }
 
-fn rollback_lost_operations(index: &StrataIndex) -> Result<()> {
+fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -> Result<()> {
     let store_state = index.get_store_state()?.unwrap_or_default();
     let states = index.iter_segment_states()?;
     let mut rollback_from = None;
@@ -1160,6 +1291,7 @@ fn rollback_lost_operations(index: &StrataIndex) -> Result<()> {
             .map_err(strata_index::Error::from)?;
     }
     index.remove_blob_versions_batch(&mut batch, &hidden_versions)?;
+    let rollback_ops = hidden_versions.len() as u64;
 
     let mut store_state = store_state;
     store_state.next_lsn = rollback_from;
@@ -1168,10 +1300,11 @@ fn rollback_lost_operations(index: &StrataIndex) -> Result<()> {
         .map_err(strata_index::Error::from)?;
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
+    metrics.record_rollback(rollback_from, rollback_ops);
     Ok(())
 }
 
-fn advance_recovered_durable_lsn(index: &StrataIndex) -> Result<()> {
+fn advance_recovered_durable_lsn(index: &StrataIndex, metrics: &StrataStoreMetrics) -> Result<()> {
     let mut batch = index.batch();
     let store_state = store_state_with_advanced_durable_lsn(index, None, &mut batch)?;
     batch
@@ -1179,6 +1312,7 @@ fn advance_recovered_durable_lsn(index: &StrataIndex) -> Result<()> {
         .map_err(strata_index::Error::from)?;
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
+    metrics.set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
     Ok(())
 }
 
@@ -1218,6 +1352,7 @@ fn enqueue_unsealed_segments_for_sealing(
     index: &StrataIndex,
     active_segment_id: SegmentId,
     seal_tx: &mpsc::Sender<SealCommand>,
+    metrics: &StrataStoreMetrics,
 ) -> Result<()> {
     for segment_id in unsealed_ingest_segment_ids(index)? {
         if segment_id < active_segment_id
@@ -1229,6 +1364,7 @@ fn enqueue_unsealed_segments_for_sealing(
                     sealed_len: state.write_offset,
                 }))
                 .map_err(|_| Error::SealQueueClosed)?;
+            metrics.record_seal_enqueued();
         }
     }
     Ok(())
@@ -1399,6 +1535,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use prometheus::Registry;
     use strata_core::{BlobLifecycle, FIXED_RECORD_HEADER_LEN};
     use tempfile::tempdir;
     use typed_store::{
@@ -1428,6 +1565,34 @@ mod tests {
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
         }
+    }
+
+    fn counter_value(registry: &Registry, name: &str) -> f64 {
+        registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .first()
+                    .map(|metric| metric.get_counter().value())
+            })
+            .unwrap_or_else(|| panic!("missing counter metric {name}"))
+    }
+
+    fn gauge_value(registry: &Registry, name: &str) -> i64 {
+        registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .first()
+                    .map(|metric| metric.get_gauge().value() as i64)
+            })
+            .unwrap_or_else(|| panic!("missing gauge metric {name}"))
     }
 
     fn wait_for_segment_state(
@@ -1478,7 +1643,8 @@ mod tests {
     fn seal_first_segment(config: &StrataStoreConfig) -> SegmentState {
         let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
         let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config.clone()).unwrap();
+        let store =
+            StrataStore::open_standalone(config.clone(), StrataStoreMetrics::default()).unwrap();
 
         store
             .put(&key_1, BlobLifecycle::new(42), b"payload-a")
@@ -1495,7 +1661,11 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store
             .put(&key, BlobLifecycle::new(42), b"hello strata")
@@ -1511,7 +1681,11 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store
             .put(&key, BlobLifecycle::new(42), b"hello strata")
@@ -1553,18 +1727,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_sliver_range_reads_payload_slice() {
+    async fn get_blob_range_reads_payload_slice() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store
             .put(&key, BlobLifecycle::new(42), b"hello strata")
             .unwrap();
 
         assert_eq!(
-            store.get_sliver_range(&key, 6..12).unwrap(),
+            store.get_blob_range(&key, 6..12).unwrap(),
             Some(b"strata".to_vec())
         );
     }
@@ -1574,7 +1752,11 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store
             .put(&key, BlobLifecycle::new(42), b"hello strata")
@@ -1608,17 +1790,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_sliver_reads_payload_slice() {
+    async fn stream_blob_reads_payload_slice() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store
             .put(&key, BlobLifecycle::new(42), b"hello strata")
             .unwrap();
 
-        let mut stream = store.stream_sliver(&key, 0..5).unwrap().unwrap();
+        let mut stream = store.stream_blob(&key, 0..5).unwrap().unwrap();
         let mut read = Vec::new();
         stream.read_to_end(&mut read).unwrap();
 
@@ -1632,18 +1818,22 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = BlobKey::new(b"missing".to_vec()).unwrap();
         let tombstoned = BlobKey::new(b"tombstoned".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
-        assert_eq!(store.get_sliver_range(&missing, 0..1).unwrap(), None);
-        assert!(store.stream_sliver(&missing, 0..1).unwrap().is_none());
+        assert_eq!(store.get_blob_range(&missing, 0..1).unwrap(), None);
+        assert!(store.stream_blob(&missing, 0..1).unwrap().is_none());
 
         store
             .put(&tombstoned, BlobLifecycle::new(42), b"payload")
             .unwrap();
         store.tombstone(&tombstoned).unwrap();
 
-        assert_eq!(store.get_sliver_range(&tombstoned, 0..1).unwrap(), None);
-        assert!(store.stream_sliver(&tombstoned, 0..1).unwrap().is_none());
+        assert_eq!(store.get_blob_range(&tombstoned, 0..1).unwrap(), None);
+        assert!(store.stream_blob(&tombstoned, 0..1).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1651,11 +1841,15 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
 
-        let err = store.get_sliver_range(&key, 0..8).unwrap_err();
+        let err = store.get_blob_range(&key, 0..8).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1669,7 +1863,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
         let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store
             .put(&key_a, BlobLifecycle::new(42), b"payload-a")
@@ -1682,7 +1880,7 @@ mod tests {
         entry_b.lsn += 1;
         store.index().put_blob_entry(&key_a, &entry_b).unwrap();
 
-        let err = store.get_sliver_range(&key_a, 0..1).unwrap_err();
+        let err = store.get_blob_range(&key_a, 0..1).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1707,7 +1905,12 @@ mod tests {
         .unwrap();
         let index = StrataIndex::from_db(db, "strata/shard-99").unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::from_index(config(dir.path(), "shard-99"), index).unwrap();
+        let store = StrataStore::from_index(
+            config(dir.path(), "shard-99"),
+            index,
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store.put(&key, BlobLifecycle::new(7), b"payload").unwrap();
 
@@ -1721,7 +1924,11 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"missing".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         assert_eq!(store.get(&key).unwrap(), None);
         assert!(!store.contains(&key).unwrap());
@@ -1736,7 +1943,7 @@ mod tests {
         fs::create_dir_all(cfg.ingest_dir()).unwrap();
         fs::write(&orphan_path, b"stale bytes").unwrap();
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
         assert_eq!(fs::metadata(&orphan_path).unwrap().len(), 0);
 
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -1757,7 +1964,7 @@ mod tests {
         fs::create_dir_all(cfg.ingest_dir()).unwrap();
         fs::write(&orphan_path, b"stale bytes").unwrap();
 
-        let err = StrataStore::open_standalone(cfg).unwrap_err();
+        let err = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap_err();
         assert!(matches!(
             err,
             Error::OrphanSegmentFile {
@@ -1772,7 +1979,11 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
         let put_lsn = store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
 
         let tombstone_lsn = store.tombstone(&key).unwrap();
@@ -1804,11 +2015,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_track_core_store_operations() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let missing = BlobKey::new(b"missing".to_vec()).unwrap();
+        let registry = Registry::new();
+        let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
+        let store = StrataStore::open_standalone(config(dir.path(), "default"), metrics).unwrap();
+
+        let put_lsn = store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+        assert_eq!(store.get(&missing).unwrap(), None);
+        assert_eq!(
+            store.get_blob_range(&key, 1..4).unwrap(),
+            Some(b"ayl".to_vec())
+        );
+        store.sync().unwrap();
+        let tombstone_lsn = store.tombstone(&key).unwrap();
+
+        assert_eq!(put_lsn, 1);
+        assert_eq!(tombstone_lsn, 2);
+        assert_eq!(
+            gauge_value(&registry, "strata_store_queued_write_commands"),
+            0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_put_calls_total"),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_put_errors_total"),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_put_payload_bytes_total"),
+            7.0
+        );
+        assert!(
+            counter_value(&registry, "strata_store_put_record_bytes_total")
+                > counter_value(&registry, "strata_store_put_payload_bytes_total")
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_tombstone_calls_total"),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_tombstone_errors_total"),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_sync_calls_total"),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_sync_errors_total"),
+            0.0
+        );
+        assert!(counter_value(&registry, "strata_store_sync_bytes_total") > 0.0);
+        assert_eq!(
+            counter_value(&registry, "strata_store_get_calls_total"),
+            2.0
+        );
+        assert_eq!(counter_value(&registry, "strata_store_get_hits_total"), 1.0);
+        assert_eq!(
+            counter_value(&registry, "strata_store_get_misses_total"),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_get_payload_bytes_total"),
+            7.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_range_read_calls_total"),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_range_read_hits_total"),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_range_read_payload_bytes_total"),
+            3.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_stream_calls_total"),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_stream_hits_total"),
+            1.0
+        );
+        assert_eq!(
+            gauge_value(&registry, "strata_store_active_segment_id"),
+            FIRST_SEGMENT_ID as i64
+        );
+        assert!(gauge_value(&registry, "strata_store_active_segment_write_offset") > 0);
+        assert!(gauge_value(&registry, "strata_store_active_segment_durable_offset") > 0);
+        assert_eq!(gauge_value(&registry, "strata_store_next_lsn"), 3);
+        assert_eq!(gauge_value(&registry, "strata_store_durable_lsn"), 1);
+        assert_eq!(gauge_value(&registry, "strata_store_pending_lsn_count"), 1);
+    }
+
+    #[tokio::test]
     async fn extend_updates_lifecycle_without_moving_payload() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         let put_lsn = store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
         let before = store.index().get_blob_entry(&key).unwrap().unwrap();
@@ -1847,7 +2165,11 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
         let entry = store.index().get_blob_entry(&key).unwrap().unwrap();
@@ -1872,12 +2194,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extend_missing_or_tombstoned_sliver_is_noop() {
+    async fn extend_missing_or_tombstoned_blob_is_noop() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let missing = BlobKey::new(b"missing".to_vec()).unwrap();
         let tombstoned = BlobKey::new(b"tombstoned".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         assert_eq!(store.extend(&missing, 50).unwrap(), None);
         assert_eq!(
@@ -1908,12 +2234,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
         {
-            let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+            let store = StrataStore::open_standalone(
+                config(dir.path(), "default"),
+                StrataStoreMetrics::default(),
+            )
+            .unwrap();
             store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
             store.sync().unwrap();
         }
 
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
     }
@@ -1923,7 +2257,11 @@ mod tests {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
 
@@ -1954,7 +2292,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
         let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(config(dir.path(), "default")).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
 
         store
             .put(&key_1, BlobLifecycle::new(42), b"payload-a")
@@ -1986,12 +2328,13 @@ mod tests {
         let cfg = config(dir.path(), "default");
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
             store.index().flush_wal(true).unwrap();
         }
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
         let state = store
@@ -2011,7 +2354,8 @@ mod tests {
         let cfg = config(dir.path(), "default");
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
             store.index().flush_wal(true).unwrap();
         }
@@ -2023,7 +2367,7 @@ mod tests {
             .set_len(0)
             .unwrap();
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(store.get(&key).unwrap(), None);
         assert_eq!(store.index().get_blob_entry(&key).unwrap(), None);
@@ -2036,7 +2380,8 @@ mod tests {
         let cfg = config(dir.path(), "default");
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             let segment_path = segment_path(&cfg, FIRST_SEGMENT_ID);
             let mut segment = SegmentWriter::open_existing(
                 &segment_path,
@@ -2069,7 +2414,7 @@ mod tests {
             store.index().flush_wal(true).unwrap();
         }
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(store.get(&key).unwrap(), None);
         assert_eq!(store.index().get_blob_entry(&key).unwrap(), None);
@@ -2087,7 +2432,8 @@ mod tests {
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
         let valid_len;
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
             store.index().flush_wal(true).unwrap();
             valid_len = store
@@ -2104,7 +2450,7 @@ mod tests {
         drop(file);
         assert!(std::fs::metadata(&path).unwrap().len() > valid_len);
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
@@ -2117,7 +2463,8 @@ mod tests {
         let cfg = config(dir.path(), "default");
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             store.put(&key, BlobLifecycle::new(42), b"payload").unwrap();
             store.tombstone(&key).unwrap();
             store.index().flush_wal(true).unwrap();
@@ -2130,7 +2477,7 @@ mod tests {
             .set_len(0)
             .unwrap();
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(store.index().get_blob_entry(&key).unwrap(), None);
         assert_eq!(store.get(&key).unwrap(), None);
@@ -2145,7 +2492,8 @@ mod tests {
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
         let first_len;
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             store
                 .put(&key, BlobLifecycle::new(42), b"payload-a")
                 .unwrap();
@@ -2169,7 +2517,7 @@ mod tests {
             .set_len(first_len)
             .unwrap();
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(store.get(&key).unwrap(), Some(b"payload-a".to_vec()));
         let entry = store.index().get_blob_entry(&key).unwrap().unwrap();
@@ -2184,7 +2532,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = config(dir.path(), "default");
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         let min_lsn = store
             .put(&key, BlobLifecycle::new(42), b"payload-a")
@@ -2223,7 +2571,8 @@ mod tests {
         let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
         let key_3 = BlobKey::new(b"blob-c".to_vec()).unwrap();
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             let lsn_1 = store
                 .put(&key_1, BlobLifecycle::new(42), b"payload-a")
                 .unwrap();
@@ -2265,7 +2614,7 @@ mod tests {
             );
         }
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
         let lsn_3 = store.put(&key_3, BlobLifecycle::new(44), b"x").unwrap();
 
         assert_eq!(lsn_3, 3);
@@ -2289,7 +2638,8 @@ mod tests {
         let first_lsn;
         let second_lsn;
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             first_lsn = store
                 .put(&key, BlobLifecycle::new(42), b"payload-a")
                 .unwrap();
@@ -2313,7 +2663,7 @@ mod tests {
             store.index().flush_wal(true).unwrap();
         }
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(
             store
@@ -2419,7 +2769,7 @@ mod tests {
             index.flush_wal(true).unwrap();
         }
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         assert_eq!(store.get(&key_a).unwrap(), Some(b"payload-a".to_vec()));
         assert_eq!(store.get(&key_b).unwrap(), None);
@@ -2508,7 +2858,7 @@ mod tests {
             index.flush_wal(true).unwrap();
         }
 
-        let err = StrataStore::open_standalone(cfg).unwrap_err();
+        let err = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap_err();
 
         assert!(matches!(
             err,
@@ -2546,7 +2896,7 @@ mod tests {
 
         std::fs::remove_file(segment_path(&cfg, FIRST_SEGMENT_ID)).unwrap();
 
-        let err = StrataStore::open_standalone(cfg).unwrap_err();
+        let err = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap_err();
         assert!(matches!(
             err,
             Error::SealedSegmentMissing {
@@ -2573,7 +2923,7 @@ mod tests {
             .set_len(sealed_len - 1)
             .unwrap();
 
-        let err = StrataStore::open_standalone(cfg).unwrap_err();
+        let err = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap_err();
         assert!(matches!(
             err,
             Error::SealedSegmentLengthMismatch {
@@ -2601,7 +2951,7 @@ mod tests {
             .write_all(b"X")
             .unwrap();
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
         assert_eq!(
             store
                 .index()
@@ -2629,7 +2979,7 @@ mod tests {
             .write_all(b"X")
             .unwrap();
 
-        let err = StrataStore::open_standalone(cfg).unwrap_err();
+        let err = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap_err();
         assert!(matches!(
             err,
             Error::SealedSegmentChecksumMismatch {
@@ -2652,6 +3002,7 @@ mod tests {
             config: cfg,
             index: index.clone(),
             seal_rx,
+            metrics: StrataStoreMetrics::default(),
         };
 
         assert!(
@@ -2676,7 +3027,7 @@ mod tests {
         cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
         let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
         let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
 
         store
             .put(&key_1, BlobLifecycle::new(42), b"payload-a")
@@ -2751,7 +3102,8 @@ mod tests {
         let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
         let key_3 = BlobKey::new(b"blob-c".to_vec()).unwrap();
         {
-            let store = StrataStore::open_standalone(cfg.clone()).unwrap();
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
             store
                 .put(&key_1, BlobLifecycle::new(42), b"payload-a")
                 .unwrap();
@@ -2761,7 +3113,7 @@ mod tests {
             wait_for_segment_state(store.index(), 1, SegmentFileState::Sealed);
         }
 
-        let store = StrataStore::open_standalone(cfg).unwrap();
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
         store.put(&key_3, BlobLifecycle::new(44), b"x").unwrap();
 
         assert_eq!(

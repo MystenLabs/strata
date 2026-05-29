@@ -14,6 +14,7 @@ use std::{
 use strata_core::{BlobKey, BlobLifecycle};
 use strata_store::{
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 use tokio::runtime::Handle;
 
@@ -58,7 +59,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let config = Config::parse()?;
-    let store = Arc::new(StrataStore::open_standalone(config.store_config()).map_err(format_err)?);
+    let store = Arc::new(
+        StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())
+            .map_err(format_err)?,
+    );
     let output = Arc::new(Mutex::new(io::stdout()));
     let published = Arc::new(Mutex::new(Vec::<KeySpec>::new()));
     let next_reader_index = Arc::new(AtomicUsize::new(0));

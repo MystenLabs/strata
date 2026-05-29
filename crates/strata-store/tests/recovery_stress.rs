@@ -13,6 +13,7 @@ use strata_core::{BlobKey, BlobState, PlacementClass, SegmentFileState, SegmentI
 use strata_index::StrataIndex;
 use strata_store::{
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 use tempfile::tempdir;
 use typed_store::{DBMetrics, Map};
@@ -125,8 +126,7 @@ fn kill_worker_after_ready(child: &mut Child, run_id: u64) -> (Vec<WorkerEvent>,
         for line in BufReader::new(stdout).lines() {
             match line {
                 Ok(line) => {
-                    let event = parse_worker_line(&line)
-                        .unwrap_or_else(|error| WorkerEvent::ParseError(error));
+                    let event = parse_worker_line(&line).unwrap_or_else(WorkerEvent::ParseError);
                     if event_tx.send(event).is_err() {
                         break;
                     }
@@ -353,12 +353,13 @@ fn validate_recovered_store(
     worker_stderr: &str,
 ) {
     let cfg = store_config(root_dir);
-    let store = StrataStore::open_standalone(cfg.clone()).unwrap_or_else(|error| {
-        panic!(
-            "failed to reopen store after fault {:?}; worker stderr:\n{}; error: {}",
-            fault, worker_stderr, error
-        )
-    });
+    let store = StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default())
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to reopen store after fault {:?}; worker stderr:\n{}; error: {}",
+                fault, worker_stderr, error
+            )
+        });
     let durable_lsn = store.durable_lsn().unwrap();
     assert!(
         durable_lsn >= durable_lsn_floor,

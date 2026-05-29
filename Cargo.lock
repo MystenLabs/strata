@@ -8150,6 +8150,7 @@ dependencies = [
 name = "strata-store"
 version = "0.1.0"
 dependencies = [
+ "prometheus",
  "sha2 0.10.9",
  "strata-core",
  "strata-index",

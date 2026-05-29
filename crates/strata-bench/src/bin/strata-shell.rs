@@ -10,6 +10,7 @@ use std::{
 use strata_core::{BlobKey, BlobLifecycle, Epoch};
 use strata_store::{
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -145,7 +146,7 @@ impl Config {
 }
 
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let store = StrataStore::open_standalone(config.store_config())?;
+    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
     println!(
         "opened root={} namespace={}",
         config.root_dir.display(),
@@ -241,7 +242,7 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
         "get" => {
             expect_arg_count(&words, 2, 2)?;
             let key = parse_key(&words[1])?;
-            match store.get_sliver(&key).map_err(|error| error.to_string())? {
+            match store.get_blob(&key).map_err(|error| error.to_string())? {
                 Some(payload) => print_payload(&payload, config, true),
                 None => println!("not_found"),
             }
@@ -249,7 +250,7 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
         "get-hex" => {
             expect_arg_count(&words, 2, 2)?;
             let key = parse_key(&words[1])?;
-            match store.get_sliver(&key).map_err(|error| error.to_string())? {
+            match store.get_blob(&key).map_err(|error| error.to_string())? {
                 Some(payload) => print_payload(&payload, config, false),
                 None => println!("not_found"),
             }
@@ -263,7 +264,7 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
                 .checked_add(len)
                 .ok_or_else(|| "range end overflows u64".to_owned())?;
             match store
-                .get_sliver_range(&key, start..end)
+                .get_blob_range(&key, start..end)
                 .map_err(|error| error.to_string())?
             {
                 Some(payload) => print_payload(&payload, config, true),
