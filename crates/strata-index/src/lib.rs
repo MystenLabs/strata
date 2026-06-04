@@ -252,9 +252,18 @@ impl StrataIndex {
 
     pub fn put_blob_entry(&self, key: &BlobKey, entry: &BlobEntry) -> Result<()> {
         let mut batch = self.batch();
-        self.put_blob_version_batch(&mut batch, key, entry)?;
+        self.put_blob_entry_batch(&mut batch, key, entry)?;
         batch.write()?;
         Ok(())
+    }
+
+    pub fn put_blob_entry_batch(
+        &self,
+        batch: &mut DBBatch,
+        key: &BlobKey,
+        entry: &BlobEntry,
+    ) -> Result<()> {
+        self.put_blob_version_batch(batch, key, entry)
     }
 
     pub fn put_blob_version_batch(
@@ -357,7 +366,16 @@ impl StrataIndex {
     }
 
     pub fn put_segment_state(&self, state: &SegmentState) -> Result<()> {
-        self.segment_states.insert(&state.segment_id, state)?;
+        let mut batch = self.batch();
+        self.put_segment_state_batch(&mut batch, state)?;
+        batch.write()?;
+        Ok(())
+    }
+
+    pub fn put_segment_state_batch(&self, batch: &mut DBBatch, state: &SegmentState) -> Result<()> {
+        batch
+            .insert_batch(self.segment_states(), [(&state.segment_id, state)])
+            .map_err(Error::from)?;
         Ok(())
     }
 
@@ -366,7 +384,21 @@ impl StrataIndex {
     }
 
     pub fn put_segment_stats(&self, segment_id: SegmentId, stats: &SegmentStats) -> Result<()> {
-        self.segment_stats.insert(&segment_id, stats)?;
+        let mut batch = self.batch();
+        self.put_segment_stats_batch(&mut batch, segment_id, stats)?;
+        batch.write()?;
+        Ok(())
+    }
+
+    pub fn put_segment_stats_batch(
+        &self,
+        batch: &mut DBBatch,
+        segment_id: SegmentId,
+        stats: &SegmentStats,
+    ) -> Result<()> {
+        batch
+            .insert_batch(self.segment_stats(), [(&segment_id, stats)])
+            .map_err(Error::from)?;
         Ok(())
     }
 
@@ -477,6 +509,29 @@ impl StrataIndex {
             .safe_iter()?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)
+    }
+
+    pub fn put_pending_lsn_op_batch(
+        &self,
+        batch: &mut DBBatch,
+        lsn: StrataLsn,
+        key: &BlobKey,
+    ) -> Result<()> {
+        batch
+            .insert_batch(self.pending_lsn_ops(), [(&lsn, key)])
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub fn remove_pending_lsn_ops_batch(
+        &self,
+        batch: &mut DBBatch,
+        lsns: &[StrataLsn],
+    ) -> Result<()> {
+        for lsn in lsns {
+            batch.delete_batch(self.pending_lsn_ops(), [lsn])?;
+        }
+        Ok(())
     }
 
     pub fn iter_segment_states(&self) -> Result<Vec<(SegmentId, SegmentState)>> {
@@ -660,16 +715,14 @@ mod tests {
 
         let mut batch = index.batch();
         index
-            .put_blob_version_batch(&mut batch, &key, &entry)
+            .put_blob_entry_batch(&mut batch, &key, &entry)
             .unwrap();
-        batch
-            .insert_batch(index.segment_states(), [(&state.segment_id, &state)])
+        index.put_segment_state_batch(&mut batch, &state).unwrap();
+        index
+            .put_segment_stats_batch(&mut batch, state.segment_id, &stats)
             .unwrap();
-        batch
-            .insert_batch(index.segment_stats(), [(&state.segment_id, &stats)])
-            .unwrap();
-        batch
-            .insert_batch(index.pending_lsn_ops(), [(&entry.lsn, &key)])
+        index
+            .put_pending_lsn_op_batch(&mut batch, entry.lsn, &key)
             .unwrap();
         batch.write().unwrap();
 
@@ -858,20 +911,31 @@ mod tests {
         let key_3 = BlobKey::new(b"blob-c".to_vec()).unwrap();
 
         let mut batch = index.batch();
-        batch
-            .insert_batch(index.pending_lsn_ops(), [(&2, &key_2)])
+        index
+            .put_pending_lsn_op_batch(&mut batch, 2, &key_2)
             .unwrap();
-        batch
-            .insert_batch(index.pending_lsn_ops(), [(&3, &key_3)])
+        index
+            .put_pending_lsn_op_batch(&mut batch, 3, &key_3)
             .unwrap();
-        batch
-            .insert_batch(index.pending_lsn_ops(), [(&1, &key_1)])
+        index
+            .put_pending_lsn_op_batch(&mut batch, 1, &key_1)
             .unwrap();
         batch.write().unwrap();
 
         assert_eq!(
             index.iter_pending_lsn_ops().unwrap(),
-            vec![(1, key_1), (2, key_2), (3, key_3)]
+            vec![(1, key_1.clone()), (2, key_2), (3, key_3.clone())]
+        );
+
+        let mut batch = index.batch();
+        index
+            .remove_pending_lsn_ops_batch(&mut batch, &[2])
+            .unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(
+            index.iter_pending_lsn_ops().unwrap(),
+            vec![(1, key_1), (3, key_3)]
         );
     }
 }
