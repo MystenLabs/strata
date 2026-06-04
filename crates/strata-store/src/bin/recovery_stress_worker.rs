@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use strata_core::{BlobKey, BlobLifecycle};
+use strata_core::{BlobKey, BlobLifecycle, Epoch};
 use strata_store::{
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
     StrataStoreMetrics,
@@ -30,6 +30,7 @@ struct Config {
     segment_max_bytes: u64,
     write_queue_capacity: usize,
     max_unsealed_segments: usize,
+    starting_epoch: Epoch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,6 +134,7 @@ impl Config {
         let mut segment_max_bytes = 512;
         let mut write_queue_capacity = 4;
         let mut max_unsealed_segments = 3;
+        let mut starting_epoch = 1;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -153,6 +155,7 @@ impl Config {
                 "--max-unsealed-segments" => {
                     max_unsealed_segments = parse_arg(&mut args, "--max-unsealed-segments")?
                 }
+                "--starting-epoch" => starting_epoch = parse_arg(&mut args, "--starting-epoch")?,
                 _ => return Err(format!("unknown argument {arg}")),
             }
         }
@@ -180,6 +183,7 @@ impl Config {
             segment_max_bytes,
             write_queue_capacity,
             max_unsealed_segments,
+            starting_epoch,
         })
     }
 
@@ -193,6 +197,7 @@ impl Config {
             segment_reader_cache_capacity: 8,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            starting_epoch: self.starting_epoch,
         }
     }
 }

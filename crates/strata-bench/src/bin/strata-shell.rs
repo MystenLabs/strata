@@ -19,6 +19,7 @@ const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1 << 40;
 const DEFAULT_MAX_UNSEALED_SEGMENTS: usize = 8;
 const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READER_CACHE_CAPACITY;
 const DEFAULT_MAX_PRINT_BYTES: usize = 4096;
+const DEFAULT_STARTING_EPOCH: Epoch = 42;
 const DEFAULT_END_EPOCH: Epoch = 42;
 
 fn main() {
@@ -56,6 +57,7 @@ struct Config {
     recovery_policy: StrataRecoveryPolicy,
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     max_print_bytes: usize,
+    starting_epoch: Epoch,
     default_end_epoch: Epoch,
     script: Option<PathBuf>,
 }
@@ -72,6 +74,7 @@ impl Config {
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             max_print_bytes: DEFAULT_MAX_PRINT_BYTES,
+            starting_epoch: DEFAULT_STARTING_EPOCH,
             default_end_epoch: DEFAULT_END_EPOCH,
             script: None,
         };
@@ -110,6 +113,10 @@ impl Config {
                     config.max_print_bytes =
                         parse_usize(&next_value(&mut args, "--max-print-bytes")?)?
                 }
+                "--starting-epoch" => {
+                    config.starting_epoch =
+                        parse_epoch(&next_value(&mut args, "--starting-epoch")?)?
+                }
                 "--default-end-epoch" => {
                     config.default_end_epoch =
                         parse_epoch(&next_value(&mut args, "--default-end-epoch")?)?
@@ -141,6 +148,7 @@ impl Config {
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: self.recovery_policy,
             sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
+            starting_epoch: self.starting_epoch,
         }
     }
 }
@@ -575,6 +583,7 @@ options:
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --recovery-policy <point-in-time|absolute-consistency>
   --sealed-integrity <metadata-only|checksum>
+  --starting-epoch <epoch>
   --default-end-epoch <epoch>
   --max-print-bytes <count>
   --script <path>"

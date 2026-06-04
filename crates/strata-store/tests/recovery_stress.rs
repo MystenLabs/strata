@@ -491,6 +491,7 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         segment_reader_cache_capacity: 8,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+        starting_epoch: 1,
     }
 }
 

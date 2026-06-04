@@ -27,7 +27,7 @@ use std::{
 };
 
 use rocksdb::{DB, Options};
-use strata_core::{BlobKey, BlobLifecycle, PlacementClass};
+use strata_core::{BlobKey, BlobLifecycle, Epoch, PlacementClass};
 use strata_segment::SegmentWriter;
 use strata_store::{
     ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile, StrataRecoveryPolicy, StrataStore,
@@ -42,6 +42,7 @@ const DEFAULT_READ_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1 << 40;
 const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READER_CACHE_CAPACITY;
+const DEFAULT_STARTING_EPOCH: Epoch = 1;
 const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
 const BENCH_SEGMENT_ID: u64 = 1;
@@ -167,6 +168,7 @@ struct Config {
     queue_capacity: usize,
     segment_max_bytes: u64,
     reader_cache_capacity: usize,
+    starting_epoch: Epoch,
     rocksdb_min_blob_size: u64,
     rocksdb_blob_file_size: u64,
     rocksdb_blob_gc: bool,
@@ -192,6 +194,7 @@ impl Config {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
+            starting_epoch: DEFAULT_STARTING_EPOCH,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
             rocksdb_blob_gc: true,
@@ -246,6 +249,9 @@ impl Config {
                     config.reader_cache_capacity =
                         parse_usize(&next_value(&mut args, "--reader-cache-capacity")?)?
                 }
+                "--starting-epoch" => {
+                    config.starting_epoch = parse_u64(&next_value(&mut args, "--starting-epoch")?)?
+                }
                 "--rocksdb-min-blob-size" => {
                     config.rocksdb_min_blob_size =
                         parse_size(&next_value(&mut args, "--rocksdb-min-blob-size")?)? as u64
@@ -292,6 +298,7 @@ impl Config {
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            starting_epoch: self.starting_epoch,
         }
     }
 }
@@ -797,6 +804,7 @@ options:
   --queue-capacity <count>
   --segment-max-bytes <bytes|KiB|MiB|GiB>
   --reader-cache-capacity <count>       cached segment readers; 0 disables
+  --starting-epoch <epoch>
   --rocksdb-min-blob-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-file-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-gc <true|false>

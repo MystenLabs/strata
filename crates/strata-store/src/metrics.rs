@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry};
-use strata_core::{SegmentId, StrataLsn};
+use strata_core::{Epoch, SegmentId, StrataLsn};
 
 const OPERATION_LATENCY_BUCKETS: &[f64] = &[
     0.000_001, 0.000_005, 0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001,
@@ -57,6 +57,7 @@ struct PrometheusMetrics {
     active_segment_durable_offset: IntGauge,
     next_lsn: IntGauge,
     durable_lsn: IntGauge,
+    current_epoch: IntGauge,
     pending_lsn_count: IntGauge,
     unsealed_segments: IntGauge,
     seal_enqueued_total: IntCounter,
@@ -341,6 +342,12 @@ impl StrataStoreMetrics {
                     "durable_lsn",
                     "Highest contiguous durable Strata LSN.",
                 )?,
+                current_epoch: register_gauge(
+                    registry,
+                    &labels,
+                    "current_epoch",
+                    "Current Strata epoch.",
+                )?,
                 pending_lsn_count: register_gauge(
                     registry,
                     &labels,
@@ -622,6 +629,12 @@ impl StrataStoreMetrics {
         };
         metrics.durable_lsn.set(to_i64(durable_lsn));
         set_pending_lsn_count(metrics, lsn_from_i64(metrics.next_lsn.get()), durable_lsn);
+    }
+
+    pub(crate) fn set_current_epoch(&self, epoch: Epoch) {
+        if let Some(metrics) = &self.inner {
+            metrics.current_epoch.set(to_i64(epoch));
+        }
     }
 
     pub(crate) fn set_unsealed_segments(&self, count: usize) {

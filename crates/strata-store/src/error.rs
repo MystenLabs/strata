@@ -48,6 +48,9 @@ pub enum Error {
     #[error("seal queue is closed")]
     SealQueueClosed,
 
+    #[error("epoch metadata is not initialized")]
+    EpochNotInitialized,
+
     #[error("segment {segment_id} failed sealing")]
     SealFailed { segment_id: SegmentId },
 

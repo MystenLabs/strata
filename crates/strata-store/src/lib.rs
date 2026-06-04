@@ -18,6 +18,20 @@
 //!        pending_lsn_ops[lsn] = key
 //! ```
 //!
+//! Epoch path:
+//!
+//! ```text
+//! open new namespace
+//!   -> epoch_changes[0] = starting_epoch
+//!   -> store_state[CurrentEpoch] = starting_epoch
+//!
+//! StrataStore::increment_epoch
+//!   -> enqueue write command
+//!   -> epoch_changes[lsn] = current_epoch + 1
+//!   -> store_state[CurrentEpoch] = current_epoch + 1
+//!   -> store_state[NextLsn] = lsn + 1
+//! ```
+//!
 //! Sync path:
 //!
 //! ```text
@@ -190,8 +204,12 @@ impl StrataStore {
     ) -> Result<Self> {
         validate_config(&config)?;
         ensure_ingest_dir(&config)?;
+        ensure_epoch_initialized(&index, config.starting_epoch)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
         recover_unsealed_segments(&config, &index, &metrics)?;
+        let current_epoch = index
+            .get_current_epoch()?
+            .ok_or(Error::EpochNotInitialized)?;
         verify_sealed_segments(&config, &index)?;
         let active_segment_id = choose_active_segment_id(&index)?;
         let active_writer = open_active_writer(&config, active_segment_id)?;
@@ -204,6 +222,7 @@ impl StrataStore {
             durable_offset,
         );
         metrics.set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
+        metrics.set_current_epoch(current_epoch);
         metrics.set_unsealed_segments(unsealed_ingest_segment_count(&index)?);
         let rebase_tracker = Arc::new(RebaseTracker::default());
         let (seal_tx, seal_rx) = mpsc::channel();
@@ -226,6 +245,7 @@ impl StrataStore {
             active_writer,
             durable_offset,
             next_lsn: store_state.next_lsn,
+            current_epoch,
             seal_tx: seal_tx.clone(),
             write_rx,
             rebase_tracker: Arc::clone(&rebase_tracker),
@@ -322,6 +342,24 @@ impl StrataStore {
             .map_err(|_| Error::WriteResponseDropped)?
     }
 
+    pub fn current_epoch(&self) -> Result<Epoch> {
+        self.index
+            .get_current_epoch()?
+            .ok_or(Error::EpochNotInitialized)
+    }
+
+    pub fn epoch_at_lsn(&self, lsn: StrataLsn) -> Result<Option<Epoch>> {
+        Ok(self.index.latest_epoch_at_lsn(lsn)?.map(|(_, epoch)| epoch))
+    }
+
+    pub fn increment_epoch(&self) -> Result<(Epoch, StrataLsn)> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.send_write_command(WriteCommand::IncrementEpoch(response_tx))?;
+        response_rx
+            .recv()
+            .map_err(|_| Error::WriteResponseDropped)?
+    }
+
     pub fn sync(&self) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
         self.send_write_command(WriteCommand::Sync(response_tx))?;
@@ -404,6 +442,7 @@ enum WriteCommand {
     Tombstone(TombstoneRequest),
     Extend(ExtendRequest),
     Rebase(RebaseRequest),
+    IncrementEpoch(mpsc::Sender<Result<(Epoch, StrataLsn)>>),
     Sync(mpsc::Sender<Result<()>>),
     Shutdown,
 }
@@ -445,6 +484,7 @@ struct WriteCoordinator {
     active_writer: SegmentWriter,
     durable_offset: u64,
     next_lsn: StrataLsn,
+    current_epoch: Epoch,
     seal_tx: mpsc::Sender<SealCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
     rebase_tracker: Arc<RebaseTracker>,
@@ -494,6 +534,10 @@ impl WriteCoordinator {
                 }
                 WriteCommand::Rebase(request) => {
                     let _ = self.process_rebase(request);
+                }
+                WriteCommand::IncrementEpoch(response_tx) => {
+                    let result = self.process_increment_epoch();
+                    let _ = response_tx.send(result);
                 }
                 WriteCommand::Sync(response_tx) => {
                     let result = self.sync_data();
@@ -721,6 +765,31 @@ impl WriteCoordinator {
         self.metrics.set_next_lsn(next_lsn);
 
         Ok(Some(lsn))
+    }
+
+    fn process_increment_epoch(&mut self) -> Result<(Epoch, StrataLsn)> {
+        let lsn = self.next_lsn;
+        let next_lsn = lsn
+            .checked_add(1)
+            .ok_or(strata_segment::Error::RangeOverflow)?;
+        let next_epoch = self
+            .current_epoch
+            .checked_add(1)
+            .ok_or(strata_segment::Error::RangeOverflow)?;
+
+        let mut batch = self.index.batch();
+        self.index
+            .put_epoch_change_batch(&mut batch, lsn, next_epoch)?;
+        self.index.put_current_epoch_batch(&mut batch, next_epoch)?;
+        self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
+        batch.write().map_err(strata_index::Error::from)?;
+
+        self.current_epoch = next_epoch;
+        self.next_lsn = next_lsn;
+        self.metrics.set_current_epoch(next_epoch);
+        self.metrics.set_next_lsn(next_lsn);
+
+        Ok((next_epoch, lsn))
     }
 
     fn rollover_active_segment(&mut self) -> Result<()> {
@@ -1394,6 +1463,23 @@ fn discard_unsealed_segment(
     }
 }
 
+fn ensure_epoch_initialized(index: &StrataIndex, starting_epoch: Epoch) -> Result<Epoch> {
+    if let Some(current_epoch) = index.get_current_epoch()? {
+        return Ok(current_epoch);
+    }
+
+    let latest_epoch = index.latest_epoch_at_lsn(StrataLsn::MAX)?;
+    let current_epoch = latest_epoch.map_or(starting_epoch, |(_, epoch)| epoch);
+    let mut batch = index.batch();
+    if latest_epoch.is_none() {
+        index.put_epoch_change_batch(&mut batch, 0, current_epoch)?;
+    }
+    index.put_current_epoch_batch(&mut batch, current_epoch)?;
+    batch.write().map_err(strata_index::Error::from)?;
+    index.flush_wal(true)?;
+    Ok(current_epoch)
+}
+
 fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -> Result<()> {
     let durable_lsn = index.get_durable_lsn()?;
     let states = index.iter_segment_states()?;
@@ -1418,6 +1504,11 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
 
     let mut batch = index.batch();
     let mut hidden_versions = Vec::new();
+    let hidden_epoch_changes = index
+        .iter_epoch_changes_from(rollback_from)?
+        .into_iter()
+        .map(|(lsn, _)| lsn)
+        .collect::<Vec<_>>();
     for (lsn, key) in entries {
         hidden_versions.push((key, lsn));
         batch
@@ -1425,12 +1516,22 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
             .map_err(strata_index::Error::from)?;
     }
     index.remove_blob_versions_batch(&mut batch, &hidden_versions)?;
-    let rollback_ops = hidden_versions.len() as u64;
+    index.remove_epoch_changes_batch(&mut batch, &hidden_epoch_changes)?;
+    let rollback_ops = hidden_versions
+        .len()
+        .saturating_add(hidden_epoch_changes.len()) as u64;
 
+    let previous_lsn = rollback_from.saturating_sub(1);
+    let current_epoch = index
+        .latest_epoch_at_lsn(previous_lsn)?
+        .map(|(_, epoch)| epoch)
+        .ok_or(Error::EpochNotInitialized)?;
+    index.put_current_epoch_batch(&mut batch, current_epoch)?;
     index.put_next_lsn_batch(&mut batch, rollback_from)?;
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
     metrics.set_next_lsn(rollback_from);
+    metrics.set_current_epoch(current_epoch);
     metrics.record_rollback(rollback_from, rollback_ops);
     Ok(())
 }
@@ -1693,6 +1794,7 @@ mod tests {
             segment_reader_cache_capacity: 16,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            starting_epoch: 42,
         }
     }
 
@@ -1817,6 +1919,66 @@ mod tests {
         assert_eq!(store.get(&key).unwrap(), Some(b"hello strata".to_vec()));
         assert!(dir.path().join("default").join("ingest").exists());
         assert!(dir.path().join("default").join("index").exists());
+    }
+
+    #[tokio::test]
+    async fn new_store_records_starting_epoch_as_lsn_zero_genesis() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path(), "default");
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
+
+        assert_eq!(store.current_epoch().unwrap(), 42);
+        assert_eq!(store.epoch_at_lsn(0).unwrap(), Some(42));
+        assert_eq!(store.epoch_at_lsn(1).unwrap(), Some(42));
+        assert_eq!(store.index().get_epoch_change(0).unwrap(), Some(42));
+        assert_eq!(store.index().get_next_lsn().unwrap(), 1);
+        assert_eq!(store.index().get_durable_lsn().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reopen_uses_persisted_epoch_instead_of_config_starting_epoch() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        {
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+            assert_eq!(store.increment_epoch().unwrap(), (43, 1));
+            store.sync().unwrap();
+        }
+
+        cfg.starting_epoch = 99;
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
+
+        assert_eq!(store.current_epoch().unwrap(), 43);
+        assert_eq!(store.epoch_at_lsn(0).unwrap(), Some(42));
+        assert_eq!(store.epoch_at_lsn(1).unwrap(), Some(43));
+    }
+
+    #[tokio::test]
+    async fn increment_epoch_consumes_lsn_and_is_metadata_durable() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store = StrataStore::open_standalone(
+            config(dir.path(), "default"),
+            StrataStoreMetrics::default(),
+        )
+        .unwrap();
+
+        assert_eq!(store.increment_epoch().unwrap(), (43, 1));
+        assert_eq!(store.current_epoch().unwrap(), 43);
+        assert_eq!(store.index().get_next_lsn().unwrap(), 2);
+        assert_eq!(store.index().get_epoch_change(1).unwrap(), Some(43));
+        assert_eq!(
+            store.put(&key, BlobLifecycle::new(43), b"payload").unwrap(),
+            2
+        );
+
+        store.sync().unwrap();
+
+        assert_eq!(store.durable_lsn().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -2312,6 +2474,7 @@ mod tests {
             active_writer,
             durable_offset: 0,
             next_lsn: 1,
+            current_epoch: 42,
             seal_tx,
             write_rx,
             rebase_tracker: Arc::new(RebaseTracker::default()),
@@ -2761,6 +2924,39 @@ mod tests {
         assert_eq!(store.index().get_blob_entry(&key).unwrap(), None);
         assert_eq!(store.get(&key).unwrap(), None);
         assert_eq!(store.durable_lsn().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_removes_epoch_changes_after_rolled_back_blob_lsn() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path(), "default");
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        {
+            let store =
+                StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+            assert_eq!(
+                store.put(&key, BlobLifecycle::new(42), b"payload").unwrap(),
+                1
+            );
+            assert_eq!(store.increment_epoch().unwrap(), (43, 2));
+            store.index().flush_wal(true).unwrap();
+        }
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(segment_path(&cfg, FIRST_SEGMENT_ID))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        let store = StrataStore::open_standalone(cfg, StrataStoreMetrics::default()).unwrap();
+
+        assert_eq!(store.get(&key).unwrap(), None);
+        assert_eq!(store.current_epoch().unwrap(), 42);
+        assert_eq!(store.epoch_at_lsn(2).unwrap(), Some(42));
+        assert_eq!(store.index().get_epoch_change(2).unwrap(), None);
+        assert_eq!(store.index().get_next_lsn().unwrap(), 1);
     }
 
     #[tokio::test]

@@ -80,6 +80,7 @@ pub struct StrataStoreState {
 pub enum StoreStateKey {
     NextLsn,
     DurableLsn,
+    CurrentEpoch,
 }
 
 impl Default for StrataStoreState {

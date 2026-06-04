@@ -10,7 +10,8 @@
 //! | blob_versions   | (BlobKey, LSN) -> BlobEntry version/delta     |
 //! | segment_states  | SegmentId -> SegmentState                     |
 //! | segment_stats   | SegmentId -> SegmentStats                     |
-//! | store_state     | StoreStateKey -> LSN                         |
+//! | store_state     | StoreStateKey -> u64                         |
+//! | epoch_changes   | LSN -> current Epoch                          |
 //! | pending_lsn_ops | LSN -> BlobKey                                |
 //! +-----------------+-----------------------------------------------+
 //! ```
@@ -41,8 +42,8 @@ use std::{
 };
 
 use strata_core::{
-    BlobEntry, BlobKey, BlobVersionKey, SegmentId, SegmentState, SegmentStats, StoreStateKey,
-    StrataLsn, StrataStoreState,
+    BlobEntry, BlobKey, BlobVersionKey, Epoch, SegmentId, SegmentState, SegmentStats,
+    StoreStateKey, StrataLsn, StrataStoreState,
 };
 use typed_store::{
     Map, TypedStoreError,
@@ -55,6 +56,7 @@ const BLOB_VERSIONS_CF: &str = "blob_versions";
 const SEGMENT_STATES_CF: &str = "segment_states";
 const SEGMENT_STATS_CF: &str = "segment_stats";
 const STORE_STATE_CF: &str = "store_state";
+const EPOCH_CHANGES_CF: &str = "epoch_changes";
 const PENDING_LSN_OPS_CF: &str = "pending_lsn_ops";
 static NEXT_METRIC_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -73,6 +75,8 @@ pub struct StrataIndex {
     segment_stats: DBMap<SegmentId, SegmentStats>,
     /// Store cursor fields: next assigned LSN and highest contiguous durable LSN.
     store_state: DBMap<StoreStateKey, StrataLsn>,
+    /// Epoch timeline. LSN 0 is the genesis epoch; later rows are explicit epoch increments.
+    epoch_changes: DBMap<StrataLsn, Epoch>,
     /// Pending logical operations keyed by LSN, used to advance and roll back the durable frontier.
     pending_lsn_ops: DBMap<StrataLsn, BlobKey>,
 }
@@ -83,6 +87,7 @@ pub struct StrataIndexCfNames {
     pub segment_states: String,
     pub segment_stats: String,
     pub store_state: String,
+    pub epoch_changes: String,
     pub pending_lsn_ops: String,
 }
 
@@ -102,16 +107,18 @@ impl StrataIndexCfNames {
             segment_states: with_prefix(SEGMENT_STATES_CF),
             segment_stats: with_prefix(SEGMENT_STATS_CF),
             store_state: with_prefix(STORE_STATE_CF),
+            epoch_changes: with_prefix(EPOCH_CHANGES_CF),
             pending_lsn_ops: with_prefix(PENDING_LSN_OPS_CF),
         }
     }
 
-    fn as_strs(&self) -> [&str; 5] {
+    fn as_strs(&self) -> [&str; 6] {
         [
             self.blob_versions.as_str(),
             self.segment_states.as_str(),
             self.segment_stats.as_str(),
             self.store_state.as_str(),
+            self.epoch_changes.as_str(),
             self.pending_lsn_ops.as_str(),
         ]
     }
@@ -172,6 +179,13 @@ impl StrataIndex {
             true,
         )?;
         migrate_legacy_store_state(&db, &cf_names.store_state, &rw_options, &store_state)?;
+        let epoch_changes = DBMap::reopen_with_class(
+            &db,
+            Some(&cf_names.epoch_changes),
+            Some(EPOCH_CHANGES_CF),
+            &rw_options,
+            true,
+        )?;
         let pending_lsn_ops = DBMap::reopen_with_class(
             &db,
             Some(&cf_names.pending_lsn_ops),
@@ -187,6 +201,7 @@ impl StrataIndex {
             segment_states,
             segment_stats,
             store_state,
+            epoch_changes,
             pending_lsn_ops,
         })
     }
@@ -217,6 +232,10 @@ impl StrataIndex {
 
     pub fn store_state(&self) -> &DBMap<StoreStateKey, StrataLsn> {
         &self.store_state
+    }
+
+    pub fn epoch_changes(&self) -> &DBMap<StrataLsn, Epoch> {
+        &self.epoch_changes
     }
 
     pub fn pending_lsn_ops(&self) -> &DBMap<StrataLsn, BlobKey> {
@@ -365,6 +384,10 @@ impl StrataIndex {
             .unwrap_or_else(|| StrataStoreState::default().durable_lsn))
     }
 
+    pub fn get_current_epoch(&self) -> Result<Option<Epoch>> {
+        Ok(self.store_state.get(&StoreStateKey::CurrentEpoch)?)
+    }
+
     pub fn get_store_state(&self) -> Result<Option<StrataStoreState>> {
         Ok(Some(StrataStoreState {
             next_lsn: self.get_next_lsn()?,
@@ -389,6 +412,13 @@ impl StrataIndex {
         Ok(())
     }
 
+    pub fn put_current_epoch_batch(&self, batch: &mut DBBatch, epoch: Epoch) -> Result<()> {
+        batch
+            .insert_batch(self.store_state(), [(&StoreStateKey::CurrentEpoch, &epoch)])
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
     pub fn put_store_state_batch(
         &self,
         batch: &mut DBBatch,
@@ -396,6 +426,50 @@ impl StrataIndex {
     ) -> Result<()> {
         self.put_next_lsn_batch(batch, state.next_lsn)?;
         self.put_durable_lsn_batch(batch, state.durable_lsn)
+    }
+
+    pub fn put_epoch_change_batch(
+        &self,
+        batch: &mut DBBatch,
+        lsn: StrataLsn,
+        epoch: Epoch,
+    ) -> Result<()> {
+        batch
+            .insert_batch(self.epoch_changes(), [(&lsn, &epoch)])
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub fn get_epoch_change(&self, lsn: StrataLsn) -> Result<Option<Epoch>> {
+        Ok(self.epoch_changes.get(&lsn)?)
+    }
+
+    pub fn latest_epoch_at_lsn(&self, max_lsn: StrataLsn) -> Result<Option<(StrataLsn, Epoch)>> {
+        for result in self
+            .epoch_changes
+            .reversed_safe_iter_with_bounds(None, Some(max_lsn))?
+        {
+            return result.map(Some).map_err(Error::from);
+        }
+        Ok(None)
+    }
+
+    pub fn iter_epoch_changes_from(&self, min_lsn: StrataLsn) -> Result<Vec<(StrataLsn, Epoch)>> {
+        self.epoch_changes
+            .safe_iter_with_bounds(Some(min_lsn), None)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    pub fn remove_epoch_changes_batch(
+        &self,
+        batch: &mut DBBatch,
+        lsns: &[StrataLsn],
+    ) -> Result<()> {
+        for lsn in lsns {
+            batch.delete_batch(&self.epoch_changes, [lsn])?;
+        }
+        Ok(())
     }
 
     pub fn iter_pending_lsn_ops(&self) -> Result<Vec<(StrataLsn, BlobKey)>> {
@@ -687,6 +761,7 @@ mod tests {
             index.get_store_state().unwrap(),
             Some(StrataStoreState::default())
         );
+        assert_eq!(index.get_current_epoch().unwrap(), None);
 
         let mut batch = index.batch();
         index.put_next_lsn_batch(&mut batch, 42).unwrap();
@@ -706,6 +781,33 @@ mod tests {
                 durable_lsn: 41,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn epoch_changes_track_genesis_and_lsn_ordered_updates() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+
+        assert_eq!(index.latest_epoch_at_lsn(StrataLsn::MAX).unwrap(), None);
+
+        let mut batch = index.batch();
+        index.put_epoch_change_batch(&mut batch, 0, 42).unwrap();
+        index.put_current_epoch_batch(&mut batch, 42).unwrap();
+        index.put_epoch_change_batch(&mut batch, 5, 43).unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(index.get_current_epoch().unwrap(), Some(42));
+        assert_eq!(index.latest_epoch_at_lsn(0).unwrap(), Some((0, 42)));
+        assert_eq!(index.latest_epoch_at_lsn(4).unwrap(), Some((0, 42)));
+        assert_eq!(index.latest_epoch_at_lsn(5).unwrap(), Some((5, 43)));
+        assert_eq!(index.iter_epoch_changes_from(1).unwrap(), vec![(5, 43)]);
+
+        let mut batch = index.batch();
+        index.remove_epoch_changes_batch(&mut batch, &[5]).unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(index.latest_epoch_at_lsn(5).unwrap(), Some((0, 42)));
     }
 
     #[tokio::test]

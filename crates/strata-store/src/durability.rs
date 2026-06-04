@@ -34,19 +34,20 @@ fn compute_durable_lsn(
         let Some(next_lsn) = durable_lsn.checked_add(1) else {
             break;
         };
-        let Some(key) = index
+        if let Some(key) = index
             .pending_lsn_ops()
             .get(&next_lsn)
             .map_err(strata_index::Error::from)?
-        else {
-            break;
-        };
-        if !pending_lsn_is_durable(index, next_lsn, &key, &states)? {
+        {
+            if !pending_lsn_is_durable(index, next_lsn, &key, &states)? {
+                break;
+            }
+            batch
+                .delete_batch(index.pending_lsn_ops(), [&next_lsn])
+                .map_err(strata_index::Error::from)?;
+        } else if index.get_epoch_change(next_lsn)?.is_none() {
             break;
         }
-        batch
-            .delete_batch(index.pending_lsn_ops(), [&next_lsn])
-            .map_err(strata_index::Error::from)?;
         durable_lsn = next_lsn;
     }
 

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use strata_core::Epoch;
+
 const INGEST_DIR: &str = "ingest";
 const INDEX_DIR: &str = "index";
 
@@ -16,6 +18,8 @@ pub struct StrataStoreConfig {
     pub segment_reader_cache_capacity: usize,
     pub recovery_policy: StrataRecoveryPolicy,
     pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
+    /// Initial epoch used only when creating a namespace without persisted epoch metadata.
+    pub starting_epoch: Epoch,
 }
 
 /// Policy used when recovering unsealed ingest segments after a crash.
