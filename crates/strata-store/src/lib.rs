@@ -97,13 +97,12 @@
 //! waiting on them.
 
 mod config;
-mod durability;
 mod error;
-mod integrity;
 mod layout;
 mod metrics;
 mod read;
 mod reader_cache;
+mod seal;
 mod stats;
 
 use std::{
@@ -127,14 +126,17 @@ pub use config::{
     DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
 };
-use durability::{active_segment_durable_offset, durable_lsn_with_advanced_frontier};
 pub use error::{Error, Result};
-use integrity::{sha256_file_prefix, verify_sealed_segments};
 use layout::{parse_segment_file_name, relative_segment_path, segment_path};
 use metrics::PutMetric;
 pub use metrics::StrataStoreMetrics;
 pub use read::{ReadOptions, StoreGetProfile};
 use reader_cache::SegmentReaderCache;
+use seal::{
+    SealCommand, SealWorker, SegmentSealTask, active_segment_durable_offset,
+    durable_lsn_with_advanced_frontier, enqueue_unsealed_segments_for_sealing,
+    verify_sealed_segments,
+};
 use stats::add_live_lifecycle_stats;
 
 const FIRST_SEGMENT_ID: SegmentId = 1;
@@ -488,26 +490,6 @@ struct WriteCoordinator {
     seal_tx: mpsc::Sender<SealCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
     rebase_tracker: Arc<RebaseTracker>,
-    metrics: StrataStoreMetrics,
-}
-
-#[derive(Debug)]
-enum SealCommand {
-    Seal(SegmentSealTask),
-    Shutdown,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SegmentSealTask {
-    segment_id: SegmentId,
-    sealed_len: u64,
-}
-
-#[derive(Debug)]
-struct SealWorker {
-    config: StrataStoreConfig,
-    index: StrataIndex,
-    seal_rx: mpsc::Receiver<SealCommand>,
     metrics: StrataStoreMetrics,
 }
 
@@ -942,96 +924,6 @@ impl WriteCoordinator {
             Ok(durable_offset.saturating_sub(previous_durable_offset)),
             started.elapsed(),
         );
-        Ok(())
-    }
-}
-
-impl SealWorker {
-    fn run(self) {
-        while let Ok(command) = self.seal_rx.recv() {
-            match command {
-                SealCommand::Seal(task) => {
-                    if self.seal_segment(task).is_err() {
-                        self.metrics.record_seal_error();
-                        let _ = self.mark_seal_failed(task.segment_id);
-                    }
-                }
-                SealCommand::Shutdown => break,
-            }
-        }
-    }
-
-    fn seal_segment(&self, task: SegmentSealTask) -> Result<()> {
-        if let Some(existing) = self.index.get_segment_state(task.segment_id)?
-            && existing.state == SegmentFileState::Sealed
-        {
-            return Ok(());
-        }
-
-        let path = segment_path(&self.config, task.segment_id);
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
-        file.sync_data().map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let sealed_sha256 = sha256_file_prefix(&path, task.sealed_len)?;
-
-        let mut state = active_segment_state_from_path(
-            &self.config,
-            task.segment_id,
-            task.sealed_len,
-            task.sealed_len,
-        );
-        if let Some(existing) = self.index.get_segment_state(task.segment_id)? {
-            state.volume_id = existing.volume_id;
-            state.placement_class = existing.placement_class;
-            state.min_lsn = existing.min_lsn;
-            state.max_lsn = existing.max_lsn;
-        }
-        state.state = SegmentFileState::Sealed;
-        state.sealed_len = Some(task.sealed_len);
-        state.sealed_sha256 = Some(sealed_sha256);
-
-        let durable_lsn = {
-            let mut batch = self.index.batch();
-            batch
-                .insert_batch(self.index.segment_states(), [(&state.segment_id, &state)])
-                .map_err(strata_index::Error::from)?;
-            let durable_lsn =
-                durable_lsn_with_advanced_frontier(&self.index, Some(&state), &mut batch)?;
-            self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
-            batch.write().map_err(strata_index::Error::from)?;
-            durable_lsn
-        };
-        self.index.flush_wal(true)?;
-        self.metrics.record_segment_sealed();
-        self.metrics.set_durable_lsn(durable_lsn);
-        self.metrics
-            .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
-        Ok(())
-    }
-
-    fn mark_seal_failed(&self, segment_id: SegmentId) -> Result<()> {
-        let Some(mut state) = self.index.get_segment_state(segment_id)? else {
-            return Ok(());
-        };
-        if state.state == SegmentFileState::Sealed {
-            return Ok(());
-        }
-        state.state = SegmentFileState::SealFailed;
-        let mut batch = self.index.batch();
-        batch
-            .insert_batch(self.index.segment_states(), [(&state.segment_id, &state)])
-            .map_err(strata_index::Error::from)?;
-        batch.write().map_err(strata_index::Error::from)?;
-        self.index.flush_wal(true)?;
         Ok(())
     }
 }
@@ -1576,28 +1468,6 @@ fn pending_operation_survived(
                     | SegmentFileState::Deleted
             ) && state.write_offset >= record_end_offset
         }))
-}
-
-fn enqueue_unsealed_segments_for_sealing(
-    index: &StrataIndex,
-    active_segment_id: SegmentId,
-    seal_tx: &mpsc::Sender<SealCommand>,
-    metrics: &StrataStoreMetrics,
-) -> Result<()> {
-    for segment_id in unsealed_ingest_segment_ids(index)? {
-        if segment_id < active_segment_id
-            && let Some(state) = index.get_segment_state(segment_id)?
-        {
-            seal_tx
-                .send(SealCommand::Seal(SegmentSealTask {
-                    segment_id,
-                    sealed_len: state.write_offset,
-                }))
-                .map_err(|_| Error::SealQueueClosed)?;
-            metrics.record_seal_enqueued();
-        }
-    }
-    Ok(())
 }
 
 fn publish_active_segment_state(
@@ -3536,7 +3406,8 @@ mod tests {
         assert_eq!(
             sealed.sealed_sha256,
             Some(
-                sha256_file_prefix(&segment_path(store.config(), 1), sealed.write_offset).unwrap()
+                seal::sha256_file_prefix(&segment_path(store.config(), 1), sealed.write_offset)
+                    .unwrap()
             )
         );
         assert_eq!(store.durable_lsn().unwrap(), 1);
