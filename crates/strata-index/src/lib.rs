@@ -7,18 +7,20 @@
 //! ```text
 //! StrataIndex
 //! +-----------------+-----------------------------------------------+
-//! | blob_versions   | (BlobKey, LSN) -> BlobEntry                   |
+//! | blob_versions   | (BlobKey, LSN) -> BlobEntry version/delta     |
 //! | segment_states  | SegmentId -> SegmentState                     |
 //! | segment_stats   | SegmentId -> SegmentStats                     |
-//! | store_state     | () -> { next_lsn, durable_lsn }               |
+//! | store_state     | StoreStateKey -> LSN                         |
 //! | pending_lsn_ops | LSN -> BlobKey                                |
 //! +-----------------+-----------------------------------------------+
 //! ```
 //!
-//! The `blob_versions` table is append-only from the store's point of view: overwrites and
-//! tombstones create newer versions instead of mutating old rows. `pending_lsn_ops` is the
-//! bridge between metadata and segment durability; the store removes pending rows only when the
-//! corresponding bytes are durable or the operation is rolled back during recovery.
+//! The `blob_versions` table is append-only from the store's point of view: puts, snapshots,
+//! extension deltas, and tombstones create newer versions instead of mutating old rows. Extension
+//! deltas carry the latest logical end epoch without repeating the payload reference. The store
+//! resolves them by walking backward to the latest payload-bearing version. `pending_lsn_ops` is
+//! the bridge between metadata and segment durability; the store removes pending rows only when
+//! the corresponding bytes are durable or the operation is rolled back during recovery.
 //!
 //! Namespacing is handled by prefixing column family names:
 //!
@@ -39,8 +41,8 @@ use std::{
 };
 
 use strata_core::{
-    BlobEntry, BlobKey, BlobVersionKey, SegmentId, SegmentState, SegmentStats, StrataLsn,
-    StrataStoreState,
+    BlobEntry, BlobKey, BlobVersionKey, SegmentId, SegmentState, SegmentStats, StoreStateKey,
+    StrataLsn, StrataStoreState,
 };
 use typed_store::{
     Map, TypedStoreError,
@@ -69,8 +71,8 @@ pub struct StrataIndex {
     segment_states: DBMap<SegmentId, SegmentState>,
     /// Segment-level accounting used by cleanup planning without scanning payload files.
     segment_stats: DBMap<SegmentId, SegmentStats>,
-    /// Singleton store cursor state: next assigned LSN and highest contiguous durable LSN.
-    store_state: DBMap<(), StrataStoreState>,
+    /// Store cursor fields: next assigned LSN and highest contiguous durable LSN.
+    store_state: DBMap<StoreStateKey, StrataLsn>,
     /// Pending logical operations keyed by LSN, used to advance and roll back the durable frontier.
     pending_lsn_ops: DBMap<StrataLsn, BlobKey>,
 }
@@ -169,6 +171,7 @@ impl StrataIndex {
             &rw_options,
             true,
         )?;
+        migrate_legacy_store_state(&db, &cf_names.store_state, &rw_options, &store_state)?;
         let pending_lsn_ops = DBMap::reopen_with_class(
             &db,
             Some(&cf_names.pending_lsn_ops),
@@ -212,7 +215,7 @@ impl StrataIndex {
         &self.segment_stats
     }
 
-    pub fn store_state(&self) -> &DBMap<(), StrataStoreState> {
+    pub fn store_state(&self) -> &DBMap<StoreStateKey, StrataLsn> {
         &self.store_state
     }
 
@@ -280,6 +283,34 @@ impl StrataIndex {
         Ok(None)
     }
 
+    pub fn reversed_blob_versions(
+        &self,
+        key: &BlobKey,
+        max_lsn: StrataLsn,
+    ) -> Result<Vec<(BlobVersionKey, BlobEntry)>> {
+        let lower = BlobVersionKey {
+            key: key.clone(),
+            lsn: 0,
+        };
+        let upper = BlobVersionKey {
+            key: key.clone(),
+            lsn: max_lsn,
+        };
+        let mut versions = Vec::new();
+
+        for result in self
+            .blob_versions
+            .reversed_safe_iter_with_bounds(Some(lower), Some(upper))?
+        {
+            let (version_key, entry) = result?;
+            if version_key.key == *key {
+                versions.push((version_key, entry));
+            }
+        }
+
+        Ok(versions)
+    }
+
     pub fn get_blob_version(&self, key: &BlobVersionKey) -> Result<Option<BlobEntry>> {
         Ok(self.blob_versions.get(key)?)
     }
@@ -320,8 +351,51 @@ impl StrataIndex {
         Ok(())
     }
 
+    pub fn get_next_lsn(&self) -> Result<StrataLsn> {
+        Ok(self
+            .store_state
+            .get(&StoreStateKey::NextLsn)?
+            .unwrap_or_else(|| StrataStoreState::default().next_lsn))
+    }
+
+    pub fn get_durable_lsn(&self) -> Result<StrataLsn> {
+        Ok(self
+            .store_state
+            .get(&StoreStateKey::DurableLsn)?
+            .unwrap_or_else(|| StrataStoreState::default().durable_lsn))
+    }
+
     pub fn get_store_state(&self) -> Result<Option<StrataStoreState>> {
-        Ok(self.store_state.get(&())?)
+        Ok(Some(StrataStoreState {
+            next_lsn: self.get_next_lsn()?,
+            durable_lsn: self.get_durable_lsn()?,
+        }))
+    }
+
+    pub fn put_next_lsn_batch(&self, batch: &mut DBBatch, next_lsn: StrataLsn) -> Result<()> {
+        batch
+            .insert_batch(self.store_state(), [(&StoreStateKey::NextLsn, &next_lsn)])
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub fn put_durable_lsn_batch(&self, batch: &mut DBBatch, durable_lsn: StrataLsn) -> Result<()> {
+        batch
+            .insert_batch(
+                self.store_state(),
+                [(&StoreStateKey::DurableLsn, &durable_lsn)],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub fn put_store_state_batch(
+        &self,
+        batch: &mut DBBatch,
+        state: &StrataStoreState,
+    ) -> Result<()> {
+        self.put_next_lsn_batch(batch, state.next_lsn)?;
+        self.put_durable_lsn_batch(batch, state.durable_lsn)
     }
 
     pub fn iter_pending_lsn_ops(&self) -> Result<Vec<(StrataLsn, BlobKey)>> {
@@ -351,6 +425,51 @@ impl StrataIndex {
     }
 }
 
+fn migrate_legacy_store_state(
+    db: &Arc<RocksDB>,
+    cf_name: &str,
+    rw_options: &ReadWriteOptions,
+    store_state: &DBMap<StoreStateKey, StrataLsn>,
+) -> Result<()> {
+    let legacy_store_state = DBMap::<(), StrataStoreState>::reopen_with_class(
+        db,
+        Some(cf_name),
+        Some(STORE_STATE_CF),
+        rw_options,
+        true,
+    )?;
+    let Some(legacy) = legacy_store_state.get(&())? else {
+        return Ok(());
+    };
+
+    let next_lsn_exists = store_state.get(&StoreStateKey::NextLsn)?.is_some();
+    let durable_lsn_exists = store_state.get(&StoreStateKey::DurableLsn)?.is_some();
+    if next_lsn_exists && durable_lsn_exists {
+        return Ok(());
+    }
+
+    let mut batch = store_state.batch();
+    if !next_lsn_exists {
+        batch
+            .insert_batch(store_state, [(&StoreStateKey::NextLsn, &legacy.next_lsn)])
+            .map_err(Error::from)?;
+    }
+    if !durable_lsn_exists {
+        batch
+            .insert_batch(
+                store_state,
+                [(&StoreStateKey::DurableLsn, &legacy.durable_lsn)],
+            )
+            .map_err(Error::from)?;
+    }
+    batch
+        .delete_batch(&legacy_store_state, [()])
+        .map_err(Error::from)?;
+    batch.write().map_err(Error::from)?;
+
+    Ok(())
+}
+
 fn unique_metric_conf(base: &str) -> MetricConf {
     let metric_id = NEXT_METRIC_ID.fetch_add(1, Ordering::Relaxed);
     MetricConf::new(&format!("{base}_{metric_id}"))
@@ -362,7 +481,10 @@ mod tests {
 
     use strata_core::{BlobLifecycle, BlobState, PlacementClass, RecordRef, SegmentFileState};
     use tempfile::tempdir;
-    use typed_store::{DBMetrics, rocks::open_cf};
+    use typed_store::{
+        DBMetrics,
+        rocks::{DBMap, ReadWriteOptions, open_cf},
+    };
 
     use super::*;
 
@@ -553,6 +675,75 @@ mod tests {
 
         let states = index.iter_segment_states().unwrap();
         assert_eq!(states, vec![(1, state_1), (2, state_2)]);
+    }
+
+    #[tokio::test]
+    async fn store_state_fields_update_independently() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+
+        assert_eq!(
+            index.get_store_state().unwrap(),
+            Some(StrataStoreState::default())
+        );
+
+        let mut batch = index.batch();
+        index.put_next_lsn_batch(&mut batch, 42).unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(index.get_next_lsn().unwrap(), 42);
+        assert_eq!(index.get_durable_lsn().unwrap(), 0);
+
+        let mut batch = index.batch();
+        index.put_durable_lsn_batch(&mut batch, 41).unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(
+            index.get_store_state().unwrap(),
+            Some(StrataStoreState {
+                next_lsn: 42,
+                durable_lsn: 41,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_singleton_store_state_is_migrated() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let cf_names = StrataIndexCfNames::new("strata");
+        let db = open_cf(
+            dir.path(),
+            None,
+            unique_metric_conf("strata_index_test"),
+            &cf_names.as_strs(),
+        )
+        .unwrap();
+        let rw_options = ReadWriteOptions::default();
+        let legacy_store_state = DBMap::<(), StrataStoreState>::reopen_with_class(
+            &db,
+            Some(&cf_names.store_state),
+            Some(STORE_STATE_CF),
+            &rw_options,
+            true,
+        )
+        .unwrap();
+        legacy_store_state
+            .insert(
+                &(),
+                &StrataStoreState {
+                    next_lsn: 9,
+                    durable_lsn: 7,
+                },
+            )
+            .unwrap();
+
+        let index = StrataIndex::from_db(db, "strata").unwrap();
+
+        assert_eq!(index.get_next_lsn().unwrap(), 9);
+        assert_eq!(index.get_durable_lsn().unwrap(), 7);
+        assert_eq!(legacy_store_state.get(&()).unwrap(), None);
     }
 
     #[tokio::test]

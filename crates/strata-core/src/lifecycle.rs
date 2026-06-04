@@ -48,7 +48,12 @@ pub enum BlobState {
     Tombstoned,
 }
 
-/// Metadata entry stored in the Strata blob index.
+/// Metadata entry stored in the Strata blob version index.
+///
+/// A live entry with a record reference is a payload-bearing put or snapshot. A live entry without
+/// a record reference is an extension delta: it carries the current logical end epoch, while the
+/// read path walks backward to find the latest payload-bearing version. A tombstoned entry ends the
+/// live chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobEntry {
     pub record_ref: Option<RecordRef>,
@@ -71,6 +76,12 @@ pub struct StrataStoreState {
     pub durable_lsn: StrataLsn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum StoreStateKey {
+    NextLsn,
+    DurableLsn,
+}
+
 impl Default for StrataStoreState {
     fn default() -> Self {
         Self {
@@ -83,5 +94,17 @@ impl Default for StrataStoreState {
 impl BlobEntry {
     pub fn is_live(&self) -> bool {
         self.state == BlobState::Live
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self.state == BlobState::Tombstoned
+    }
+
+    pub fn is_extension_delta(&self) -> bool {
+        self.state == BlobState::Live && self.record_ref.is_none()
+    }
+
+    pub fn has_payload_ref(&self) -> bool {
+        self.state == BlobState::Live && self.record_ref.is_some()
     }
 }

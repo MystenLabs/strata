@@ -37,8 +37,8 @@ pub use checksum::{Checksum, ChecksumAlgorithm};
 pub use error::{Error, Result};
 pub use key::{BlobKey, BlobKeyError};
 pub use lifecycle::{
-    BlobEntry, BlobLifecycle, BlobState, BlobVersionKey, Epoch, Generation, RecordRef, StrataLsn,
-    StrataStoreState,
+    BlobEntry, BlobLifecycle, BlobState, BlobVersionKey, Epoch, Generation, RecordRef,
+    StoreStateKey, StrataLsn, StrataStoreState,
 };
 pub use record::{
     DecodedRecord, EncodedRecordParts, FIXED_RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_VERSION,

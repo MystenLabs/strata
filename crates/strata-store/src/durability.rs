@@ -1,6 +1,4 @@
-use strata_core::{
-    BlobKey, BlobVersionKey, SegmentFileState, SegmentId, SegmentState, StrataLsn, StrataStoreState,
-};
+use strata_core::{BlobKey, BlobVersionKey, SegmentFileState, SegmentId, SegmentState, StrataLsn};
 use strata_index::StrataIndex;
 use typed_store::Map;
 
@@ -15,15 +13,12 @@ pub(crate) fn active_segment_durable_offset(
         .map_or(0, |state| state.durable_offset))
 }
 
-pub(crate) fn store_state_with_advanced_durable_lsn(
+pub(crate) fn durable_lsn_with_advanced_frontier(
     index: &StrataIndex,
     override_state: Option<&SegmentState>,
     batch: &mut typed_store::rocks::DBBatch,
-) -> Result<StrataStoreState> {
-    let mut store_state = index.get_store_state()?.unwrap_or_default();
-    store_state.durable_lsn =
-        compute_durable_lsn(index, store_state.durable_lsn, override_state, batch)?;
-    Ok(store_state)
+) -> Result<StrataLsn> {
+    compute_durable_lsn(index, index.get_durable_lsn()?, override_state, batch)
 }
 
 fn compute_durable_lsn(

@@ -4,10 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use strata_core::{BlobKey, BlobState, RecordRef, SegmentFileState, SegmentId};
+use strata_core::{BlobKey, RecordRef, SegmentFileState, SegmentId};
 use strata_segment::{SegmentPayloadStream, SegmentReadOptions};
 
-use crate::{Error, Result, StrataStore};
+use crate::{Error, Result, StrataStore, resolve_blob_version};
 
 /// Options for point reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,19 +225,15 @@ impl StrataStore {
     }
 
     pub(crate) fn live_record_ref(&self, key: &BlobKey) -> Result<Option<RecordRef>> {
-        let Some(entry) = self.index.get_blob_entry(key)? else {
+        let Some(resolved) = resolve_blob_version(&self.index, key)? else {
             return Ok(None);
         };
-        if entry.state == BlobState::Tombstoned {
-            return Ok(None);
-        }
-        let Some(record_ref) = entry.record_ref else {
-            return Ok(None);
-        };
+        let record_ref = resolved.record_ref;
         if !self.segment_is_readable(record_ref.segment_id)? {
             self.evict_segment_reader(record_ref.segment_id);
             return Ok(None);
         }
+        self.queue_rebase_if_needed(key, &resolved);
         Ok(Some(record_ref))
     }
 

@@ -16,6 +16,8 @@ pub struct StrataStoreMetrics {
 #[derive(Debug)]
 struct PrometheusMetrics {
     queued_write_commands: IntGauge,
+    write_queue_send_duration_seconds: Histogram,
+    write_queue_send_errors_total: IntCounter,
     put_calls_total: IntCounter,
     put_errors_total: IntCounter,
     put_duration_seconds: Histogram,
@@ -60,6 +62,9 @@ struct PrometheusMetrics {
     seal_enqueued_total: IntCounter,
     sealed_segments_total: IntCounter,
     seal_errors_total: IntCounter,
+    seal_backpressure_waits_total: IntCounter,
+    seal_backpressure_wait_duration_seconds: Histogram,
+    seal_backpressure_current: IntGauge,
     recovery_segments_total: IntCounter,
     recovery_complete_segments_total: IntCounter,
     recovery_incomplete_segments_total: IntCounter,
@@ -89,6 +94,18 @@ impl StrataStoreMetrics {
                     &labels,
                     "queued_write_commands",
                     "Number of write commands queued for the Strata writer.",
+                )?,
+                write_queue_send_duration_seconds: register_histogram(
+                    registry,
+                    &labels,
+                    "write_queue_send_duration_seconds",
+                    "Time spent sending commands into the bounded Strata write queue.",
+                )?,
+                write_queue_send_errors_total: register_counter(
+                    registry,
+                    &labels,
+                    "write_queue_send_errors_total",
+                    "Total failures while sending commands into the Strata write queue.",
                 )?,
                 put_calls_total: register_counter(
                     registry,
@@ -354,6 +371,24 @@ impl StrataStoreMetrics {
                     "seal_errors_total",
                     "Total Strata segment seal failures.",
                 )?,
+                seal_backpressure_waits_total: register_counter(
+                    registry,
+                    &labels,
+                    "seal_backpressure_waits_total",
+                    "Total times Strata writes waited for unsealed segment backlog capacity.",
+                )?,
+                seal_backpressure_wait_duration_seconds: register_histogram(
+                    registry,
+                    &labels,
+                    "seal_backpressure_wait_duration_seconds",
+                    "Time Strata writes spent waiting for unsealed segment backlog capacity.",
+                )?,
+                seal_backpressure_current: register_gauge(
+                    registry,
+                    &labels,
+                    "seal_backpressure_current",
+                    "Whether the Strata writer is currently waiting for unsealed segment backlog capacity.",
+                )?,
                 recovery_segments_total: register_counter(
                     registry,
                     &labels,
@@ -415,6 +450,18 @@ impl StrataStoreMetrics {
     pub(crate) fn dequeue_write_command(&self) {
         if let Some(metrics) = &self.inner {
             metrics.queued_write_commands.dec();
+        }
+    }
+
+    pub(crate) fn record_write_queue_send(&self, success: bool, elapsed: Duration) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics
+            .write_queue_send_duration_seconds
+            .observe(duration_seconds(elapsed));
+        if !success {
+            metrics.write_queue_send_errors_total.inc();
         }
     }
 
@@ -558,9 +605,23 @@ impl StrataStoreMetrics {
         };
         metrics.next_lsn.set(to_i64(next_lsn));
         metrics.durable_lsn.set(to_i64(durable_lsn));
-        metrics.pending_lsn_count.set(to_i64(
-            next_lsn.saturating_sub(durable_lsn).saturating_sub(1),
-        ));
+        set_pending_lsn_count(metrics, next_lsn, durable_lsn);
+    }
+
+    pub(crate) fn set_next_lsn(&self, next_lsn: StrataLsn) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics.next_lsn.set(to_i64(next_lsn));
+        set_pending_lsn_count(metrics, next_lsn, lsn_from_i64(metrics.durable_lsn.get()));
+    }
+
+    pub(crate) fn set_durable_lsn(&self, durable_lsn: StrataLsn) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics.durable_lsn.set(to_i64(durable_lsn));
+        set_pending_lsn_count(metrics, lsn_from_i64(metrics.next_lsn.get()), durable_lsn);
     }
 
     pub(crate) fn set_unsealed_segments(&self, count: usize) {
@@ -584,6 +645,22 @@ impl StrataStoreMetrics {
     pub(crate) fn record_seal_error(&self) {
         if let Some(metrics) = &self.inner {
             metrics.seal_errors_total.inc();
+        }
+    }
+
+    pub(crate) fn start_seal_backpressure_wait(&self) {
+        if let Some(metrics) = &self.inner {
+            metrics.seal_backpressure_waits_total.inc();
+            metrics.seal_backpressure_current.set(1);
+        }
+    }
+
+    pub(crate) fn finish_seal_backpressure_wait(&self, elapsed: Duration) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .seal_backpressure_wait_duration_seconds
+                .observe(duration_seconds(elapsed));
+            metrics.seal_backpressure_current.set(0);
         }
     }
 
@@ -677,6 +754,16 @@ fn metric_name(name: &str) -> String {
 
 fn duration_seconds(elapsed: Duration) -> f64 {
     elapsed.as_secs_f64()
+}
+
+fn set_pending_lsn_count(metrics: &PrometheusMetrics, next_lsn: StrataLsn, durable_lsn: StrataLsn) {
+    metrics.pending_lsn_count.set(to_i64(
+        next_lsn.saturating_sub(durable_lsn).saturating_sub(1),
+    ));
+}
+
+fn lsn_from_i64(value: i64) -> StrataLsn {
+    u64::try_from(value).unwrap_or(0)
 }
 
 fn to_i64(value: u64) -> i64 {
