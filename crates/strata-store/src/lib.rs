@@ -15,7 +15,7 @@
 //!        segment_states[segment_id].write_offset = end_of_record
 //!        segment_stats[segment_id] += record bytes
 //!        store_state[NextLsn] = lsn + 1
-//!        pending_lsn_ops[lsn] = key
+//!        unaccounted_lsn_ops[lsn] = key
 //! ```
 //!
 //! Epoch path:
@@ -38,7 +38,7 @@
 //! StrataStore::sync
 //!   -> fsync active segment bytes
 //!   -> advance segment_states[active].durable_offset
-//!   -> advance durable_lsn while pending LSNs are covered by durable bytes
+//!   -> advance durable_lsn while unaccounted blob LSNs are covered by durable bytes
 //!   -> store_state[DurableLsn] = durable_lsn
 //!   -> fsync RocksDB WAL
 //! ```
@@ -61,7 +61,7 @@
 //!   is compatible with the recovery policy.
 //! - Orphan segment files without index state are ignored by point-in-time recovery by deleting
 //!   the file before any active writer is opened.
-//! - Lost pending LSNs are rolled back from `blob_versions` and `pending_lsn_ops`.
+//! - Lost unaccounted LSNs are rolled back from `blob_versions` and `unaccounted_lsn_ops`.
 //! - Sealed segments are expected to be stable. On open, their files must exist and match
 //!   indexed length; optional checksum verification recomputes the sealed SHA-256 digest.
 //! - `durable_lsn` means every logical operation up to that LSN is recoverable after restart.
@@ -374,6 +374,10 @@ impl StrataStore {
         Ok(self.index.get_durable_lsn()?)
     }
 
+    pub fn accounted_lsn(&self) -> Result<StrataLsn> {
+        Ok(self.index.get_accounted_lsn()?)
+    }
+
     pub(crate) fn queue_rebase_if_needed(&self, key: &BlobKey, resolved: &ResolvedBlobVersion) {
         if resolved.extension_chain_len < REBASE_EXTENSION_CHAIN_THRESHOLD {
             return;
@@ -620,9 +624,8 @@ impl WriteCoordinator {
             )
             .map_err(strata_index::Error::from)?;
         self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-        batch
-            .insert_batch(self.index.pending_lsn_ops(), [(&lsn, key)])
-            .map_err(strata_index::Error::from)?;
+        self.index
+            .put_unaccounted_lsn_op_batch(&mut batch, lsn, key)?;
         batch.write().map_err(strata_index::Error::from)?;
         self.next_lsn = next_lsn;
         self.metrics.set_active_segment(
@@ -653,9 +656,8 @@ impl WriteCoordinator {
         let mut batch = self.index.batch();
         self.index.put_blob_version_batch(&mut batch, key, &entry)?;
         self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-        batch
-            .insert_batch(self.index.pending_lsn_ops(), [(&lsn, key)])
-            .map_err(strata_index::Error::from)?;
+        self.index
+            .put_unaccounted_lsn_op_batch(&mut batch, lsn, key)?;
         let result = batch.write().map_err(strata_index::Error::from);
         if let Err(error) = result {
             self.metrics.record_tombstone(false, started.elapsed());
@@ -692,9 +694,8 @@ impl WriteCoordinator {
         let mut batch = self.index.batch();
         self.index.put_blob_version_batch(&mut batch, key, &entry)?;
         self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-        batch
-            .insert_batch(self.index.pending_lsn_ops(), [(&lsn, key)])
-            .map_err(strata_index::Error::from)?;
+        self.index
+            .put_unaccounted_lsn_op_batch(&mut batch, lsn, key)?;
         if let Err(error) = batch.write().map_err(strata_index::Error::from) {
             self.metrics.record_extend(Err(()), started.elapsed());
             return Err(error.into());
@@ -739,9 +740,8 @@ impl WriteCoordinator {
         self.index
             .put_blob_version_batch(&mut batch, &request.key, &entry)?;
         self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-        batch
-            .insert_batch(self.index.pending_lsn_ops(), [(&lsn, &request.key)])
-            .map_err(strata_index::Error::from)?;
+        self.index
+            .put_unaccounted_lsn_op_batch(&mut batch, lsn, &request.key)?;
         batch.write().map_err(strata_index::Error::from)?;
         self.next_lsn = next_lsn;
         self.metrics.set_next_lsn(next_lsn);
@@ -900,8 +900,7 @@ impl WriteCoordinator {
             batch
                 .insert_batch(self.index.segment_states(), [(&state.segment_id, &state)])
                 .map_err(strata_index::Error::from)?;
-            let durable_lsn =
-                durable_lsn_with_advanced_frontier(&self.index, Some(&state), &mut batch)?;
+            let durable_lsn = durable_lsn_with_advanced_frontier(&self.index, Some(&state))?;
             self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
             if let Err(error) = batch.write().map_err(strata_index::Error::from) {
                 self.metrics.record_sync(Err(()), started.elapsed());
@@ -1376,8 +1375,8 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
     let durable_lsn = index.get_durable_lsn()?;
     let states = index.iter_segment_states()?;
     let mut rollback_from = None;
-    for (lsn, key) in index.iter_pending_lsn_ops()? {
-        if lsn <= durable_lsn || pending_operation_survived(index, lsn, &key, &states)? {
+    for (lsn, key) in index.iter_unaccounted_lsn_ops()? {
+        if lsn <= durable_lsn || unaccounted_operation_survived(index, lsn, &key, &states)? {
             continue;
         }
         rollback_from = Some(rollback_from.map_or(lsn, |current: StrataLsn| current.min(lsn)));
@@ -1388,7 +1387,7 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
     };
 
     let mut entries = index
-        .iter_pending_lsn_ops()?
+        .iter_unaccounted_lsn_ops()?
         .into_iter()
         .filter(|(lsn, _)| *lsn >= rollback_from)
         .collect::<Vec<_>>();
@@ -1403,9 +1402,7 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
         .collect::<Vec<_>>();
     for (lsn, key) in entries {
         hidden_versions.push((key, lsn));
-        batch
-            .delete_batch(index.pending_lsn_ops(), [&lsn])
-            .map_err(strata_index::Error::from)?;
+        index.remove_unaccounted_lsn_ops_batch(&mut batch, &[lsn])?;
     }
     index.remove_blob_versions_batch(&mut batch, &hidden_versions)?;
     index.remove_epoch_changes_batch(&mut batch, &hidden_epoch_changes)?;
@@ -1430,7 +1427,7 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
 
 fn advance_recovered_durable_lsn(index: &StrataIndex, metrics: &StrataStoreMetrics) -> Result<()> {
     let mut batch = index.batch();
-    let durable_lsn = durable_lsn_with_advanced_frontier(index, None, &mut batch)?;
+    let durable_lsn = durable_lsn_with_advanced_frontier(index, None)?;
     index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
@@ -1438,7 +1435,7 @@ fn advance_recovered_durable_lsn(index: &StrataIndex, metrics: &StrataStoreMetri
     Ok(())
 }
 
-fn pending_operation_survived(
+fn unaccounted_operation_survived(
     index: &StrataIndex,
     lsn: StrataLsn,
     key: &BlobKey,
@@ -2590,6 +2587,10 @@ mod tests {
         assert_eq!(unsynced.durable_offset, 0);
         assert!(unsynced.write_offset > 0);
         assert_eq!(store.durable_lsn().unwrap(), 0);
+        assert_eq!(
+            store.index().iter_unaccounted_lsn_ops().unwrap(),
+            vec![(1, key.clone())]
+        );
 
         store.sync().unwrap();
 
@@ -2601,6 +2602,10 @@ mod tests {
         assert_eq!(synced.durable_offset, unsynced.write_offset);
         assert_eq!(synced.write_offset, unsynced.write_offset);
         assert_eq!(store.durable_lsn().unwrap(), 1);
+        assert_eq!(
+            store.index().iter_unaccounted_lsn_ops().unwrap(),
+            vec![(1, key)]
+        );
     }
 
     #[tokio::test]
@@ -3091,8 +3096,8 @@ mod tests {
                         },
                     )
                     .unwrap();
-                batch
-                    .insert_batch(index.pending_lsn_ops(), [(&lsn, key)])
+                index
+                    .put_unaccounted_lsn_op_batch(&mut batch, lsn, key)
                     .unwrap();
             }
             batch
@@ -3186,8 +3191,8 @@ mod tests {
                         },
                     )
                     .unwrap();
-                batch
-                    .insert_batch(index.pending_lsn_ops(), [(&lsn, key)])
+                index
+                    .put_unaccounted_lsn_op_batch(&mut batch, lsn, key)
                     .unwrap();
             }
             batch

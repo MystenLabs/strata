@@ -11,17 +11,18 @@
 //! | segment_states  | SegmentId -> SegmentState                     |
 //! | segment_stats   | SegmentId -> SegmentStats                     |
 //! | store_state     | StoreStateKey -> u64                         |
-//! | epoch_changes   | LSN -> current Epoch                          |
-//! | pending_lsn_ops | LSN -> BlobKey                                |
+//! | epoch_changes       | LSN -> current Epoch                      |
+//! | unaccounted_lsn_ops | LSN -> BlobKey                            |
 //! +-----------------+-----------------------------------------------+
 //! ```
 //!
 //! The `blob_versions` table is append-only from the store's point of view: puts, snapshots,
 //! extension deltas, and tombstones create newer versions instead of mutating old rows. Extension
 //! deltas carry the latest logical end epoch without repeating the payload reference. The store
-//! resolves them by walking backward to the latest payload-bearing version. `pending_lsn_ops` is
-//! the bridge between metadata and segment durability; the store removes pending rows only when
-//! the corresponding bytes are durable or the operation is rolled back during recovery.
+//! resolves them by walking backward to the latest payload-bearing version.
+//! `unaccounted_lsn_ops` is the LSN-to-blob-key index used by durability, recovery, and later
+//! accounting. Rows are written with blob ops, retained after durability, removed on rollback if
+//! lost, and will be removed by accounting once consumed.
 //!
 //! Namespacing is handled by prefixing column family names:
 //!
@@ -57,7 +58,7 @@ const SEGMENT_STATES_CF: &str = "segment_states";
 const SEGMENT_STATS_CF: &str = "segment_stats";
 const STORE_STATE_CF: &str = "store_state";
 const EPOCH_CHANGES_CF: &str = "epoch_changes";
-const PENDING_LSN_OPS_CF: &str = "pending_lsn_ops";
+const UNACCOUNTED_LSN_OPS_CF: &str = "unaccounted_lsn_ops";
 static NEXT_METRIC_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Typed-store backed Strata metadata index.
@@ -73,12 +74,12 @@ pub struct StrataIndex {
     segment_states: DBMap<SegmentId, SegmentState>,
     /// Segment-level accounting used by cleanup planning without scanning payload files.
     segment_stats: DBMap<SegmentId, SegmentStats>,
-    /// Store cursor fields: next assigned LSN and highest contiguous durable LSN.
+    /// Store cursor fields: next assigned, highest durable, and highest accounted LSNs.
     store_state: DBMap<StoreStateKey, StrataLsn>,
     /// Epoch timeline. LSN 0 is the genesis epoch; later rows are explicit epoch increments.
     epoch_changes: DBMap<StrataLsn, Epoch>,
-    /// Pending logical operations keyed by LSN, used to advance and roll back the durable frontier.
-    pending_lsn_ops: DBMap<StrataLsn, BlobKey>,
+    /// Blob-key operations keyed by LSN, retained until the accounting worker consumes them.
+    unaccounted_lsn_ops: DBMap<StrataLsn, BlobKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,7 +89,7 @@ pub struct StrataIndexCfNames {
     pub segment_stats: String,
     pub store_state: String,
     pub epoch_changes: String,
-    pub pending_lsn_ops: String,
+    pub unaccounted_lsn_ops: String,
 }
 
 impl StrataIndexCfNames {
@@ -108,7 +109,7 @@ impl StrataIndexCfNames {
             segment_stats: with_prefix(SEGMENT_STATS_CF),
             store_state: with_prefix(STORE_STATE_CF),
             epoch_changes: with_prefix(EPOCH_CHANGES_CF),
-            pending_lsn_ops: with_prefix(PENDING_LSN_OPS_CF),
+            unaccounted_lsn_ops: with_prefix(UNACCOUNTED_LSN_OPS_CF),
         }
     }
 
@@ -119,7 +120,7 @@ impl StrataIndexCfNames {
             self.segment_stats.as_str(),
             self.store_state.as_str(),
             self.epoch_changes.as_str(),
-            self.pending_lsn_ops.as_str(),
+            self.unaccounted_lsn_ops.as_str(),
         ]
     }
 }
@@ -178,7 +179,6 @@ impl StrataIndex {
             &rw_options,
             true,
         )?;
-        migrate_legacy_store_state(&db, &cf_names.store_state, &rw_options, &store_state)?;
         let epoch_changes = DBMap::reopen_with_class(
             &db,
             Some(&cf_names.epoch_changes),
@@ -186,10 +186,10 @@ impl StrataIndex {
             &rw_options,
             true,
         )?;
-        let pending_lsn_ops = DBMap::reopen_with_class(
+        let unaccounted_lsn_ops = DBMap::reopen_with_class(
             &db,
-            Some(&cf_names.pending_lsn_ops),
-            Some(PENDING_LSN_OPS_CF),
+            Some(&cf_names.unaccounted_lsn_ops),
+            Some(UNACCOUNTED_LSN_OPS_CF),
             &rw_options,
             true,
         )?;
@@ -202,7 +202,7 @@ impl StrataIndex {
             segment_stats,
             store_state,
             epoch_changes,
-            pending_lsn_ops,
+            unaccounted_lsn_ops,
         })
     }
 
@@ -238,8 +238,8 @@ impl StrataIndex {
         &self.epoch_changes
     }
 
-    pub fn pending_lsn_ops(&self) -> &DBMap<StrataLsn, BlobKey> {
-        &self.pending_lsn_ops
+    pub fn unaccounted_lsn_ops(&self) -> &DBMap<StrataLsn, BlobKey> {
+        &self.unaccounted_lsn_ops
     }
 
     pub fn get_blob_entry(&self, key: &BlobKey) -> Result<Option<BlobEntry>> {
@@ -416,6 +416,13 @@ impl StrataIndex {
             .unwrap_or_else(|| StrataStoreState::default().durable_lsn))
     }
 
+    pub fn get_accounted_lsn(&self) -> Result<StrataLsn> {
+        Ok(self
+            .store_state
+            .get(&StoreStateKey::AccountedLsn)?
+            .unwrap_or_else(|| StrataStoreState::default().accounted_lsn))
+    }
+
     pub fn get_current_epoch(&self) -> Result<Option<Epoch>> {
         Ok(self.store_state.get(&StoreStateKey::CurrentEpoch)?)
     }
@@ -424,6 +431,7 @@ impl StrataIndex {
         Ok(Some(StrataStoreState {
             next_lsn: self.get_next_lsn()?,
             durable_lsn: self.get_durable_lsn()?,
+            accounted_lsn: self.get_accounted_lsn()?,
         }))
     }
 
@@ -444,6 +452,20 @@ impl StrataIndex {
         Ok(())
     }
 
+    pub fn put_accounted_lsn_batch(
+        &self,
+        batch: &mut DBBatch,
+        accounted_lsn: StrataLsn,
+    ) -> Result<()> {
+        batch
+            .insert_batch(
+                self.store_state(),
+                [(&StoreStateKey::AccountedLsn, &accounted_lsn)],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
     pub fn put_current_epoch_batch(&self, batch: &mut DBBatch, epoch: Epoch) -> Result<()> {
         batch
             .insert_batch(self.store_state(), [(&StoreStateKey::CurrentEpoch, &epoch)])
@@ -457,7 +479,8 @@ impl StrataIndex {
         state: &StrataStoreState,
     ) -> Result<()> {
         self.put_next_lsn_batch(batch, state.next_lsn)?;
-        self.put_durable_lsn_batch(batch, state.durable_lsn)
+        self.put_durable_lsn_batch(batch, state.durable_lsn)?;
+        self.put_accounted_lsn_batch(batch, state.accounted_lsn)
     }
 
     pub fn put_epoch_change_batch(
@@ -504,32 +527,42 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn iter_pending_lsn_ops(&self) -> Result<Vec<(StrataLsn, BlobKey)>> {
-        self.pending_lsn_ops
+    pub fn iter_unaccounted_lsn_ops(&self) -> Result<Vec<(StrataLsn, BlobKey)>> {
+        self.unaccounted_lsn_ops
             .safe_iter()?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)
     }
 
-    pub fn put_pending_lsn_op_batch(
+    pub fn put_unaccounted_lsn_op_batch(
         &self,
         batch: &mut DBBatch,
         lsn: StrataLsn,
         key: &BlobKey,
     ) -> Result<()> {
         batch
-            .insert_batch(self.pending_lsn_ops(), [(&lsn, key)])
+            .insert_batch(self.unaccounted_lsn_ops(), [(&lsn, key)])
             .map_err(Error::from)?;
         Ok(())
     }
 
-    pub fn remove_pending_lsn_ops_batch(
+    pub fn iter_unaccounted_lsn_ops_from(
+        &self,
+        min_lsn: StrataLsn,
+    ) -> Result<Vec<(StrataLsn, BlobKey)>> {
+        self.unaccounted_lsn_ops
+            .safe_iter_with_bounds(Some(min_lsn), None)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    pub fn remove_unaccounted_lsn_ops_batch(
         &self,
         batch: &mut DBBatch,
         lsns: &[StrataLsn],
     ) -> Result<()> {
         for lsn in lsns {
-            batch.delete_batch(self.pending_lsn_ops(), [lsn])?;
+            batch.delete_batch(self.unaccounted_lsn_ops(), [lsn])?;
         }
         Ok(())
     }
@@ -554,51 +587,6 @@ impl StrataIndex {
     }
 }
 
-fn migrate_legacy_store_state(
-    db: &Arc<RocksDB>,
-    cf_name: &str,
-    rw_options: &ReadWriteOptions,
-    store_state: &DBMap<StoreStateKey, StrataLsn>,
-) -> Result<()> {
-    let legacy_store_state = DBMap::<(), StrataStoreState>::reopen_with_class(
-        db,
-        Some(cf_name),
-        Some(STORE_STATE_CF),
-        rw_options,
-        true,
-    )?;
-    let Some(legacy) = legacy_store_state.get(&())? else {
-        return Ok(());
-    };
-
-    let next_lsn_exists = store_state.get(&StoreStateKey::NextLsn)?.is_some();
-    let durable_lsn_exists = store_state.get(&StoreStateKey::DurableLsn)?.is_some();
-    if next_lsn_exists && durable_lsn_exists {
-        return Ok(());
-    }
-
-    let mut batch = store_state.batch();
-    if !next_lsn_exists {
-        batch
-            .insert_batch(store_state, [(&StoreStateKey::NextLsn, &legacy.next_lsn)])
-            .map_err(Error::from)?;
-    }
-    if !durable_lsn_exists {
-        batch
-            .insert_batch(
-                store_state,
-                [(&StoreStateKey::DurableLsn, &legacy.durable_lsn)],
-            )
-            .map_err(Error::from)?;
-    }
-    batch
-        .delete_batch(&legacy_store_state, [()])
-        .map_err(Error::from)?;
-    batch.write().map_err(Error::from)?;
-
-    Ok(())
-}
-
 fn unique_metric_conf(base: &str) -> MetricConf {
     let metric_id = NEXT_METRIC_ID.fetch_add(1, Ordering::Relaxed);
     MetricConf::new(&format!("{base}_{metric_id}"))
@@ -610,10 +598,7 @@ mod tests {
 
     use strata_core::{BlobLifecycle, BlobState, PlacementClass, RecordRef, SegmentFileState};
     use tempfile::tempdir;
-    use typed_store::{
-        DBMetrics,
-        rocks::{DBMap, ReadWriteOptions, open_cf},
-    };
+    use typed_store::{DBMetrics, rocks::open_cf};
 
     use super::*;
 
@@ -722,7 +707,7 @@ mod tests {
             .put_segment_stats_batch(&mut batch, state.segment_id, &stats)
             .unwrap();
         index
-            .put_pending_lsn_op_batch(&mut batch, entry.lsn, &key)
+            .put_unaccounted_lsn_op_batch(&mut batch, entry.lsn, &key)
             .unwrap();
         batch.write().unwrap();
 
@@ -733,8 +718,8 @@ mod tests {
         );
         assert_eq!(index.get_segment_stats(9).unwrap(), Some(stats));
         assert_eq!(
-            index.iter_pending_lsn_ops().unwrap(),
-            vec![(entry.lsn, key)]
+            index.iter_unaccounted_lsn_ops().unwrap(),
+            vec![(entry.lsn, key.clone())]
         );
     }
 
@@ -822,9 +807,11 @@ mod tests {
 
         assert_eq!(index.get_next_lsn().unwrap(), 42);
         assert_eq!(index.get_durable_lsn().unwrap(), 0);
+        assert_eq!(index.get_accounted_lsn().unwrap(), 0);
 
         let mut batch = index.batch();
         index.put_durable_lsn_batch(&mut batch, 41).unwrap();
+        index.put_accounted_lsn_batch(&mut batch, 40).unwrap();
         batch.write().unwrap();
 
         assert_eq!(
@@ -832,6 +819,7 @@ mod tests {
             Some(StrataStoreState {
                 next_lsn: 42,
                 durable_lsn: 41,
+                accounted_lsn: 40,
             })
         );
     }
@@ -864,45 +852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_singleton_store_state_is_migrated() {
-        init_typed_store_metrics();
-        let dir = tempdir().unwrap();
-        let cf_names = StrataIndexCfNames::new("strata");
-        let db = open_cf(
-            dir.path(),
-            None,
-            unique_metric_conf("strata_index_test"),
-            &cf_names.as_strs(),
-        )
-        .unwrap();
-        let rw_options = ReadWriteOptions::default();
-        let legacy_store_state = DBMap::<(), StrataStoreState>::reopen_with_class(
-            &db,
-            Some(&cf_names.store_state),
-            Some(STORE_STATE_CF),
-            &rw_options,
-            true,
-        )
-        .unwrap();
-        legacy_store_state
-            .insert(
-                &(),
-                &StrataStoreState {
-                    next_lsn: 9,
-                    durable_lsn: 7,
-                },
-            )
-            .unwrap();
-
-        let index = StrataIndex::from_db(db, "strata").unwrap();
-
-        assert_eq!(index.get_next_lsn().unwrap(), 9);
-        assert_eq!(index.get_durable_lsn().unwrap(), 7);
-        assert_eq!(legacy_store_state.get(&()).unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn iterates_pending_lsn_ops_in_order() {
+    async fn iterates_unaccounted_lsn_ops_in_order() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
@@ -912,30 +862,82 @@ mod tests {
 
         let mut batch = index.batch();
         index
-            .put_pending_lsn_op_batch(&mut batch, 2, &key_2)
+            .put_unaccounted_lsn_op_batch(&mut batch, 2, &key_2)
             .unwrap();
         index
-            .put_pending_lsn_op_batch(&mut batch, 3, &key_3)
+            .put_unaccounted_lsn_op_batch(&mut batch, 3, &key_3)
             .unwrap();
         index
-            .put_pending_lsn_op_batch(&mut batch, 1, &key_1)
+            .put_unaccounted_lsn_op_batch(&mut batch, 1, &key_1)
             .unwrap();
         batch.write().unwrap();
 
         assert_eq!(
-            index.iter_pending_lsn_ops().unwrap(),
+            index.iter_unaccounted_lsn_ops().unwrap(),
             vec![(1, key_1.clone()), (2, key_2), (3, key_3.clone())]
         );
 
         let mut batch = index.batch();
         index
-            .remove_pending_lsn_ops_batch(&mut batch, &[2])
+            .remove_unaccounted_lsn_ops_batch(&mut batch, &[2])
             .unwrap();
         batch.write().unwrap();
 
         assert_eq!(
-            index.iter_pending_lsn_ops().unwrap(),
+            index.iter_unaccounted_lsn_ops().unwrap(),
             vec![(1, key_1), (3, key_3)]
         );
+    }
+
+    #[tokio::test]
+    async fn unaccounted_lsn_ops_are_retained_until_explicitly_removed() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+        let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let entry_1 = blob_entry(1, 0);
+        let mut entry_2 = blob_entry(1, 1);
+        entry_2.lsn = 2;
+        entry_2.generation = 2;
+
+        let mut batch = index.batch();
+        index
+            .put_blob_version_batch(&mut batch, &key_1, &entry_1)
+            .unwrap();
+        index
+            .put_blob_version_batch(&mut batch, &key_2, &entry_2)
+            .unwrap();
+        index
+            .put_unaccounted_lsn_op_batch(&mut batch, entry_1.lsn, &key_1)
+            .unwrap();
+        index
+            .put_unaccounted_lsn_op_batch(&mut batch, entry_2.lsn, &key_2)
+            .unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(
+            index.iter_unaccounted_lsn_ops_from(2).unwrap(),
+            vec![(2, key_2.clone())]
+        );
+
+        let mut batch = index.batch();
+        index
+            .remove_blob_versions_batch(&mut batch, &[(key_2.clone(), 2)])
+            .unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(
+            index.iter_unaccounted_lsn_ops().unwrap(),
+            vec![(1, key_1.clone()), (2, key_2.clone())]
+        );
+
+        let mut batch = index.batch();
+        index
+            .remove_unaccounted_lsn_ops_batch(&mut batch, &[2])
+            .unwrap();
+        batch.write().unwrap();
+
+        assert_eq!(index.iter_unaccounted_lsn_ops().unwrap(), vec![(1, key_1)]);
     }
 }

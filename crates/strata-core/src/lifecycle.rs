@@ -74,6 +74,7 @@ pub struct BlobVersionKey {
 pub struct StrataStoreState {
     pub next_lsn: StrataLsn,
     pub durable_lsn: StrataLsn,
+    pub accounted_lsn: StrataLsn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -81,6 +82,7 @@ pub enum StoreStateKey {
     NextLsn,
     DurableLsn,
     CurrentEpoch,
+    AccountedLsn,
 }
 
 impl Default for StrataStoreState {
@@ -88,6 +90,7 @@ impl Default for StrataStoreState {
         Self {
             next_lsn: 1,
             durable_lsn: 0,
+            accounted_lsn: 0,
         }
     }
 }

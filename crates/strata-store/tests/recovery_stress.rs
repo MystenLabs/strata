@@ -392,10 +392,11 @@ fn validate_recovered_store(
     assert_eq!(store_state.durable_lsn, durable_lsn);
     assert!(store_state.next_lsn > durable_lsn);
 
-    for (lsn, _) in store.index().iter_pending_lsn_ops().unwrap() {
+    for (lsn, _) in store.index().iter_unaccounted_lsn_ops().unwrap() {
         assert!(
-            lsn > durable_lsn,
-            "pending LSN {lsn} remained at or below durable_lsn {durable_lsn}; fault={fault:?}"
+            lsn < store_state.next_lsn,
+            "unaccounted LSN {lsn} remained at or beyond next_lsn {}; fault={fault:?}",
+            store_state.next_lsn
         );
     }
 
