@@ -496,22 +496,6 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn apply_blob_version_merge_ops_batch(
-        &self,
-        batch: &mut DBBatch,
-        key: &BlobKey,
-        ops: Vec<VersionMergeOp>,
-    ) -> Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let operand = encode_blob_version_merge_operand(EncodedBlobVersionMergeOperand::Ops(
-            ops.into_iter().map(BlobVersionMergeOp::Version).collect(),
-        ))?;
-        batch.partial_merge_batch(&self.blob_versions, [(key, operand)])?;
-        Ok(())
-    }
-
     pub fn apply_blob_lifecycle_merge_op_batch(
         &self,
         batch: &mut DBBatch,
@@ -520,22 +504,6 @@ impl StrataIndex {
     ) -> Result<()> {
         let operand = encode_blob_version_merge_operand(EncodedBlobVersionMergeOperand::Op(
             BlobVersionMergeOp::Lifecycle(op),
-        ))?;
-        batch.partial_merge_batch(&self.blob_versions, [(key, operand)])?;
-        Ok(())
-    }
-
-    pub fn apply_blob_lifecycle_merge_ops_batch(
-        &self,
-        batch: &mut DBBatch,
-        key: &BlobKey,
-        ops: Vec<BlobLifecycleMergeOp>,
-    ) -> Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let operand = encode_blob_version_merge_operand(EncodedBlobVersionMergeOperand::Ops(
-            ops.into_iter().map(BlobVersionMergeOp::Lifecycle).collect(),
         ))?;
         batch.partial_merge_batch(&self.blob_versions, [(key, operand)])?;
         Ok(())
@@ -609,47 +577,6 @@ impl StrataIndex {
         }))
     }
 
-    pub fn reversed_blob_versions(
-        &self,
-        key: &BlobKey,
-        max_lsn: StrataLsn,
-    ) -> Result<Vec<(BlobVersionKey, BlobEntry)>> {
-        let Some(state) = self.get_blob_version_state(key)? else {
-            return Ok(Vec::new());
-        };
-        let mut versions = Vec::new();
-
-        if let Some(head) = state.heads.get(&STANDALONE_SHARD)
-            && head.head_lsn <= max_lsn
-        {
-            versions.push((
-                BlobVersionKey {
-                    key: key.clone(),
-                    lsn: head.head_lsn,
-                },
-                head.entry.clone(),
-            ));
-        }
-
-        for op in state
-            .tail
-            .iter()
-            .filter(|op| op.shard == STANDALONE_SHARD && op.lsn() <= max_lsn)
-        {
-            versions.push((
-                BlobVersionKey {
-                    key: key.clone(),
-                    lsn: op.lsn(),
-                },
-                op.entry.clone(),
-            ));
-        }
-
-        versions.sort_by_key(|(version_key, _)| std::cmp::Reverse(version_key.lsn));
-
-        Ok(versions)
-    }
-
     pub fn get_blob_version(&self, key: &BlobVersionKey) -> Result<Option<BlobEntry>> {
         self.get_blob_version_for_shard(key, STANDALONE_SHARD)
     }
@@ -717,27 +644,6 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn remove_blob_versions_at_lsns_batch(
-        &self,
-        batch: &mut DBBatch,
-        hidden_versions: &[(BlobKey, StrataLsn)],
-    ) -> Result<()> {
-        let mut by_key = BTreeMap::<BlobKey, BTreeSet<StrataLsn>>::new();
-        for (key, lsn) in hidden_versions {
-            by_key.entry(key.clone()).or_default().insert(*lsn);
-        }
-
-        for (key, lsns) in by_key {
-            let Some(mut state) = self.get_blob_state(&key)? else {
-                continue;
-            };
-            remove_version_lsns_from_state(&mut state.versions, &lsns);
-            self.put_blob_state_batch(batch, &key, &state)?;
-        }
-
-        Ok(())
-    }
-
     pub fn remove_blob_ops_at_lsns_batch(
         &self,
         batch: &mut DBBatch,
@@ -753,27 +659,6 @@ impl StrataIndex {
                 continue;
             };
             remove_version_lsns_from_state(&mut state.versions, &lsns);
-            remove_lifecycle_lsns_from_state(&mut state.lifecycle, &lsns);
-            self.put_blob_state_batch(batch, &key, &state)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn remove_blob_lifecycle_ops_at_lsns_batch(
-        &self,
-        batch: &mut DBBatch,
-        hidden_ops: &[(BlobKey, StrataLsn)],
-    ) -> Result<()> {
-        let mut by_key = BTreeMap::<BlobKey, BTreeSet<StrataLsn>>::new();
-        for (key, lsn) in hidden_ops {
-            by_key.entry(key.clone()).or_default().insert(*lsn);
-        }
-
-        for (key, lsns) in by_key {
-            let Some(mut state) = self.get_blob_state(&key)? else {
-                continue;
-            };
             remove_lifecycle_lsns_from_state(&mut state.lifecycle, &lsns);
             self.put_blob_state_batch(batch, &key, &state)?;
         }
