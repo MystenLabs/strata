@@ -23,13 +23,6 @@ struct PrometheusMetrics {
     put_duration_seconds: Histogram,
     put_payload_bytes_total: IntCounter,
     put_record_bytes_total: IntCounter,
-    tombstone_calls_total: IntCounter,
-    tombstone_errors_total: IntCounter,
-    tombstone_duration_seconds: Histogram,
-    extend_calls_total: IntCounter,
-    extend_misses_total: IntCounter,
-    extend_errors_total: IntCounter,
-    extend_duration_seconds: Histogram,
     sync_calls_total: IntCounter,
     sync_errors_total: IntCounter,
     sync_duration_seconds: Histogram,
@@ -52,6 +45,8 @@ struct PrometheusMetrics {
     stream_errors_total: IntCounter,
     stream_duration_seconds: Histogram,
     reader_cache_evictions_total: IntCounter,
+    orphaned_segment_records_total: IntCounter,
+    orphaned_segment_bytes_total: IntCounter,
     active_segment_id: IntGauge,
     active_segment_write_offset: IntGauge,
     active_segment_durable_offset: IntGauge,
@@ -137,48 +132,6 @@ impl StrataStoreMetrics {
                     &labels,
                     "put_record_bytes_total",
                     "Total encoded record bytes written by Strata put calls.",
-                )?,
-                tombstone_calls_total: register_counter(
-                    registry,
-                    &labels,
-                    "tombstone_calls_total",
-                    "Total Strata tombstone calls.",
-                )?,
-                tombstone_errors_total: register_counter(
-                    registry,
-                    &labels,
-                    "tombstone_errors_total",
-                    "Total failed Strata tombstone calls.",
-                )?,
-                tombstone_duration_seconds: register_histogram(
-                    registry,
-                    &labels,
-                    "tombstone_duration_seconds",
-                    "Strata tombstone latency in seconds.",
-                )?,
-                extend_calls_total: register_counter(
-                    registry,
-                    &labels,
-                    "extend_calls_total",
-                    "Total Strata lifecycle extension calls.",
-                )?,
-                extend_misses_total: register_counter(
-                    registry,
-                    &labels,
-                    "extend_misses_total",
-                    "Total Strata extension calls for missing or tombstoned blobs.",
-                )?,
-                extend_errors_total: register_counter(
-                    registry,
-                    &labels,
-                    "extend_errors_total",
-                    "Total failed Strata extension calls.",
-                )?,
-                extend_duration_seconds: register_histogram(
-                    registry,
-                    &labels,
-                    "extend_duration_seconds",
-                    "Strata lifecycle extension latency in seconds.",
                 )?,
                 sync_calls_total: register_counter(
                     registry,
@@ -311,6 +264,18 @@ impl StrataStoreMetrics {
                     &labels,
                     "reader_cache_evictions_total",
                     "Total Strata segment reader cache evictions.",
+                )?,
+                orphaned_segment_records_total: register_counter(
+                    registry,
+                    &labels,
+                    "orphaned_segment_records_total",
+                    "Total Strata records appended before their metadata batch failed.",
+                )?,
+                orphaned_segment_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "orphaned_segment_bytes_total",
+                    "Total Strata segment bytes appended before their metadata batch failed.",
                 )?,
                 active_segment_id: register_gauge(
                     registry,
@@ -489,34 +454,6 @@ impl StrataStoreMetrics {
         }
     }
 
-    pub(crate) fn record_tombstone(&self, success: bool, elapsed: Duration) {
-        let Some(metrics) = &self.inner else {
-            return;
-        };
-        metrics.tombstone_calls_total.inc();
-        metrics
-            .tombstone_duration_seconds
-            .observe(duration_seconds(elapsed));
-        if !success {
-            metrics.tombstone_errors_total.inc();
-        }
-    }
-
-    pub(crate) fn record_extend(&self, result: Result<bool, ()>, elapsed: Duration) {
-        let Some(metrics) = &self.inner else {
-            return;
-        };
-        metrics.extend_calls_total.inc();
-        metrics
-            .extend_duration_seconds
-            .observe(duration_seconds(elapsed));
-        match result {
-            Ok(true) => {}
-            Ok(false) => metrics.extend_misses_total.inc(),
-            Err(()) => metrics.extend_errors_total.inc(),
-        }
-    }
-
     pub(crate) fn record_sync(&self, result: Result<u64, ()>, elapsed: Duration) {
         let Some(metrics) = &self.inner else {
             return;
@@ -586,6 +523,14 @@ impl StrataStoreMetrics {
         if let Some(metrics) = &self.inner {
             metrics.reader_cache_evictions_total.inc();
         }
+    }
+
+    pub(crate) fn record_orphaned_segment_bytes(&self, records: u64, bytes: u64) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics.orphaned_segment_records_total.inc_by(records);
+        metrics.orphaned_segment_bytes_total.inc_by(bytes);
     }
 
     pub(crate) fn set_active_segment(

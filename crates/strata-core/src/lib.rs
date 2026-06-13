@@ -1,16 +1,16 @@
 //! Stable storage vocabulary and record wire format shared by all Strata crates.
 //!
 //! This crate owns the types that are used everywhere: blob keys, record headers, and segment metadata.
-//! Record v2 is append-friendly and self-validating:
+//! Record v3 is append-friendly and self-validating:
 //!
 //! ```text
 //! +----------------------+----------------------+----------------------+
-//! | fixed header (56 B)  | payload (N bytes)    | blob key (K bytes)   |
+//! | fixed header (48 B)  | payload (N bytes)    | blob key (K bytes)   |
 //! +----------------------+----------------------+----------------------+
 //!
 //! fixed header:
-//!   magic | version | header_len | key_len | logical_end_epoch
-//!   generation | payload_len | xxh3_128_checksum | checksum_algorithm
+//!   magic | version | header_len | key_len | generation | payload_len
+//!   xxh3_128_checksum | checksum_algorithm
 //! ```
 //!
 //! The record checksum is computed over:
@@ -37,13 +37,17 @@ pub use checksum::{Checksum, ChecksumAlgorithm};
 pub use error::{Error, Result};
 pub use key::{BlobKey, BlobKeyError};
 pub use lifecycle::{
-    BlobEntry, BlobLifecycle, BlobState, BlobVersionKey, Epoch, Generation, RecordRef,
-    StoreStateKey, StrataLsn, StrataStoreState,
+    BlobEntry, BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp,
+    BlobLifecycleOp, BlobLifecycleState, BlobLifetimeHead, BlobState, BlobVersionKey,
+    BlobVersionState, Epoch, Generation, RecordRef, ShardGeneration, ShardHead, ShardId, ShardInfo,
+    ShardKey, ShardLsnKey, ShardState, ShardStoreStateKey, StoreStateKey, StrataLsn,
+    StrataStoreState, VersionMergeOp, VersionOp, VersionState,
 };
 pub use record::{
     DecodedRecord, EncodedRecordParts, FIXED_RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_VERSION,
-    RecordHeader, RecordHeaderFields,
+    RecordHeader, RecordHeaderFields, encoded_record_len,
 };
 pub use segment::{
-    PlacementClass, SegmentFileState, SegmentId, SegmentState, SegmentStats, VolumeId,
+    EpochBucket, PlacementClass, SegmentFileState, SegmentId, SegmentKey, SegmentState,
+    SegmentStats, VolumeId,
 };

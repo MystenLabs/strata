@@ -4,10 +4,10 @@ use xxhash_rust::xxh3::Xxh3Default;
 use crate::{BlobKey, Checksum, ChecksumAlgorithm, Error, Generation, Result};
 
 pub const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"STR0");
-pub const RECORD_VERSION: u16 = 2;
-pub const FIXED_RECORD_HEADER_LEN: usize = 56;
+pub const RECORD_VERSION: u16 = 3;
+pub const FIXED_RECORD_HEADER_LEN: usize = 48;
 const MAX_PAYLOAD_LEN: u64 = 1 << 40;
-const RECORD_CHECKSUM_OFFSET: usize = 36;
+const RECORD_CHECKSUM_OFFSET: usize = 28;
 const RECORD_CHECKSUM_LEN: usize = 16;
 const RECORD_CHECKSUM_ALGORITHM_OFFSET: usize = RECORD_CHECKSUM_OFFSET + RECORD_CHECKSUM_LEN;
 
@@ -15,7 +15,6 @@ const RECORD_CHECKSUM_ALGORITHM_OFFSET: usize = RECORD_CHECKSUM_OFFSET + RECORD_
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordHeaderFields {
     pub key_len: u32,
-    pub logical_end_epoch: u64,
     pub generation: Generation,
     pub payload_len: u64,
 }
@@ -27,7 +26,6 @@ pub struct RecordHeader {
     pub version: u16,
     pub header_len: u16,
     pub key_len: u32,
-    pub logical_end_epoch: u64,
     pub generation: Generation,
     pub payload_len: u64,
     pub record_checksum: Checksum,
@@ -41,7 +39,6 @@ impl RecordHeader {
             version: RECORD_VERSION,
             header_len: FIXED_RECORD_HEADER_LEN as u16,
             key_len: fields.key_len,
-            logical_end_epoch: fields.logical_end_epoch,
             generation: fields.generation,
             payload_len: fields.payload_len,
             record_checksum: Checksum::xxh3_128_value(0),
@@ -83,14 +80,23 @@ impl RecordHeader {
         output[4..6].copy_from_slice(&self.version.to_le_bytes());
         output[6..8].copy_from_slice(&self.header_len.to_le_bytes());
         output[8..12].copy_from_slice(&self.key_len.to_le_bytes());
-        output[12..20].copy_from_slice(&self.logical_end_epoch.to_le_bytes());
-        output[20..28].copy_from_slice(&self.generation.to_le_bytes());
-        output[28..36].copy_from_slice(&self.payload_len.to_le_bytes());
+        output[12..20].copy_from_slice(&self.generation.to_le_bytes());
+        output[20..28].copy_from_slice(&self.payload_len.to_le_bytes());
         output[RECORD_CHECKSUM_OFFSET..RECORD_CHECKSUM_OFFSET + RECORD_CHECKSUM_LEN]
             .copy_from_slice(&self.record_checksum.value.to_le_bytes());
         output[RECORD_CHECKSUM_ALGORITHM_OFFSET..RECORD_CHECKSUM_ALGORITHM_OFFSET + 4]
             .copy_from_slice(&self.record_checksum.algorithm.code().to_le_bytes());
     }
+}
+
+pub fn encoded_record_len(key: &BlobKey, payload_len: usize) -> Result<u64> {
+    let payload_len = u64::try_from(payload_len).map_err(|_| Error::RecordLengthOverflow)?;
+    RecordHeader::new(RecordHeaderFields {
+        key_len: key.len() as u32,
+        generation: 0,
+        payload_len,
+    })?
+    .encoded_record_len()
 }
 
 /// Borrowed encoded record pieces.
@@ -106,15 +112,9 @@ pub struct EncodedRecordParts<'a> {
 }
 
 impl<'a> EncodedRecordParts<'a> {
-    pub fn new(
-        key: &'a BlobKey,
-        logical_end_epoch: u64,
-        generation: Generation,
-        payload: &'a [u8],
-    ) -> Result<Self> {
+    pub fn new(key: &'a BlobKey, generation: Generation, payload: &'a [u8]) -> Result<Self> {
         let mut header = RecordHeader::new(RecordHeaderFields {
             key_len: key.len() as u32,
-            logical_end_epoch,
             generation,
             payload_len: payload.len() as u64,
         })?;
@@ -151,13 +151,8 @@ pub struct DecodedRecord {
 }
 
 impl DecodedRecord {
-    pub fn encode(
-        key: &BlobKey,
-        logical_end_epoch: u64,
-        generation: Generation,
-        payload: &[u8],
-    ) -> Result<Vec<u8>> {
-        Ok(EncodedRecordParts::new(key, logical_end_epoch, generation, payload)?.to_vec())
+    pub fn encode(key: &BlobKey, generation: Generation, payload: &[u8]) -> Result<Vec<u8>> {
+        Ok(EncodedRecordParts::new(key, generation, payload)?.to_vec())
     }
 
     pub fn peek_fixed_header(input: &[u8]) -> Result<RecordHeader> {
@@ -202,9 +197,8 @@ impl DecodedRecord {
             version,
             header_len,
             key_len: read_u32(input, 8),
-            logical_end_epoch: read_u64(input, 12),
-            generation: read_u64(input, 20),
-            payload_len: read_u64(input, 28),
+            generation: read_u64(input, 12),
+            payload_len: read_u64(input, 20),
             record_checksum,
         };
         validate_lengths(header.key_len as usize, header.payload_len)?;
@@ -360,7 +354,7 @@ mod tests {
     fn encoded_record() -> (BlobKey, Vec<u8>, Vec<u8>) {
         let key = BlobKey::new(b"blob-1".to_vec()).unwrap();
         let payload = b"payload bytes".to_vec();
-        let encoded = DecodedRecord::encode(&key, 42, 7, &payload).unwrap();
+        let encoded = DecodedRecord::encode(&key, 7, &payload).unwrap();
         (key, payload, encoded)
     }
 
@@ -371,7 +365,6 @@ mod tests {
 
         assert_eq!(decoded.key, key);
         assert_eq!(decoded.payload, payload);
-        assert_eq!(decoded.header.logical_end_epoch, 42);
         assert_eq!(decoded.header.generation, 7);
         assert_eq!(decoded.header.payload_len, payload.len() as u64);
         assert_eq!(decoded.header.key_len, key.len() as u32);

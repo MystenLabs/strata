@@ -144,7 +144,7 @@ fn can_stop_recovery_scan(durable_offset: Option<u64>, offset: u64) -> bool {
 mod tests {
     use std::io::{Read, Write};
 
-    use strata_core::{BlobLifecycle, PlacementClass};
+    use strata_core::PlacementClass;
     use tempfile::tempdir;
 
     use super::*;
@@ -158,9 +158,7 @@ mod tests {
         let payload = b"hello strata";
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
 
-        let outcome = writer
-            .append(&key, BlobLifecycle::new(100), 0, payload)
-            .unwrap();
+        let outcome = writer.append(&key, 0, payload).unwrap();
         writer.seal().unwrap();
 
         let mut reader = SegmentReader::open(&path, 1).unwrap();
@@ -175,9 +173,7 @@ mod tests {
         let payload = b"hello strata";
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
 
-        let outcome = writer
-            .append(&key, BlobLifecycle::new(100), 0, payload)
-            .unwrap();
+        let outcome = writer.append(&key, 0, payload).unwrap();
         writer.seal().unwrap();
 
         let mut reader = SegmentReader::open(&path, 1).unwrap();
@@ -197,9 +193,7 @@ mod tests {
         let payload = b"hello strata";
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
 
-        let outcome = writer
-            .append(&key, BlobLifecycle::new(100), 0, payload)
-            .unwrap();
+        let outcome = writer.append(&key, 0, payload).unwrap();
         writer.seal().unwrap();
 
         let reader = SegmentReader::open(&path, 1).unwrap();
@@ -221,9 +215,7 @@ mod tests {
         let payload = b"hello strata";
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
 
-        let outcome = writer
-            .append(&key, BlobLifecycle::new(100), 0, payload)
-            .unwrap();
+        let outcome = writer.append(&key, 0, payload).unwrap();
         writer.seal().unwrap();
 
         let mut reader = SegmentReader::open(&path, 1).unwrap();
@@ -242,9 +234,7 @@ mod tests {
         let payload = b"hello strata";
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
 
-        let outcome = writer
-            .append(&key, BlobLifecycle::new(100), 0, payload)
-            .unwrap();
+        let outcome = writer.append(&key, 0, payload).unwrap();
         writer.seal().unwrap();
 
         let mut bad_ref = outcome.record_ref;
@@ -265,9 +255,7 @@ mod tests {
         for i in 0..10 {
             let key = BlobKey::new(format!("key-{i}").into_bytes()).unwrap();
             let payload = format!("payload-{i}").into_bytes();
-            let outcome = writer
-                .append(&key, BlobLifecycle::new(200 + i), i, &payload)
-                .unwrap();
+            let outcome = writer.append(&key, i, &payload).unwrap();
             expected.push((key, payload, outcome.record_ref));
         }
         writer.seal().unwrap();
@@ -292,9 +280,7 @@ mod tests {
         let key = BlobKey::new(b"alpha".to_vec()).unwrap();
         let payload = b"hello strata";
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
-        writer
-            .append(&key, BlobLifecycle::new(100), 0, payload)
-            .unwrap();
+        writer.append(&key, 0, payload).unwrap();
         let valid_len = writer.write_offset();
         drop(writer);
 
@@ -320,9 +306,7 @@ mod tests {
         let key = BlobKey::new(b"alpha".to_vec()).unwrap();
         let payload = b"hello strata";
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
-        let outcome = writer
-            .append(&key, BlobLifecycle::new(100), 0, payload)
-            .unwrap();
+        let outcome = writer.append(&key, 0, payload).unwrap();
         drop(writer);
 
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -342,10 +326,6 @@ mod tests {
         let key = BlobKey::new(b"alpha".to_vec()).unwrap();
         let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 10).unwrap();
 
-        assert!(
-            writer
-                .append(&key, BlobLifecycle::new(100), 0, b"hello")
-                .is_err()
-        );
+        assert!(writer.append(&key, 0, b"hello").is_err());
     }
 }

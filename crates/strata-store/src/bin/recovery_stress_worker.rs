@@ -11,8 +11,9 @@ use std::{
     time::Duration,
 };
 
-use strata_core::{BlobKey, BlobLifecycle, Epoch};
+use strata_core::{BlobKey, Epoch};
 use strata_store::{
+    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
     StrataStoreMetrics,
 };
@@ -60,9 +61,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let config = Config::parse()?;
+    let store_config = config.store_config();
     let store = Arc::new(
-        StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())
-            .map_err(format_err)?,
+        StrataStore::open(store_config, StrataStoreMetrics::default()).map_err(format_err)?,
     );
     let output = Arc::new(Mutex::new(io::stdout()));
     let published = Arc::new(Mutex::new(Vec::<KeySpec>::new()));
@@ -197,6 +198,8 @@ impl Config {
             segment_reader_cache_capacity: 8,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
+            accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
             starting_epoch: self.starting_epoch,
         }
     }
@@ -219,8 +222,7 @@ fn writer_loop(
         };
         let key = key_for(spec);
         let payload = payload_for(spec, config.seed, config.payload_bytes);
-        let lifecycle = BlobLifecycle::new(100 + ((sequence + thread_id as u64) % 50));
-        let lsn = match store.put(&key, lifecycle, &payload) {
+        let lsn = match store.put(0, &key, &payload) {
             Ok(lsn) => lsn,
             Err(error) => exit_worker(format!("put failed: {error}")),
         };

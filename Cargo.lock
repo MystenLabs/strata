@@ -8124,6 +8124,9 @@ dependencies = [
 name = "strata-index"
 version = "0.1.0"
 dependencies = [
+ "bcs",
+ "rocksdb",
+ "serde",
  "strata-core",
  "tempfile",
  "thiserror 2.0.18",

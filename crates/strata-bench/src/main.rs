@@ -27,10 +27,11 @@ use std::{
 };
 
 use rocksdb::{DB, Options};
-use strata_core::{BlobKey, BlobLifecycle, Epoch, PlacementClass};
+use strata_core::{BlobKey, Epoch, PlacementClass};
 use strata_segment::SegmentWriter;
 use strata_store::{
-    ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile, StrataRecoveryPolicy, StrataStore,
+    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD, ReadOptions,
+    SealedSegmentIntegrityPolicy, StoreGetProfile, StrataRecoveryPolicy, StrataStore,
     StrataStoreConfig, StrataStoreMetrics,
 };
 
@@ -298,6 +299,8 @@ impl Config {
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
+            accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
             starting_epoch: self.starting_epoch,
         }
     }
@@ -378,9 +381,7 @@ fn run_segment_append(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     for op in 0..config.ops {
         let key = bench_key(key_prefix, op)?;
         let op_started = Instant::now();
-        let record_ref = writer
-            .append(&key, BlobLifecycle::new(42), 0, &payload)?
-            .record_ref;
+        let record_ref = writer.append(&key, 0, &payload)?.record_ref;
         hint::black_box(record_ref);
         record_sync(config.sync_every, op + 1, || writer.sync_data())?;
         timings.push(op_started.elapsed());
@@ -393,14 +394,15 @@ fn run_segment_append(config: &Config) -> Result<(), Box<dyn std::error::Error>>
 
 fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
-    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
+    let store_config = config.store_config();
+    let store = StrataStore::open(store_config, StrataStoreMetrics::default())?;
     let mut timings = Vec::with_capacity(config.ops);
     let started = Instant::now();
 
     for op in 0..config.ops {
         let key = bench_key(b"store-key-", op)?;
         let op_started = Instant::now();
-        let lsn = store.put(&key, BlobLifecycle::new(42), &payload)?;
+        let lsn = store.put(0, &key, &payload)?;
         hint::black_box(lsn);
         record_sync(config.sync_every, op + 1, || store.sync())?;
         timings.push(op_started.elapsed());
@@ -413,14 +415,15 @@ fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload: Arc<[u8]> = Arc::from(payload(config.payload_size));
-    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
+    let store_config = config.store_config();
+    let store = StrataStore::open(store_config, StrataStoreMetrics::default())?;
     let mut timings = Vec::with_capacity(config.ops);
     let started = Instant::now();
 
     for op in 0..config.ops {
         let key = bench_key(b"store-key-", op)?;
         let op_started = Instant::now();
-        let lsn = store.put_arc(key, BlobLifecycle::new(42), payload.clone())?;
+        let lsn = store.put_arc(0, key, payload.clone())?;
         hint::black_box(lsn);
         record_sync(config.sync_every, op + 1, || store.sync())?;
         timings.push(op_started.elapsed());
@@ -433,14 +436,15 @@ fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
 
 fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
-    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
+    let store_config = config.store_config();
+    let store = StrataStore::open(store_config, StrataStoreMetrics::default())?;
     let read_set_size = config.read_set_size.min(config.ops.max(1));
     let keys = (0..read_set_size)
         .map(|op| bench_key(b"read-key-", op))
         .collect::<Result<Vec<_>, _>>()?;
 
     for key in &keys {
-        store.put(key, BlobLifecycle::new(42), &payload)?;
+        store.put(0, key, &payload)?;
     }
     store.sync()?;
 

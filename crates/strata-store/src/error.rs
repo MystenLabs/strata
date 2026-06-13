@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use strata_core::{BlobKey, SegmentId};
+use strata_core::{BlobKey, SegmentId, ShardGeneration, ShardId, ShardState};
 
 /// Result type used by `strata-store`.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -51,8 +51,30 @@ pub enum Error {
     #[error("epoch metadata is not initialized")]
     EpochNotInitialized,
 
+    #[error("shard {shard_id} does not exist")]
+    ShardNotFound { shard_id: ShardId },
+
+    #[error("shard {shard_id} generation overflow at {current_generation}")]
+    ShardGenerationOverflow {
+        shard_id: ShardId,
+        current_generation: ShardGeneration,
+    },
+
+    #[error(
+        "shard {shard_id} generation {generation} is not active; current generation {current_generation}, state {state:?}"
+    )]
+    ShardUnavailable {
+        shard_id: ShardId,
+        generation: ShardGeneration,
+        current_generation: ShardGeneration,
+        state: ShardState,
+    },
+
     #[error("segment {segment_id} failed sealing")]
     SealFailed { segment_id: SegmentId },
+
+    #[error("segment {segment_id} has no index state for accounting")]
+    AccountingMissingSegmentState { segment_id: SegmentId },
 
     #[error("orphan segment file {segment_id} has no index state at {path}")]
     OrphanSegmentFile {

@@ -1,14 +1,15 @@
 use std::{fs, io::Read, path::Path, sync::mpsc};
 
 use sha2::{Digest, Sha256};
-use strata_core::{BlobKey, BlobVersionKey, SegmentFileState, SegmentId, SegmentState, StrataLsn};
+use strata_core::{
+    BlobKey, SegmentFileState, SegmentId, SegmentKey, SegmentState, ShardKey, StrataLsn,
+};
 use strata_index::StrataIndex;
-use typed_store::Map;
 
 use crate::{
-    Error, Result, SealedSegmentIntegrityPolicy, StrataStoreConfig, StrataStoreMetrics,
-    active_segment_state_from_path, layout::segment_path, unsealed_ingest_segment_count,
-    unsealed_ingest_segment_ids,
+    Error, Result, STORE_SCOPE, SealedSegmentIntegrityPolicy, StrataStoreConfig,
+    StrataStoreMetrics, accounting::AccountingCommand, active_segment_state_from_path,
+    layout::segment_path, unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
 
 #[derive(Debug)]
@@ -27,7 +28,9 @@ pub(crate) struct SegmentSealTask {
 pub(crate) struct SealWorker {
     pub(crate) config: StrataStoreConfig,
     pub(crate) index: StrataIndex,
+    pub(crate) store_scope: ShardKey,
     pub(crate) seal_rx: mpsc::Receiver<SealCommand>,
+    pub(crate) accounting_tx: mpsc::SyncSender<AccountingCommand>,
     pub(crate) metrics: StrataStoreMetrics,
 }
 
@@ -70,6 +73,7 @@ impl SealWorker {
 
         let mut state = active_segment_state_from_path(
             &self.config,
+            self.store_scope,
             task.segment_id,
             task.sealed_len,
             task.sealed_len,
@@ -86,9 +90,7 @@ impl SealWorker {
 
         let durable_lsn = {
             let mut batch = self.index.batch();
-            batch
-                .insert_batch(self.index.segment_states(), [(&state.segment_id, &state)])
-                .map_err(strata_index::Error::from)?;
+            self.index.put_segment_state_batch(&mut batch, &state)?;
             let durable_lsn = durable_lsn_with_advanced_frontier(&self.index, Some(&state))?;
             self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
             batch.write().map_err(strata_index::Error::from)?;
@@ -99,6 +101,7 @@ impl SealWorker {
         self.metrics.set_durable_lsn(durable_lsn);
         self.metrics
             .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
+        let _ = self.accounting_tx.try_send(AccountingCommand::Run);
         Ok(())
     }
 
@@ -111,9 +114,7 @@ impl SealWorker {
         }
         state.state = SegmentFileState::SealFailed;
         let mut batch = self.index.batch();
-        batch
-            .insert_batch(self.index.segment_states(), [(&state.segment_id, &state)])
-            .map_err(strata_index::Error::from)?;
+        self.index.put_segment_state_batch(&mut batch, &state)?;
         batch.write().map_err(strata_index::Error::from)?;
         self.index.flush_wal(true)?;
         Ok(())
@@ -261,11 +262,7 @@ fn compute_durable_lsn(
         let Some(next_lsn) = durable_lsn.checked_add(1) else {
             break;
         };
-        if let Some(key) = index
-            .unaccounted_lsn_ops()
-            .get(&next_lsn)
-            .map_err(strata_index::Error::from)?
-        {
+        if let Some(key) = index.get_unaccounted_lsn_op(next_lsn)? {
             if !unaccounted_lsn_is_durable(index, next_lsn, &key, &states)? {
                 break;
             }
@@ -281,19 +278,23 @@ fn compute_durable_lsn(
 fn segment_states_with_override(
     index: &StrataIndex,
     override_state: Option<&SegmentState>,
-) -> Result<Vec<(SegmentId, SegmentState)>> {
-    let mut states = index.iter_segment_states()?;
+) -> Result<Vec<(SegmentKey, SegmentState)>> {
+    let mut states = index.iter_segment_states_by_key()?;
     if let Some(override_state) = override_state {
+        let override_key = SegmentKey {
+            shard: STORE_SCOPE,
+            segment_id: override_state.segment_id,
+        };
         let mut replaced = false;
-        for (_, state) in &mut states {
-            if state.segment_id == override_state.segment_id {
+        for (key, state) in &mut states {
+            if *key == override_key {
                 *state = override_state.clone();
                 replaced = true;
                 break;
             }
         }
         if !replaced {
-            states.push((override_state.segment_id, override_state.clone()));
+            states.push((override_key, override_state.clone()));
         }
     }
     Ok(states)
@@ -303,30 +304,37 @@ fn unaccounted_lsn_is_durable(
     index: &StrataIndex,
     lsn: StrataLsn,
     key: &BlobKey,
-    states: &[(SegmentId, SegmentState)],
+    states: &[(SegmentKey, SegmentState)],
 ) -> Result<bool> {
-    let Some(entry) = index.get_blob_version(&BlobVersionKey {
-        key: key.clone(),
-        lsn,
-    })?
-    else {
-        return Ok(false);
+    let (ops, lifecycle_ops) = index.blob_ops_at_lsn(key, lsn)?;
+    if ops.is_empty() {
+        return Ok(!lifecycle_ops.is_empty());
     };
-    let Some(record_ref) = entry.record_ref else {
-        return Ok(true);
-    };
-    let Some(record_end_offset) = record_ref.end_offset() else {
-        return Err(strata_segment::Error::RangeOverflow.into());
-    };
-    Ok(states
-        .iter()
-        .find(|(candidate, _)| *candidate == record_ref.segment_id)
-        .is_some_and(|(_, state)| {
-            !matches!(
-                state.state,
-                SegmentFileState::SealFailed
-                    | SegmentFileState::Deleting
-                    | SegmentFileState::Deleted
-            ) && state.durable_offset >= record_end_offset
-        }))
+    for op in ops {
+        let Some(record_ref) = op.entry.record_ref else {
+            continue;
+        };
+        let Some(record_end_offset) = record_ref.end_offset() else {
+            return Err(strata_segment::Error::RangeOverflow.into());
+        };
+        let segment_key = SegmentKey {
+            shard: STORE_SCOPE,
+            segment_id: record_ref.segment_id,
+        };
+        let is_durable = states
+            .iter()
+            .find(|(candidate, _)| *candidate == segment_key)
+            .is_some_and(|(_, state)| {
+                !matches!(
+                    state.state,
+                    SegmentFileState::SealFailed
+                        | SegmentFileState::Deleting
+                        | SegmentFileState::Deleted
+                ) && state.durable_offset >= record_end_offset
+            });
+        if !is_durable {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

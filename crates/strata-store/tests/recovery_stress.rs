@@ -12,11 +12,12 @@ use std::{
 use strata_core::{BlobKey, BlobState, PlacementClass, SegmentFileState, SegmentId, StrataLsn};
 use strata_index::StrataIndex;
 use strata_store::{
+    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
     StrataStoreMetrics,
 };
 use tempfile::tempdir;
-use typed_store::{DBMetrics, Map};
+use typed_store::DBMetrics;
 
 static INIT_TYPED_STORE_METRICS: Once = Once::new();
 
@@ -353,8 +354,8 @@ fn validate_recovered_store(
     worker_stderr: &str,
 ) {
     let cfg = store_config(root_dir);
-    let store = StrataStore::open_standalone(cfg.clone(), StrataStoreMetrics::default())
-        .unwrap_or_else(|error| {
+    let store =
+        StrataStore::open(cfg.clone(), StrataStoreMetrics::default()).unwrap_or_else(|error| {
             panic!(
                 "failed to reopen store after fault {:?}; worker stderr:\n{}; error: {}",
                 fault, worker_stderr, error
@@ -439,8 +440,7 @@ fn validate_segment_states(cfg: &StrataStoreConfig, store: &StrataStore, fault: 
 }
 
 fn validate_blob_versions(store: &StrataStore, fault: Option<&str>) {
-    for result in store.index().blob_versions().safe_iter().unwrap() {
-        let (version_key, entry) = result.unwrap();
+    for (version_key, entry) in store.index().iter_blob_versions().unwrap() {
         if entry.state == BlobState::Tombstoned {
             continue;
         }
@@ -492,6 +492,8 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         segment_reader_cache_capacity: 8,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+        accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
+        accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
         starting_epoch: 1,
     }
 }

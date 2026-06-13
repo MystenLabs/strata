@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bcs.workspace = true
+rocksdb.workspace = true
+serde.workspace = true
 strata-core.workspace = true
 thiserror.workspace = true
 typed-store.workspace = true

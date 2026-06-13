@@ -9,4 +9,7 @@ pub enum Error {
 
     #[error("rocksdb error: {0}")]
     RocksDb(String),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }

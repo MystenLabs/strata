@@ -14,6 +14,7 @@ license = "Apache-2.0"
 repository = "https://github.com/walrus-foundation/strata"
 
 [workspace.dependencies]
+bcs = "0.1.6"
 prometheus = "0.14.0"
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "multi-threaded-cf", "snappy", "zlib", "zstd"] }
 serde = { version = "1", features = ["derive"] }

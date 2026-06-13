@@ -7,8 +7,9 @@ use std::{
     process,
 };
 
-use strata_core::{BlobKey, BlobLifecycle, Epoch};
+use strata_core::{BlobKey, Epoch};
 use strata_store::{
+    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
     StrataStoreMetrics,
 };
@@ -20,7 +21,6 @@ const DEFAULT_MAX_UNSEALED_SEGMENTS: usize = 8;
 const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READER_CACHE_CAPACITY;
 const DEFAULT_MAX_PRINT_BYTES: usize = 4096;
 const DEFAULT_STARTING_EPOCH: Epoch = 42;
-const DEFAULT_END_EPOCH: Epoch = 42;
 
 fn main() {
     match Config::parse(env::args().skip(1)) {
@@ -58,7 +58,6 @@ struct Config {
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     max_print_bytes: usize,
     starting_epoch: Epoch,
-    default_end_epoch: Epoch,
     script: Option<PathBuf>,
 }
 
@@ -75,7 +74,6 @@ impl Config {
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             max_print_bytes: DEFAULT_MAX_PRINT_BYTES,
             starting_epoch: DEFAULT_STARTING_EPOCH,
-            default_end_epoch: DEFAULT_END_EPOCH,
             script: None,
         };
 
@@ -117,10 +115,6 @@ impl Config {
                     config.starting_epoch =
                         parse_epoch(&next_value(&mut args, "--starting-epoch")?)?
                 }
-                "--default-end-epoch" => {
-                    config.default_end_epoch =
-                        parse_epoch(&next_value(&mut args, "--default-end-epoch")?)?
-                }
                 "--script" => {
                     config.script = Some(PathBuf::from(next_value(&mut args, "--script")?))
                 }
@@ -148,13 +142,16 @@ impl Config {
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: self.recovery_policy,
             sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
+            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
+            accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
             starting_epoch: self.starting_epoch,
         }
     }
 }
 
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let store = StrataStore::open_standalone(config.store_config(), StrataStoreMetrics::default())?;
+    let store_config = config.store_config();
+    let store = StrataStore::open(store_config, StrataStoreMetrics::default())?;
     println!(
         "opened root={} namespace={}",
         config.root_dir.display(),
@@ -228,22 +225,20 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
         }
         "quit" | "exit" => return Ok(Control::Quit),
         "put" => {
-            expect_arg_count(&words, 3, 4)?;
+            expect_arg_count(&words, 3, 3)?;
             let key = parse_key(&words[1])?;
             let payload = parse_bytes_arg(&words[2])?;
-            let epoch = optional_epoch(&words, 3, config.default_end_epoch)?;
             let lsn = store
-                .put(&key, BlobLifecycle::new(epoch), &payload)
+                .put(0, &key, &payload)
                 .map_err(|error| error.to_string())?;
             println!("ok lsn={lsn}");
         }
         "put-hex" => {
-            expect_arg_count(&words, 3, 4)?;
+            expect_arg_count(&words, 3, 3)?;
             let key = parse_key(&words[1])?;
             let payload = decode_hex(&words[2])?;
-            let epoch = optional_epoch(&words, 3, config.default_end_epoch)?;
             let lsn = store
-                .put(&key, BlobLifecycle::new(epoch), &payload)
+                .put(0, &key, &payload)
                 .map_err(|error| error.to_string())?;
             println!("ok lsn={lsn}");
         }
@@ -285,17 +280,14 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
             let lsn = store.tombstone(&key).map_err(|error| error.to_string())?;
             println!("ok lsn={lsn}");
         }
-        "extend" => {
+        "extend" | "set-lifetime" => {
             expect_arg_count(&words, 3, 3)?;
             let key = parse_key(&words[1])?;
             let epoch = parse_epoch(&words[2])?;
-            match store
-                .extend(&key, epoch)
-                .map_err(|error| error.to_string())?
-            {
-                Some(lsn) => println!("ok lsn={lsn}"),
-                None => println!("not_found"),
-            }
+            let lsn = store
+                .set_blob_lifetime(&key, epoch)
+                .map_err(|error| error.to_string())?;
+            println!("ok lsn={lsn}");
         }
         "contains" => {
             expect_arg_count(&words, 2, 2)?;
@@ -367,7 +359,6 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
                 "sealed_integrity={:?}",
                 config.sealed_segment_integrity_policy
             );
-            println!("default_end_epoch={}", config.default_end_epoch);
             println!("max_print_bytes={}", config.max_print_bytes);
         }
         unknown => return Err(format!("unknown command '{unknown}'")),
@@ -404,12 +395,6 @@ fn parse_bytes_arg(input: &str) -> Result<Vec<u8>, String> {
     } else {
         Ok(input.as_bytes().to_vec())
     }
-}
-
-fn optional_epoch(words: &[String], index: usize, default: Epoch) -> Result<Epoch, String> {
-    words
-        .get(index)
-        .map_or(Ok(default), |value| parse_epoch(value))
 }
 
 fn expect_arg_count(words: &[String], min: usize, max: usize) -> Result<(), String> {
@@ -584,22 +569,22 @@ options:
   --recovery-policy <point-in-time|absolute-consistency>
   --sealed-integrity <metadata-only|checksum>
   --starting-epoch <epoch>
-  --default-end-epoch <epoch>
   --max-print-bytes <count>
   --script <path>"
 }
 
 fn help() -> &'static str {
     "commands:
-  put <key> <value> [epoch]       write UTF-8 bytes; use quotes for spaces
-  put-hex <key> <hex> [epoch]     write hex payload bytes
+  put <key> <value>               write UTF-8 bytes; use quotes for spaces
+  put-hex <key> <hex>             write hex payload bytes
   get <key>                       read full payload, print UTF-8/hex prefix
   get-hex <key>                   read full payload, print hex prefix
   range <key> <start> <len>       read payload byte range
   contains <key>                  index-only live check
   delete <key>                    write tombstone
   tombstone <key>                 alias for delete
-  extend <key> <epoch>            extend logical end epoch without moving bytes
+  set-lifetime <key> <epoch>      set blob logical end epoch without moving bytes
+  extend <key> <epoch>            alias for set-lifetime
   entry <key>                     print latest blob index entry
   segment <segment_id>            print segment state
   stats <segment_id>              print segment stats

@@ -4,9 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use strata_core::{
-    BlobKey, BlobLifecycle, EncodedRecordParts, PlacementClass, RecordRef, SegmentId,
-};
+use strata_core::{BlobKey, EncodedRecordParts, PlacementClass, RecordRef, SegmentId};
 
 use crate::{Error, Result, error::IoResultExt};
 
@@ -83,7 +81,6 @@ impl SegmentWriter {
     pub fn append(
         &mut self,
         key: &BlobKey,
-        lifecycle: BlobLifecycle,
         generation: u64,
         payload: &[u8],
     ) -> Result<AppendOutcome> {
@@ -94,8 +91,7 @@ impl SegmentWriter {
             });
         }
 
-        let encoded_record =
-            EncodedRecordParts::new(key, lifecycle.logical_end_epoch, generation, payload)?;
+        let encoded_record = EncodedRecordParts::new(key, generation, payload)?;
         let record_len = encoded_record.record_len;
         let attempted_size = self
             .write_offset
