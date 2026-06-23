@@ -96,24 +96,26 @@
 //! ```
 //!
 //! Reads resolve payload and lifecycle state from the packed `blob_versions` row. The lifecycle
-//! merge operator folds accounted metadata ops into the blob-level head once accounting advances
-//! the safe frontier.
+//! merge operator folds metadata ops into the blob-level head only through the blob compaction
+//! frontier published by the index.
 //!
 //! Accounting path (background, see `accounting.rs`):
 //!
 //! ```text
 //! accounting worker (interval tick or nudge from the writer)
-//!   -> replay blob ops and epoch changes in LSN order over (accounted_lsn, durable_lsn]
-//!   -> blob op: diff the resolved head before/after the LSN, apply the delta to segment stats
-//!   -> epoch change: drain future_epoch_histogram buckets <= new epoch into expired counters
-//!   -> commit stats + accounted_lsn in one batch
+//!   -> read the durable range of active-delta.log
+//!   -> write immutable sidecar delta runs and publish manifest + consumed cursor together
+//!   -> compact delta runs into patch runs
+//!   -> major-compact patches/base state, producing ordered ref events
+//!   -> apply those events to segment stats, ref states, ref events, and GC overlays
+//!   -> advance accounted_lsn while sidecar materialization covers the next durable LSN
 //! ```
 //!
 //! The accounting worker is the *only* writer of segment stats. The foreground write path never
-//! reads or writes stats — that keeps puts at one index batch and means stats consumers (GC) never
-//! race a foreground writer. Stats lag durability by design; `accounted_lsn` says how far they are
-//! caught up, and replaying is idempotent because each run recomputes head transitions from the
-//! packed version state and commits atomically with the cursor.
+//! reads or writes stats; it only appends cheap accounting deltas. Stats lag durability by design:
+//! `accounted_lsn` says how far sidecar compaction events have been reflected in the GC-facing
+//! rows. The sidecar manifest/cursor and derived rows commit atomically, so crash retry reopens from
+//! one published sidecar state instead of replaying blob keys from the packed version rows.
 
 mod accounting;
 mod config;
@@ -134,18 +136,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+use strata_accounting::{
+    AccountingDelta, ActiveDeltaLog, ActiveDeltaLogState, BlobUpdate,
+    EpochChange as AccountingEpochChange,
+};
 use strata_core::{
     BlobEntry, BlobKey, BlobLifecycle, BlobLifecycleAction, BlobLifecycleMergeOp, BlobLifecycleOp,
-    BlobState, BlobVersionKey, Epoch, PlacementClass, SegmentFileState, SegmentId, SegmentState,
-    SegmentStats, ShardId, ShardInfo, ShardKey, ShardState, StrataLsn, VersionMergeOp, VersionOp,
-    encoded_record_len,
+    BlobState, BlobVersionKey, Epoch, PlacementClass, RecordRef, SegmentFileState, SegmentId,
+    SegmentState, SegmentStats, ShardId, ShardInfo, ShardKey, ShardState, StrataLsn,
+    VersionMergeOp, VersionOp, encoded_record_len,
 };
 use strata_index::StrataIndex;
 use strata_segment::{SegmentScanner, SegmentWriter};
 
 use accounting::{AccountingCommand, AccountingWorker};
 pub use config::{
-    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
+    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
+    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
 };
@@ -157,7 +168,7 @@ pub use read::{ReadOptions, StoreGetProfile};
 use reader_cache::SegmentReaderCache;
 use seal::{
     SealCommand, SealWorker, SegmentSealTask, active_segment_durable_offset,
-    durable_lsn_with_advanced_frontier, enqueue_unsealed_segments_for_sealing,
+    durable_lsn_with_accounting_frontier, enqueue_unsealed_segments_for_sealing,
     verify_sealed_segments,
 };
 
@@ -201,18 +212,28 @@ pub(crate) struct ResolvedBlobVersion {
 }
 
 impl StrataStore {
+    /// Opens a standalone store using the configured on-disk index directory.
+    ///
+    /// Failure mode avoided: callers should not separately open the index and then start store
+    /// workers out of order. For example, starting a writer before orphan-file reconciliation can
+    /// make a segment file left by a crashed rollover look like usable active data.
     pub fn open(config: StrataStoreConfig, metrics: StrataStoreMetrics) -> Result<Self> {
         let index =
             StrataIndex::open_path(config.standalone_index_dir(), config.index_cf_prefix())?;
         Self::from_index(config, index, metrics)
     }
 
+    /// Opens a store around an already-created index handle.
+    ///
+    /// Failure mode avoided: tests and embedders that share an index still get the exact same
+    /// recovery sequencing as `open`. If this bypassed `open_inner`, a stale segment state could
+    /// survive in the shared index while the writer appends new bytes against a different view.
     pub fn from_index(
         config: StrataStoreConfig,
         index: StrataIndex,
         metrics: StrataStoreMetrics,
     ) -> Result<Self> {
-        Self::open_inner(config, index, metrics, Arc::new(Mutex::new(())))
+        Self::open_inner(config, index, metrics)
     }
 
     /// The real open path. The order of the recovery steps is deliberate and most of them only
@@ -237,7 +258,6 @@ impl StrataStore {
         config: StrataStoreConfig,
         index: StrataIndex,
         metrics: StrataStoreMetrics,
-        write_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
         validate_config(&config)?;
         ensure_ingest_dir(&config)?;
@@ -245,6 +265,8 @@ impl StrataStore {
         ensure_epoch_initialized(&index, config.starting_epoch)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
         recover_unsealed_segments(&config, &index, &metrics)?;
+        let active_accounting_delta_log =
+            recover_active_accounting_delta_log(&config, &index, &metrics)?;
         let current_epoch = index
             .get_current_epoch()?
             .ok_or(Error::EpochNotInitialized)?;
@@ -272,6 +294,7 @@ impl StrataStore {
         let (accounting_tx, accounting_rx) = mpsc::sync_channel(1);
         let accounting_lock = Arc::new(Mutex::new(()));
         let accounting_worker = AccountingWorker {
+            config: config.clone(),
             index: index.clone(),
             interval: config.accounting_interval,
             command_rx: accounting_rx,
@@ -300,10 +323,10 @@ impl StrataStore {
             config: config.clone(),
             index: index.clone(),
             active_writer,
+            active_accounting_delta_log,
             active_segment_state,
             durable_offset,
             pending_rollovers: Vec::new(),
-            write_lock,
             seal_tx: seal_tx.clone(),
             accounting_tx: accounting_tx.clone(),
             write_rx,
@@ -346,6 +369,11 @@ impl StrataStore {
         STANDALONE_SHARD
     }
 
+    /// Starts a client-side batch whose operations commit under one store-global LSN allocation.
+    ///
+    /// Failure mode avoided: callers that need "put blob, then increment epoch" should not issue
+    /// separate commands and hope no other writer interleaves. Without this batch wrapper another
+    /// put could land between them and accounting would replay a different history than intended.
     pub fn batch(&self) -> StrataBatch<'_> {
         StrataBatch {
             store: self,
@@ -353,10 +381,20 @@ impl StrataStore {
         }
     }
 
+    /// Reads the current shard registry entry.
+    ///
+    /// Failure mode avoided: writers must observe generation changes after drop/re-add. A caller
+    /// that cached only `shard_id = 7` would otherwise be unable to tell old generation 0 data from
+    /// newly-created generation 1 data.
     pub fn shard_info(&self, shard_id: ShardId) -> Result<Option<ShardInfo>> {
         Ok(self.index.get_shard_info(shard_id)?)
     }
 
+    /// Registers a logical shard, or returns its current active generation.
+    ///
+    /// Failure mode avoided: shard creation is serialized through the writer so two concurrent
+    /// creators cannot both decide that shard 12 starts at generation 0 and race to publish
+    /// conflicting registry rows.
     pub fn add_shard(&self, shard_id: ShardId) -> Result<ShardKey> {
         let (response_tx, response_rx) = mpsc::channel();
         self.send_write_command(WriteCommand::AddShard(AddShardRequest {
@@ -368,6 +406,11 @@ impl StrataStore {
             .map_err(|_| Error::WriteResponseDropped)?
     }
 
+    /// Marks a logical shard as dropped.
+    ///
+    /// Failure mode avoided: dropping through the writer drains pending rollovers first. Without
+    /// that ordering, a crash could leave a shard marked dropped while the segment containing its
+    /// last writes still looks `Open`, which would confuse recovery and GC ownership.
     pub fn drop_shard(&self, shard_id: ShardId) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
         self.send_write_command(WriteCommand::DropShard(DropShardRequest {
@@ -382,6 +425,9 @@ impl StrataStore {
     /// Writes a blob and returns its LSN. Returning means *visible*, not durable: the bytes are
     /// in the segment file and the index points at them, but only `sync` (or the periodic sync)
     /// makes them crash-safe. Callers that need durability gate on `durable_lsn() >= lsn`.
+    /// For example, if a caller acknowledges an upstream event immediately after `put` and the
+    /// machine loses power before `sync`, recovery may roll the blob back while the upstream event
+    /// cursor has already advanced.
     ///
     /// All mutations are funneled through one writer thread (see `WriteCoordinator`), so this
     /// just packages the request and blocks on the response channel.
@@ -389,6 +435,11 @@ impl StrataStore {
         self.put_arc(shard_id, key.clone(), Arc::from(payload))
     }
 
+    /// Writes a blob from shared bytes without forcing the caller to copy them first.
+    ///
+    /// Failure mode avoided: the write queue can hold the payload until the writer thread reaches
+    /// it. Passing borrowed bytes across that boundary would let the caller mutate or drop the
+    /// buffer before the segment append actually happens.
     pub fn put_arc(
         &self,
         shard_id: ShardId,
@@ -403,6 +454,12 @@ impl StrataStore {
         result.first_lsn().ok_or(Error::WriteResponseDropped)
     }
 
+    /// Records or updates a blob's logical lifetime without rewriting its payload.
+    ///
+    /// Failure mode avoided: lifetime changes are metadata-only LSNs so accounting can update
+    /// expiration stats without touching segment bytes. Rewriting the blob just to change its
+    /// lifetime would create a second payload record and could make GC think the old record was
+    /// still live until accounting catches up.
     pub fn set_blob_lifetime(&self, key: &BlobKey, logical_end_epoch: Epoch) -> Result<StrataLsn> {
         let result = self.write_batch(vec![BatchOp::SetBlobLifetime {
             key: key.clone(),
@@ -411,11 +468,21 @@ impl StrataStore {
         result.first_lsn().ok_or(Error::WriteResponseDropped)
     }
 
+    /// Appends a logical delete for a blob.
+    ///
+    /// Failure mode avoided: a tombstone is an ordered LSN, not an in-place removal. If we deleted
+    /// the version row immediately, recovery after a crash could resurrect an older payload because
+    /// there would be no durable delete marker to hide it.
     pub fn tombstone(&self, key: &BlobKey) -> Result<StrataLsn> {
         let result = self.write_batch(vec![BatchOp::Tombstone { key: key.clone() }])?;
         Ok(result.first_lsn().unwrap_or(0))
     }
 
+    /// Sends a prepared list of operations to the single writer and waits for the committed result.
+    ///
+    /// Failure mode avoided: LSNs, segment offsets, and epoch rows must be allocated together by
+    /// the owner of the active writer. If callers wrote directly to the index from many threads,
+    /// two puts could both publish `next_lsn = 42` while their bytes landed at different offsets.
     fn write_batch(&self, ops: Vec<BatchOp>) -> Result<BatchWriteResult> {
         let (response_tx, response_rx) = mpsc::channel();
         let command = WriteCommand::Batch(BatchWriteRequest { ops, response_tx });
@@ -435,16 +502,31 @@ impl StrataStore {
         self.metrics.record_reader_cache_eviction();
     }
 
+    /// Returns the persisted current epoch.
+    ///
+    /// Failure mode avoided: reopen must not trust `config.starting_epoch` after genesis. If an
+    /// operator changes the config from 100 to 1, this still reports the epoch timeline stored in
+    /// the index instead of making new lifetime updates appear to move backward.
     pub fn current_epoch(&self) -> Result<Epoch> {
         self.index
             .get_current_epoch()?
             .ok_or(Error::EpochNotInitialized)
     }
 
+    /// Resolves the epoch that was active at a specific LSN.
+    ///
+    /// Failure mode avoided: accounting needs to classify an old write under the epoch that was
+    /// true when it happened. Using today's epoch for LSN 25 after several increments would expire
+    /// or pin bytes in the wrong bucket.
     pub fn epoch_at_lsn(&self, lsn: StrataLsn) -> Result<Option<Epoch>> {
         Ok(self.index.latest_epoch_at_lsn(lsn)?.map(|(_, epoch)| epoch))
     }
 
+    /// Appends an epoch-change operation and returns the new epoch with its LSN.
+    ///
+    /// Failure mode avoided: epoch increments consume LSNs so they are ordered with blob writes.
+    /// Without that, a crash replay could see "blob A was written before epoch 9" while accounting
+    /// had previously counted it as written after epoch 9.
     pub fn increment_epoch(&self) -> Result<(Epoch, StrataLsn)> {
         let result = self.write_batch(vec![BatchOp::IncrementEpoch])?;
         let Some(lsn) = result.first_lsn() else {
@@ -479,6 +561,11 @@ impl StrataStore {
         Ok(self.index.get_accounted_lsn()?)
     }
 
+    /// Enqueues work for the writer and records queue metrics around the send.
+    ///
+    /// Failure mode avoided: if the writer has exited, this converts the broken channel into a
+    /// store error and immediately undoes the queued metric. Otherwise a caller could block on a
+    /// response that will never be sent while dashboards show phantom queued work.
     fn send_write_command(&self, command: WriteCommand) -> Result<()> {
         let started = Instant::now();
         self.metrics.enqueue_write_command();
@@ -574,10 +661,18 @@ pub struct BatchWriteResult {
 }
 
 impl BatchWriteResult {
+    /// LSNs in the same order as the submitted operations.
+    ///
+    /// Failure mode avoided: callers should not infer "the next operation is previous + 1" after
+    /// a failed or empty batch. The writer is the source of truth for what actually committed.
     pub fn op_lsns(&self) -> &[StrataLsn] {
         &self.op_lsns
     }
 
+    /// Epoch outputs in operation order; non-epoch operations have `None`.
+    ///
+    /// Failure mode avoided: mixed batches need to know which op advanced the epoch. Returning a
+    /// single final epoch would make `put, increment, put` ambiguous to callers recording fences.
     pub fn op_epochs(&self) -> &[Option<Epoch>] {
         &self.op_epochs
     }
@@ -606,6 +701,11 @@ pub struct StrataBatch<'a> {
 }
 
 impl<'a> StrataBatch<'a> {
+    /// Adds a payload write to this batch.
+    ///
+    /// Failure mode avoided: batching submits all operations as one writer command. That keeps
+    /// `put, tombstone` in one batch from being interleaved by another writer between the two
+    /// operations.
     pub fn put(
         &mut self,
         shard_id: ShardId,
@@ -620,6 +720,11 @@ impl<'a> StrataBatch<'a> {
         self
     }
 
+    /// Adds a metadata-only lifetime update to this batch.
+    ///
+    /// Failure mode avoided: when a lifetime change is batched with other ops, it shares the same
+    /// contiguous LSN reservation. Otherwise a concurrent tombstone could slip between the caller's
+    /// payload write and its lifetime update.
     pub fn set_blob_lifetime(&mut self, key: BlobKey, logical_end_epoch: Epoch) -> &mut Self {
         self.ops.push(BatchOp::SetBlobLifetime {
             key,
@@ -628,16 +733,30 @@ impl<'a> StrataBatch<'a> {
         self
     }
 
+    /// Adds a tombstone to this batch.
+    ///
+    /// Failure mode avoided: tombstones remain ordered relative to any preceding puts in the same
+    /// batch. Without this, deleting a key after writing a replacement could race with another put
+    /// and hide the wrong version.
     pub fn tombstone(&mut self, key: BlobKey) -> &mut Self {
         self.ops.push(BatchOp::Tombstone { key });
         self
     }
 
+    /// Adds an epoch increment to this batch.
+    ///
+    /// Failure mode avoided: epoch changes are treated like logical operations. A batch such as
+    /// `put A, increment epoch, put B` must replay exactly that order after crash recovery so A and
+    /// B do not end up in the same accounting epoch.
     pub fn increment_epoch(&mut self) -> &mut Self {
         self.ops.push(BatchOp::IncrementEpoch);
         self
     }
 
+    /// Submits the accumulated operations to the writer.
+    ///
+    /// Failure mode avoided: the batch is consumed on write, so callers cannot accidentally submit
+    /// the same prepared operations twice and create duplicate records with new LSNs.
     pub fn write(self) -> Result<BatchWriteResult> {
         self.store.write_batch(self.ops)
     }
@@ -657,7 +776,7 @@ enum PreparedBatchOp {
         key: BlobKey,
         payload: Arc<[u8]>,
         lsn: StrataLsn,
-        record_ref: Option<strata_core::RecordRef>,
+        record_ref: Option<RecordRef>,
         record_bytes: u64,
     },
     Lifecycle {
@@ -671,6 +790,70 @@ enum PreparedBatchOp {
     },
 }
 
+/// Converts a committed writer batch into active accounting-log deltas.
+///
+/// Failure mode avoided: accounting replays from this side log without reading the foreground
+/// writer's in-memory state. If a put were committed to `blob_versions` but missing here, a crash
+/// before sidecar ingestion would leave segment stats permanently unaware of those live bytes.
+fn accounting_deltas_for_prepared_batch(prepared: &PreparedBatch) -> Vec<AccountingDelta> {
+    let mut deltas = Vec::with_capacity(prepared.ops.len());
+    for op in &prepared.ops {
+        match op {
+            PreparedBatchOp::Put {
+                shard,
+                key,
+                lsn,
+                record_ref,
+                ..
+            } => deltas.push(AccountingDelta::Blob(BlobUpdate::Put {
+                lsn: *lsn,
+                key: key.clone(),
+                shard: *shard,
+                record_ref: record_ref.expect("put record ref must be filled before delta append"),
+                // Foreground put should not read current blob metadata. `None` means "preserve any
+                // materialized lifecycle"; SetLifetime deltas carry actual lifecycle changes.
+                lifecycle: None,
+            })),
+            PreparedBatchOp::Lifecycle {
+                key,
+                lsn: _,
+                lifecycle_op:
+                    BlobLifecycleMergeOp::Append(BlobLifecycleOp {
+                        lsn,
+                        action: BlobLifecycleAction::SetLifetime { logical_end_epoch },
+                    }),
+            } => deltas.push(AccountingDelta::Blob(BlobUpdate::SetLifetime {
+                lsn: *lsn,
+                key: key.clone(),
+                logical_end_epoch: *logical_end_epoch,
+            })),
+            PreparedBatchOp::Lifecycle {
+                key,
+                lsn: _,
+                lifecycle_op:
+                    BlobLifecycleMergeOp::Append(BlobLifecycleOp {
+                        lsn,
+                        action: BlobLifecycleAction::Tombstone,
+                    }),
+            } => deltas.push(AccountingDelta::Blob(BlobUpdate::Tombstone {
+                lsn: *lsn,
+                key: key.clone(),
+            })),
+            PreparedBatchOp::Lifecycle {
+                lifecycle_op: BlobLifecycleMergeOp::RollbackFrom { .. },
+                ..
+            } => {}
+            PreparedBatchOp::EpochChange { lsn, epoch } => {
+                deltas.push(AccountingDelta::Epoch(AccountingEpochChange {
+                    lsn: *lsn,
+                    epoch: *epoch,
+                }));
+            }
+        }
+    }
+    deltas
+}
+
 #[derive(Debug)]
 struct PendingRollover {
     old_segment_state: SegmentState,
@@ -679,6 +862,11 @@ struct PendingRollover {
 }
 
 impl PendingRollover {
+    /// Adds the old-segment `Sealing` row and the new open-segment row to a write batch.
+    ///
+    /// Failure mode avoided: rollover metadata must commit atomically with an LSN-bearing write or
+    /// shard drop. If the old segment were marked `Sealing` without publishing the new active row,
+    /// a crash could reopen with no writable segment.
     fn apply_batch(
         &self,
         index: &StrataIndex,
@@ -694,6 +882,11 @@ impl PendingRollover {
         Ok(())
     }
 
+    /// Queues sealing only after the index commit that made the rollover visible.
+    ///
+    /// Failure mode avoided: if the sealer hashed and published an old segment before the
+    /// `Sealing` row committed, a crash could leave sealed bytes on disk while the index still
+    /// believes the segment is open and appendable.
     fn run_post_commit(self, seal_tx: mpsc::Sender<SealCommand>, metrics: StrataStoreMetrics) {
         seal_action(seal_tx, self.seal_task, metrics).run();
     }
@@ -714,6 +907,11 @@ enum PostCommitAction {
 }
 
 impl PostCommitAction {
+    /// Runs side effects that are safe only after the index batch has committed.
+    ///
+    /// Failure mode avoided: these actions intentionally do not happen during batch assembly. For
+    /// example, nudging accounting before the blob-version batch commits could make accounting
+    /// observe an LSN in the delta log whose index entry is not visible yet.
     fn run(self) {
         match self {
             Self::MaybeNudgeAccounting {
@@ -778,10 +976,10 @@ struct WriteCoordinator {
     config: StrataStoreConfig,
     index: StrataIndex,
     active_writer: SegmentWriter,
+    active_accounting_delta_log: ActiveDeltaLog,
     active_segment_state: SegmentState,
     durable_offset: u64,
     pending_rollovers: Vec<PendingRollover>,
-    write_lock: Arc<Mutex<()>>,
     seal_tx: mpsc::Sender<SealCommand>,
     accounting_tx: mpsc::SyncSender<AccountingCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
@@ -790,6 +988,11 @@ struct WriteCoordinator {
 }
 
 impl WriteCoordinator {
+    /// Main writer loop: every mutation and sync is serialized through this receiver.
+    ///
+    /// Failure mode avoided: sync must not race append. If sync ran on a separate thread, it could
+    /// publish durable_lsn 10 while a concurrent append for LSN 10 had reserved an offset but not
+    /// finished writing its record bytes.
     fn run(mut self) {
         while let Ok(command) = self.write_rx.recv() {
             if matches!(command, WriteCommand::Shutdown) {
@@ -820,10 +1023,12 @@ impl WriteCoordinator {
         let _ = request.response_tx.send(result);
     }
 
+    /// Creates or reactivates a shard generation through the writer queue.
+    ///
+    /// Failure mode avoided: drop/re-add must bump generation exactly once. Without this serialized
+    /// registry update, one thread could resurrect generation 0 while another has already dropped
+    /// it and started generation 1, making old writes visible in the new namespace.
     fn submit_add_shard(&mut self, shard_id: ShardId) -> Result<ShardKey> {
-        let write_lock = Arc::clone(&self.write_lock);
-        let _write_guard = write_lock.lock().unwrap();
-
         let info = match self.index.get_shard_info(shard_id)? {
             Some(info) if info.is_active() => return Ok(info.key(shard_id)),
             Some(info) if info.state == ShardState::Dropped => {
@@ -859,10 +1064,12 @@ impl WriteCoordinator {
         let _ = request.response_tx.send(result);
     }
 
+    /// Validates that a shard can be dropped and delegates the durable registry update.
+    ///
+    /// Failure mode avoided: treating "already dropped" as success makes retries idempotent after
+    /// caller timeouts. Treating missing shards as success would hide bugs where a caller thinks it
+    /// deleted tenant 42 but that tenant was never registered.
     fn submit_drop_shard(&mut self, shard_id: ShardId) -> Result<()> {
-        let write_lock = Arc::clone(&self.write_lock);
-        let _write_guard = write_lock.lock().unwrap();
-
         let Some(info) = self.index.get_shard_info(shard_id)? else {
             return Err(Error::ShardNotFound { shard_id });
         };
@@ -882,6 +1089,11 @@ impl WriteCoordinator {
         self.mark_shard_dropped(shard_id, shard)
     }
 
+    /// Persists the dropped shard state together with any rollover metadata already staged.
+    ///
+    /// Failure mode avoided: a rollover can be pending when the next command is `drop_shard`
+    /// instead of a put. If the drop skipped the pending rollover rows, the old segment would stay
+    /// `Open` forever and recovery would append to or rescan the wrong file.
     fn mark_shard_dropped(&mut self, shard_id: ShardId, shard: ShardKey) -> Result<()> {
         let dropped_info = ShardInfo {
             current_generation: shard.generation,
@@ -914,6 +1126,11 @@ impl WriteCoordinator {
         }
     }
 
+    /// Handles one client batch and records user-visible put metrics.
+    ///
+    /// Failure mode avoided: metrics are recorded once per submitted put after the writer knows
+    /// whether the batch committed. Recording during append would count a write as successful even
+    /// if the later index batch failed and recovery had to discard the orphaned bytes.
     fn process_batch(&mut self, request: BatchWriteRequest) {
         let started = Instant::now();
         let put_count = request
@@ -941,6 +1158,12 @@ impl WriteCoordinator {
         }
     }
 
+    /// Full write transaction for a batch: reserve LSNs, append payload bytes, append accounting
+    /// deltas, then commit one index batch.
+    ///
+    /// Failure mode avoided: bytes may be orphaned if the process dies after append but before
+    /// index commit, but recovery can discard bytes with no committed index entry. The reverse
+    /// ordering would be worse: an index entry could point at bytes that were never written.
     fn submit_batch(
         &mut self,
         request: BatchWriteRequest,
@@ -951,9 +1174,6 @@ impl WriteCoordinator {
             let _ = response_tx.send(Ok(result.clone()));
             return Ok((result, Vec::new()));
         }
-
-        let write_lock = Arc::clone(&self.write_lock);
-        let _write_guard = write_lock.lock().unwrap();
 
         let mut prepared = match self.prepare_batch(request.ops) {
             Ok(prepared) => prepared,
@@ -968,6 +1188,7 @@ impl WriteCoordinator {
         let mut put_metrics = Vec::new();
         for op in &mut prepared.ops {
             let PreparedBatchOp::Put {
+                shard,
                 key,
                 payload,
                 lsn,
@@ -986,15 +1207,19 @@ impl WriteCoordinator {
                 return Err(());
             }
 
-            let outcome = match self.active_writer.append(&*key, *lsn, payload.as_ref()) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.metrics
-                        .record_orphaned_segment_bytes(appended_records, appended_bytes);
-                    let _ = response_tx.send(Err(error.into()));
-                    return Err(());
-                }
-            };
+            let outcome =
+                match self
+                    .active_writer
+                    .append_for_shard(&*key, *lsn, *shard, payload.as_ref())
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.metrics
+                            .record_orphaned_segment_bytes(appended_records, appended_bytes);
+                        let _ = response_tx.send(Err(error.into()));
+                        return Err(());
+                    }
+                };
 
             *record_ref = Some(outcome.record_ref);
             *record_bytes = outcome.record_len;
@@ -1018,7 +1243,29 @@ impl WriteCoordinator {
         }
 
         let pending_rollovers = self.take_pending_rollovers();
+        let accounting_delta_position = self.active_accounting_delta_log.position();
+        if let Err(error) = self.append_accounting_deltas(&prepared) {
+            let error = match self
+                .active_accounting_delta_log
+                .rollback_to(accounting_delta_position)
+            {
+                Ok(()) => error,
+                Err(rollback_error) => rollback_error.into(),
+            };
+            self.restore_pending_rollovers(pending_rollovers);
+            self.metrics
+                .record_orphaned_segment_bytes(appended_records, appended_bytes);
+            let _ = response_tx.send(Err(error));
+            return Err(());
+        }
         if let Err(error) = self.commit_write_batch(&pending_rollovers, &prepared) {
+            let error = match self
+                .active_accounting_delta_log
+                .rollback_to(accounting_delta_position)
+            {
+                Ok(()) => error,
+                Err(rollback_error) => rollback_error.into(),
+            };
             self.restore_pending_rollovers(pending_rollovers);
             self.metrics
                 .record_orphaned_segment_bytes(appended_records, appended_bytes);
@@ -1044,6 +1291,11 @@ impl WriteCoordinator {
         Ok((result, put_metrics))
     }
 
+    /// Resolves a client batch into concrete LSNs and per-op metadata before any bytes are written.
+    ///
+    /// Failure mode avoided: every operation in a batch reserves a contiguous LSN range. If LSNs
+    /// were assigned lazily during append, a too-large payload error halfway through could leave
+    /// later metadata ops committed at unexpected LSNs.
     fn prepare_batch(&self, ops: Vec<BatchOp>) -> Result<PreparedBatch> {
         let first_lsn = self.index.get_next_lsn()?;
         let mut prepared_ops = Vec::with_capacity(ops.len());
@@ -1124,14 +1376,29 @@ impl WriteCoordinator {
         })
     }
 
+    /// Temporarily removes staged rollover metadata so it can be included in the next durable
+    /// index batch exactly once.
+    ///
+    /// Failure mode avoided: if a batch commit fails after we started adding rollover rows, the
+    /// pending rollover must not be lost from memory. Otherwise the writer would continue on the
+    /// new segment while the old one never gets sealed.
     fn take_pending_rollovers(&mut self) -> Vec<PendingRollover> {
         std::mem::take(&mut self.pending_rollovers)
     }
 
+    /// Restores rollover metadata when a batch that tried to publish it fails.
+    ///
+    /// Failure mode avoided: a transient RocksDB write error should not silently drop the sealer's
+    /// work item. Restoring lets the next successful batch publish the same old/new segment state.
     fn restore_pending_rollovers(&mut self, pending_rollovers: Vec<PendingRollover>) {
         self.pending_rollovers = pending_rollovers;
     }
 
+    /// Commits the index side of a prepared batch.
+    ///
+    /// Failure mode avoided: blob versions, unaccounted LSN rows, epoch changes, active segment
+    /// offsets, rollover rows, and `next_lsn` must move together. If `next_lsn` advanced without
+    /// the blob row, recovery would skip that LSN forever and create a hole in the history.
     fn commit_write_batch(
         &self,
         pending_rollovers: &[PendingRollover],
@@ -1204,6 +1471,21 @@ impl WriteCoordinator {
         Ok(())
     }
 
+    /// Appends accounting deltas for the prepared batch before the index batch commits.
+    ///
+    /// If the later index commit fails, the caller rolls this log back to its previous
+    /// position so uncommitted deltas do not become phantom accounting work.
+    fn append_accounting_deltas(&mut self, prepared: &PreparedBatch) -> Result<()> {
+        let deltas = accounting_deltas_for_prepared_batch(prepared);
+        self.active_accounting_delta_log.append_all(&deltas)?;
+        Ok(())
+    }
+
+    /// Returns the active generation key for a shard that can accept writes.
+    ///
+    /// Failure mode avoided: a stale writer that only knows `shard_id` must not write into a shard
+    /// after it has been dropped and recreated. This forces every put to use the current generation
+    /// stored in the registry.
     fn openable_shard_key(&self, shard_id: ShardId) -> Result<ShardKey> {
         match self.index.get_shard_info(shard_id)? {
             Some(info) if info.is_active() => Ok(info.key(shard_id)),
@@ -1217,6 +1499,11 @@ impl WriteCoordinator {
         }
     }
 
+    /// Runs all rollover side effects whose metadata was just committed.
+    ///
+    /// Failure mode avoided: the sealer queue is outside RocksDB and cannot be rolled back. Running
+    /// this only after commit means a crash before commit has no queued seal for an index-invisible
+    /// segment.
     fn run_rollover_post_commit(&self, pending_rollovers: Vec<PendingRollover>) {
         for rollover in pending_rollovers {
             rollover.run_post_commit(self.seal_tx.clone(), self.metrics.clone());
@@ -1279,6 +1566,11 @@ impl WriteCoordinator {
         Ok(())
     }
 
+    /// Ensures the active segment can fit the next record, rolling over as many times as needed.
+    ///
+    /// Failure mode avoided: records are never split across segment files. If a too-large record
+    /// were partially appended before discovering the limit, recovery would only see a torn record
+    /// and would have to roll back unrelated later LSNs.
     fn ensure_segment_capacity(&mut self, record_len: u64) -> Result<()> {
         loop {
             let attempted_size = self
@@ -1335,8 +1627,8 @@ impl WriteCoordinator {
     /// The durability step. The ordering here is the single most load bearing thing in this
     /// file:
     ///
-    /// 1. fsync the segment bytes,
-    /// 2. then write durable_offset + durable_lsn to the index,
+    /// 1. fsync the segment bytes and active accounting delta log,
+    /// 2. then write durable offsets + durable_lsn to the index,
     /// 3. then fsync the RocksDB WAL.
     ///
     /// Bytes become durable strictly before the metadata that claims they are. A crash between
@@ -1347,12 +1639,17 @@ impl WriteCoordinator {
     /// event cursor advances based on it.
     ///
     /// The durable LSN frontier itself is computed by walking unaccounted ops forward while their
-    /// record bytes are covered by fsynced offsets (see `seal::compute_durable_lsn`).
+    /// record bytes are covered by fsynced offsets (see `seal::compute_durable_lsn`), then clamped
+    /// to the accounting delta log frontier.
     fn sync_data(&mut self) -> Result<()> {
         let started = Instant::now();
         let previous_durable_offset = self.durable_offset;
         let durable_offset = self.active_writer.write_offset();
         if let Err(error) = self.active_writer.sync_data() {
+            self.metrics.record_sync(Err(()), started.elapsed());
+            return Err(error.into());
+        }
+        if let Err(error) = self.active_accounting_delta_log.sync_data() {
             self.metrics.record_sync(Err(()), started.elapsed());
             return Err(error.into());
         }
@@ -1376,8 +1673,18 @@ impl WriteCoordinator {
             state.durable_offset = durable_offset;
             let mut batch = self.index.batch();
             self.index.put_segment_state_batch(&mut batch, &state)?;
-            let durable_lsn = durable_lsn_with_advanced_frontier(&self.index, Some(&state))?;
+            let current_durable_lsn = self.index.get_durable_lsn()?;
+            let mut active_delta_state = self.active_accounting_delta_log.state();
+            active_delta_state.durable_lsn =
+                active_delta_state.durable_lsn.max(current_durable_lsn);
+            let durable_lsn = durable_lsn_with_accounting_frontier(
+                &self.index,
+                Some(&state),
+                Some(active_delta_state),
+            )?;
             self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
+            self.index
+                .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
             if let Err(error) = batch.write().map_err(strata_index::Error::from) {
                 self.metrics.record_sync(Err(()), started.elapsed());
                 return Err(error.into());
@@ -1389,6 +1696,7 @@ impl WriteCoordinator {
             self.metrics.record_sync(Err(()), started.elapsed());
             return Err(error.into());
         }
+        self.index.set_blob_compact_safe_lsn(durable_lsn);
         self.durable_offset = durable_offset;
         self.active_segment_state.durable_offset = durable_offset;
         self.metrics.set_active_segment(
@@ -1449,6 +1757,12 @@ pub(crate) fn resolve_blob_version(
     }))
 }
 
+/// Opens the segment chosen for appends, creating it only if recovery did not already leave a file
+/// for that segment id.
+///
+/// Failure mode avoided: after a clean reopen, the active segment usually already exists with valid
+/// trailing bytes. Recreating it would truncate those bytes and force recovery to roll back
+/// committed-but-not-yet-sealed writes.
 fn open_active_writer(
     config: &StrataStoreConfig,
     active_segment_id: SegmentId,
@@ -1481,7 +1795,7 @@ fn ensure_ingest_dir(config: &StrataStoreConfig) -> Result<()> {
 }
 
 /// First open of a shard automatically registers it, afterwards the (id, generation) pair must match the
-/// registry exactly. The generation check is what makes shard drop/re-add safe: a stale handle
+/// registry exactly. The generation check is what makes shard drop and re-add safe: a stale handle
 /// from before a drop carries the old generation and gets rejected here, instead of silently
 /// writing into a namespace whose metadata was already torn down.
 fn ensure_shard_active(index: &StrataIndex, shard: ShardKey) -> Result<()> {
@@ -1560,9 +1874,20 @@ fn reconcile_orphan_ingest_segment_files(
 ///    later segments hold later LSNs, and keeping LSN 50 while LSN 40 is gone would break the
 ///    "durable means a contiguous prefix" contract — so later segments are discarded outright.
 /// 2. Roll back index entries whose bytes didn't survive (see `rollback_lost_operations`).
-/// 3. Recompute the durable LSN frontier from what actually survived — this can move *forward*
-///    past the persisted value, because the scan may have promoted bytes that were fsynced (or
-///    survived in the page cache of a process-only crash) but never claimed before the crash.
+///
+/// This deliberately does not advance `next_lsn` from records found only in segment files. The
+/// segment file is the payload log, not the commit log: a batch can reserve LSN 10 for an epoch
+/// increment and LSN 11 for a put, write the LSN 11 payload record, then crash before the RocksDB
+/// batch publishes either operation. If recovery treated that segment record as committed and
+/// bumped `next_lsn` to 12, it would create a hole at LSN 10 and silently drop the epoch change.
+/// Even a put-only batch has the same shape: a RocksDB commit failure observed by the caller would
+/// become a visible write after restart. Only RocksDB's batch tells us which LSNs committed; segment
+/// recovery can promote/truncate bytes for already-indexed operations, but it must not discover new
+/// committed LSNs from payload bytes alone.
+///
+/// The caller recomputes the durable LSN frontier after the active accounting delta log has been
+/// truncated to the same committed prefix. Post recovery we can assert the fact that index has
+/// next_lsn == durable_lsn + 1.
 fn recover_unsealed_segments(
     config: &StrataStoreConfig,
     index: &StrataIndex,
@@ -1582,8 +1907,83 @@ fn recover_unsealed_segments(
         }
     }
     rollback_lost_operations(index, metrics)?;
-    advance_recovered_durable_lsn(index, metrics)?;
     Ok(())
+}
+
+/// Reopens the active accounting delta log and makes it agree with the recovered index prefix.
+///
+/// The active log is a sidecar replay source for accounting. The writer appends deltas before it
+/// commits the matching RocksDB index batch, but the log append is not made durable until a later
+/// sync, so a crash can leave the two prefixes disagreeing in either direction:
+///
+/// - Log ahead of RocksDB: the delta append happened, but the index batch did not commit. Example:
+///   the log contains LSN 25 while `next_lsn` still says 25 is free. Those deltas are not store
+///   history, so we truncate them before accounting can replay phantom work.
+/// - RocksDB ahead of the log: the index batch survived, but the active log's valid prefix does not
+///   reach every committed LSN. Accounting would never see those committed operations, so recovery
+///   rolls the store back to the first LSN missing from the log.
+///
+/// Once both prefixes match, we fsync the trimmed log. That makes the log state a valid accounting
+/// frontier for the recovered `durable_lsn`: payload bytes may have been promoted by segment
+/// recovery, but an LSN is not durable until its accounting delta is durable too. In summary, the
+/// rough order of operations here to ensure durable_lsn is consistent in log and segment files:
+/// 1. Trim active delta log to current committed prefix.
+/// 2. If active delta log is shorter than RocksDB’s committed prefix, call rollback_operations_from(...),
+///    which rewinds next_lsn.
+/// 3. Recompute committed_lsn from the new next_lsn.
+/// 4. Sync the recovered active delta log.
+/// 5. Call advance_recovered_durable_lsn, which finally writes the recovered durable_lsn.
+fn recover_active_accounting_delta_log(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+    metrics: &StrataStoreMetrics,
+) -> Result<ActiveDeltaLog> {
+    let mut log = open_active_accounting_delta_log(config, index)?;
+
+    // First trim the easy mismatch: deltas for operations that never committed to RocksDB.
+    let committed_lsn = index.get_next_lsn()?.saturating_sub(1);
+    log.truncate_after_lsn(committed_lsn)?;
+
+    // Then handle the opposite mismatch. If the log is shorter than RocksDB's committed prefix,
+    // keep the contiguous-prefix invariant by rolling back store metadata that accounting could not
+    // replay. `rollback_operations_from` also rewinds `next_lsn`, so recompute `committed_lsn`.
+    let delta_log_lsn = log.max_lsn().unwrap_or_default();
+    if delta_log_lsn < committed_lsn {
+        rollback_operations_from(index, metrics, delta_log_lsn.saturating_add(1))?;
+    }
+    let committed_lsn = index.get_next_lsn()?.saturating_sub(1);
+    log.truncate_after_lsn(committed_lsn)?;
+
+    // Persist the recovered log prefix before publishing a recomputed durable frontier that depends
+    // on it. This is the recovery equivalent of the foreground sync ordering.
+    log.sync_data()?;
+    advance_recovered_durable_lsn(index, metrics, log.state())?;
+    Ok(log)
+}
+
+/// Opens the active accounting delta log at the persisted durable frontier.
+///
+/// Failure mode avoided: the delta log and store durable_lsn are flushed in separate files. If
+/// RocksDB remembers durable_lsn 40 but the delta-log state row still says 37, using the lower
+/// value would make recovery treat already-acknowledged operations as not covered by accounting
+/// deltas.
+fn open_active_accounting_delta_log(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+) -> Result<ActiveDeltaLog> {
+    let mut durable_state =
+        index
+            .get_accounting_active_delta_log_state()?
+            .unwrap_or(ActiveDeltaLogState {
+                durable_offset: 0,
+                durable_lsn: index.get_durable_lsn()?,
+            });
+
+    durable_state.durable_lsn = durable_state.durable_lsn.max(index.get_durable_lsn()?);
+    Ok(ActiveDeltaLog::open(
+        config.accounting_index_dir(),
+        durable_state,
+    )?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1872,8 +2272,8 @@ fn discard_unsealed_segment(
 /// Seeds the epoch timeline for a fresh namespace. The genesis row lives at LSN 0 — below every
 /// real LSN — so `latest_epoch_at_lsn(any)` always has an answer; accounting and rollback both
 /// rely on "epoch at LSN" never being undefined. `config.starting_epoch` only matters on first
-/// creation; after that the persisted timeline wins, so changing the config later is a no-op
-/// rather than a footgun. The middle case (timeline rows exist but `CurrentEpoch` is missing)
+/// creation; after that the persisted timeline wins, so changing the config later is a no-op.
+/// The middle case (timeline rows exist but `CurrentEpoch` is missing)
 /// rebuilds the register from the timeline, consistent with the timeline being the truth.
 fn ensure_epoch_initialized(index: &StrataIndex, starting_epoch: Epoch) -> Result<Epoch> {
     if let Some(current_epoch) = index.get_current_epoch()? {
@@ -1924,6 +2324,20 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
         return Ok(());
     };
 
+    rollback_operations_from(index, metrics, rollback_from)
+}
+
+/// Erases every unaccounted blob and epoch operation from `rollback_from` onward and rewinds the
+/// store frontiers to that LSN.
+///
+/// Failure mode avoided: the cleanup must remove both blob-version merge ops and epoch rows. If
+/// rollback removed only payload rows but left an epoch change at LSN 51, the next write reusing
+/// LSN 51 would inherit an impossible epoch timeline.
+fn rollback_operations_from(
+    index: &StrataIndex,
+    metrics: &StrataStoreMetrics,
+    rollback_from: StrataLsn,
+) -> Result<()> {
     let mut entries = index
         .iter_unaccounted_lsn_ops()?
         .into_iter()
@@ -1966,12 +2380,21 @@ fn rollback_lost_operations(index: &StrataIndex, metrics: &StrataStoreMetrics) -
 /// Recomputes the durable LSN frontier after recovery has settled what survived. Runs last so it
 /// can pick up bytes the scan promoted — the persisted durable_lsn is a floor, not the truth,
 /// after a crash.
-fn advance_recovered_durable_lsn(index: &StrataIndex, metrics: &StrataStoreMetrics) -> Result<()> {
+fn advance_recovered_durable_lsn(
+    index: &StrataIndex,
+    metrics: &StrataStoreMetrics,
+    active_delta_state: ActiveDeltaLogState,
+) -> Result<()> {
     let mut batch = index.batch();
-    let durable_lsn = durable_lsn_with_advanced_frontier(index, None)?;
+    let current_durable_lsn = index.get_durable_lsn()?;
+    let mut active_delta_state = active_delta_state;
+    active_delta_state.durable_lsn = active_delta_state.durable_lsn.max(current_durable_lsn);
+    let durable_lsn = durable_lsn_with_accounting_frontier(index, None, Some(active_delta_state))?;
     index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
+    index.put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
+    index.set_blob_compact_safe_lsn(durable_lsn);
     metrics.set_durable_lsn(durable_lsn);
     Ok(())
 }
@@ -2045,6 +2468,11 @@ fn publish_active_segment_state(
     Ok(state)
 }
 
+/// Builds the normal open-segment state row for the current writer.
+///
+/// Failure mode avoided: all open segment rows should use the same relative path and store scope.
+/// Hand-building this in multiple places risks one path being absolute, so a later move of the
+/// store root would make that segment unreadable while others still resolve correctly.
 fn active_segment_state(
     config: &StrataStoreConfig,
     store_scope: ShardKey,
@@ -2094,6 +2522,11 @@ fn active_segment_state_with_lsn(
     state
 }
 
+/// Creates a fresh segment-state row from an on-disk path.
+///
+/// Failure mode avoided: new rows start with no sealed checksum or LSN bounds. Accidentally
+/// carrying those fields from a previous segment id would make recovery think an open segment is
+/// sealed or make GC believe it contains LSNs it never wrote.
 fn active_segment_state_from_path(
     config: &StrataStoreConfig,
     store_scope: ShardKey,
@@ -2118,6 +2551,11 @@ fn active_segment_state_from_path(
     }
 }
 
+/// Rejects configs that would break the store's ordering or worker assumptions.
+///
+/// Failure mode avoided: some invalid values do not fail fast by themselves. For example,
+/// `max_unsealed_segments = 1` would make the writer roll over into a second segment and then
+/// wait forever for the backlog to drop below one, blocking every future write.
 fn validate_config(config: &StrataStoreConfig) -> Result<()> {
     if config.namespace.trim().is_empty() {
         return Err(Error::InvalidConfig("namespace cannot be empty"));
@@ -2143,6 +2581,16 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
     }
     if config.accounting_interval.is_zero() {
         return Err(Error::InvalidConfig("accounting_interval must be non-zero"));
+    }
+    if config.accounting_sidecar_partition_count == 0 {
+        return Err(Error::InvalidConfig(
+            "accounting_sidecar_partition_count must be non-zero",
+        ));
+    }
+    if config.accounting_sidecar_interval.is_zero() {
+        return Err(Error::InvalidConfig(
+            "accounting_sidecar_interval must be non-zero",
+        ));
     }
     Ok(())
 }
@@ -2171,6 +2619,11 @@ fn choose_active_segment_id(index: &StrataIndex) -> Result<SegmentId> {
         .unwrap_or(FIRST_SEGMENT_ID))
 }
 
+/// Returns unsealed ingest segments in write order.
+///
+/// Failure mode avoided: recovery must scan low segment ids first. If segment 3 is recovered before
+/// segment 2 and segment 2 then turns out to have lost LSN 40, keeping segment 3's later LSNs would
+/// create a non-contiguous history.
 fn unsealed_ingest_segment_ids(index: &StrataIndex) -> Result<Vec<SegmentId>> {
     let mut segment_ids = index
         .iter_segment_states()?
@@ -2188,6 +2641,11 @@ fn unsealed_ingest_segment_count(index: &StrataIndex) -> Result<usize> {
     Ok(unsealed_ingest_segment_ids(index)?.len())
 }
 
+/// Finds the first ingest segment whose sealing failed.
+///
+/// Failure mode avoided: a failed seal is a permanent blockage until repaired. If rollover
+/// backpressure ignored it, the writer could keep producing new unsealed segments while the old
+/// failed segment never becomes immutable or GC-safe.
 fn first_seal_failed_segment(index: &StrataIndex) -> Result<Option<SegmentId>> {
     Ok(index
         .iter_segment_states()?
@@ -2219,7 +2677,13 @@ mod tests {
     };
 
     use prometheus::Registry;
-    use strata_core::{EpochBucket, FIXED_RECORD_HEADER_LEN, StrataStoreState};
+    use strata_accounting::{
+        AccountingIndex, AccountingIndexConfig, ActiveDeltaLogReadCursor, ActiveDeltaLogState,
+    };
+    use strata_core::{
+        EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcLifetimeRange, SegmentGcRecordRange,
+        SegmentRefEvent, SegmentRefKey, SegmentRefState, SegmentRefStatus, StrataStoreState,
+    };
     use tempfile::tempdir;
     use typed_store::{
         DBMetrics,
@@ -2233,6 +2697,36 @@ mod tests {
     const TEST_PAYLOAD_LEN: u64 = 9;
     const TEST_RECORD_LEN: u64 = FIXED_RECORD_HEADER_LEN as u64 + TEST_KEY_LEN + TEST_PAYLOAD_LEN;
     const TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD: u64 = TEST_RECORD_LEN * 2 - 1;
+
+    fn gc_range(record_ref: RecordRef) -> SegmentGcRecordRange {
+        SegmentGcRecordRange::from(record_ref)
+    }
+
+    fn active_delta_log_state(index: &StrataIndex) -> ActiveDeltaLogState {
+        index
+            .get_accounting_active_delta_log_state()
+            .unwrap()
+            .unwrap()
+    }
+
+    fn active_delta_log_read_cursor(index: &StrataIndex) -> ActiveDeltaLogReadCursor {
+        index
+            .get_accounting_active_delta_log_consumed_cursor()
+            .unwrap()
+            .unwrap()
+    }
+
+    fn open_accounting_sidecar(store: &StrataStore) -> AccountingIndex {
+        let manifest = store.index().get_accounting_index_manifest().unwrap();
+        AccountingIndex::open_with_manifest(
+            AccountingIndexConfig::new(
+                store.config().accounting_index_dir(),
+                store.config().accounting_sidecar_partition_count(),
+            ),
+            manifest,
+        )
+        .unwrap()
+    }
 
     #[derive(Debug)]
     struct StandaloneStore {
@@ -2275,6 +2769,15 @@ mod tests {
         Ok(StandaloneStore { store })
     }
 
+    fn stop_accounting_worker(store: &mut StrataStore) {
+        if let Some(accounting_tx) = store.accounting_tx.take() {
+            let _ = accounting_tx.send(AccountingCommand::Shutdown);
+        }
+        if let Some(accounting_handle) = store.accounting_handle.take() {
+            let _ = accounting_handle.join();
+        }
+    }
+
     fn init_typed_store_metrics() {
         INIT_TYPED_STORE_METRICS.call_once(|| {
             DBMetrics::get();
@@ -2293,6 +2796,18 @@ mod tests {
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
             accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
+            accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
+            accounting_sidecar_interval: DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
+            accounting_sidecar_ingest_record_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD,
+            accounting_sidecar_delta_run_count_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
+            accounting_sidecar_delta_run_bytes_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
+            accounting_sidecar_major_patch_count_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
+            accounting_sidecar_major_patch_bytes_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
             starting_epoch: 42,
         }
     }
@@ -2462,6 +2977,43 @@ mod tests {
         assert!(index.resolve_blob_head(&key, shard).unwrap().is_some());
         assert!(index.get_segment_state(FIRST_SEGMENT_ID).unwrap().is_some());
         assert_eq!(index.get_blob_entry(&key).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn store_writes_logical_shard_into_record_header() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path(), "record-shard");
+        let index =
+            StrataIndex::open_path(dir.path().join("shared-index"), cfg.index_cf_prefix()).unwrap();
+        let shard = ShardKey {
+            id: 5,
+            generation: 2,
+        };
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        index
+            .put_shard_info(shard.id, ShardInfo::active(shard.generation))
+            .unwrap();
+        let store =
+            StrataStore::from_index(cfg.clone(), index.clone(), StrataStoreMetrics::default())
+                .unwrap();
+
+        let lsn = store.put(shard.id, &key, b"hello shard").unwrap();
+        let record_ref = index
+            .get_blob_version_for_shard(&version_key(&key, lsn), shard)
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        let mut reader = strata_segment::SegmentReader::open(
+            segment_path(&cfg, record_ref.segment_id),
+            record_ref.segment_id,
+        )
+        .unwrap();
+
+        let metadata = reader.read_record_metadata(record_ref).unwrap();
+
+        assert_eq!(metadata.header.shard, shard);
     }
 
     #[tokio::test]
@@ -2786,6 +3338,104 @@ mod tests {
         store.sync().unwrap();
 
         assert_eq!(store.durable_lsn().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn sync_publishes_active_accounting_delta_log_state() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        store.put(&key, b"payload").unwrap();
+        store.tombstone(&key).unwrap();
+        let (_, epoch_lsn) = store.increment_epoch().unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(store.durable_lsn().unwrap(), epoch_lsn);
+        let state = store
+            .index()
+            .get_accounting_active_delta_log_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.durable_lsn, epoch_lsn);
+        assert!(state.durable_offset > 0);
+    }
+
+    #[tokio::test]
+    async fn accounting_sidecar_ingests_active_delta_log_and_compacts_to_patch() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"sidecar-ingest".to_vec()).unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.accounting_interval = Duration::from_secs(3600);
+        cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
+        cfg.accounting_sidecar_major_patch_count_threshold = 0;
+        cfg.accounting_sidecar_major_patch_bytes_threshold = 0;
+        let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+        stop_accounting_worker(&mut store.store);
+
+        store.put(&key, b"payload").unwrap();
+        store.sync().unwrap();
+        accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+
+        let active_state = active_delta_log_state(store.index());
+        let consumed_cursor = active_delta_log_read_cursor(store.index());
+        assert_eq!(consumed_cursor.offset, active_state.durable_offset);
+        assert_eq!(consumed_cursor.max_lsn, active_state.durable_lsn);
+
+        let sidecar = open_accounting_sidecar(&store);
+        let partition = sidecar.manifest().partitions.values().next().unwrap();
+        let delta_count = sidecar
+            .manifest()
+            .partitions
+            .values()
+            .map(|partition| partition.deltas.len())
+            .sum::<usize>();
+        let patch_count = sidecar
+            .manifest()
+            .partitions
+            .values()
+            .map(|partition| partition.patches.len())
+            .sum::<usize>();
+        assert_eq!(delta_count, 0);
+        assert_eq!(patch_count, 1);
+        assert!(partition.base.is_none());
+    }
+
+    #[tokio::test]
+    async fn accounting_sidecar_major_compacts_when_patch_threshold_reached() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"sidecar-major".to_vec()).unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.accounting_interval = Duration::from_secs(3600);
+        cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
+        cfg.accounting_sidecar_major_patch_count_threshold = 1;
+        let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+        stop_accounting_worker(&mut store.store);
+
+        store.put(&key, b"payload").unwrap();
+        store.sync().unwrap();
+        accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+
+        let sidecar = open_accounting_sidecar(&store);
+        let base_count = sidecar
+            .manifest()
+            .partitions
+            .values()
+            .filter(|partition| partition.base.is_some())
+            .count();
+        let patch_count = sidecar
+            .manifest()
+            .partitions
+            .values()
+            .map(|partition| partition.patches.len())
+            .sum::<usize>();
+        assert_eq!(base_count, 1);
+        assert_eq!(patch_count, 0);
     }
 
     #[tokio::test]
@@ -3451,14 +4101,17 @@ mod tests {
         let (_write_tx, write_rx) = mpsc::sync_channel(1);
         let (accounting_tx, _accounting_rx) = mpsc::sync_channel(1);
         let active_segment_state = active_segment_state(&cfg, STORE_SCOPE, &active_writer, 0);
+        let active_accounting_delta_log =
+            ActiveDeltaLog::open(cfg.accounting_index_dir(), ActiveDeltaLogState::default())
+                .unwrap();
         let coordinator = WriteCoordinator {
             config: cfg,
             index: index.clone(),
             active_writer,
+            active_accounting_delta_log,
             active_segment_state,
             durable_offset: 0,
             pending_rollovers: Vec::new(),
-            write_lock: Arc::new(Mutex::new(())),
             seal_tx,
             accounting_tx,
             write_rx,
@@ -4230,6 +4883,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accounting_publishes_live_segment_ref_state_for_put() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        let put_lsn = store.put(&key, b"payload").unwrap();
+        let record_ref = store
+            .index()
+            .get_blob_version(&version_key(&key, put_lsn))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, put_lsn);
+
+        let state = store
+            .index()
+            .get_segment_ref_state(SegmentRefKey {
+                segment_id: record_ref.segment_id,
+                offset: record_ref.offset,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state,
+            SegmentRefState {
+                status: SegmentRefStatus::Live,
+                lifecycle: None,
+                last_accounted_lsn: put_lsn,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn accounting_publishes_retired_segment_ref_event_for_tombstone() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        let put_lsn = store.put(&key, b"payload").unwrap();
+        let tombstone_lsn = store.tombstone(&key).unwrap();
+        let record_ref = store
+            .index()
+            .get_blob_version(&version_key(&key, put_lsn))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+
+        let state = store
+            .index()
+            .get_segment_ref_state(SegmentRefKey {
+                segment_id: record_ref.segment_id,
+                offset: record_ref.offset,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, SegmentRefStatus::Retired);
+        assert_eq!(state.last_accounted_lsn, tombstone_lsn);
+        assert_eq!(
+            store
+                .index()
+                .iter_segment_ref_events_since(record_ref.segment_id, put_lsn)
+                .unwrap(),
+            vec![(
+                strata_core::SegmentRefEventKey {
+                    segment_id: record_ref.segment_id,
+                    lsn: tombstone_lsn,
+                    offset: record_ref.offset,
+                },
+                SegmentRefEvent::Retired,
+            )]
+        );
+        let overlay = store
+            .index()
+            .get_segment_gc_overlay(record_ref.segment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlay.dead, vec![gc_range(record_ref)]);
+        assert!(overlay.lifetimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accounting_publishes_lifecycle_changed_segment_ref_event() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        let put_lsn = store.put(&key, b"payload").unwrap();
+        let lifetime_lsn = store.extend(&key, 50).unwrap().unwrap();
+        let record_ref = store
+            .index()
+            .get_blob_version(&version_key(&key, put_lsn))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, lifetime_lsn);
+
+        let lifecycle = BlobLifecycle {
+            logical_end_epoch: 50,
+            extension_count: 0,
+        };
+        let state = store
+            .index()
+            .get_segment_ref_state(SegmentRefKey {
+                segment_id: record_ref.segment_id,
+                offset: record_ref.offset,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, SegmentRefStatus::Live);
+        assert_eq!(state.lifecycle, Some(lifecycle));
+        assert_eq!(
+            store
+                .index()
+                .iter_segment_ref_events_since(record_ref.segment_id, put_lsn)
+                .unwrap(),
+            vec![(
+                strata_core::SegmentRefEventKey {
+                    segment_id: record_ref.segment_id,
+                    lsn: lifetime_lsn,
+                    offset: record_ref.offset,
+                },
+                SegmentRefEvent::LifecycleChanged {
+                    lifecycle: Some(lifecycle),
+                },
+            )]
+        );
+        let overlay = store
+            .index()
+            .get_segment_gc_overlay(record_ref.segment_id)
+            .unwrap()
+            .unwrap();
+        assert!(overlay.dead.is_empty());
+        assert_eq!(
+            overlay.lifetimes,
+            vec![SegmentGcLifetimeRange {
+                range: gc_range(record_ref),
+                lifecycle,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn accounting_gc_overlay_retire_removes_lifetime_hint() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        let put_lsn = store.put(&key, b"payload").unwrap();
+        let lifetime_lsn = store.extend(&key, 50).unwrap().unwrap();
+        let record_ref = store
+            .index()
+            .get_blob_version(&version_key(&key, put_lsn))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, lifetime_lsn);
+
+        let overlay = store
+            .index()
+            .get_segment_gc_overlay(record_ref.segment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlay.lifetimes.len(), 1);
+
+        let tombstone_lsn = store.tombstone(&key).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+
+        let overlay = store
+            .index()
+            .get_segment_gc_overlay(record_ref.segment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlay.dead, vec![gc_range(record_ref)]);
+        assert!(overlay.lifetimes.is_empty());
+    }
+
+    #[tokio::test]
     async fn accounting_expires_segment_stats_on_epoch_change() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
@@ -4574,6 +5429,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_rolls_back_ops_missing_from_active_delta_log() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path(), "default");
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        {
+            let store =
+                try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+            assert_eq!(store.put(&key, b"payload-a").unwrap(), 1);
+            assert_eq!(store.index().get_next_lsn().unwrap(), 2);
+        }
+
+        std::fs::remove_file(cfg.accounting_index_dir().join("active-delta.log")).unwrap();
+
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+        assert_eq!(store.index().get_next_lsn().unwrap(), 1);
+        assert_eq!(store.get(&key).unwrap(), None);
+        assert_eq!(store.put(&key, b"payload-b").unwrap(), 1);
+        assert_eq!(store.get(&key).unwrap(), Some(b"payload-b".to_vec()));
+    }
+
+    #[tokio::test]
     async fn recovery_keeps_valid_blob_versions_for_old_versions() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
@@ -4671,6 +5548,26 @@ mod tests {
             let segment_2_state =
                 active_segment_state_from_path(&cfg, STORE_SCOPE, 2, segment_2_end, 0);
 
+            let mut active_delta_log =
+                ActiveDeltaLog::open(cfg.accounting_index_dir(), ActiveDeltaLogState::default())
+                    .unwrap();
+            for (key, record_ref, lsn) in [
+                (&key_a, out_a.record_ref, 1),
+                (&key_b, out_b.record_ref, 2),
+                (&key_c, out_c.record_ref, 3),
+            ] {
+                active_delta_log
+                    .append(&AccountingDelta::Blob(BlobUpdate::Put {
+                        lsn,
+                        key: key.clone(),
+                        shard: STORE_SCOPE,
+                        record_ref,
+                        lifecycle: None,
+                    }))
+                    .unwrap();
+            }
+            active_delta_log.sync_data().unwrap();
+
             let mut batch = index.batch();
             for (key, record_ref, lsn) in [
                 (&key_a, out_a.record_ref, 1),
@@ -4698,6 +5595,9 @@ mod tests {
                 .unwrap();
             index
                 .put_segment_state_batch(&mut batch, &segment_2_state)
+                .unwrap();
+            index
+                .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_log.state())
                 .unwrap();
             batch.write().unwrap();
             index.flush_wal(true).unwrap();
@@ -4996,7 +5896,7 @@ mod tests {
                     .unwrap()
             )
         );
-        assert_eq!(store.durable_lsn().unwrap(), 1);
+        assert_eq!(store.durable_lsn().unwrap(), 0);
 
         let open = store.index().get_segment_state(2).unwrap().unwrap();
         assert_eq!(open.state, SegmentFileState::Open);

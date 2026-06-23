@@ -1,6 +1,7 @@
 use std::{fs, io::Read, path::Path, sync::mpsc};
 
 use sha2::{Digest, Sha256};
+use strata_accounting::ActiveDeltaLogState;
 use strata_core::{
     BlobKey, SegmentFileState, SegmentId, SegmentKey, SegmentState, ShardKey, StrataLsn,
 };
@@ -91,12 +92,14 @@ impl SealWorker {
         let durable_lsn = {
             let mut batch = self.index.batch();
             self.index.put_segment_state_batch(&mut batch, &state)?;
-            let durable_lsn = durable_lsn_with_advanced_frontier(&self.index, Some(&state))?;
+            let durable_lsn =
+                durable_lsn_with_accounting_frontier(&self.index, Some(&state), None)?;
             self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
             batch.write().map_err(strata_index::Error::from)?;
             durable_lsn
         };
         self.index.flush_wal(true)?;
+        self.index.set_blob_compact_safe_lsn(durable_lsn);
         self.metrics.record_segment_sealed();
         self.metrics.set_durable_lsn(durable_lsn);
         self.metrics
@@ -243,11 +246,19 @@ pub(crate) fn active_segment_durable_offset(
         .map_or(0, |state| state.durable_offset))
 }
 
-pub(crate) fn durable_lsn_with_advanced_frontier(
+pub(crate) fn durable_lsn_with_accounting_frontier(
     index: &StrataIndex,
     override_state: Option<&SegmentState>,
+    active_delta_state: Option<ActiveDeltaLogState>,
 ) -> Result<StrataLsn> {
-    compute_durable_lsn(index, index.get_durable_lsn()?, override_state)
+    let current_durable_lsn = index.get_durable_lsn()?;
+    let payload_durable_lsn = compute_durable_lsn(index, current_durable_lsn, override_state)?;
+    let delta_durable_lsn = active_delta_state
+        .or(index.get_accounting_active_delta_log_state()?)
+        .map_or(current_durable_lsn, |state| state.durable_lsn);
+    Ok(payload_durable_lsn
+        .min(delta_durable_lsn)
+        .max(current_durable_lsn))
 }
 
 fn compute_durable_lsn(

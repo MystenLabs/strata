@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use strata_core::{BlobKey, EncodedRecordParts, PlacementClass, RecordRef, SegmentId};
+use strata_core::{BlobKey, EncodedRecordParts, PlacementClass, RecordRef, SegmentId, ShardKey};
 
 use crate::{Error, Result, error::IoResultExt};
 
@@ -84,6 +84,16 @@ impl SegmentWriter {
         generation: u64,
         payload: &[u8],
     ) -> Result<AppendOutcome> {
+        self.append_for_shard(key, generation, strata_core::DEFAULT_RECORD_SHARD, payload)
+    }
+
+    pub fn append_for_shard(
+        &mut self,
+        key: &BlobKey,
+        generation: u64,
+        shard: ShardKey,
+        payload: &[u8],
+    ) -> Result<AppendOutcome> {
         if self.sealed {
             return Err(Error::SegmentFull {
                 max_size: self.write_offset,
@@ -91,7 +101,7 @@ impl SegmentWriter {
             });
         }
 
-        let encoded_record = EncodedRecordParts::new(key, generation, payload)?;
+        let encoded_record = EncodedRecordParts::new_with_shard(key, generation, shard, payload)?;
         let record_len = encoded_record.record_len;
         let attempted_size = self
             .write_offset

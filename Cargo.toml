@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/strata-bench",
+    "crates/strata-accounting",
     "crates/strata-core",
     "crates/strata-index",
     "crates/strata-segment",
@@ -19,6 +20,7 @@ prometheus = "0.14.0"
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "multi-threaded-cf", "snappy", "zlib", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+strata-accounting = { path = "crates/strata-accounting" }
 strata-core = { path = "crates/strata-core" }
 strata-index = { path = "crates/strata-index" }
 strata-segment = { path = "crates/strata-segment" }

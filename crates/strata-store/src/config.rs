@@ -1,13 +1,21 @@
-use std::{path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use strata_core::Epoch;
 
 const INGEST_DIR: &str = "ingest";
 const INDEX_DIR: &str = "index";
+const ACCOUNTING_INDEX_DIR: &str = "accounting-index";
 
 pub const DEFAULT_SEGMENT_READER_CACHE_CAPACITY: usize = 64;
 pub const DEFAULT_ACCOUNTING_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD: usize = 1024;
+pub const DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT: u32 = 64;
+pub const DEFAULT_ACCOUNTING_SIDECAR_INTERVAL: Duration = Duration::from_secs(20 * 60);
+pub const DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD: usize = 4096;
+pub const DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD: usize = 8;
+pub const DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD: usize = 8;
+pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD: u64 = 256 * 1024 * 1024;
 
 /// Runtime configuration for one Strata store namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +30,13 @@ pub struct StrataStoreConfig {
     pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     pub accounting_interval: Duration,
     pub accounting_unaccounted_threshold: usize,
+    pub accounting_sidecar_partition_count: u32,
+    pub accounting_sidecar_interval: Duration,
+    pub accounting_sidecar_ingest_record_threshold: usize,
+    pub accounting_sidecar_delta_run_count_threshold: usize,
+    pub accounting_sidecar_delta_run_bytes_threshold: u64,
+    pub accounting_sidecar_major_patch_count_threshold: usize,
+    pub accounting_sidecar_major_patch_bytes_threshold: u64,
     /// Initial epoch used only when creating a namespace without persisted epoch metadata.
     pub starting_epoch: Epoch,
 }
@@ -55,6 +70,15 @@ impl StrataStoreConfig {
 
     pub fn standalone_index_dir(&self) -> PathBuf {
         self.namespace_dir().join(INDEX_DIR)
+    }
+
+    pub fn accounting_index_dir(&self) -> PathBuf {
+        self.namespace_dir().join(ACCOUNTING_INDEX_DIR)
+    }
+
+    pub(crate) fn accounting_sidecar_partition_count(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.accounting_sidecar_partition_count)
+            .expect("accounting sidecar partition count is validated before use")
     }
 
     pub fn index_cf_prefix(&self) -> String {

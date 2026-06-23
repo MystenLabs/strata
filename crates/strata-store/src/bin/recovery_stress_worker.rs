@@ -13,7 +13,12 @@ use std::{
 
 use strata_core::{BlobKey, Epoch};
 use strata_store::{
-    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
+    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
+    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
+    DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
     StrataStoreMetrics,
 };
@@ -200,6 +205,18 @@ impl Config {
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
             accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
+            accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
+            accounting_sidecar_interval: DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
+            accounting_sidecar_ingest_record_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD,
+            accounting_sidecar_delta_run_count_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
+            accounting_sidecar_delta_run_bytes_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
+            accounting_sidecar_major_patch_count_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
+            accounting_sidecar_major_patch_bytes_threshold:
+                DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
             starting_epoch: self.starting_epoch,
         }
     }

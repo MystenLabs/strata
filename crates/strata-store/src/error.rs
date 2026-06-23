@@ -33,6 +33,9 @@ pub enum Error {
     #[error("index error: {0}")]
     Index(#[from] strata_index::Error),
 
+    #[error("accounting index error: {0}")]
+    AccountingIndex(#[from] strata_accounting::Error),
+
     #[error("segment error: {0}")]
     Segment(#[from] strata_segment::Error),
 

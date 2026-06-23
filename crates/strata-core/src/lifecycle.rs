@@ -112,7 +112,16 @@ pub struct VersionOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VersionMergeOp {
     Append(VersionOp),
-    RollbackFrom { shard: ShardKey, lsn: StrataLsn },
+    MapRef {
+        shard: ShardKey,
+        payload_lsn: StrataLsn,
+        from: RecordRef,
+        to: RecordRef,
+    },
+    RollbackFrom {
+        shard: ShardKey,
+        lsn: StrataLsn,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,7 +209,18 @@ impl VersionState {
 
     pub fn apply_merge_op(&mut self, op: VersionMergeOp) {
         match op {
-            VersionMergeOp::Append(op) => self.append_op(op),
+            VersionMergeOp::Append(op) => {
+                // Keep new ops in the exact per-LSN tail until the compaction frontier crosses them.
+                // Readers call `resolve_head()` to project `heads + tail`; only
+                // `compact_through(compact_safe_lsn)` may fold tail history into compact heads.
+                self.append_op(op)
+            }
+            VersionMergeOp::MapRef {
+                shard,
+                payload_lsn,
+                from,
+                to,
+            } => self.map_ref(shard, payload_lsn, from, to),
             VersionMergeOp::RollbackFrom { shard, lsn } => self.rollback_from(shard, lsn),
         }
     }
@@ -214,6 +234,35 @@ impl VersionState {
     pub fn rollback_from(&mut self, shard: ShardKey, rollback_from: StrataLsn) {
         self.tail
             .retain(|op| op.shard != shard || op.lsn() < rollback_from);
+    }
+
+    pub fn map_ref(
+        &mut self,
+        shard: ShardKey,
+        payload_lsn: StrataLsn,
+        from: RecordRef,
+        to: RecordRef,
+    ) {
+        // `payload_lsn` identifies the exact payload version being relocated. Matching only `from`
+        // would corrupt a later version that reused the same physical ref: for example
+        // `put@7 -> A`, `put@9 -> A`, then `MapRef(payload_lsn=7, A -> B)` must leave `put@9`
+        // pointing at A. The same identity check works whether that payload is still in the tail or
+        // has already been folded into a compact head.
+        for op in self
+            .tail
+            .iter_mut()
+            .filter(|op| op.shard == shard && op.lsn() == payload_lsn)
+        {
+            map_entry_ref(&mut op.entry, from, to);
+        }
+
+        if let Some(head) = self
+            .heads
+            .get_mut(&shard)
+            .filter(|head| head.payload_lsn == Some(payload_lsn))
+        {
+            map_entry_ref(&mut head.entry, from, to);
+        }
     }
 
     pub fn resolve_head(&self, shard: ShardKey) -> Option<ShardHead> {
@@ -282,6 +331,12 @@ impl VersionState {
                 self.heads.insert(op.shard, ShardHead::from_op(op));
             }
         }
+    }
+}
+
+fn map_entry_ref(entry: &mut BlobEntry, from: RecordRef, to: RecordRef) {
+    if entry.is_live() && entry.record_ref == Some(from) {
+        entry.record_ref = Some(to);
     }
 }
 
@@ -648,5 +703,69 @@ mod tests {
         let other_head = state.resolve_head(OTHER_SHARD).unwrap();
         assert_eq!(other_head.head_lsn, 1);
         assert_eq!(other_head.entry.record_ref, Some(other_ref));
+    }
+
+    #[test]
+    fn map_ref_rewrites_exact_tail_payload_ref() {
+        let source = record_ref(1, 10);
+        let destination = record_ref(2, 20);
+        let mut state = VersionState::default();
+        state.append_op(op(SHARD, put_entry(7, source)));
+
+        state.apply_merge_op(VersionMergeOp::MapRef {
+            shard: SHARD,
+            payload_lsn: 7,
+            from: source,
+            to: destination,
+        });
+
+        let head = state.resolve_head(SHARD).unwrap();
+        assert_eq!(head.head_lsn, 7);
+        assert_eq!(head.entry.record_ref, Some(destination));
+    }
+
+    #[test]
+    fn map_ref_rewrites_exact_compacted_head_payload_ref() {
+        let source = record_ref(1, 10);
+        let destination = record_ref(2, 20);
+        let mut state = VersionState::default();
+        state.append_op(op(SHARD, put_entry(7, source)));
+        state.compact_through(7);
+
+        state.apply_merge_op(VersionMergeOp::MapRef {
+            shard: SHARD,
+            payload_lsn: 7,
+            from: source,
+            to: destination,
+        });
+
+        let head = state.resolve_head(SHARD).unwrap();
+        assert_eq!(head.entry.record_ref, Some(destination));
+    }
+
+    #[test]
+    fn map_ref_does_not_rewrite_mismatched_lsn_or_ref() {
+        let source = record_ref(1, 10);
+        let destination = record_ref(2, 20);
+        let mut state = VersionState::default();
+        state.append_op(op(SHARD, put_entry(7, source)));
+
+        state.apply_merge_ops([
+            VersionMergeOp::MapRef {
+                shard: SHARD,
+                payload_lsn: 6,
+                from: source,
+                to: destination,
+            },
+            VersionMergeOp::MapRef {
+                shard: SHARD,
+                payload_lsn: 7,
+                from: record_ref(9, 90),
+                to: destination,
+            },
+        ]);
+
+        let head = state.resolve_head(SHARD).unwrap();
+        assert_eq!(head.entry.record_ref, Some(source));
     }
 }

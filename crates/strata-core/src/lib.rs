@@ -1,7 +1,7 @@
 //! Stable storage vocabulary and record wire format shared by all Strata crates.
 //!
 //! This crate owns the types that are used everywhere: blob keys, record headers, and segment metadata.
-//! Record v3 is append-friendly and self-validating:
+//! Record v4 is append-friendly and self-validating:
 //!
 //! ```text
 //! +----------------------+----------------------+----------------------+
@@ -10,7 +10,7 @@
 //!
 //! fixed header:
 //!   magic | version | header_len | key_len | generation | payload_len
-//!   xxh3_128_checksum | checksum_algorithm
+//!   xxh3_128_checksum | checksum_algorithm | shard_id | shard_generation
 //! ```
 //!
 //! The record checksum is computed over:
@@ -44,10 +44,12 @@ pub use lifecycle::{
     StrataStoreState, VersionMergeOp, VersionOp, VersionState,
 };
 pub use record::{
-    DecodedRecord, EncodedRecordParts, FIXED_RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_VERSION,
-    RecordHeader, RecordHeaderFields, encoded_record_len,
+    DEFAULT_RECORD_SHARD, DecodedRecord, EncodedRecordParts, FIXED_RECORD_HEADER_LEN, RECORD_MAGIC,
+    RECORD_VERSION, RecordHeader, RecordHeaderFields, encoded_record_len,
 };
 pub use segment::{
-    EpochBucket, PlacementClass, SegmentFileState, SegmentId, SegmentKey, SegmentState,
-    SegmentStats, VolumeId,
+    EpochBucket, PlacementClass, SegmentFileState, SegmentGcLifetimeRange, SegmentGcLifetimeUpdate,
+    SegmentGcOverlay, SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, SegmentKey,
+    SegmentRefEvent, SegmentRefEventKey, SegmentRefKey, SegmentRefState, SegmentRefStatus,
+    SegmentState, SegmentStats, VolumeId,
 };

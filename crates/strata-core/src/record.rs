@@ -1,15 +1,21 @@
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::{BlobKey, Checksum, ChecksumAlgorithm, Error, Generation, Result};
+use crate::{BlobKey, Checksum, ChecksumAlgorithm, Error, Generation, Result, ShardKey};
 
 pub const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"STR0");
-pub const RECORD_VERSION: u16 = 3;
-pub const FIXED_RECORD_HEADER_LEN: usize = 48;
+pub const RECORD_VERSION: u16 = 4;
+pub const FIXED_RECORD_HEADER_LEN: usize = 64;
 const MAX_PAYLOAD_LEN: u64 = 1 << 40;
 const RECORD_CHECKSUM_OFFSET: usize = 28;
 const RECORD_CHECKSUM_LEN: usize = 16;
 const RECORD_CHECKSUM_ALGORITHM_OFFSET: usize = RECORD_CHECKSUM_OFFSET + RECORD_CHECKSUM_LEN;
+const RECORD_SHARD_ID_OFFSET: usize = 48;
+const RECORD_SHARD_GENERATION_OFFSET: usize = 52;
+pub const DEFAULT_RECORD_SHARD: ShardKey = ShardKey {
+    id: 0,
+    generation: 0,
+};
 
 /// Logical fields needed to build a Strata record header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +23,7 @@ pub struct RecordHeaderFields {
     pub key_len: u32,
     pub generation: Generation,
     pub payload_len: u64,
+    pub shard: ShardKey,
 }
 
 /// Fixed header fields for a Strata record.
@@ -29,6 +36,7 @@ pub struct RecordHeader {
     pub generation: Generation,
     pub payload_len: u64,
     pub record_checksum: Checksum,
+    pub shard: ShardKey,
 }
 
 impl RecordHeader {
@@ -42,6 +50,7 @@ impl RecordHeader {
             generation: fields.generation,
             payload_len: fields.payload_len,
             record_checksum: Checksum::xxh3_128_value(0),
+            shard: fields.shard,
         })
     }
 
@@ -86,6 +95,10 @@ impl RecordHeader {
             .copy_from_slice(&self.record_checksum.value.to_le_bytes());
         output[RECORD_CHECKSUM_ALGORITHM_OFFSET..RECORD_CHECKSUM_ALGORITHM_OFFSET + 4]
             .copy_from_slice(&self.record_checksum.algorithm.code().to_le_bytes());
+        output[RECORD_SHARD_ID_OFFSET..RECORD_SHARD_ID_OFFSET + 4]
+            .copy_from_slice(&self.shard.id.to_le_bytes());
+        output[RECORD_SHARD_GENERATION_OFFSET..RECORD_SHARD_GENERATION_OFFSET + 8]
+            .copy_from_slice(&self.shard.generation.to_le_bytes());
     }
 }
 
@@ -95,6 +108,7 @@ pub fn encoded_record_len(key: &BlobKey, payload_len: usize) -> Result<u64> {
         key_len: key.len() as u32,
         generation: 0,
         payload_len,
+        shard: DEFAULT_RECORD_SHARD,
     })?
     .encoded_record_len()
 }
@@ -113,10 +127,20 @@ pub struct EncodedRecordParts<'a> {
 
 impl<'a> EncodedRecordParts<'a> {
     pub fn new(key: &'a BlobKey, generation: Generation, payload: &'a [u8]) -> Result<Self> {
+        Self::new_with_shard(key, generation, DEFAULT_RECORD_SHARD, payload)
+    }
+
+    pub fn new_with_shard(
+        key: &'a BlobKey,
+        generation: Generation,
+        shard: ShardKey,
+        payload: &'a [u8],
+    ) -> Result<Self> {
         let mut header = RecordHeader::new(RecordHeaderFields {
             key_len: key.len() as u32,
             generation,
             payload_len: payload.len() as u64,
+            shard,
         })?;
         let record_len = header.encoded_record_len()?;
         let mut encoded_header = header.encode_fixed();
@@ -200,6 +224,10 @@ impl DecodedRecord {
             generation: read_u64(input, 12),
             payload_len: read_u64(input, 20),
             record_checksum,
+            shard: ShardKey {
+                id: read_u32(input, RECORD_SHARD_ID_OFFSET),
+                generation: read_u64(input, RECORD_SHARD_GENERATION_OFFSET),
+            },
         };
         validate_lengths(header.key_len as usize, header.payload_len)?;
         Ok(header)
@@ -374,6 +402,25 @@ mod tests {
             decoded.header.record_checksum.algorithm,
             ChecksumAlgorithm::Xxh3_128
         );
+    }
+
+    #[test]
+    fn round_trips_record_shard() {
+        let key = BlobKey::new(b"blob-1".to_vec()).unwrap();
+        let payload = b"payload bytes".to_vec();
+        let shard = ShardKey {
+            id: 17,
+            generation: 3,
+        };
+        let encoded = EncodedRecordParts::new_with_shard(&key, 7, shard, &payload)
+            .unwrap()
+            .to_vec();
+
+        let decoded = DecodedRecord::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.header.shard, shard);
+        assert_eq!(decoded.key, key);
+        assert_eq!(decoded.payload, payload);
     }
 
     #[test]
