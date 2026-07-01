@@ -2,8 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
-    sync::mpsc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use strata_core::{
@@ -11,15 +11,16 @@ use strata_core::{
     SegmentGcRecordRange, SegmentId, SegmentState, StrataLsn,
 };
 use strata_gc::{
-    DestinationClass, GcAction, GcCopyRecord, GcCopySelection, GcPlan, GcPlanner, GcSourceRecord,
-    select_copy_records,
+    DestinationClass, GcAction, GcCopyRecord, GcCopySelection, GcPlan, GcPlanner, GcSnapshot,
+    GcSourceRecord, select_copy_records,
 };
-use strata_index::AccountingSnapshotGuard;
+use strata_index::{AccountingSnapshotGuard, StrataIndex};
 use strata_segment::{SegmentReader, SegmentScanner, SegmentWriter};
 
 use crate::{
     Error, GcPublishRequest, Result, StrataStore, WriteCommand,
     layout::{segment_path, segment_state_path},
+    metrics::StrataStoreMetrics,
     seal::sha256_file_prefix,
 };
 
@@ -38,6 +39,9 @@ pub struct PreparedGcPlan {
     /// `None` means the plan is metadata-only, such as deleting an empty segment or reclassifying a
     /// segment whose pinned bytes are too expensive to copy in this run.
     pub copy_selection: Option<GcCopySelection>,
+    /// In-memory source segment claim held until this plan is copied or dropped.
+    #[doc(hidden)]
+    pub claim: Option<GcSourceClaimGuard>,
 }
 
 /// Bytes copied into GC staging files, ready for a later publish/finalize step.
@@ -55,6 +59,9 @@ pub struct PreparedGcCopy {
     pub outputs: Vec<GcStagedOutputSegment>,
     /// Source-to-staged-record mapping for later `MapRef` publication.
     pub copied_records: Vec<GcStagedCopiedRecord>,
+    /// In-memory source segment claim held until publish completes or this copy is dropped.
+    #[doc(hidden)]
+    pub claim: Option<GcSourceClaimGuard>,
 }
 
 /// Result of publishing staged GC copies into durable Strata metadata.
@@ -152,9 +159,201 @@ impl GcAccountingLag {
     }
 }
 
+/// In-memory ownership table for source segments currently used by GC jobs.
+#[derive(Debug, Default)]
+pub(crate) struct GcSourceClaims {
+    claimed: Mutex<BTreeSet<SegmentId>>,
+}
+
+impl GcSourceClaims {
+    pub(crate) fn try_claim(
+        self: &Arc<Self>,
+        segments: BTreeSet<SegmentId>,
+    ) -> Option<GcSourceClaimGuard> {
+        let mut claimed = self.claimed.lock().expect("gc source claims lock poisoned");
+        if segments
+            .iter()
+            .any(|segment_id| claimed.contains(segment_id))
+        {
+            return None;
+        }
+        claimed.extend(segments.iter().copied());
+        Some(GcSourceClaimGuard {
+            claims: Arc::clone(self),
+            segments,
+        })
+    }
+
+    fn mark_snapshot(&self, snapshot: &mut GcSnapshot) {
+        let claimed = self.claimed.lock().expect("gc source claims lock poisoned");
+        for segment in &mut snapshot.segments {
+            if claimed.contains(&segment.state.segment_id) {
+                segment.claimed = true;
+            }
+        }
+    }
+}
+
+/// Releases in-memory GC source claims when dropped.
+#[derive(Debug)]
+pub struct GcSourceClaimGuard {
+    claims: Arc<GcSourceClaims>,
+    segments: BTreeSet<SegmentId>,
+}
+
+impl Drop for GcSourceClaimGuard {
+    fn drop(&mut self) {
+        let mut claimed = self
+            .claims
+            .claimed
+            .lock()
+            .expect("gc source claims lock poisoned");
+        for segment_id in &self.segments {
+            claimed.remove(segment_id);
+        }
+    }
+}
+
+pub(crate) enum GcCommand {
+    /// Ask the background worker to run one GC attempt immediately.
+    Run,
+    /// Stop the worker during store shutdown.
+    Shutdown,
+}
+
+pub(crate) struct GcWorker {
+    pub(crate) executor: GcExecutor,
+    pub(crate) planner: GcPlanner,
+    pub(crate) interval: Duration,
+    pub(crate) command_rx: mpsc::Receiver<GcCommand>,
+}
+
+impl GcWorker {
+    pub(crate) fn run(self) {
+        loop {
+            match self.command_rx.recv_timeout(self.interval) {
+                Ok(GcCommand::Run) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = self.executor.run_once(&self.planner);
+                }
+                Ok(GcCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GcExecutor {
+    pub(crate) config: crate::StrataStoreConfig,
+    pub(crate) index: StrataIndex,
+    pub(crate) write_tx: mpsc::SyncSender<WriteCommand>,
+    pub(crate) accounting_lock: Arc<Mutex<()>>,
+    pub(crate) claims: Arc<GcSourceClaims>,
+    pub(crate) metrics: StrataStoreMetrics,
+}
+
 impl StrataStore {
+    fn gc_executor(&self) -> Result<GcExecutor> {
+        Ok(GcExecutor {
+            config: self.config.clone(),
+            index: self.index.clone(),
+            write_tx: self
+                .write_tx
+                .as_ref()
+                .ok_or(Error::WriteQueueClosed)?
+                .clone(),
+            accounting_lock: Arc::clone(&self.accounting_lock),
+            claims: Arc::clone(&self.gc_claims),
+            metrics: self.metrics.clone(),
+        })
+    }
+
+    /// Wakes the production GC worker for one immediate attempt.
+    pub fn request_gc(&self) -> Result<()> {
+        if self.gc_txs.is_empty() {
+            return Err(Error::GcQueueClosed);
+        }
+        for gc_tx in &self.gc_txs {
+            gc_tx
+                .send(GcCommand::Run)
+                .map_err(|_| Error::GcQueueClosed)?;
+        }
+        Ok(())
+    }
+
+    /// Runs one GC plan synchronously using the store's configured planner policy.
+    pub fn run_gc_once(&self) -> Result<Option<GcPublishResult>> {
+        let planner = GcPlanner::new(self.config.gc_planner_config.clone());
+        self.gc_executor()?.run_once(&planner)
+    }
+
     /// Reports the accounting lag GC would use for admission control.
     pub fn gc_accounting_lag(&self) -> Result<GcAccountingLag> {
+        self.gc_executor()?.gc_accounting_lag()
+    }
+
+    /// Returns a lag snapshot when the configured GC accounting-lag gate would defer a new run.
+    pub fn gc_deferred_by_accounting_lag(&self) -> Result<Option<GcAccountingLag>> {
+        self.gc_executor()?.gc_deferred_by_accounting_lag()
+    }
+
+    /// Prepares one GC plan using real segment files and the segment GC overlay.
+    ///
+    /// This is the bridge from pure planning to execution. It creates an accounting snapshot guard,
+    /// builds the GC planning view from that guard, asks the planner for one plan, scans every
+    /// source segment named by copy actions, applies dead/lifetime overlay ranges, and validates
+    /// exact copy records against the aggregate route estimates. It does not copy bytes or publish
+    /// metadata.
+    pub fn prepare_gc_plan(&self, planner: &GcPlanner) -> Result<Option<PreparedGcPlan>> {
+        self.gc_executor()?.prepare_gc_plan(planner)
+    }
+
+    /// Copies selected GC records into sealed staging files.
+    ///
+    /// This consumes a `PreparedGcPlan` so the accounting snapshot guard moves forward with the
+    /// copied bytes. The method does not publish `MapRef` operations or create durable segment
+    /// metadata for the outputs; that is the next step, after reconciling accounting changes since
+    /// `accounting_snapshot`.
+    pub fn copy_prepared_gc_plan(&self, prepared: PreparedGcPlan) -> Result<PreparedGcCopy> {
+        self.gc_executor()?.copy_prepared_gc_plan(prepared)
+    }
+
+    /// Publishes staged GC copies through the serialized writer path.
+    ///
+    /// This method pauses accounting before it enters the writer queue, so the writer thread never
+    /// blocks waiting for a long-running sidecar pass. The writer still assigns the final LSN range
+    /// and commits metadata in order with user writes; any user writes that were already ahead of
+    /// this command in the queue have lower LSNs and are handled later by relocation forwarding.
+    pub fn publish_prepared_gc_copy(&self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
+        self.gc_executor()?.publish_prepared_gc_copy(copy)
+    }
+}
+
+impl GcExecutor {
+    pub(crate) fn run_once(&self, planner: &GcPlanner) -> Result<Option<GcPublishResult>> {
+        let Some(prepared) = self.prepare_gc_plan(planner)? else {
+            return Ok(None);
+        };
+        let copy = self.copy_prepared_gc_plan(prepared)?;
+        self.publish_prepared_gc_copy(copy).map(Some)
+    }
+
+    fn send_write_command(&self, command: WriteCommand) -> Result<()> {
+        let started = Instant::now();
+        self.metrics.enqueue_write_command();
+        let result = self
+            .write_tx
+            .send(command)
+            .map_err(|_| Error::WriteQueueClosed);
+        if result.is_err() {
+            self.metrics.dequeue_write_command();
+        }
+        self.metrics
+            .record_write_queue_send(result.is_ok(), started.elapsed());
+        result
+    }
+
+    /// Reports the accounting lag GC would use for admission control.
+    pub(crate) fn gc_accounting_lag(&self) -> Result<GcAccountingLag> {
         let durable_lsn = self.index.get_durable_lsn()?;
         let accounted_lsn = self.index.get_accounted_lsn()?;
         Ok(GcAccountingLag {
@@ -166,7 +365,7 @@ impl StrataStore {
     }
 
     /// Returns a lag snapshot when the configured GC accounting-lag gate would defer a new run.
-    pub fn gc_deferred_by_accounting_lag(&self) -> Result<Option<GcAccountingLag>> {
+    pub(crate) fn gc_deferred_by_accounting_lag(&self) -> Result<Option<GcAccountingLag>> {
         let lag = self.gc_accounting_lag()?;
         Ok(lag.exceeds_configured_limit().then_some(lag))
     }
@@ -178,29 +377,35 @@ impl StrataStore {
     /// source segment named by copy actions, applies dead/lifetime overlay ranges, and validates
     /// exact copy records against the aggregate route estimates. It does not copy bytes or publish
     /// metadata.
-    pub fn prepare_gc_plan(&self, planner: &GcPlanner) -> Result<Option<PreparedGcPlan>> {
+    pub(crate) fn prepare_gc_plan(&self, planner: &GcPlanner) -> Result<Option<PreparedGcPlan>> {
         if self.gc_deferred_by_accounting_lag()?.is_some() {
             return Ok(None);
         }
 
-        let accounting_snapshot = self.create_accounting_snapshot()?;
-        let Some(snapshot) = self.index.build_gc_snapshot(&accounting_snapshot)? else {
+        let accounting_snapshot = self.index.create_accounting_snapshot()?;
+        let Some(mut snapshot) = self.index.build_gc_snapshot(&accounting_snapshot)? else {
             return Ok(None);
         };
-        let Some(plan) = planner.plan(&snapshot) else {
-            return Ok(None);
-        };
-        let copy_selection = if plan_has_copy_action(&plan) {
-            Some(self.select_gc_copy_records(&plan)?)
-        } else {
-            None
-        };
+        self.claims.mark_snapshot(&mut snapshot);
+        for plan in planner.plans(&snapshot) {
+            let source_segments = gc_plan_source_segment_ids(&plan);
+            let Some(claim) = self.claims.try_claim(source_segments) else {
+                continue;
+            };
+            let copy_selection = if plan_has_copy_action(&plan) {
+                Some(self.select_gc_copy_records(&plan)?)
+            } else {
+                None
+            };
 
-        Ok(Some(PreparedGcPlan {
-            accounting_snapshot,
-            plan,
-            copy_selection,
-        }))
+            return Ok(Some(PreparedGcPlan {
+                accounting_snapshot,
+                plan,
+                copy_selection,
+                claim: Some(claim),
+            }));
+        }
+        Ok(None)
     }
 
     fn select_gc_copy_records(&self, plan: &GcPlan) -> Result<GcCopySelection> {
@@ -272,6 +477,7 @@ impl StrataStore {
             accounting_snapshot,
             plan,
             copy_selection,
+            claim,
         } = prepared;
         let records = copy_selection
             .as_ref()
@@ -283,6 +489,7 @@ impl StrataStore {
                 plan,
                 outputs: Vec::new(),
                 copied_records: Vec::new(),
+                claim,
             });
         }
 
@@ -301,6 +508,7 @@ impl StrataStore {
             plan,
             outputs,
             copied_records,
+            claim,
         })
     }
 
@@ -602,6 +810,20 @@ fn copy_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
                 source_ids.extend(routes.iter().map(|route| route.source_segment_id));
             }
             GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {}
+        }
+    }
+    source_ids
+}
+
+fn gc_plan_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
+    let mut source_ids = copy_source_segment_ids(plan);
+    for action in &plan.actions {
+        match action {
+            GcAction::DeleteSegment { segment_id }
+            | GcAction::ReclassifySegment { segment_id, .. } => {
+                source_ids.insert(*segment_id);
+            }
+            GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {}
         }
     }
     source_ids

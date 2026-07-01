@@ -36,7 +36,8 @@ use strata_store::{
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile,
+    DEFAULT_GC_INTERVAL, DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_WORKER_COUNT,
+    GcPlannerConfig, ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile,
     StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
 
@@ -318,6 +319,9 @@ impl Config {
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
             accounting_sidecar_major_patch_bytes_threshold:
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+            gc_interval: DEFAULT_GC_INTERVAL,
+            gc_worker_count: DEFAULT_GC_WORKER_COUNT,
+            gc_planner_config: GcPlannerConfig::default(),
             gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             starting_epoch: self.starting_epoch,
         }

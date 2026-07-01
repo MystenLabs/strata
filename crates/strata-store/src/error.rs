@@ -59,6 +59,9 @@ pub enum Error {
     #[error("seal queue is closed")]
     SealQueueClosed,
 
+    #[error("gc queue is closed")]
+    GcQueueClosed,
+
     #[error("epoch metadata is not initialized")]
     EpochNotInitialized,
 

@@ -1,6 +1,7 @@
 use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use strata_core::{Epoch, StrataLsn};
+use strata_gc::GcPlannerConfig;
 
 const INGEST_DIR: &str = "ingest";
 const INDEX_DIR: &str = "index";
@@ -16,6 +17,8 @@ pub const DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD: usize = 8;
 pub const DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD: usize = 8;
 pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_GC_WORKER_COUNT: usize = 1;
 pub const DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN: Option<StrataLsn> = None;
 
 /// Runtime configuration for one Strata store namespace.
@@ -38,6 +41,12 @@ pub struct StrataStoreConfig {
     pub accounting_sidecar_delta_run_bytes_threshold: u64,
     pub accounting_sidecar_major_patch_count_threshold: usize,
     pub accounting_sidecar_major_patch_bytes_threshold: u64,
+    /// Background GC cadence for one planning/copy/publish attempt.
+    pub gc_interval: Duration,
+    /// Number of background GC workers that may plan/copy disjoint source segments concurrently.
+    pub gc_worker_count: usize,
+    /// Policy knobs used by the background GC planner.
+    pub gc_planner_config: GcPlannerConfig,
     /// Optional GC admission limit measured as `durable_lsn - accounted_lsn`.
     ///
     /// This is an efficiency gate, not a correctness barrier. If set, new GC planning/copy work is

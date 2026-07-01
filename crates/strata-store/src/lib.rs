@@ -161,14 +161,16 @@ pub use config::{
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
-    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStoreConfig,
+    DEFAULT_GC_INTERVAL, DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_WORKER_COUNT,
+    DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
+    StrataStoreConfig,
 };
 pub use error::{Error, Result};
 pub use gc::{
     GcAccountingLag, GcPublishResult, GcPublishedOutputSegment, GcPublishedRecord,
     GcStagedCopiedRecord, GcStagedOutputSegment, PreparedGcCopy, PreparedGcPlan,
 };
+use gc::{GcCommand, GcExecutor, GcSourceClaims, GcWorker};
 use layout::{parse_segment_file_name, relative_segment_path, segment_path, segment_state_path};
 use metrics::PutMetric;
 pub use metrics::StrataStoreMetrics;
@@ -179,6 +181,7 @@ use seal::{
     durable_lsn_with_accounting_frontier, enqueue_unsealed_segments_for_sealing,
     verify_sealed_segments,
 };
+pub use strata_gc::{GcPlanner, GcPlannerConfig};
 
 const FIRST_SEGMENT_ID: SegmentId = 1;
 /// How long the writer naps while waiting for the sealer to drain its backlog. Short, because
@@ -199,13 +202,16 @@ pub(crate) const STORE_SCOPE: ShardKey = STANDALONE_SHARD;
 pub struct StrataStore {
     pub(crate) config: StrataStoreConfig,
     pub(crate) index: StrataIndex,
-    write_tx: Option<mpsc::SyncSender<WriteCommand>>,
+    pub(crate) write_tx: Option<mpsc::SyncSender<WriteCommand>>,
     writer_handle: Option<JoinHandle<()>>,
     seal_tx: Option<mpsc::Sender<SealCommand>>,
     seal_handle: Option<JoinHandle<()>>,
     accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
     accounting_handle: Option<JoinHandle<()>>,
+    pub(crate) gc_txs: Vec<mpsc::Sender<GcCommand>>,
+    gc_handles: Vec<JoinHandle<()>>,
     pub(crate) accounting_lock: Arc<Mutex<()>>,
+    pub(crate) gc_claims: Arc<GcSourceClaims>,
     pub(crate) reader_cache: Arc<SegmentReaderCache>,
     metrics: StrataStoreMetrics,
 }
@@ -257,9 +263,9 @@ impl StrataStore {
     ///    frontier is recomputed.
     /// 3. Sealed segments are only *verified*; they were declared immutable at seal time, so
     ///    anything wrong with them is an error, not something to repair silently.
-    /// 4. Only then are the three workers started: sealer first (the writer hands rollovers to
-    ///    it), then the writer, with the accounting worker spawned alongside since both the
-    ///    writer and sealer nudge it.
+    /// 4. Only then are the workers started: sealer first (the writer hands rollovers to it), then
+    ///    the writer, with accounting spawned alongside since both the writer and sealer nudge it.
+    ///    GC starts after the writer because GC publish uses the same serialized write queue.
     ///
     /// Everything mutable ends up owned by the writer thread; the `StrataStore` handle itself
     /// only holds channels, the index, and the read-side cache.
@@ -302,6 +308,7 @@ impl StrataStore {
         let (seal_tx, seal_rx) = mpsc::channel();
         let (accounting_tx, accounting_rx) = mpsc::sync_channel(1);
         let accounting_lock = Arc::new(Mutex::new(()));
+        let gc_claims = Arc::new(GcSourceClaims::default());
         let accounting_worker = AccountingWorker {
             config: config.clone(),
             index: index.clone(),
@@ -350,6 +357,42 @@ impl StrataStore {
             .name(format!("strata-writer-{}", config.namespace))
             .spawn(move || coordinator.run())
             .map_err(|source| Error::ThreadSpawn { source })?;
+        let mut gc_txs = Vec::with_capacity(config.gc_worker_count);
+        let mut gc_handles = Vec::with_capacity(config.gc_worker_count);
+        for worker_index in 0..config.gc_worker_count {
+            let (gc_tx, gc_rx) = mpsc::channel();
+            let gc_worker = GcWorker {
+                executor: GcExecutor {
+                    config: config.clone(),
+                    index: index.clone(),
+                    write_tx: write_tx.clone(),
+                    accounting_lock: Arc::clone(&accounting_lock),
+                    claims: Arc::clone(&gc_claims),
+                    metrics: metrics.clone(),
+                },
+                planner: GcPlanner::new(config.gc_planner_config.clone()),
+                interval: config.gc_interval,
+                command_rx: gc_rx,
+            };
+            match thread::Builder::new()
+                .name(format!("strata-gc-{}-{worker_index}", config.namespace))
+                .spawn(move || gc_worker.run())
+            {
+                Ok(gc_handle) => {
+                    gc_txs.push(gc_tx);
+                    gc_handles.push(gc_handle);
+                }
+                Err(source) => {
+                    for gc_tx in gc_txs {
+                        let _ = gc_tx.send(GcCommand::Shutdown);
+                    }
+                    for gc_handle in gc_handles {
+                        let _ = gc_handle.join();
+                    }
+                    return Err(Error::ThreadSpawn { source });
+                }
+            }
+        }
 
         Ok(Self {
             reader_cache,
@@ -361,7 +404,10 @@ impl StrataStore {
             seal_handle: Some(seal_handle),
             accounting_tx: Some(accounting_tx),
             accounting_handle: Some(accounting_handle),
+            gc_txs,
+            gc_handles,
             accounting_lock,
+            gc_claims,
             metrics,
         })
     }
@@ -614,12 +660,17 @@ impl StrataStore {
     }
 }
 
-// Shutdown order matters: the writer goes first because it is the only producer for the sealer
-// and accounting channels — once it has drained and exited, shutting the others down can't lose
-// work that the writer was still about to hand over. Joins are best-effort; a panicked worker
-// shouldn't turn drop into a second panic.
+// Shutdown order matters: GC goes first because it publishes through the writer queue. Then the
+// writer drains and exits before the sealer/accounting workers it can still nudge. Joins are
+// best-effort; a panicked worker shouldn't turn drop into a second panic.
 impl Drop for StrataStore {
     fn drop(&mut self) {
+        for gc_tx in self.gc_txs.drain(..) {
+            let _ = gc_tx.send(GcCommand::Shutdown);
+        }
+        for gc_handle in self.gc_handles.drain(..) {
+            let _ = gc_handle.join();
+        }
         if let Some(write_tx) = self.write_tx.take() {
             let _ = write_tx.send(WriteCommand::Shutdown);
         }
@@ -3473,6 +3524,12 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
             "accounting_sidecar_interval must be non-zero",
         ));
     }
+    if config.gc_interval.is_zero() {
+        return Err(Error::InvalidConfig("gc_interval must be non-zero"));
+    }
+    if config.gc_worker_count == 0 {
+        return Err(Error::InvalidConfig("gc_worker_count must be non-zero"));
+    }
     Ok(())
 }
 
@@ -3554,6 +3611,7 @@ mod tests {
         ops::Deref,
         path::Path,
         sync::{Once, mpsc},
+        thread,
         time::{Duration, Instant},
     };
 
@@ -3772,6 +3830,9 @@ mod tests {
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
             accounting_sidecar_major_patch_bytes_threshold:
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+            gc_interval: Duration::from_secs(3600),
+            gc_worker_count: DEFAULT_GC_WORKER_COUNT,
+            gc_planner_config: GcPlannerConfig::default(),
             gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             starting_epoch: 42,
         }
@@ -6058,6 +6119,7 @@ mod tests {
             },
             outputs: Vec::new(),
             copied_records: Vec::new(),
+            claim: None,
         };
 
         let published = store.publish_prepared_gc_copy(copy).unwrap();
@@ -6092,6 +6154,7 @@ mod tests {
             },
             outputs: Vec::new(),
             copied_records: Vec::new(),
+            claim: None,
         };
 
         let accounting_lock = store.store.accounting_lock.clone();
@@ -6118,6 +6181,70 @@ mod tests {
             assert!(publish.join().unwrap().is_ok());
             put.join().unwrap();
         });
+    }
+
+    #[tokio::test]
+    async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+        let larger_segment_id = 10;
+        let smaller_segment_id = 11;
+        for (segment_id, bytes) in [(larger_segment_id, 100), (smaller_segment_id, 10)] {
+            let state = SegmentState {
+                shard: STORE_SCOPE,
+                segment_id,
+                volume_id: 0,
+                path: format!("ingest/{segment_id:012}.data"),
+                placement_class: PlacementClass::Spillover,
+                state: SegmentFileState::Sealed,
+                write_offset: bytes,
+                durable_offset: bytes,
+                min_lsn: Some(0),
+                max_lsn: Some(0),
+                sealed_len: Some(bytes),
+                sealed_sha256: None,
+            };
+            let mut batch = store.index().batch();
+            store
+                .index()
+                .put_segment_state_batch(&mut batch, &state)
+                .unwrap();
+            store
+                .index()
+                .merge_segment_gc_overlay_batch(
+                    &mut batch,
+                    segment_id,
+                    vec![SegmentGcOverlayMergeOp::AddRetiredBatch {
+                        ranges: vec![SegmentGcRecordRange {
+                            offset: 0,
+                            len: bytes,
+                        }],
+                    }],
+                )
+                .unwrap();
+            batch.write().unwrap();
+        }
+        store.index().flush_wal(true).unwrap();
+
+        let _claim = store
+            .store
+            .gc_claims
+            .try_claim(BTreeSet::from([larger_segment_id]))
+            .unwrap();
+        let prepared = store
+            .prepare_gc_plan(&GcPlanner::new(GcPlannerConfig::default()))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            prepared.plan.actions,
+            vec![GcAction::DeleteSegment {
+                segment_id: smaller_segment_id
+            }]
+        );
     }
 
     #[tokio::test]
@@ -6318,6 +6445,116 @@ mod tests {
         assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
         assert_eq!(store.get(&key_a).unwrap(), None);
         assert!(lsn_a < lsn_b);
+    }
+
+    #[tokio::test]
+    async fn gc_worker_request_runs_production_gc_plan() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        store.sync().unwrap();
+        let sealed_state =
+            wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        let sealed_path = segment_state_path(store.config(), &sealed_state);
+        wait_for_accounted_lsn(&store, lsn_b);
+
+        let tombstone_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+        store.request_gc().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = store
+                .index()
+                .get_segment_state(FIRST_SEGMENT_ID)
+                .unwrap()
+                .unwrap();
+            if state.state == SegmentFileState::Deleted && !sealed_path.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gc worker did not delete segment and remove file"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+        assert_eq!(store.get(&key_a).unwrap(), None);
+        assert!(lsn_a < lsn_b);
+    }
+
+    #[tokio::test]
+    async fn gc_worker_count_broadcasts_request_to_parallel_workers() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+        cfg.gc_worker_count = 2;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let _lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+        store.sync().unwrap();
+        let first_state =
+            wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        let second_segment_id = FIRST_SEGMENT_ID + 1;
+        let second_state =
+            wait_for_segment_state(store.index(), second_segment_id, SegmentFileState::Sealed);
+        let first_path = segment_state_path(store.config(), &first_state);
+        let second_path = segment_state_path(store.config(), &second_state);
+        wait_for_accounted_lsn(&store, lsn_c);
+
+        store.tombstone(&key_a).unwrap();
+        let tombstone_lsn_b = store.tombstone(&key_b).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn_b);
+        assert_eq!(store.store.gc_txs.len(), 2);
+
+        store.request_gc().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let first_deleted = store
+                .index()
+                .get_segment_state(FIRST_SEGMENT_ID)
+                .unwrap()
+                .unwrap()
+                .state
+                == SegmentFileState::Deleted;
+            let second_deleted = store
+                .index()
+                .get_segment_state(second_segment_id)
+                .unwrap()
+                .unwrap()
+                .state
+                == SegmentFileState::Deleted;
+            if first_deleted && second_deleted && !first_path.exists() && !second_path.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "two-worker GC request did not delete both empty source segments"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(store.get(&key_a).unwrap(), None);
+        assert_eq!(store.get(&key_b).unwrap(), None);
+        assert_eq!(store.get(&key_c).unwrap(), Some(b"payload-c".to_vec()));
+        assert!(lsn_b < lsn_c);
     }
 
     #[tokio::test]

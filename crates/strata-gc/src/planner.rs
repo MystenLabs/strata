@@ -277,23 +277,30 @@ impl GcPlanner {
     }
 
     pub fn plan(&self, snapshot: &GcSnapshot) -> Option<GcPlan> {
-        self.best_empty_delete(snapshot).or_else(|| {
-            let mut candidates = Vec::new();
-            candidates.extend(self.l0_candidates(snapshot));
-            candidates.extend(self.dead_ref_candidates(snapshot));
-            candidates.extend(self.join_multiple_candidates(snapshot));
-            candidates.extend(self.pinned_epoch_candidates(snapshot));
-            candidates.into_iter().max_by_key(|plan| plan.score)
-        })
+        self.plans(snapshot).into_iter().next()
     }
 
-    fn best_empty_delete(&self, snapshot: &GcSnapshot) -> Option<GcPlan> {
+    pub fn plans(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
+        let mut empty_deletes = self.empty_delete_candidates(snapshot);
+        empty_deletes.sort_by(|left, right| right.score.cmp(&left.score));
+
+        let mut candidates = Vec::new();
+        candidates.extend(self.l0_candidates(snapshot));
+        candidates.extend(self.dead_ref_candidates(snapshot));
+        candidates.extend(self.join_multiple_candidates(snapshot));
+        candidates.extend(self.pinned_epoch_candidates(snapshot));
+        candidates.sort_by(|left, right| right.score.cmp(&left.score));
+
+        empty_deletes.extend(candidates);
+        empty_deletes
+    }
+
+    fn empty_delete_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
         snapshot
             .segments
             .iter()
             .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
             .filter(|segment| segment.summary.live_ref_count == 0)
-            .max_by_key(|segment| segment.summary.total_bytes)
             .map(|segment| GcPlan {
                 scenario: GcScenario::EmptyDelete,
                 actions: vec![GcAction::DeleteSegment {
@@ -303,6 +310,7 @@ impl GcPlanner {
                 expected_reclaim_bytes: segment.summary.total_bytes,
                 score: i128::from(segment.summary.total_bytes) * 10_000,
             })
+            .collect()
     }
 
     fn l0_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
