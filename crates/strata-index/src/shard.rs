@@ -102,7 +102,7 @@ impl StrataIndex {
     ) -> Result<()> {
         // Dropping a shard generation removes metadata keyed by the full physical generation, not
         // just the logical shard id. That keeps a later reincarnation of the same shard id from
-        // inheriting segment manifests or stats that belonged to the old writer.
+        // inheriting segment manifests that belonged to the old writer.
         let segment_state_keys = self
             .segment_states
             .safe_iter()?
@@ -114,18 +114,6 @@ impl StrataIndex {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)?;
         batch.delete_batch(&self.segment_states, segment_state_keys)?;
-
-        let segment_stats_keys = self
-            .segment_stats
-            .safe_iter()?
-            .filter_map(|result| match result {
-                Ok((key, _)) if key.shard == shard => Some(Ok(key)),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)?;
-        batch.delete_batch(&self.segment_stats, segment_stats_keys)?;
 
         Ok(())
     }

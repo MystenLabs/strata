@@ -92,7 +92,7 @@
 //! StrataStore::set_blob_lifetime
 //!   -> append a metadata-only blob lifecycle op
 //!   -> do not read segment state
-//!   -> do not update segment stats
+//!   -> do not update GC overlay summary/ranges
 //! ```
 //!
 //! Reads resolve payload and lifecycle state from the packed `blob_versions` row. The lifecycle
@@ -107,28 +107,29 @@
 //!   -> write immutable sidecar delta runs and publish manifest + consumed cursor together
 //!   -> compact delta runs into patch runs
 //!   -> major-compact patches/base state, producing ordered ref events
-//!   -> apply those events to segment stats, ref states, ref events, and GC overlays
+//!   -> apply those events to segment ref events and GC overlay summary/ranges
 //!   -> advance accounted_lsn while sidecar materialization covers the next durable LSN
 //! ```
 //!
-//! The accounting worker is the *only* writer of segment stats. The foreground write path never
-//! reads or writes stats; it only appends cheap accounting deltas. Stats lag durability by design:
-//! `accounted_lsn` says how far sidecar compaction events have been reflected in the GC-facing
-//! rows. The sidecar manifest/cursor and derived rows commit atomically, so crash retry reopens from
-//! one published sidecar state instead of replaying blob keys from the packed version rows.
+//! The accounting worker is the *only* writer of GC overlay summary/ranges. The foreground write
+//! path never reads or writes GC accounting state; it only appends cheap accounting deltas.
+//! Accounting lag is expected: `accounted_lsn` says how far sidecar compaction events have been
+//! reflected in the GC-facing rows. The sidecar manifest/cursor and derived rows commit atomically,
+//! so crash retry reopens from one published sidecar state instead of replaying blob keys from the
+//! packed version rows.
 
 mod accounting;
 mod config;
 mod error;
+mod gc;
 mod layout;
 mod metrics;
 mod read;
 mod reader_cache;
 mod seal;
-mod stats;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
     sync::{Arc, Mutex, mpsc},
@@ -138,15 +139,18 @@ use std::{
 
 use strata_accounting::{
     AccountingDelta, ActiveDeltaLog, ActiveDeltaLogState, BlobUpdate,
-    EpochChange as AccountingEpochChange,
+    EpochChange as AccountingEpochChange, GcMapRefDelta,
 };
 use strata_core::{
-    BlobEntry, BlobKey, BlobLifecycle, BlobLifecycleAction, BlobLifecycleMergeOp, BlobLifecycleOp,
-    BlobState, BlobVersionKey, Epoch, PlacementClass, RecordRef, SegmentFileState, SegmentId,
-    SegmentState, SegmentStats, ShardId, ShardInfo, ShardKey, ShardState, StrataLsn,
-    VersionMergeOp, VersionOp, encoded_record_len,
+    BlobEntry, BlobKey, BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead,
+    BlobLifecycleMergeOp, BlobLifecycleOp, BlobState, BlobVersionKey, Epoch, GcRelocation,
+    PlacementClass, RecordRef, SegmentFileState, SegmentGcLiveRecord, SegmentGcOverlayMergeOp,
+    SegmentGcRecordRange, SegmentId, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId,
+    ShardInfo, ShardKey, ShardState, StrataLsn, VersionMergeOp, VersionOp, encoded_record_len,
 };
+use strata_gc::{GcAction, GcPlan};
 use strata_index::StrataIndex;
+pub use strata_index::{AccountingRefEvent, AccountingSnapshot, AccountingSnapshotGuard};
 use strata_segment::{SegmentScanner, SegmentWriter};
 
 use accounting::{AccountingCommand, AccountingWorker};
@@ -157,11 +161,15 @@ pub use config::{
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
-    StrataStoreConfig,
+    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStoreConfig,
 };
 pub use error::{Error, Result};
-use layout::{parse_segment_file_name, relative_segment_path, segment_path};
+pub use gc::{
+    GcAccountingLag, GcPublishResult, GcPublishedOutputSegment, GcPublishedRecord,
+    GcStagedCopiedRecord, GcStagedOutputSegment, PreparedGcCopy, PreparedGcPlan,
+};
+use layout::{parse_segment_file_name, relative_segment_path, segment_path, segment_state_path};
 use metrics::PutMetric;
 pub use metrics::StrataStoreMetrics;
 pub use read::{ReadOptions, StoreGetProfile};
@@ -197,7 +205,8 @@ pub struct StrataStore {
     seal_handle: Option<JoinHandle<()>>,
     accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
     accounting_handle: Option<JoinHandle<()>>,
-    pub(crate) reader_cache: SegmentReaderCache,
+    pub(crate) accounting_lock: Arc<Mutex<()>>,
+    pub(crate) reader_cache: Arc<SegmentReaderCache>,
     metrics: StrataStoreMetrics,
 }
 
@@ -319,6 +328,9 @@ impl StrataStore {
         enqueue_unsealed_segments_for_sealing(&index, active_segment_id, &seal_tx, &metrics)?;
 
         let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
+        let reader_cache = Arc::new(SegmentReaderCache::new(
+            config.segment_reader_cache_capacity,
+        ));
         let coordinator = WriteCoordinator {
             config: config.clone(),
             index: index.clone(),
@@ -331,6 +343,7 @@ impl StrataStore {
             accounting_tx: accounting_tx.clone(),
             write_rx,
             store_scope: STORE_SCOPE,
+            reader_cache: Arc::clone(&reader_cache),
             metrics: metrics.clone(),
         };
         let writer_handle = thread::Builder::new()
@@ -339,7 +352,7 @@ impl StrataStore {
             .map_err(|source| Error::ThreadSpawn { source })?;
 
         Ok(Self {
-            reader_cache: SegmentReaderCache::new(config.segment_reader_cache_capacity),
+            reader_cache,
             config,
             index,
             write_tx: Some(write_tx),
@@ -348,6 +361,7 @@ impl StrataStore {
             seal_handle: Some(seal_handle),
             accounting_tx: Some(accounting_tx),
             accounting_handle: Some(accounting_handle),
+            accounting_lock,
             metrics,
         })
     }
@@ -457,7 +471,7 @@ impl StrataStore {
     /// Records or updates a blob's logical lifetime without rewriting its payload.
     ///
     /// Failure mode avoided: lifetime changes are metadata-only LSNs so accounting can update
-    /// expiration stats without touching segment bytes. Rewriting the blob just to change its
+    /// expiration overlay state without touching segment bytes. Rewriting the blob just to change its
     /// lifetime would create a second payload record and could make GC think the old record was
     /// still live until accounting catches up.
     pub fn set_blob_lifetime(&self, key: &BlobKey, logical_end_epoch: Epoch) -> Result<StrataLsn> {
@@ -555,10 +569,27 @@ impl StrataStore {
         Ok(self.index.get_durable_lsn()?)
     }
 
-    /// How far the background accounting worker has folded operations into segment stats.
-    /// Always `<= durable_lsn`; the gap is the stats lag, not a correctness problem.
+    /// How far the background accounting worker has folded operations into GC overlay state.
+    /// Always `<= durable_lsn`; the gap is accounting lag, not a correctness problem.
     pub fn accounted_lsn(&self) -> Result<StrataLsn> {
         Ok(self.index.get_accounted_lsn()?)
+    }
+
+    /// Pins the current accounted frontier for a long-running GC job.
+    ///
+    /// The returned guard does not hold a RocksDB snapshot. It only prevents ref-event cleanup from
+    /// deleting events newer than the captured `accounted_lsn` while GC copies records. Dropping the
+    /// guard releases that retention pin.
+    pub fn create_accounting_snapshot(&self) -> Result<AccountingSnapshotGuard> {
+        Ok(self.index.create_accounting_snapshot()?)
+    }
+
+    /// Returns accounting ref events published after the frontier captured by `snapshot`.
+    pub fn accounting_changes_since(
+        &self,
+        snapshot: &AccountingSnapshotGuard,
+    ) -> Result<Vec<AccountingRefEvent>> {
+        Ok(self.index.accounting_changes_since(snapshot)?)
     }
 
     /// Enqueues work for the writer and records queue metrics around the send.
@@ -615,6 +646,7 @@ enum WriteCommand {
     AddShard(AddShardRequest),
     Batch(BatchWriteRequest),
     DropShard(DropShardRequest),
+    GcPublish(GcPublishRequest),
     Sync(mpsc::Sender<Result<()>>),
     Shutdown,
 }
@@ -635,6 +667,14 @@ struct BatchWriteRequest {
 struct DropShardRequest {
     shard_id: ShardId,
     response_tx: mpsc::Sender<Result<()>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GcPublishRequest {
+    /// Prepared copy bundle whose staging files are ready to become durable segment files.
+    copy: PreparedGcCopy,
+    /// One-shot response channel back to the caller that requested GC publication.
+    response_tx: mpsc::Sender<Result<GcPublishResult>>,
 }
 
 #[derive(Debug)]
@@ -776,6 +816,7 @@ enum PreparedBatchOp {
         key: BlobKey,
         payload: Arc<[u8]>,
         lsn: StrataLsn,
+        current_epoch: Epoch,
         record_ref: Option<RecordRef>,
         record_bytes: u64,
     },
@@ -794,7 +835,7 @@ enum PreparedBatchOp {
 ///
 /// Failure mode avoided: accounting replays from this side log without reading the foreground
 /// writer's in-memory state. If a put were committed to `blob_versions` but missing here, a crash
-/// before sidecar ingestion would leave segment stats permanently unaware of those live bytes.
+/// before sidecar ingestion would leave the GC overlay summary unaware of those live bytes.
 fn accounting_deltas_for_prepared_batch(prepared: &PreparedBatch) -> Vec<AccountingDelta> {
     let mut deltas = Vec::with_capacity(prepared.ops.len());
     for op in &prepared.ops {
@@ -803,6 +844,7 @@ fn accounting_deltas_for_prepared_batch(prepared: &PreparedBatch) -> Vec<Account
                 shard,
                 key,
                 lsn,
+                current_epoch,
                 record_ref,
                 ..
             } => deltas.push(AccountingDelta::Blob(BlobUpdate::Put {
@@ -810,6 +852,7 @@ fn accounting_deltas_for_prepared_batch(prepared: &PreparedBatch) -> Vec<Account
                 key: key.clone(),
                 shard: *shard,
                 record_ref: record_ref.expect("put record ref must be filled before delta append"),
+                current_epoch: *current_epoch,
                 // Foreground put should not read current blob metadata. `None` means "preserve any
                 // materialized lifecycle"; SetLifetime deltas carry actual lifecycle changes.
                 lifecycle: None,
@@ -820,12 +863,17 @@ fn accounting_deltas_for_prepared_batch(prepared: &PreparedBatch) -> Vec<Account
                 lifecycle_op:
                     BlobLifecycleMergeOp::Append(BlobLifecycleOp {
                         lsn,
-                        action: BlobLifecycleAction::SetLifetime { logical_end_epoch },
+                        action:
+                            BlobLifecycleAction::SetLifetime {
+                                logical_end_epoch,
+                                current_epoch,
+                            },
                     }),
             } => deltas.push(AccountingDelta::Blob(BlobUpdate::SetLifetime {
                 lsn: *lsn,
                 key: key.clone(),
                 logical_end_epoch: *logical_end_epoch,
+                current_epoch: *current_epoch,
             })),
             PreparedBatchOp::Lifecycle {
                 key,
@@ -874,11 +922,6 @@ impl PendingRollover {
     ) -> Result<()> {
         index.put_segment_state_batch(batch, &self.old_segment_state)?;
         index.put_segment_state_batch(batch, &self.new_segment_state)?;
-        index.put_segment_stats_batch(
-            batch,
-            self.new_segment_state.segment_id,
-            &SegmentStats::default(),
-        )?;
         Ok(())
     }
 
@@ -984,6 +1027,7 @@ struct WriteCoordinator {
     accounting_tx: mpsc::SyncSender<AccountingCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
     store_scope: ShardKey,
+    reader_cache: Arc<SegmentReaderCache>,
     metrics: StrataStoreMetrics,
 }
 
@@ -1008,6 +1052,9 @@ impl WriteCoordinator {
                 }
                 WriteCommand::DropShard(request) => {
                     self.process_drop_shard(request);
+                }
+                WriteCommand::GcPublish(request) => {
+                    self.process_gc_publish(request);
                 }
                 WriteCommand::Sync(response_tx) => {
                     let result = self.sync_data();
@@ -1061,6 +1108,16 @@ impl WriteCoordinator {
 
     fn process_drop_shard(&mut self, request: DropShardRequest) {
         let result = self.submit_drop_shard(request.shard_id);
+        let _ = request.response_tx.send(result);
+    }
+
+    /// Runs a GC publish request on the writer thread and reports the result to the caller.
+    ///
+    /// GC publish needs the writer thread because it assigns store-global LSNs, appends active
+    /// accounting deltas, and commits segment metadata in the same ordering domain as foreground
+    /// writes.
+    fn process_gc_publish(&mut self, request: GcPublishRequest) {
+        let result = self.submit_gc_publish(request.copy);
         let _ = request.response_tx.send(result);
     }
 
@@ -1291,6 +1348,435 @@ impl WriteCoordinator {
         Ok((result, put_metrics))
     }
 
+    /// Publishes GC-staged copies as durable segment metadata and `MapRef` operations.
+    ///
+    /// The caller already holds the accounting run lock before this command reaches the writer.
+    /// Keeping the pause outside the writer loop means a long accounting pass can delay the GC
+    /// caller without stalling unrelated user writes. This writer-side critical section only does
+    /// the ordering-sensitive work: sync previous writes, assign the GC LSN range, append the bulk
+    /// accounting delta, and commit the index metadata.
+    fn submit_gc_publish(&mut self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
+        self.sync_data()?;
+        let reconciled_accounted_lsn = self.index.get_accounted_lsn()?;
+        if gc_plan_has_metadata_action(&copy.plan) {
+            if gc_plan_has_copy_action(&copy.plan)
+                || !copy.outputs.is_empty()
+                || !copy.copied_records.is_empty()
+            {
+                return Err(Error::GcInvalidPlan(
+                    "metadata actions cannot be mixed with copied records",
+                ));
+            }
+            self.apply_gc_metadata_actions(&copy.plan)?;
+            return Ok(GcPublishResult {
+                reconciled_accounted_lsn,
+                output_segments: Vec::new(),
+                published_records: Vec::new(),
+                skipped_records: Vec::new(),
+            });
+        }
+
+        let accounting_changes = self
+            .index
+            .accounting_changes_since(&copy.accounting_snapshot)?;
+        let (survivors, skipped_records) =
+            split_gc_copied_records(copy.copied_records, &accounting_changes);
+
+        if survivors.is_empty() {
+            // Every staged copy became stale before publish. The staging files are still invisible:
+            // no segment state has been installed and no blob version points at them. Turning them
+            // into durable segments would only create metadata and later GC work for bytes that no
+            // surviving `MapRef` can use, so discard the temporary files and report the skipped
+            // records to the caller. This also keeps the publish-LSN assignment below simple: once
+            // we continue past this point, there is at least one record to map and one LSN to
+            // reserve.
+            remove_gc_staging_outputs(copy.outputs)?;
+            return Ok(GcPublishResult {
+                reconciled_accounted_lsn,
+                output_segments: Vec::new(),
+                published_records: Vec::new(),
+                skipped_records: skipped_records
+                    .into_iter()
+                    .map(|skipped| skipped.record)
+                    .collect(),
+            });
+        }
+
+        let mut output_plan = self.plan_gc_output_segments(&copy.outputs, &survivors)?;
+        let published_records = match assign_gc_publish_lsns(
+            self.index.get_next_lsn()?,
+            &survivors,
+            &output_plan.staged_to_final_segment_id,
+        ) {
+            Ok(published_records) => published_records,
+            Err(error) => {
+                return Err(cleanup_uncommitted_gc_outputs(
+                    &copy.outputs,
+                    &output_plan,
+                    error,
+                ));
+            }
+        };
+        apply_gc_output_lsn_bounds(&mut output_plan.segment_states, &published_records);
+        let live_output_records = live_gc_output_records(&published_records);
+        let skipped_output_ranges =
+            skipped_gc_output_ranges(&skipped_records, &output_plan.staged_to_final_segment_id);
+
+        let accounting_delta_position = self.active_accounting_delta_log.position();
+        let pending_rollovers = self.take_pending_rollovers();
+        let commit_result = (|| {
+            if let Some(delta) = gc_publish_accounting_delta(&published_records) {
+                self.active_accounting_delta_log.append(&delta)?;
+            }
+            self.active_accounting_delta_log.sync_data()?;
+            let active_delta_state = self.active_accounting_delta_log.state();
+
+            let mut batch = self.index.batch();
+            for rollover in &pending_rollovers {
+                rollover.apply_batch(&self.index, &mut batch)?;
+            }
+            for state in &output_plan.segment_states {
+                self.index.put_segment_state_batch(&mut batch, state)?;
+            }
+            for record in &published_records {
+                self.index.put_gc_relocation_batch(
+                    &mut batch,
+                    record.source.from,
+                    &GcRelocation {
+                        publish_lsn: record.publish_lsn,
+                        to: record.to,
+                    },
+                )?;
+                self.index.map_blob_ref_batch(
+                    &mut batch,
+                    &record.source.key,
+                    record.source.shard,
+                    record.source.payload_lsn,
+                    record.source.from,
+                    record.to,
+                )?;
+                self.index.put_blob_unaccounted_lsn_op_batch(
+                    &mut batch,
+                    record.publish_lsn,
+                    &record.source.key,
+                )?;
+                self.index.put_segment_ref_event_batch(
+                    &mut batch,
+                    SegmentRefEventKey {
+                        segment_id: record.source.from.segment_id,
+                        lsn: record.publish_lsn,
+                        offset: record.source.from.offset,
+                    },
+                    &SegmentRefEvent::Retired,
+                )?;
+                self.index.merge_segment_gc_overlay_batch(
+                    &mut batch,
+                    record.source.from.segment_id,
+                    vec![SegmentGcOverlayMergeOp::RetireBatch {
+                        ranges: vec![SegmentGcRecordRange::from(record.source.from)],
+                    }],
+                )?;
+            }
+            for (segment_id, records) in live_output_records {
+                self.index.merge_segment_gc_overlay_batch(
+                    &mut batch,
+                    segment_id,
+                    vec![SegmentGcOverlayMergeOp::AddLiveBatch { records }],
+                )?;
+            }
+            for ((segment_id, kind), ranges) in skipped_output_ranges {
+                let op = match kind {
+                    GcSkippedCopiedRecordKind::Retired => {
+                        SegmentGcOverlayMergeOp::AddRetiredBatch { ranges }
+                    }
+                    GcSkippedCopiedRecordKind::Expired => {
+                        SegmentGcOverlayMergeOp::AddExpiredBatch { ranges }
+                    }
+                };
+                self.index
+                    .merge_segment_gc_overlay_batch(&mut batch, segment_id, vec![op])?;
+            }
+
+            let next_lsn = published_records
+                .last()
+                .and_then(|record| record.publish_lsn.checked_add(1))
+                .ok_or(strata_segment::Error::RangeOverflow)?;
+            let durable_lsn = published_records
+                .last()
+                .map(|record| record.publish_lsn)
+                .expect("survivors are non-empty");
+            self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
+            self.index
+                .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+            self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
+            batch
+                .write()
+                .map_err(strata_index::Error::from)
+                .map_err(Error::from)?;
+            self.index
+                .flush_wal(true)
+                .map_err(|error| GcPublishCommitError::AfterIndexBatch(error.into()))?;
+            Ok::<(), GcPublishCommitError>(())
+        })();
+
+        match commit_result {
+            Ok(()) => {
+                self.run_rollover_post_commit(pending_rollovers);
+                let durable_lsn = published_records
+                    .last()
+                    .map(|record| record.publish_lsn)
+                    .expect("survivors are non-empty");
+                self.index.set_blob_compact_safe_lsn(durable_lsn);
+                self.metrics.set_durable_lsn(durable_lsn);
+                self.metrics.set_next_lsn(durable_lsn.saturating_add(1));
+                let _ = self.accounting_tx.try_send(AccountingCommand::Run);
+                remove_unused_gc_staging_outputs(copy.outputs, &output_plan.used_staged_ids)?;
+                Ok(GcPublishResult {
+                    reconciled_accounted_lsn,
+                    output_segments: output_plan.published_outputs,
+                    published_records,
+                    skipped_records: skipped_records
+                        .into_iter()
+                        .map(|skipped| skipped.record)
+                        .collect(),
+                })
+            }
+            Err(GcPublishCommitError::BeforeIndexBatch(error)) => {
+                let error = match self
+                    .active_accounting_delta_log
+                    .rollback_to(accounting_delta_position)
+                {
+                    Ok(()) => error,
+                    Err(rollback_error) => rollback_error.into(),
+                };
+                self.restore_pending_rollovers(pending_rollovers);
+                Err(cleanup_uncommitted_gc_outputs(
+                    &copy.outputs,
+                    &output_plan,
+                    error,
+                ))
+            }
+            Err(GcPublishCommitError::AfterIndexBatch(error)) => {
+                self.run_rollover_post_commit(pending_rollovers);
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_gc_metadata_actions(&self, plan: &GcPlan) -> Result<()> {
+        for action in &plan.actions {
+            match action {
+                GcAction::DeleteSegment { segment_id } => {
+                    self.delete_empty_gc_segment(*segment_id)?;
+                }
+                GcAction::ReclassifySegment {
+                    segment_id,
+                    placement_class,
+                } => {
+                    self.reclassify_gc_segment(*segment_id, *placement_class)?;
+                }
+                GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {
+                    return Err(Error::GcInvalidPlan(
+                        "copy actions must use the copy publish path",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_empty_gc_segment(&self, segment_id: SegmentId) -> Result<()> {
+        let mut state = self
+            .index
+            .get_segment_state(segment_id)?
+            .ok_or(Error::GcMissingSourceSegment { segment_id })?;
+        if state.state == SegmentFileState::Deleted {
+            self.reader_cache.evict(segment_id);
+            self.metrics.record_reader_cache_eviction();
+            return unlink_gc_segment_file(&self.config, &state);
+        }
+        if state.state != SegmentFileState::Sealed && state.state != SegmentFileState::Deleting {
+            return Err(Error::GcSourceSegmentNotSealed {
+                segment_id,
+                state: state.state,
+            });
+        }
+
+        let summary = self
+            .index
+            .get_segment_gc_overlay(segment_id)?
+            .unwrap_or_default()
+            .summary;
+        if summary.live_ref_count != 0 {
+            return Err(Error::GcSourceSegmentNotEmpty {
+                segment_id,
+                live_ref_count: summary.live_ref_count,
+            });
+        }
+
+        state.state = SegmentFileState::Deleted;
+        let mut batch = self.index.batch();
+        self.index.put_segment_state_batch(&mut batch, &state)?;
+        batch.write().map_err(strata_index::Error::from)?;
+        self.index.flush_wal(true)?;
+        self.reader_cache.evict(segment_id);
+        self.metrics.record_reader_cache_eviction();
+        unlink_gc_segment_file(&self.config, &state)
+    }
+
+    fn reclassify_gc_segment(
+        &self,
+        segment_id: SegmentId,
+        placement_class: PlacementClass,
+    ) -> Result<()> {
+        let mut state = self
+            .index
+            .get_segment_state(segment_id)?
+            .ok_or(Error::GcMissingSourceSegment { segment_id })?;
+        if state.state != SegmentFileState::Sealed {
+            return Err(Error::GcSourceSegmentNotSealed {
+                segment_id,
+                state: state.state,
+            });
+        }
+        if state.placement_class == placement_class {
+            return Ok(());
+        }
+
+        state.placement_class = placement_class;
+        let mut batch = self.index.batch();
+        self.index.put_segment_state_batch(&mut batch, &state)?;
+        batch.write().map_err(strata_index::Error::from)?;
+        self.index.flush_wal(true)?;
+        Ok(())
+    }
+
+    /// Converts sealed GC staging files into final segment identities and on-disk locations.
+    ///
+    /// Only staging files that contain surviving copied records are renamed into the segment
+    /// directory. The returned map is the translation table from temporary staged segment ids to
+    /// final durable segment ids, which later helpers use to build `MapRef` destinations.
+    fn plan_gc_output_segments(
+        &self,
+        outputs: &[GcStagedOutputSegment],
+        survivors: &[GcStagedCopiedRecord],
+    ) -> Result<PlannedGcOutputSegments> {
+        let used_staged_ids = survivors
+            .iter()
+            .map(|record| record.staged.segment_id)
+            .collect::<BTreeSet<_>>();
+        let mut outputs_by_staged_id = outputs
+            .iter()
+            .map(|output| (output.staged_segment_id, output))
+            .collect::<BTreeMap<_, _>>();
+        let mut next_segment_id = self.next_gc_output_segment_id()?;
+        let mut staged_to_final_segment_id = BTreeMap::new();
+        let mut published_outputs = Vec::new();
+        let mut segment_states = Vec::new();
+
+        for staged_segment_id in &used_staged_ids {
+            let output = match outputs_by_staged_id.remove(staged_segment_id) {
+                Some(output) => output,
+                None => {
+                    return Err(cleanup_gc_output_paths(
+                        &published_outputs,
+                        Error::GcMissingStagedOutput {
+                            staged_segment_id: *staged_segment_id,
+                        },
+                    ));
+                }
+            };
+            let final_segment_id = next_segment_id;
+            next_segment_id = match next_segment_id.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    return Err(cleanup_gc_output_paths(
+                        &published_outputs,
+                        strata_segment::Error::RangeOverflow.into(),
+                    ));
+                }
+            };
+            let final_path = segment_path(&self.config, final_segment_id);
+            if final_path.exists() {
+                return Err(cleanup_gc_output_paths(
+                    &published_outputs,
+                    Error::GcOutputSegmentExists {
+                        segment_id: final_segment_id,
+                        path: final_path,
+                    },
+                ));
+            }
+            if let Err(error) = fs::rename(&output.path, &final_path).map_err(|source| Error::Io {
+                path: final_path.clone(),
+                source,
+            }) {
+                return Err(cleanup_gc_output_paths(&published_outputs, error));
+            }
+            let published_output = GcPublishedOutputSegment {
+                staged_segment_id: output.staged_segment_id,
+                segment_id: final_segment_id,
+                path: final_path.clone(),
+                placement_class: output.placement_class,
+                sealed_len: output.sealed_len,
+            };
+            published_outputs.push(published_output);
+            if let Err(error) = sync_parent_dir(&final_path) {
+                return Err(cleanup_gc_output_paths(&published_outputs, error));
+            }
+            if output.path.parent() != final_path.parent() {
+                if let Err(error) = sync_parent_dir(&output.path) {
+                    return Err(cleanup_gc_output_paths(&published_outputs, error));
+                }
+            }
+
+            let state = SegmentState {
+                shard: self.store_scope,
+                segment_id: final_segment_id,
+                volume_id: 0,
+                path: relative_segment_path(&self.config, final_path.clone()),
+                placement_class: output.placement_class,
+                state: SegmentFileState::Sealed,
+                write_offset: output.sealed_len,
+                durable_offset: output.sealed_len,
+                min_lsn: None,
+                max_lsn: None,
+                sealed_len: Some(output.sealed_len),
+                sealed_sha256: Some(output.sealed_sha256),
+            };
+            staged_to_final_segment_id.insert(output.staged_segment_id, final_segment_id);
+            segment_states.push(state);
+        }
+
+        Ok(PlannedGcOutputSegments {
+            staged_to_final_segment_id,
+            used_staged_ids,
+            published_outputs,
+            segment_states,
+        })
+    }
+
+    /// Chooses the first segment id that a GC output file may use.
+    ///
+    /// This must consider committed segment rows, the current active writer, and pending rollover
+    /// rows that have not yet been applied to RocksDB. Otherwise GC could rename a staging file on
+    /// top of a segment id that a rollover is about to publish.
+    fn next_gc_output_segment_id(&self) -> Result<SegmentId> {
+        let mut next = self
+            .index
+            .iter_segment_states()?
+            .into_iter()
+            .map(|(segment_id, _)| segment_id)
+            .chain(std::iter::once(self.active_writer.segment_id()))
+            .max()
+            .and_then(|segment_id| segment_id.checked_add(1))
+            .unwrap_or(FIRST_SEGMENT_ID);
+        for rollover in &self.pending_rollovers {
+            next = next.max(rollover.old_segment_state.segment_id.saturating_add(1));
+            next = next.max(rollover.new_segment_state.segment_id.saturating_add(1));
+        }
+        Ok(next)
+    }
+
     /// Resolves a client batch into concrete LSNs and per-op metadata before any bytes are written.
     ///
     /// Failure mode avoided: every operation in a batch reserves a contiguous LSN range. If LSNs
@@ -1313,6 +1799,7 @@ impl WriteCoordinator {
                     key,
                     payload,
                 } => {
+                    let current_epoch = current_epoch.ok_or(Error::EpochNotInitialized)?;
                     let shard = self.openable_shard_key(shard_id)?;
                     let record_bytes = encoded_record_len(&key, payload.len())
                         .map_err(strata_segment::Error::from)?;
@@ -1321,6 +1808,7 @@ impl WriteCoordinator {
                         key,
                         payload,
                         lsn,
+                        current_epoch,
                         record_ref: None,
                         record_bytes,
                     });
@@ -1330,12 +1818,22 @@ impl WriteCoordinator {
                     key,
                     logical_end_epoch,
                 } => {
+                    let epoch = current_epoch.ok_or(Error::EpochNotInitialized)?;
+                    if logical_end_epoch <= epoch {
+                        return Err(Error::InvalidBlobLifetime {
+                            logical_end_epoch,
+                            current_epoch: epoch,
+                        });
+                    }
                     prepared_ops.push(PreparedBatchOp::Lifecycle {
                         key,
                         lsn,
                         lifecycle_op: BlobLifecycleMergeOp::Append(BlobLifecycleOp {
                             lsn,
-                            action: BlobLifecycleAction::SetLifetime { logical_end_epoch },
+                            action: BlobLifecycleAction::SetLifetime {
+                                logical_end_epoch,
+                                current_epoch: epoch,
+                            },
                         }),
                     });
                     op_epochs.push(None);
@@ -1720,6 +2218,365 @@ impl WriteCoordinator {
     }
 }
 
+#[derive(Debug)]
+struct PlannedGcOutputSegments {
+    /// Translation from temporary staging segment ids to final durable segment ids.
+    staged_to_final_segment_id: BTreeMap<SegmentId, SegmentId>,
+    /// Staging segment ids that actually contain at least one survivor.
+    used_staged_ids: BTreeSet<SegmentId>,
+    /// User-facing publication metadata for every output segment made visible.
+    published_outputs: Vec<GcPublishedOutputSegment>,
+    /// Durable segment state rows to install in the publish batch.
+    segment_states: Vec<SegmentState>,
+}
+
+#[derive(Debug)]
+enum GcPublishCommitError {
+    BeforeIndexBatch(Error),
+    AfterIndexBatch(Error),
+}
+
+impl From<Error> for GcPublishCommitError {
+    fn from(error: Error) -> Self {
+        Self::BeforeIndexBatch(error)
+    }
+}
+
+impl From<strata_accounting::Error> for GcPublishCommitError {
+    fn from(error: strata_accounting::Error) -> Self {
+        Self::BeforeIndexBatch(error.into())
+    }
+}
+
+impl From<strata_index::Error> for GcPublishCommitError {
+    fn from(error: strata_index::Error) -> Self {
+        Self::BeforeIndexBatch(error.into())
+    }
+}
+
+impl From<strata_segment::Error> for GcPublishCommitError {
+    fn from(error: strata_segment::Error) -> Self {
+        Self::BeforeIndexBatch(error.into())
+    }
+}
+
+/// Terminal state assigned to copied bytes that became stale before publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GcSkippedCopiedRecordKind {
+    /// The source was overwritten, tombstoned, or mapped before publish.
+    Retired,
+    /// The source became dead because its lifecycle expired before publish.
+    Expired,
+}
+
+/// A staged copy whose source is no longer eligible to publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GcSkippedCopiedRecord {
+    /// Original staged copy metadata. This is still useful to classify bytes already present in an
+    /// output file that also contains survivors.
+    record: GcStagedCopiedRecord,
+    /// Whether those bytes should be accounted as retired or expired garbage.
+    kind: GcSkippedCopiedRecordKind,
+}
+
+/// Reconciles copied records against ref events published after the GC planning snapshot.
+///
+/// A terminal event means the staged copy must not receive a `MapRef`; the source no longer
+/// protects that logical blob. A lifecycle-only event keeps the copy publishable, but the survivor
+/// must inherit the freshest lifecycle so destination overlay state is accurate at publish time.
+fn split_gc_copied_records(
+    records: Vec<GcStagedCopiedRecord>,
+    accounting_changes: &[AccountingRefEvent],
+) -> (Vec<GcStagedCopiedRecord>, Vec<GcSkippedCopiedRecord>) {
+    let mut terminal_sources = BTreeMap::<(SegmentId, u64), GcSkippedCopiedRecordKind>::new();
+    let mut latest_lifecycles = BTreeMap::<(SegmentId, u64), Option<BlobLifecycle>>::new();
+    for event in accounting_changes {
+        let source_key = (event.key.segment_id, event.key.offset);
+        match event.event {
+            SegmentRefEvent::Retired => {
+                terminal_sources.insert(source_key, GcSkippedCopiedRecordKind::Retired);
+            }
+            SegmentRefEvent::Expired => {
+                terminal_sources.insert(source_key, GcSkippedCopiedRecordKind::Expired);
+            }
+            SegmentRefEvent::LifecycleChanged { lifecycle } => {
+                latest_lifecycles.insert(source_key, lifecycle);
+            }
+        }
+    }
+
+    let mut survivors = Vec::new();
+    let mut skipped = Vec::new();
+    for mut record in records {
+        let source_key = (record.source.from.segment_id, record.source.from.offset);
+        if let Some(kind) = terminal_sources.get(&source_key).copied() {
+            skipped.push(GcSkippedCopiedRecord { record, kind });
+        } else {
+            if let Some(lifecycle) = latest_lifecycles.get(&source_key).copied() {
+                record.source.lifecycle = lifecycle;
+            }
+            survivors.push(record);
+        }
+    }
+    (survivors, skipped)
+}
+
+/// Assigns consecutive publish LSNs and final destination refs to copied survivors.
+///
+/// The staged record already knows its offset and length inside a temporary output file. This helper
+/// replaces the temporary segment id with the final durable segment id and pairs each move with the
+/// LSN that will order its `MapRef` in the accounting delta log.
+fn assign_gc_publish_lsns(
+    first_lsn: StrataLsn,
+    records: &[GcStagedCopiedRecord],
+    staged_to_final_segment_id: &BTreeMap<SegmentId, SegmentId>,
+) -> Result<Vec<GcPublishedRecord>> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let publish_lsn = first_lsn
+                .checked_add(index as u64)
+                .ok_or(strata_segment::Error::RangeOverflow)?;
+            let segment_id = staged_to_final_segment_id
+                .get(&record.staged.segment_id)
+                .copied()
+                .ok_or(Error::GcMissingStagedOutput {
+                    staged_segment_id: record.staged.segment_id,
+                })?;
+            Ok(GcPublishedRecord {
+                source: record.source.clone(),
+                to: RecordRef {
+                    segment_id,
+                    offset: record.staged.offset,
+                    len: record.staged.len,
+                },
+                publish_lsn,
+            })
+        })
+        .collect()
+}
+
+/// Updates output segment LSN bounds from the records published into each segment.
+///
+/// GC output segments are sealed before they enter the manifest, so their `write_offset` is already
+/// known. Their `min_lsn`/`max_lsn` bounds come from the synthetic `MapRef` LSNs assigned during
+/// publish and are used by later liveness-completeness checks.
+fn apply_gc_output_lsn_bounds(
+    states: &mut [SegmentState],
+    published_records: &[GcPublishedRecord],
+) {
+    let mut bounds = BTreeMap::<SegmentId, (StrataLsn, StrataLsn)>::new();
+    for record in published_records {
+        bounds
+            .entry(record.to.segment_id)
+            .and_modify(|(min_lsn, max_lsn)| {
+                *min_lsn = (*min_lsn).min(record.publish_lsn);
+                *max_lsn = (*max_lsn).max(record.publish_lsn);
+            })
+            .or_insert((record.publish_lsn, record.publish_lsn));
+    }
+    for state in states {
+        if let Some((min_lsn, max_lsn)) = bounds.get(&state.segment_id).copied() {
+            state.min_lsn = Some(min_lsn);
+            state.max_lsn = Some(max_lsn);
+        }
+    }
+}
+
+/// Groups destination live-record overlay additions by output segment.
+///
+/// GC publish accounts destination bytes immediately. Sidecar accounting later folds the matching
+/// `MapRef`, but that fold only retires the source; it must not allocate the destination again.
+fn live_gc_output_records(
+    published_records: &[GcPublishedRecord],
+) -> BTreeMap<SegmentId, Vec<SegmentGcLiveRecord>> {
+    let mut records = BTreeMap::<SegmentId, Vec<SegmentGcLiveRecord>>::new();
+    for record in published_records {
+        records
+            .entry(record.to.segment_id)
+            .or_default()
+            .push(SegmentGcLiveRecord {
+                range: SegmentGcRecordRange::from(record.to),
+                lifecycle: record.source.lifecycle,
+            });
+    }
+    records
+}
+
+/// Groups stale copied output ranges by final output segment and terminal kind.
+///
+/// A staging file can contain both survivors and stale copies. If any survivor is published, the
+/// whole sealed output file becomes durable, so stale ranges inside it must be accounted as garbage
+/// in the output segment rather than silently ignored.
+fn skipped_gc_output_ranges(
+    skipped_records: &[GcSkippedCopiedRecord],
+    staged_to_final_segment_id: &BTreeMap<SegmentId, SegmentId>,
+) -> BTreeMap<(SegmentId, GcSkippedCopiedRecordKind), Vec<SegmentGcRecordRange>> {
+    let mut ranges =
+        BTreeMap::<(SegmentId, GcSkippedCopiedRecordKind), Vec<SegmentGcRecordRange>>::new();
+    for record in skipped_records {
+        if let Some(segment_id) = staged_to_final_segment_id.get(&record.record.staged.segment_id) {
+            ranges
+                .entry((*segment_id, record.kind))
+                .or_default()
+                .push(SegmentGcRecordRange {
+                    offset: record.record.staged.offset,
+                    len: record.record.staged.len,
+                });
+        }
+    }
+    ranges
+}
+
+fn gc_plan_has_metadata_action(plan: &GcPlan) -> bool {
+    plan.actions.iter().any(|action| {
+        matches!(
+            action,
+            GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. }
+        )
+    })
+}
+
+fn gc_plan_has_copy_action(plan: &GcPlan) -> bool {
+    plan.actions.iter().any(|action| {
+        matches!(
+            action,
+            GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. }
+        )
+    })
+}
+
+/// Builds the bulk active-log delta that makes GC relocations visible to blob accounting.
+///
+/// Each record still has its own logical publish LSN, but the active log stores the whole publish
+/// chunk as one frame. Sidecar ingestion expands the frame back into ordered `MapRef` updates using
+/// `base_lsn + index`.
+fn gc_publish_accounting_delta(records: &[GcPublishedRecord]) -> Option<AccountingDelta> {
+    let base_lsn = records.first()?.publish_lsn;
+    Some(AccountingDelta::GcMapRefBatch {
+        base_lsn,
+        maps: records
+            .iter()
+            .map(|record| GcMapRefDelta {
+                key: record.source.key.clone(),
+                from: record.source.from,
+                to: record.to,
+            })
+            .collect(),
+    })
+}
+
+/// Deletes staging files that were not needed because all their copied records were skipped.
+///
+/// Surviving staging files have already been renamed into final segment paths. This helper cleans
+/// up the rest after the publish batch commits so temporary files do not accumulate.
+fn remove_unused_gc_staging_outputs(
+    outputs: Vec<GcStagedOutputSegment>,
+    used_staged_ids: &BTreeSet<SegmentId>,
+) -> Result<()> {
+    remove_unused_gc_staging_output_files(&outputs, used_staged_ids)
+}
+
+fn remove_unused_gc_staging_output_files(
+    outputs: &[GcStagedOutputSegment],
+    used_staged_ids: &BTreeSet<SegmentId>,
+) -> Result<()> {
+    for output in outputs {
+        if !used_staged_ids.contains(&output.staged_segment_id) {
+            remove_gc_staging_output(&output.path)?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_uncommitted_gc_outputs(
+    outputs: &[GcStagedOutputSegment],
+    output_plan: &PlannedGcOutputSegments,
+    error: Error,
+) -> Error {
+    let cleanup_result = (|| {
+        remove_gc_published_output_files(&output_plan.published_outputs)?;
+        remove_unused_gc_staging_output_files(outputs, &output_plan.used_staged_ids)?;
+        Ok(())
+    })();
+    match cleanup_result {
+        Ok(()) => error,
+        Err(cleanup_error) => cleanup_error,
+    }
+}
+
+fn cleanup_gc_output_paths(outputs: &[GcPublishedOutputSegment], error: Error) -> Error {
+    match remove_gc_published_output_files(outputs) {
+        Ok(()) => error,
+        Err(cleanup_error) => cleanup_error,
+    }
+}
+
+fn remove_gc_published_output_files(outputs: &[GcPublishedOutputSegment]) -> Result<()> {
+    for output in outputs {
+        remove_gc_output_file(&output.path)?;
+    }
+    Ok(())
+}
+
+/// Deletes every staging file in a prepared copy.
+///
+/// This is used when reconciliation finds no survivors at all, so no output segment state was
+/// installed and every staged file is still temporary and invisible.
+fn remove_gc_staging_outputs(outputs: Vec<GcStagedOutputSegment>) -> Result<()> {
+    for output in outputs {
+        remove_gc_staging_output(&output.path)?;
+    }
+    Ok(())
+}
+
+/// Removes one staging file and syncs its parent directory.
+///
+/// Missing files are treated as already-cleaned-up. That keeps publish retry/error cleanup
+/// idempotent without hiding real I/O errors from the caller.
+fn remove_gc_staging_output(path: &Path) -> Result<()> {
+    remove_gc_output_file(path)
+}
+
+fn remove_gc_output_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent_dir(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn unlink_gc_segment_file(config: &StrataStoreConfig, state: &SegmentState) -> Result<()> {
+    let path = if state.path.is_empty() {
+        segment_path(config, state.segment_id)
+    } else {
+        segment_state_path(config, state)
+    };
+    match fs::remove_file(&path) {
+        Ok(()) => sync_parent_dir(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io { path, source }),
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = fs::File::open(parent).map_err(|source| Error::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    dir.sync_all().map_err(|source| Error::Io {
+        path: parent.to_path_buf(),
+        source,
+    })
+}
+
 /// Resolves a key to its readable payload, or None for missing/tombstoned blobs.
 ///
 /// A live head without a payload ref should not be produced by new writes. If recovery or legacy
@@ -1749,12 +2606,45 @@ pub(crate) fn resolve_blob_version(
     {
         return Ok(None);
     }
+    if lifecycle
+        .expiry_lsn
+        .is_some_and(|expiry_lsn| expiry_lsn > head.head_lsn)
+    {
+        return Ok(None);
+    }
+    let current_epoch = index
+        .get_current_epoch()?
+        .ok_or(Error::EpochNotInitialized)?;
+    let lifecycle = effective_lifecycle_for_payload(index, head.head_lsn, &lifecycle)?;
+    if lifecycle.is_some_and(|lifecycle| lifecycle.logical_end_epoch <= current_epoch) {
+        return Ok(None);
+    }
     Ok(Some(ResolvedBlobVersion {
         head_lsn: head.head_lsn,
         record_ref,
         generation: head.entry.generation,
-        lifecycle: lifecycle.lifetime.map(|lifetime| lifetime.lifecycle),
+        lifecycle,
     }))
+}
+
+fn effective_lifecycle_for_payload(
+    index: &StrataIndex,
+    payload_lsn: StrataLsn,
+    lifecycle: &BlobLifecycleHead,
+) -> Result<Option<BlobLifecycle>> {
+    let Some(lifetime) = &lifecycle.lifetime else {
+        return Ok(None);
+    };
+    if lifetime.lsn <= payload_lsn {
+        let payload_epoch = index
+            .latest_epoch_at_lsn(payload_lsn)?
+            .map(|(_, epoch)| epoch)
+            .ok_or(Error::EpochNotInitialized)?;
+        if lifetime.lifecycle.logical_end_epoch <= payload_epoch {
+            return Ok(None);
+        }
+    }
+    Ok(Some(lifetime.lifecycle))
 }
 
 /// Opens the segment chosen for appends, creating it only if recovery did not already leave a file
@@ -2213,9 +3103,6 @@ fn apply_recovered_segment_prefix(
     }
 
     index.put_segment_state_batch(&mut batch, &state)?;
-    if index.get_segment_stats(segment_id)?.is_none() {
-        index.put_segment_stats_batch(&mut batch, segment_id, &SegmentStats::default())?;
-    }
 
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
@@ -2248,7 +3135,6 @@ fn discard_unsealed_segment(
 
     let mut batch = index.batch();
     index.put_segment_state_batch(&mut batch, &state)?;
-    index.put_segment_stats_batch(&mut batch, segment_id, &SegmentStats::default())?;
     batch.write().map_err(strata_index::Error::from)?;
     index.flush_wal(true)?;
 
@@ -2442,7 +3328,7 @@ fn unaccounted_operation_survived(
 
 /// Makes the active segment visible in the index at open time, before any write happens. This is
 /// what keeps a brand-new (or just-recovered) segment from looking like an orphan to the next
-/// crash recovery, and seeds the empty stats row the accounting worker expects to find.
+/// crash recovery. GC overlay state is populated lazily as accounting materializes refs.
 fn publish_active_segment_state(
     config: &StrataStoreConfig,
     index: &StrataIndex,
@@ -2460,11 +3346,6 @@ fn publish_active_segment_state(
         None,
     );
     index.put_segment_state(&state)?;
-    if index.get_segment_stats(state.segment_id)?.is_none() {
-        let mut batch = index.batch();
-        index.put_segment_stats_batch(&mut batch, state.segment_id, &SegmentStats::default())?;
-        batch.write().map_err(strata_index::Error::from)?;
-    }
     Ok(state)
 }
 
@@ -2672,7 +3553,7 @@ mod tests {
         io::{Read, Seek, SeekFrom, Write},
         ops::Deref,
         path::Path,
-        sync::Once,
+        sync::{Once, mpsc},
         time::{Duration, Instant},
     };
 
@@ -2681,8 +3562,11 @@ mod tests {
         AccountingIndex, AccountingIndexConfig, ActiveDeltaLogReadCursor, ActiveDeltaLogState,
     };
     use strata_core::{
-        EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcLifetimeRange, SegmentGcRecordRange,
-        SegmentRefEvent, SegmentRefKey, SegmentRefState, SegmentRefStatus, StrataStoreState,
+        BlobLifecycle, EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcLifetimeRange,
+        SegmentGcRecordRange, SegmentRefEvent, SegmentRefEventKey, StrataStoreState,
+    };
+    use strata_gc::{
+        DestinationClass, GcAction, GcCopyRecord, GcPlan, GcPlanner, GcPlannerConfig, GcScenario,
     };
     use tempfile::tempdir;
     use typed_store::{
@@ -2700,6 +3584,86 @@ mod tests {
 
     fn gc_range(record_ref: RecordRef) -> SegmentGcRecordRange {
         SegmentGcRecordRange::from(record_ref)
+    }
+
+    fn gc_ranges_contain(ranges: &[SegmentGcRecordRange], record_ref: RecordRef) -> bool {
+        let range = gc_range(record_ref);
+        ranges.iter().any(|candidate| {
+            candidate.offset <= range.offset
+                && candidate.offset.saturating_add(candidate.len)
+                    >= range.offset.saturating_add(range.len)
+        })
+    }
+
+    fn gc_staged_record(source_offset: u64, staged_offset: u64) -> GcStagedCopiedRecord {
+        GcStagedCopiedRecord {
+            source: GcCopyRecord {
+                key: BlobKey::new(format!("blob-{source_offset}").into_bytes()).unwrap(),
+                shard: STANDALONE_SHARD,
+                payload_lsn: source_offset,
+                from: RecordRef {
+                    segment_id: 7,
+                    offset: source_offset,
+                    len: 8,
+                },
+                lifecycle: None,
+                destination_class: DestinationClass::Spillover,
+            },
+            staged: RecordRef {
+                segment_id: 1,
+                offset: staged_offset,
+                len: 8,
+            },
+        }
+    }
+
+    #[test]
+    fn gc_publish_reconciliation_keeps_lifecycle_only_source_touches() {
+        let lifecycle_touched = gc_staged_record(10, 0);
+        let retired = gc_staged_record(30, 8);
+        let accounting_changes = vec![
+            AccountingRefEvent {
+                key: SegmentRefEventKey {
+                    segment_id: 7,
+                    lsn: 50,
+                    offset: lifecycle_touched.source.from.offset,
+                },
+                event: SegmentRefEvent::LifecycleChanged { lifecycle: None },
+            },
+            AccountingRefEvent {
+                key: SegmentRefEventKey {
+                    segment_id: 7,
+                    lsn: 51,
+                    offset: retired.source.from.offset,
+                },
+                event: SegmentRefEvent::Retired,
+            },
+        ];
+
+        let (survivors, skipped) = split_gc_copied_records(
+            vec![lifecycle_touched.clone(), retired.clone()],
+            &accounting_changes,
+        );
+
+        assert_eq!(survivors, vec![lifecycle_touched]);
+        assert_eq!(
+            skipped,
+            vec![GcSkippedCopiedRecord {
+                record: retired,
+                kind: GcSkippedCopiedRecordKind::Retired,
+            }]
+        );
+    }
+
+    fn segment_summary(
+        index: &StrataIndex,
+        segment_id: SegmentId,
+    ) -> strata_core::SegmentGcSummary {
+        index
+            .get_segment_gc_overlay(segment_id)
+            .unwrap()
+            .unwrap_or_default()
+            .summary
     }
 
     fn active_delta_log_state(index: &StrataIndex) -> ActiveDeltaLogState {
@@ -2808,6 +3772,7 @@ mod tests {
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
             accounting_sidecar_major_patch_bytes_threshold:
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+            gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             starting_epoch: 42,
         }
     }
@@ -3208,16 +4173,12 @@ mod tests {
         let mut expected_tombstoned = std::collections::BTreeMap::new();
         *expected_tombstoned.entry(ref_a.segment_id).or_insert(0) += ref_a.len;
         *expected_tombstoned.entry(ref_b.segment_id).or_insert(0) += ref_b.len;
-        for (segment_id, tombstoned_bytes) in expected_tombstoned {
-            let stats = store
-                .index()
-                .get_segment_stats(segment_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(stats.total_bytes, tombstoned_bytes);
+        for (segment_id, retired_bytes) in expected_tombstoned {
+            let stats = segment_summary(store.index(), segment_id);
+            assert_eq!(stats.total_bytes, retired_bytes);
             assert_eq!(stats.live_bytes, 0);
             assert_eq!(stats.live_ref_count, 0);
-            assert_eq!(stats.tombstoned_bytes, tombstoned_bytes);
+            assert_eq!(stats.retired_bytes, retired_bytes);
             assert!(stats.future_epoch_histogram.is_empty());
         }
         assert_eq!(
@@ -4105,7 +5066,7 @@ mod tests {
             ActiveDeltaLog::open(cfg.accounting_index_dir(), ActiveDeltaLogState::default())
                 .unwrap();
         let coordinator = WriteCoordinator {
-            config: cfg,
+            config: cfg.clone(),
             index: index.clone(),
             active_writer,
             active_accounting_delta_log,
@@ -4116,6 +5077,7 @@ mod tests {
             accounting_tx,
             write_rx,
             store_scope: STORE_SCOPE,
+            reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
             metrics,
         };
 
@@ -4180,22 +5142,14 @@ mod tests {
         assert_eq!(resolved.generation, before.generation);
         assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
 
-        let stats = store
-            .index()
-            .get_segment_stats(resolved.record_ref.segment_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats, SegmentStats::default());
+        let stats = segment_summary(store.index(), resolved.record_ref.segment_id);
+        assert_eq!(stats, strata_core::SegmentGcSummary::default());
 
         store.sync().unwrap();
 
         assert_eq!(store.durable_lsn().unwrap(), 2);
         wait_for_accounted_lsn(&store, 2);
-        let stats = store
-            .index()
-            .get_segment_stats(resolved.record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), resolved.record_ref.segment_id);
         assert_eq!(stats.future_epoch_histogram.get(&43), None);
         assert_eq!(
             stats.future_epoch_histogram.get(&50),
@@ -4237,22 +5191,13 @@ mod tests {
 
         let extend_lsn = store.extend(&key, 50).unwrap().unwrap();
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats, SegmentStats::default());
+        let stats = segment_summary(store.index(), record_ref.segment_id);
+        assert_eq!(stats, strata_core::SegmentGcSummary::default());
 
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, extend_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats.pinned_bytes, record_ref.len);
+        let stats = segment_summary(store.index(), record_ref.segment_id);
         assert_eq!(stats.future_epoch_histogram.get(&42), None);
         assert_eq!(
             stats.future_epoch_histogram.get(&50),
@@ -4286,11 +5231,7 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, put_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), record_ref.segment_id);
         assert_eq!(stats.live_bytes, record_ref.len);
         assert_eq!(stats.live_ref_count, 1);
         assert_eq!(stats.unknown_lifetime_bytes, record_ref.len);
@@ -4301,11 +5242,7 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, lifetime_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), record_ref.segment_id);
         assert_eq!(stats.live_bytes, record_ref.len);
         assert_eq!(stats.live_ref_count, 1);
         assert_eq!(stats.unknown_lifetime_bytes, 0);
@@ -4342,11 +5279,7 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, put_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), record_ref.segment_id);
         assert_eq!(stats.live_bytes, record_ref.len);
         assert_eq!(stats.live_ref_count, 1);
         assert_eq!(stats.unknown_lifetime_bytes, 0);
@@ -4425,6 +5358,115 @@ mod tests {
         assert_eq!(put_lsn, 1);
         assert_eq!(extend_lsn, 2);
         assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+        let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
+    }
+
+    #[tokio::test]
+    async fn set_blob_lifetime_rejects_current_or_past_epoch() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        assert!(matches!(
+            store.set_blob_lifetime(&key, 42),
+            Err(Error::InvalidBlobLifetime {
+                logical_end_epoch: 42,
+                current_epoch: 42
+            })
+        ));
+        assert!(matches!(
+            store.set_blob_lifetime(&key, 41),
+            Err(Error::InvalidBlobLifetime {
+                logical_end_epoch: 41,
+                current_epoch: 42
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_lifetime_hides_blob_reads_before_gc() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        store.put(&key, b"payload").unwrap();
+        store.set_blob_lifetime(&key, 43).unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+
+        store.increment_epoch().unwrap();
+
+        assert_eq!(store.get(&key).unwrap(), None);
+        assert!(!store.contains(&key).unwrap());
+    }
+
+    #[tokio::test]
+    async fn later_lifetime_before_expiry_keeps_current_blob_visible() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        store.put(&key, b"payload").unwrap();
+        store.set_blob_lifetime(&key, 43).unwrap();
+        store.set_blob_lifetime(&key, 50).unwrap();
+        store.increment_epoch().unwrap();
+
+        assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+        let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
+    }
+
+    #[tokio::test]
+    async fn new_put_after_policy_expiry_does_not_inherit_stale_lifetime() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        store.set_blob_lifetime(&key, 43).unwrap();
+        store.increment_epoch().unwrap();
+        store.put(&key, b"new").unwrap();
+
+        assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
+        let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.lifecycle, None);
+    }
+
+    #[tokio::test]
+    async fn lifetime_update_after_expiry_applies_only_to_future_put() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        store.put(&key, b"old").unwrap();
+        store.set_blob_lifetime(&key, 43).unwrap();
+        store.increment_epoch().unwrap();
+        store.set_blob_lifetime(&key, 50).unwrap();
+        assert_eq!(store.get(&key).unwrap(), None);
+
+        store.put(&key, b"new").unwrap();
+
+        assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
         let resolved = resolve_blob_version(store.index(), store.shard(), &key)
             .unwrap()
             .unwrap();
@@ -4783,7 +5825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accounting_tombstones_overwritten_payload_stats() {
+    async fn accounting_tombstones_overwritten_payload_summary() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -4809,28 +5851,20 @@ mod tests {
             .record_ref
             .unwrap();
 
-        let stats = store
-            .index()
-            .get_segment_stats(first_record_ref.segment_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats, SegmentStats::default());
+        let stats = segment_summary(store.index(), first_record_ref.segment_id);
+        assert_eq!(stats, strata_core::SegmentGcSummary::default());
 
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, lifetime_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(first_record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), first_record_ref.segment_id);
         assert_eq!(
             stats.total_bytes,
             first_record_ref.len + second_record_ref.len
         );
         assert_eq!(stats.live_bytes, second_record_ref.len);
         assert_eq!(stats.live_ref_count, 1);
-        assert_eq!(stats.tombstoned_bytes, first_record_ref.len);
+        assert_eq!(stats.retired_bytes, first_record_ref.len);
         assert_eq!(stats.future_epoch_histogram.get(&43), None);
         assert_eq!(
             stats.future_epoch_histogram.get(&44),
@@ -4847,7 +5881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accounting_tombstones_deleted_payload_stats() {
+    async fn accounting_tombstones_deleted_payload_summary() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -4868,22 +5902,18 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, tombstone_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), record_ref.segment_id);
         assert_eq!(stats.total_bytes, record_ref.len);
         assert_eq!(stats.live_bytes, 0);
         assert_eq!(stats.live_ref_count, 0);
-        assert_eq!(stats.tombstoned_bytes, record_ref.len);
+        assert_eq!(stats.retired_bytes, record_ref.len);
         assert!(stats.future_epoch_histogram.is_empty());
         assert!(stats.extension_count_histogram.is_empty());
         assert_eq!(store.get(&key).unwrap(), None);
     }
 
     #[tokio::test]
-    async fn accounting_publishes_live_segment_ref_state_for_put() {
+    async fn accounting_leaves_unknown_lifetime_put_copy_eligible() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -4903,22 +5933,14 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, put_lsn);
 
-        let state = store
+        let overlay = store
             .index()
-            .get_segment_ref_state(SegmentRefKey {
-                segment_id: record_ref.segment_id,
-                offset: record_ref.offset,
-            })
+            .get_segment_gc_overlay(record_ref.segment_id)
             .unwrap()
-            .unwrap();
-        assert_eq!(
-            state,
-            SegmentRefState {
-                status: SegmentRefStatus::Live,
-                lifecycle: None,
-                last_accounted_lsn: put_lsn,
-            }
-        );
+            .unwrap_or_default();
+        assert!(overlay.expired.is_empty());
+        assert!(overlay.retired.is_empty());
+        assert!(overlay.lifetimes.is_empty());
     }
 
     #[tokio::test]
@@ -4943,16 +5965,6 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, tombstone_lsn);
 
-        let state = store
-            .index()
-            .get_segment_ref_state(SegmentRefKey {
-                segment_id: record_ref.segment_id,
-                offset: record_ref.offset,
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(state.status, SegmentRefStatus::Retired);
-        assert_eq!(state.last_accounted_lsn, tombstone_lsn);
         assert_eq!(
             store
                 .index()
@@ -4972,8 +5984,899 @@ mod tests {
             .get_segment_gc_overlay(record_ref.segment_id)
             .unwrap()
             .unwrap();
-        assert_eq!(overlay.dead, vec![gc_range(record_ref)]);
+        assert_eq!(overlay.retired, vec![gc_range(record_ref)]);
+        assert!(overlay.expired.is_empty());
         assert!(overlay.lifetimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accounting_snapshot_guard_reports_later_ref_events() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        let put_lsn = store.put(&key, b"payload").unwrap();
+        let record_ref = store
+            .index()
+            .get_blob_version(&version_key(&key, put_lsn))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, put_lsn);
+
+        let snapshot = store.create_accounting_snapshot().unwrap();
+        assert_eq!(snapshot.accounted_lsn(), put_lsn);
+
+        let tombstone_lsn = store.tombstone(&key).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+
+        assert_eq!(
+            store.accounting_changes_since(&snapshot).unwrap(),
+            vec![AccountingRefEvent {
+                key: strata_core::SegmentRefEventKey {
+                    segment_id: record_ref.segment_id,
+                    lsn: tombstone_lsn,
+                    offset: record_ref.offset,
+                },
+                event: SegmentRefEvent::Retired,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_publish_does_not_force_accounting_to_catch_up() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let mut store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        let put_lsn = store.put(&key, b"payload").unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, put_lsn);
+        stop_accounting_worker(&mut store.store);
+
+        let accounting_snapshot = store.create_accounting_snapshot().unwrap();
+        assert_eq!(accounting_snapshot.accounted_lsn(), put_lsn);
+
+        let tombstone_lsn = store.tombstone(&key).unwrap();
+        let copy = PreparedGcCopy {
+            accounting_snapshot,
+            plan: GcPlan {
+                scenario: GcScenario::EmptyDelete,
+                actions: Vec::new(),
+                copied_bytes: 0,
+                expected_reclaim_bytes: 0,
+                score: 0,
+            },
+            outputs: Vec::new(),
+            copied_records: Vec::new(),
+        };
+
+        let published = store.publish_prepared_gc_copy(copy).unwrap();
+
+        assert_eq!(published.reconciled_accounted_lsn, put_lsn);
+        assert!(store.durable_lsn().unwrap() >= tombstone_lsn);
+        assert!(store.accounted_lsn().unwrap() < tombstone_lsn);
+    }
+
+    #[tokio::test]
+    async fn gc_publish_waiting_for_accounting_lock_does_not_block_writer() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+
+        let put_lsn = store.put(&key_a, b"payload-a").unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, put_lsn);
+        let accounting_snapshot = store.create_accounting_snapshot().unwrap();
+        let copy = PreparedGcCopy {
+            accounting_snapshot,
+            plan: GcPlan {
+                scenario: GcScenario::EmptyDelete,
+                actions: Vec::new(),
+                copied_bytes: 0,
+                expected_reclaim_bytes: 0,
+                score: 0,
+            },
+            outputs: Vec::new(),
+            copied_records: Vec::new(),
+        };
+
+        let accounting_lock = store.store.accounting_lock.clone();
+        let accounting_guard = accounting_lock
+            .lock()
+            .expect("accounting run lock poisoned");
+        std::thread::scope(|scope| {
+            let publish = scope.spawn(|| store.publish_prepared_gc_copy(copy));
+            std::thread::sleep(Duration::from_millis(50));
+
+            let (put_tx, put_rx) = mpsc::channel();
+            let store_ref = &store;
+            let key_b_ref = &key_b;
+            let put = scope.spawn(move || {
+                let result = store_ref.put(key_b_ref, b"payload-b");
+                put_tx.send(result).unwrap();
+            });
+            let put_result = put_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("writer blocked behind GC accounting-lock wait");
+            assert!(put_result.unwrap() > put_lsn);
+
+            drop(accounting_guard);
+            assert!(publish.join().unwrap().is_ok());
+            put.join().unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn gc_prepare_plan_defers_when_accounting_lag_exceeds_configured_limit() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.gc_max_accounting_lag_lsn = Some(2);
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let mut batch = store.index().batch();
+        store.index().put_durable_lsn_batch(&mut batch, 5).unwrap();
+        store
+            .index()
+            .put_accounted_lsn_batch(&mut batch, 2)
+            .unwrap();
+        batch.write().unwrap();
+
+        let lag = store.gc_deferred_by_accounting_lag().unwrap().unwrap();
+        assert_eq!(lag.durable_lsn, 5);
+        assert_eq!(lag.accounted_lsn, 2);
+        assert_eq!(lag.lag_lsn, 3);
+        assert_eq!(lag.max_lag_lsn, Some(2));
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        assert!(store.prepare_gc_plan(&planner).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+        store.sync().unwrap();
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        wait_for_accounted_lsn(&store, lsn_c);
+
+        let ref_a = store
+            .index()
+            .get_blob_version(&version_key(&key_a, lsn_a))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        let ref_b = store
+            .index()
+            .get_blob_version(&version_key(&key_b, lsn_b))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        let tombstone_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+
+        assert!(prepared.accounting_snapshot.accounted_lsn() >= tombstone_lsn);
+        assert_eq!(prepared.plan.scenario, GcScenario::L0Compaction);
+        assert_eq!(prepared.plan.copied_bytes, ref_b.len);
+
+        let selection = prepared.copy_selection.as_ref().unwrap();
+        assert_eq!(selection.copied_bytes, ref_b.len);
+        assert_eq!(selection.records.len(), 1);
+        assert_eq!(selection.records[0].key, key_b);
+        assert_eq!(selection.records[0].payload_lsn, lsn_b);
+        assert_eq!(selection.records[0].from, ref_b);
+        assert_eq!(
+            selection.records[0].destination_class,
+            DestinationClass::Spillover
+        );
+
+        assert_eq!(
+            store
+                .index()
+                .get_segment_gc_overlay(ref_a.segment_id)
+                .unwrap()
+                .unwrap()
+                .retired,
+            vec![gc_range(ref_a)]
+        );
+
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        assert_eq!(copied.plan.scenario, GcScenario::L0Compaction);
+        assert_eq!(copied.outputs.len(), 1);
+        assert_eq!(copied.copied_records.len(), 1);
+        let output = &copied.outputs[0];
+        assert_eq!(output.destination_class, DestinationClass::Spillover);
+        assert_eq!(output.placement_class, PlacementClass::Spillover);
+        assert_eq!(output.sealed_len, ref_b.len);
+        assert!(output.path.exists());
+
+        let copied_record = &copied.copied_records[0];
+        assert_eq!(copied_record.source.from, ref_b);
+        assert_eq!(copied_record.staged.segment_id, output.staged_segment_id);
+        assert_eq!(copied_record.staged.offset, 0);
+        assert_eq!(copied_record.staged.len, ref_b.len);
+
+        let mut staged_reader =
+            strata_segment::SegmentReader::open(&output.path, output.staged_segment_id).unwrap();
+        assert_eq!(
+            staged_reader.read_payload(copied_record.staged).unwrap(),
+            b"payload-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_publish_empty_delete_plan_deletes_segment_file() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        store.sync().unwrap();
+        let sealed_state =
+            wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        let sealed_path = segment_state_path(store.config(), &sealed_state);
+        assert!(sealed_path.exists());
+        wait_for_accounted_lsn(&store, lsn_b);
+
+        let tombstone_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+
+        assert_eq!(prepared.accounting_snapshot.accounted_lsn(), tombstone_lsn);
+        assert_eq!(prepared.plan.scenario, GcScenario::EmptyDelete);
+        assert_eq!(
+            prepared.plan.actions,
+            vec![GcAction::DeleteSegment {
+                segment_id: FIRST_SEGMENT_ID
+            }]
+        );
+        assert!(prepared.copy_selection.is_none());
+
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        let published = store.publish_prepared_gc_copy(copied).unwrap();
+
+        assert!(published.output_segments.is_empty());
+        assert!(published.published_records.is_empty());
+        assert!(published.skipped_records.is_empty());
+        assert_eq!(
+            store
+                .index()
+                .get_segment_state(FIRST_SEGMENT_ID)
+                .unwrap()
+                .unwrap()
+                .state,
+            SegmentFileState::Deleted
+        );
+        assert!(!sealed_path.exists());
+        assert!(store.prepare_gc_plan(&planner).unwrap().is_none());
+        assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+        assert_eq!(store.get(&key_a).unwrap(), None);
+        assert!(lsn_a < lsn_b);
+    }
+
+    #[tokio::test]
+    async fn gc_publish_reclassify_plan_updates_segment_placement() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+        let current_epoch = store.current_epoch().unwrap();
+        let segment_id = 10;
+        let range = SegmentGcRecordRange {
+            offset: 0,
+            len: TEST_RECORD_LEN,
+        };
+        let state = SegmentState {
+            shard: STORE_SCOPE,
+            segment_id,
+            volume_id: 0,
+            path: format!("ingest/{segment_id:012}.data"),
+            placement_class: PlacementClass::ExactEpoch(current_epoch),
+            state: SegmentFileState::Sealed,
+            write_offset: TEST_RECORD_LEN,
+            durable_offset: TEST_RECORD_LEN,
+            min_lsn: Some(0),
+            max_lsn: Some(0),
+            sealed_len: Some(TEST_RECORD_LEN),
+            sealed_sha256: None,
+        };
+        let mut batch = store.index().batch();
+        store
+            .index()
+            .put_segment_state_batch(&mut batch, &state)
+            .unwrap();
+        store
+            .index()
+            .merge_segment_gc_overlay_batch(
+                &mut batch,
+                segment_id,
+                vec![SegmentGcOverlayMergeOp::AddLiveBatch {
+                    records: vec![SegmentGcLiveRecord {
+                        range,
+                        lifecycle: Some(BlobLifecycle {
+                            logical_end_epoch: current_epoch + 10,
+                            extension_count: 2,
+                        }),
+                    }],
+                }],
+            )
+            .unwrap();
+        batch.write().unwrap();
+        store.index().flush_wal(true).unwrap();
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: 1,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+
+        assert_eq!(prepared.plan.scenario, GcScenario::PinnedEpochExpiry);
+        assert_eq!(
+            prepared.plan.actions,
+            vec![GcAction::ReclassifySegment {
+                segment_id,
+                placement_class: PlacementClass::Spillover,
+            }]
+        );
+        assert!(prepared.copy_selection.is_none());
+
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        let published = store.publish_prepared_gc_copy(copied).unwrap();
+
+        assert!(published.output_segments.is_empty());
+        assert!(published.published_records.is_empty());
+        assert!(published.skipped_records.is_empty());
+        assert_eq!(
+            store
+                .index()
+                .get_segment_state(segment_id)
+                .unwrap()
+                .unwrap()
+                .placement_class,
+            PlacementClass::Spillover
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+        store.sync().unwrap();
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        wait_for_accounted_lsn(&store, lsn_c);
+
+        let ref_a = store
+            .index()
+            .get_blob_version(&version_key(&key_a, lsn_a))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        let ref_b = store
+            .index()
+            .get_blob_version(&version_key(&key_b, lsn_b))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        let tombstone_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        let staged_path = copied.outputs[0].path.clone();
+
+        let published = store.publish_prepared_gc_copy(copied).unwrap();
+
+        assert!(published.reconciled_accounted_lsn >= tombstone_lsn);
+        assert_eq!(published.skipped_records, Vec::new());
+        assert_eq!(published.output_segments.len(), 1);
+        assert_eq!(published.published_records.len(), 1);
+        assert!(!staged_path.exists());
+        assert!(published.output_segments[0].path.exists());
+
+        let published_record = &published.published_records[0];
+        assert_eq!(published_record.source.from, ref_b);
+        assert_eq!(
+            store
+                .index()
+                .get_blob_entry(&key_b)
+                .unwrap()
+                .unwrap()
+                .record_ref,
+            Some(published_record.to)
+        );
+        assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+        assert_eq!(
+            store
+                .index()
+                .get_segment_state(published_record.to.segment_id)
+                .unwrap()
+                .unwrap()
+                .placement_class,
+            PlacementClass::Spillover
+        );
+        assert!(store.durable_lsn().unwrap() >= published_record.publish_lsn);
+
+        wait_for_accounted_lsn(&store, published_record.publish_lsn);
+
+        let source_overlay = store
+            .index()
+            .get_segment_gc_overlay(ref_a.segment_id)
+            .unwrap()
+            .unwrap();
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
+
+        let output_summary = segment_summary(store.index(), published_record.to.segment_id);
+        assert_eq!(output_summary.live_bytes, ref_b.len);
+        assert_eq!(output_summary.live_ref_count, 1);
+        assert_eq!(output_summary.total_bytes, ref_b.len);
+    }
+
+    #[tokio::test]
+    async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_RECORD_LEN * 4 - 1;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+        let key_d = BlobKey::new(b"blob-d".to_vec()).unwrap();
+        let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+        let lsn_d = store.put(&key_d, b"payload-d").unwrap();
+        store.sync().unwrap();
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        wait_for_accounted_lsn(&store, lsn_d);
+
+        let tombstone_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_lsn);
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        assert_eq!(copied.copied_records.len(), 2);
+        assert_eq!(copied.outputs.len(), 1);
+        let staged_path = copied.outputs[0].path.clone();
+        let output_segment_id = store
+            .index()
+            .iter_segment_states()
+            .unwrap()
+            .into_iter()
+            .map(|(segment_id, _)| segment_id)
+            .max()
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        let final_path = segment_path(store.config(), output_segment_id);
+
+        let mut batch = store.index().batch();
+        store
+            .index()
+            .put_next_lsn_batch(&mut batch, StrataLsn::MAX)
+            .unwrap();
+        batch.write().unwrap();
+        store.index().flush_wal(true).unwrap();
+
+        let err = store.publish_prepared_gc_copy(copied).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Segment(strata_segment::Error::RangeOverflow)
+        ));
+        assert!(!staged_path.exists());
+        assert!(!final_path.exists());
+        assert!(
+            store
+                .index()
+                .get_segment_state(output_segment_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+        assert_eq!(store.get(&key_c).unwrap(), Some(b"payload-c".to_vec()));
+        assert!(lsn_b < lsn_c);
+    }
+
+    #[tokio::test]
+    async fn gc_publish_tombstoned_unaccounted_copy_retires_destination_after_forwarding() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+        cfg.accounting_interval = Duration::from_secs(3600);
+        cfg.accounting_sidecar_major_patch_count_threshold = 1;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+        let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+        store.sync().unwrap();
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        wait_for_accounted_lsn(&store, lsn_c);
+
+        let ref_a = store
+            .index()
+            .get_blob_version(&version_key(&key_a, lsn_a))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        let ref_b = store
+            .index()
+            .get_blob_version(&version_key(&key_b, lsn_b))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_a_lsn);
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        stop_accounting_worker(&mut store.store);
+
+        let tombstone_b_lsn = store.tombstone(&key_b).unwrap();
+        let published = store.publish_prepared_gc_copy(copied).unwrap();
+
+        assert!(published.reconciled_accounted_lsn < tombstone_b_lsn);
+        assert_eq!(published.published_records.len(), 1);
+        assert_eq!(store.get(&key_b).unwrap(), None);
+
+        let published_record = &published.published_records[0];
+        assert_eq!(published_record.source.from, ref_b);
+        let output_summary_before_accounting =
+            segment_summary(store.index(), published_record.to.segment_id);
+        assert_eq!(output_summary_before_accounting.total_bytes, ref_b.len);
+        assert_eq!(output_summary_before_accounting.live_bytes, ref_b.len);
+        assert_eq!(output_summary_before_accounting.live_ref_count, 1);
+        assert_eq!(output_summary_before_accounting.garbage_bytes(), 0);
+        assert!(store.index().get_gc_relocation(ref_b).unwrap().is_some());
+
+        for _ in 0..4 {
+            accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+            if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
+                break;
+            }
+        }
+        assert!(store.accounted_lsn().unwrap() >= published_record.publish_lsn);
+
+        let source_overlay = store
+            .index()
+            .get_segment_gc_overlay(ref_a.segment_id)
+            .unwrap()
+            .unwrap();
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
+
+        let output_summary = segment_summary(store.index(), published_record.to.segment_id);
+        assert_eq!(output_summary.total_bytes, ref_b.len);
+        assert_eq!(output_summary.live_bytes, 0);
+        assert_eq!(output_summary.live_ref_count, 0);
+        assert_eq!(output_summary.retired_bytes, ref_b.len);
+        assert_eq!(output_summary.garbage_bytes(), ref_b.len);
+        assert!(store.index().get_gc_relocation(ref_b).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn gc_publish_unaccounted_epoch_change_expires_relocated_destination() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+        cfg.accounting_interval = Duration::from_secs(3600);
+        cfg.accounting_sidecar_major_patch_count_threshold = 1;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+        let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+        let lifetime_b_lsn = store.extend(&key_b, 43).unwrap().unwrap();
+        store.sync().unwrap();
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        wait_for_accounted_lsn(&store, lsn_c.max(lifetime_b_lsn));
+
+        let ref_a = store
+            .index()
+            .get_blob_version(&version_key(&key_a, lsn_a))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        let ref_b = store
+            .index()
+            .get_blob_version(&version_key(&key_b, lsn_b))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_a_lsn);
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        stop_accounting_worker(&mut store.store);
+
+        let (_, epoch_lsn) = store.increment_epoch().unwrap();
+        assert_eq!(store.get(&key_b).unwrap(), None);
+        let published = store.publish_prepared_gc_copy(copied).unwrap();
+
+        assert!(published.reconciled_accounted_lsn < epoch_lsn);
+        assert_eq!(published.published_records.len(), 1);
+        let published_record = &published.published_records[0];
+        assert_eq!(published_record.source.from, ref_b);
+        assert_eq!(
+            published_record.source.lifecycle.unwrap().logical_end_epoch,
+            43
+        );
+
+        let output_summary_before_accounting =
+            segment_summary(store.index(), published_record.to.segment_id);
+        assert_eq!(output_summary_before_accounting.live_bytes, ref_b.len);
+        assert_eq!(output_summary_before_accounting.expired_bytes, 0);
+
+        for _ in 0..4 {
+            accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+            if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
+                break;
+            }
+        }
+        assert!(store.accounted_lsn().unwrap() >= published_record.publish_lsn);
+
+        let source_overlay = store
+            .index()
+            .get_segment_gc_overlay(ref_a.segment_id)
+            .unwrap()
+            .unwrap();
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
+
+        let output_summary = segment_summary(store.index(), published_record.to.segment_id);
+        assert_eq!(output_summary.total_bytes, ref_b.len);
+        assert_eq!(output_summary.live_bytes, 0);
+        assert_eq!(output_summary.live_ref_count, 0);
+        assert_eq!(output_summary.expired_bytes, ref_b.len);
+        assert_eq!(output_summary.retired_bytes, 0);
+        assert_eq!(output_summary.garbage_bytes(), ref_b.len);
+    }
+
+    #[tokio::test]
+    async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
+        init_typed_store_metrics();
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "default");
+        cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+        cfg.accounting_interval = Duration::from_secs(3600);
+        cfg.accounting_sidecar_major_patch_count_threshold = 1;
+        let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+        let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+        let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+        let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+        let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+        let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+        let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+        store.sync().unwrap();
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        wait_for_accounted_lsn(&store, lsn_c);
+
+        let ref_a = store
+            .index()
+            .get_blob_version(&version_key(&key_a, lsn_a))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+        let ref_b = store
+            .index()
+            .get_blob_version(&version_key(&key_b, lsn_b))
+            .unwrap()
+            .unwrap()
+            .record_ref
+            .unwrap();
+
+        let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
+        store.sync().unwrap();
+        wait_for_accounted_lsn(&store, tombstone_a_lsn);
+
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+            min_reclaim_bytes: 1,
+            min_garbage_ratio_bps: 1,
+            min_exact_epoch_bucket_bytes: 1,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 1,
+            max_join_sources: 4,
+        });
+        let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+        assert_eq!(
+            prepared.copy_selection.as_ref().unwrap().records[0].lifecycle,
+            None
+        );
+        let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+        stop_accounting_worker(&mut store.store);
+
+        let lifetime_b_lsn = store.extend(&key_b, 43).unwrap().unwrap();
+        let (_, epoch_lsn) = store.increment_epoch().unwrap();
+        assert_eq!(store.get(&key_b).unwrap(), None);
+        let published = store.publish_prepared_gc_copy(copied).unwrap();
+
+        assert!(published.reconciled_accounted_lsn < lifetime_b_lsn);
+        assert!(published.reconciled_accounted_lsn < epoch_lsn);
+        assert_eq!(published.published_records.len(), 1);
+        let published_record = &published.published_records[0];
+        assert_eq!(published_record.source.from, ref_b);
+        assert_eq!(published_record.source.lifecycle, None);
+
+        let output_summary_before_accounting =
+            segment_summary(store.index(), published_record.to.segment_id);
+        assert_eq!(output_summary_before_accounting.live_bytes, ref_b.len);
+        assert_eq!(output_summary_before_accounting.expired_bytes, 0);
+
+        for _ in 0..4 {
+            accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+            if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
+                break;
+            }
+        }
+        assert!(store.accounted_lsn().unwrap() >= published_record.publish_lsn);
+
+        let source_overlay = store
+            .index()
+            .get_segment_gc_overlay(ref_a.segment_id)
+            .unwrap()
+            .unwrap();
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
+        assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
+
+        let output_summary = segment_summary(store.index(), published_record.to.segment_id);
+        assert_eq!(output_summary.total_bytes, ref_b.len);
+        assert_eq!(output_summary.live_bytes, 0);
+        assert_eq!(output_summary.live_ref_count, 0);
+        assert_eq!(output_summary.expired_bytes, ref_b.len);
+        assert_eq!(output_summary.retired_bytes, 0);
+        assert_eq!(output_summary.garbage_bytes(), ref_b.len);
     }
 
     #[tokio::test]
@@ -5002,16 +6905,6 @@ mod tests {
             logical_end_epoch: 50,
             extension_count: 0,
         };
-        let state = store
-            .index()
-            .get_segment_ref_state(SegmentRefKey {
-                segment_id: record_ref.segment_id,
-                offset: record_ref.offset,
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(state.status, SegmentRefStatus::Live);
-        assert_eq!(state.lifecycle, Some(lifecycle));
         assert_eq!(
             store
                 .index()
@@ -5033,7 +6926,8 @@ mod tests {
             .get_segment_gc_overlay(record_ref.segment_id)
             .unwrap()
             .unwrap();
-        assert!(overlay.dead.is_empty());
+        assert!(overlay.expired.is_empty());
+        assert!(overlay.retired.is_empty());
         assert_eq!(
             overlay.lifetimes,
             vec![SegmentGcLifetimeRange {
@@ -5080,12 +6974,13 @@ mod tests {
             .get_segment_gc_overlay(record_ref.segment_id)
             .unwrap()
             .unwrap();
-        assert_eq!(overlay.dead, vec![gc_range(record_ref)]);
+        assert_eq!(overlay.retired, vec![gc_range(record_ref)]);
+        assert!(overlay.expired.is_empty());
         assert!(overlay.lifetimes.is_empty());
     }
 
     #[tokio::test]
-    async fn accounting_expires_segment_stats_on_epoch_change() {
+    async fn accounting_updates_gc_summary_on_epoch_change() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5115,11 +7010,7 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, lifetime_b_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(ref_a.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), ref_a.segment_id);
         assert_eq!(stats.live_bytes, ref_a.len + ref_b.len);
         assert_eq!(stats.live_ref_count, 2);
         assert_eq!(stats.expired_bytes, 0);
@@ -5129,15 +7020,11 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, epoch_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(ref_a.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), ref_a.segment_id);
         assert_eq!(stats.live_bytes, ref_b.len);
         assert_eq!(stats.live_ref_count, 1);
         assert_eq!(stats.expired_bytes, ref_a.len);
-        assert_eq!(stats.tombstoned_bytes, 0);
+        assert_eq!(stats.retired_bytes, 0);
         assert_eq!(stats.future_epoch_histogram.get(&43), None);
         assert_eq!(
             stats.future_epoch_histogram.get(&50),
@@ -5157,11 +7044,7 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, last_epoch_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(ref_a.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), ref_a.segment_id);
         assert_eq!(stats.live_bytes, 0);
         assert_eq!(stats.live_ref_count, 0);
         assert_eq!(stats.expired_bytes, ref_a.len + ref_b.len);
@@ -5200,16 +7083,12 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, tombstone_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), record_ref.segment_id);
         assert_eq!(stats.total_bytes, record_ref.len);
         assert_eq!(stats.live_bytes, 0);
         assert_eq!(stats.live_ref_count, 0);
-        assert_eq!(stats.expired_bytes, record_ref.len);
-        assert_eq!(stats.tombstoned_bytes, 0);
+        assert_eq!(stats.expired_bytes, 0);
+        assert_eq!(stats.retired_bytes, record_ref.len);
         assert_eq!(store.get(&key).unwrap(), None);
     }
 
@@ -5246,16 +7125,12 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, lifetime_b_lsn.max(put_b_lsn).max(tombstone_lsn));
 
-        // The put of blob A is accounted live at epoch 42, the epoch change to 43 expires it,
-        // and the later tombstone must not move the already-expired bytes to tombstoned.
-        let stats = store
-            .index()
-            .get_segment_stats(ref_a.segment_id)
-            .unwrap()
-            .unwrap();
+        // The put of blob A is accounted live at epoch 42, the epoch change to 43 expires it, and
+        // the later tombstone moves it from expired bytes to permanently retired bytes.
+        let stats = segment_summary(store.index(), ref_a.segment_id);
         assert_eq!(stats.total_bytes, ref_a.len + ref_b.len);
-        assert_eq!(stats.expired_bytes, ref_a.len);
-        assert_eq!(stats.tombstoned_bytes, 0);
+        assert_eq!(stats.expired_bytes, 0);
+        assert_eq!(stats.retired_bytes, ref_a.len);
         assert_eq!(stats.live_bytes, ref_b.len);
         assert_eq!(stats.live_ref_count, 1);
         assert_eq!(
@@ -5268,7 +7143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accounting_revives_expired_blob_on_extension() {
+    async fn accounting_does_not_revive_expired_blob_on_extension() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5292,38 +7167,25 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, epoch_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
+        let stats = segment_summary(store.index(), record_ref.segment_id);
         assert_eq!(stats.expired_bytes, record_ref.len);
         assert_eq!(stats.live_ref_count, 0);
 
         let extend_lsn = store.extend(&key, 50).unwrap().unwrap();
+        assert_eq!(store.get(&key).unwrap(), None);
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, extend_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats.expired_bytes, 0);
-        assert_eq!(stats.live_bytes, record_ref.len);
-        assert_eq!(stats.live_ref_count, 1);
-        assert_eq!(
-            stats.future_epoch_histogram.get(&50),
-            Some(&EpochBucket {
-                refs: 1,
-                bytes: record_ref.len,
-            })
-        );
-        assert_eq!(stats.min_live_end_epoch, Some(50));
+        let stats = segment_summary(store.index(), record_ref.segment_id);
+        assert_eq!(stats.expired_bytes, record_ref.len);
+        assert_eq!(stats.live_bytes, 0);
+        assert_eq!(stats.live_ref_count, 0);
+        assert_eq!(stats.future_epoch_histogram.get(&50), None);
+        assert_eq!(stats.min_live_end_epoch, None);
     }
 
     #[tokio::test]
-    async fn accounting_expires_pinned_bytes_for_exact_epoch_segment() {
+    async fn accounting_expires_future_epoch_bucket_for_exact_epoch_segment() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5350,23 +7212,21 @@ mod tests {
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, lifetime_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats.pinned_bytes, record_ref.len);
+        let stats = segment_summary(store.index(), record_ref.segment_id);
+        assert_eq!(
+            stats.future_epoch_histogram.get(&43),
+            Some(&EpochBucket {
+                refs: 1,
+                bytes: record_ref.len,
+            })
+        );
 
         let (_, epoch_lsn) = store.increment_epoch().unwrap();
         store.sync().unwrap();
         wait_for_accounted_lsn(&store, epoch_lsn);
 
-        let stats = store
-            .index()
-            .get_segment_stats(record_ref.segment_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats.pinned_bytes, 0);
+        let stats = segment_summary(store.index(), record_ref.segment_id);
+        assert_eq!(stats.future_epoch_histogram.get(&43), None);
         assert_eq!(stats.expired_bytes, record_ref.len);
         assert_eq!(stats.live_bytes, 0);
         assert_eq!(stats.live_ref_count, 0);
@@ -5451,26 +7311,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_keeps_valid_blob_versions_for_old_versions() {
+    async fn recovery_keeps_latest_valid_blob_version() {
         init_typed_store_metrics();
         let dir = tempdir().unwrap();
         let cfg = config(dir.path(), "default");
         let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-        let first;
         let second;
-        let first_lsn;
         let second_lsn;
         {
             let store =
                 try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-            first_lsn = store.put(&key, b"payload-a").unwrap();
-            first = store
-                .index()
-                .get_blob_entry(&key)
-                .unwrap()
-                .unwrap()
-                .record_ref
-                .unwrap();
+            store.put(&key, b"payload-a").unwrap();
             second_lsn = store.put(&key, b"payload-b").unwrap();
             second = store
                 .index()
@@ -5484,15 +7335,6 @@ mod tests {
 
         let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
-        assert_eq!(
-            store
-                .index()
-                .get_blob_version(&version_key(&key, first_lsn))
-                .unwrap()
-                .unwrap()
-                .record_ref,
-            Some(first)
-        );
         assert_eq!(
             store
                 .index()
@@ -5562,6 +7404,7 @@ mod tests {
                         key: key.clone(),
                         shard: STORE_SCOPE,
                         record_ref,
+                        current_epoch: 42,
                         lifecycle: None,
                     }))
                     .unwrap();

@@ -1,7 +1,7 @@
 //! File-backed sidecar index for Strata accounting.
 //!
 //! This crate does not serve user reads. RocksDB can remain the current read index while this
-//! sidecar materializes blob update history into ref events and segment-stat deltas for GC.
+//! sidecar materializes blob update history into ref events and GC overlay operands.
 //! The physical shape is deliberately small:
 //!
 //! ```text
@@ -36,9 +36,9 @@ pub(crate) const FORMAT_VERSION: u32 = 1;
 
 pub use active_log::{
     AccountingDelta, ActiveDeltaLog, ActiveDeltaLogPosition, ActiveDeltaLogReadCursor,
-    ActiveDeltaLogState,
+    ActiveDeltaLogState, GcMapRefDelta,
 };
-pub use events::{CompactionEventBatch, RefEvent, RetireReason, SegmentStatsDelta};
+pub use events::{CompactionEventBatch, RefEvent, RetireReason, SegmentGcSummaryDelta};
 pub use index::{
     AccountingIndex, AccountingIndexConfig, PreparedAccountingDeltas, PreparedCompaction,
     PreparedDeltaRuns, PreparedEpochChange, PreparedMajorCompaction,
@@ -83,6 +83,9 @@ pub enum Error {
     #[error("accounting index manifest generation overflowed at {generation}")]
     ManifestGenerationOverflow { generation: u64 },
 
+    #[error("accounting LSN overflowed at base {base_lsn} plus offset {offset}")]
+    LsnOverflow { base_lsn: u64, offset: u64 },
+
     #[error("partition {0} is outside configured partition count")]
     InvalidPartition(PartitionId),
 
@@ -109,7 +112,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use strata_core::{
-        BlobKey, BlobLifecycle, RecordRef, SegmentGcLifetimeUpdate, SegmentGcOverlayMergeOp,
+        BlobKey, BlobLifecycle, RecordRef, SegmentGcLiveRecord, SegmentGcOverlayMergeOp,
         SegmentGcRecordRange, SegmentId, ShardKey, StrataLsn,
     };
     use tempfile::tempdir;
@@ -144,11 +147,14 @@ mod tests {
         SegmentGcRecordRange::from(record_ref)
     }
 
-    fn gc_lifetime_op(record_ref: RecordRef, lifecycle: BlobLifecycle) -> SegmentGcOverlayMergeOp {
-        SegmentGcOverlayMergeOp::LifetimeBatch {
-            updates: vec![SegmentGcLifetimeUpdate {
+    fn gc_live_op(
+        record_ref: RecordRef,
+        lifecycle: Option<BlobLifecycle>,
+    ) -> SegmentGcOverlayMergeOp {
+        SegmentGcOverlayMergeOp::AddLiveBatch {
+            records: vec![SegmentGcLiveRecord {
                 range: gc_range(record_ref),
-                lifecycle: Some(lifecycle),
+                lifecycle,
             }],
         }
     }
@@ -165,6 +171,7 @@ mod tests {
             key: key.clone(),
             shard: SHARD,
             record_ref,
+            current_epoch: 42,
             lifecycle: None,
         }
     }
@@ -215,6 +222,44 @@ mod tests {
         let read = ActiveDeltaLog::read_durable_range(dir.path(), cursor, state).unwrap();
         assert!(read.deltas.is_empty());
         assert_eq!(read.end_offset, state.durable_offset);
+    }
+
+    #[test]
+    fn active_delta_log_reads_bulk_gc_map_ref_as_one_frame() {
+        let dir = tempdir().unwrap();
+        let key_a = key(b"gc-map-a");
+        let key_b = key(b"gc-map-b");
+        let state = {
+            let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+            log.append(&AccountingDelta::GcMapRefBatch {
+                base_lsn: 10,
+                maps: vec![
+                    GcMapRefDelta {
+                        key: key_a.clone(),
+                        from: record_ref(1, 0),
+                        to: record_ref(3, 0),
+                    },
+                    GcMapRefDelta {
+                        key: key_b.clone(),
+                        from: record_ref(2, 0),
+                        to: record_ref(3, 64),
+                    },
+                ],
+            })
+            .unwrap();
+            log.sync_data().unwrap();
+            log.state()
+        };
+
+        assert_eq!(state.durable_lsn, 11);
+        let read = ActiveDeltaLog::read_durable_range(
+            dir.path(),
+            ActiveDeltaLogReadCursor::default(),
+            state,
+        )
+        .unwrap();
+        assert_eq!(read.deltas.len(), 1);
+        assert_eq!(read.max_lsn, Some(11));
     }
 
     #[test]
@@ -304,6 +349,7 @@ mod tests {
                     lsn: 2,
                     key: key.clone(),
                     logical_end_epoch: 50,
+                    current_epoch: 42,
                 },
                 put(3, &key, second_ref),
                 BlobUpdate::Tombstone {
@@ -338,14 +384,20 @@ mod tests {
         assert_eq!(
             batch.segment_gc_overlay_ops.get(&first_ref.segment_id),
             Some(&vec![
-                gc_lifetime_op(first_ref, lifecycle),
+                gc_live_op(first_ref, None),
+                SegmentGcOverlayMergeOp::LifetimeBatch {
+                    updates: vec![strata_core::SegmentGcLifetimeUpdate {
+                        range: gc_range(first_ref),
+                        lifecycle: Some(lifecycle),
+                    }],
+                },
                 gc_retire_op(first_ref)
             ])
         );
         assert_eq!(
             batch.segment_gc_overlay_ops.get(&second_ref.segment_id),
             Some(&vec![
-                gc_lifetime_op(second_ref, lifecycle),
+                gc_live_op(second_ref, Some(lifecycle)),
                 gc_retire_op(second_ref)
             ])
         );
@@ -583,7 +635,11 @@ mod tests {
         );
         assert_eq!(
             major_batch.segment_gc_overlay_ops.get(&from.segment_id),
-            Some(&vec![gc_retire_op(from)])
+            Some(&vec![gc_live_op(from, None), gc_retire_op(from)])
+        );
+        assert_eq!(
+            major_batch.segment_gc_overlay_ops.get(&to.segment_id),
+            Some(&vec![gc_live_op(to, None)])
         );
     }
 

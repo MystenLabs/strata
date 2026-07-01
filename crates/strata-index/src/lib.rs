@@ -9,10 +9,9 @@
 //! +-----------------+-----------------------------------------------+
 //! | blob_versions   | BlobKey -> packed BlobVersionState            |
 //! | segment_states  | SegmentKey -> SegmentState                    |
-//! | segment_stats   | SegmentKey -> SegmentStats                    |
-//! | segment_ref_state | SegmentRefKey -> SegmentRefState             |
 //! | segment_ref_events | SegmentRefEventKey -> SegmentRefEvent       |
-//! | segment_gc_overlay | SegmentId -> SegmentGcOverlay               |
+//! | segment_gc_overlay | SegmentId -> SegmentGcOverlay + summary     |
+//! | gc_relocations | RecordRef -> GcRelocation                      |
 //! | shards          | ShardId -> ShardInfo                          |
 //! | store_state     | StoreStateKey -> u64                         |
 //! | epoch_changes   | StrataLsn -> current Epoch                   |
@@ -42,6 +41,7 @@ mod accounting;
 mod blob;
 mod cf;
 mod error;
+mod gc;
 mod global;
 mod open;
 mod options;
@@ -51,12 +51,13 @@ mod storage;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 pub use accounting::{
     ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_CONSUMED_CURSOR_KEY,
     ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_STATE_KEY, AccountingIndexKey, AccountingIndexValue,
+    AccountingRefEvent, AccountingSnapshot, AccountingSnapshotGuard,
 };
 pub use cf::StrataIndexCfNames;
 pub use error::{Error, Result};
@@ -66,14 +67,14 @@ pub(crate) use open::unique_metric_conf;
 
 #[cfg(test)]
 use strata_core::{
-    BlobEntry, BlobLifecycleState, BlobVersionKey, SegmentGcLifetimeRange, SegmentGcLifetimeUpdate,
+    BlobEntry, BlobLifecycleState, BlobVersionKey, SegmentGcLifetimeUpdate,
     SegmentGcOverlayMergeOp, SegmentGcRecordRange, ShardHead, StrataStoreState, VersionOp,
     VersionState,
 };
 use strata_core::{
-    BlobKey, BlobVersionState, Epoch, SegmentGcOverlay, SegmentId, SegmentKey, SegmentRefEvent,
-    SegmentRefEventKey, SegmentRefKey, SegmentRefState, SegmentState, SegmentStats, ShardId,
-    ShardInfo, ShardKey, StoreStateKey, StrataLsn,
+    BlobKey, BlobVersionState, Epoch, GcRelocation, RecordRef, SegmentGcOverlay, SegmentId,
+    SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo, ShardKey,
+    StoreStateKey, StrataLsn,
 };
 use typed_store::rocks::{DBMap, RocksDB};
 
@@ -94,18 +95,18 @@ pub struct StrataIndex {
     blob_compact_safe_lsn: Arc<RwLock<StrataLsn>>,
     /// Cached shard registry used by blob-version merge and compaction cleanup.
     shard_infos: Arc<RwLock<BTreeMap<ShardId, ShardInfo>>>,
+    /// In-memory accounting frontiers currently pinning segment ref events for GC.
+    accounting_snapshot_pins: Arc<Mutex<accounting::AccountingSnapshotPins>>,
     /// Packed payload version and lifecycle state keyed by blob key.
     blob_versions: DBMap<BlobKey, BlobVersionState>,
     /// Durable manifest for each segment: path, state, offsets, placement, LSN bounds, and digest.
     segment_states: DBMap<SegmentKey, SegmentState>,
-    /// Segment-level accounting used by cleanup planning without scanning payload files.
-    segment_stats: DBMap<SegmentKey, SegmentStats>,
-    /// Current segment-local ref truth used by L0/GC without per-record blob lookups.
-    segment_ref_state: DBMap<SegmentRefKey, SegmentRefState>,
     /// Precise ref changes used to reconcile records copied while accounting was running.
     segment_ref_events: DBMap<SegmentRefEventKey, SegmentRefEvent>,
-    /// Stale-tolerant segment-local copy filter: known-dead ranges plus lifetime hints.
+    /// Stale-tolerant segment-local GC view: summary counters, expired/retired ranges, and hints.
     segment_gc_overlay: DBMap<SegmentId, SegmentGcOverlay>,
+    /// Active GC publish forwarding rows used while accounting replays pre-publish events.
+    gc_relocations: DBMap<RecordRef, GcRelocation>,
     /// Shard registry used to resolve the current internal generation for each logical shard.
     shards: DBMap<ShardId, ShardInfo>,
     /// Store-global cursors.
@@ -115,7 +116,7 @@ pub struct StrataIndex {
     /// Blob-key operations keyed by store-global LSN, retained until accounting consumes them.
     /// Unaccounted lsn ops need the blob key to partition delta log operations.
     unaccounted_lsn_ops: DBMap<StrataLsn, BlobKey>,
-    /// Sidecar accounting-index metadata committed atomically with stats and GC state.
+    /// Sidecar accounting-index metadata committed atomically with GC state.
     accounting_index: DBMap<AccountingIndexKey, AccountingIndexValue>,
 }
 

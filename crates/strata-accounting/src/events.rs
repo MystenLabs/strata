@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use strata_core::{
-    BlobKey, BlobLifecycle, RecordRef, SegmentGcLifetimeUpdate, SegmentGcOverlayMergeOp,
-    SegmentGcRecordRange, SegmentId, ShardKey, StrataLsn,
+    BlobKey, BlobLifecycle, RecordRef, SegmentGcLifetimeUpdate, SegmentGcLiveRecord,
+    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, ShardKey, StrataLsn,
 };
 
 use crate::{PartitionId, RunId};
@@ -47,16 +47,16 @@ pub enum RefEvent {
     },
 }
 
-/// Signed per-segment accounting changes produced by materializing update history.
+/// Signed per-segment GC summary changes produced by materializing update history.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SegmentStatsDelta {
+pub struct SegmentGcSummaryDelta {
     pub total_bytes: i128,
     pub live_bytes: i128,
-    pub tombstoned_bytes: i128,
+    pub retired_bytes: i128,
     pub live_ref_count: i128,
 }
 
-impl SegmentStatsDelta {
+impl SegmentGcSummaryDelta {
     fn apply_live(&mut self, len: u64) {
         let len = i128::from(len);
         self.total_bytes += len;
@@ -67,7 +67,7 @@ impl SegmentStatsDelta {
     fn apply_retired(&mut self, len: u64) {
         let len = i128::from(len);
         self.live_bytes -= len;
-        self.tombstoned_bytes += len;
+        self.retired_bytes += len;
         self.live_ref_count -= 1;
     }
 }
@@ -95,13 +95,12 @@ pub struct CompactionEventBatch {
     /// materialization watermark.
     pub max_lsn: StrataLsn,
     /// Logical ref transitions are kept as an audit trail and as the source from which the physical
-    /// segment-stat and overlay mutations were derived. They are not replayed by future sidecar reads;
+    /// summary and overlay mutations were derived. They are not replayed by future sidecar reads;
     /// future reads follow the manifest's run stack.
     pub events: Vec<RefEvent>,
-    /// Segment stats are pre-aggregated signed deltas so the owner can update per-segment accounting
-    /// directly in the publish batch instead of asking a later consumer to replay individual ref
-    /// events.
-    pub segment_stats: BTreeMap<SegmentId, SegmentStatsDelta>,
+    /// Summary deltas are retained for callers that inspect prepared sidecar output directly. The
+    /// store's durable GC summary is folded into `SegmentGcOverlay`.
+    pub segment_summary: BTreeMap<SegmentId, SegmentGcSummaryDelta>,
     /// GC overlay operands are already grouped by physical segment because RocksDB merge application
     /// is the lifecycle boundary for collectability. Publishing these operands with the manifest
     /// prevents GC from seeing a segment range as retired or lifetime-adjusted without the matching
@@ -111,35 +110,32 @@ pub struct CompactionEventBatch {
 
 impl CompactionEventBatch {
     pub(crate) fn record_event(&mut self, event: RefEvent) {
-        // RefEvents are the logical history; segment stats and GC-overlay merge operands are the
-        // physical consequences that must be published beside that history. A Live event allocates
-        // new accounted bytes, a Retired event converts an already-accounted range into tombstoned
-        // bytes, and a Mapped event is both operations joined by one ref rewrite. The overlay does
-        // not mirror the live counter: it records only dead carve-outs and lifetime routing hints,
-        // while `segment_stats` remains the source of total/live/tombstoned byte accounting.
-        // Lifecycle-only changes intentionally do not affect byte counters.
+        // RefEvents are the logical history; signed summary deltas and GC-overlay merge operands
+        // are physical consequences that can be published beside that history. The store treats the
+        // overlay summary as the canonical GC accounting view, but these deltas are still retained
+        // for tests and for callers that inspect prepared sidecar output directly.
         match &event {
             RefEvent::Live { record_ref, .. } => {
-                self.segment_stats
+                self.segment_summary
                     .entry(record_ref.segment_id)
                     .or_default()
                     .apply_live(record_ref.len);
             }
             RefEvent::Retired { record_ref, .. } => {
-                self.segment_stats
+                self.segment_summary
                     .entry(record_ref.segment_id)
                     .or_default()
                     .apply_retired(record_ref.len);
             }
             RefEvent::Mapped { from, to, .. } => {
-                // The logical key did not change, but the protected bytes did. Stats therefore see a
-                // retire on the old segment and a live allocation on the new segment; the matching GC
-                // overlay update is emitted below from the same RefEvent.
-                self.segment_stats
+                // The logical key did not change, but the protected bytes did. Summary deltas see a
+                // retire on the old segment and a live allocation on the new segment; the matching
+                // GC overlay update is emitted below from the same RefEvent.
+                self.segment_summary
                     .entry(from.segment_id)
                     .or_default()
                     .apply_retired(from.len);
-                self.segment_stats
+                self.segment_summary
                     .entry(to.segment_id)
                     .or_default()
                     .apply_live(to.len);
@@ -152,28 +148,22 @@ impl CompactionEventBatch {
 
     fn record_gc_overlay_event(&mut self, event: &RefEvent) {
         // The GC overlay is keyed by physical segment, not by blob key. These operands therefore
-        // translate each logical ref transition into range-scoped segment updates. Retires always
-        // produce a RetireBatch because the old record range must stop protecting segment space.
-        // LifetimeBatch is emitted only when there is lifecycle state to install or clear; a live ref
-        // with no lifecycle has no overlay row to create, while LifecycleChanged(new = None) must
-        // still be represented so an existing lifetime can be removed.
+        // translate each logical ref transition into range-scoped segment updates.
         match event {
             RefEvent::Live {
                 record_ref,
                 lifecycle,
                 ..
             } => {
-                if let Some(lifecycle) = lifecycle {
-                    self.push_gc_overlay_op(
-                        record_ref.segment_id,
-                        SegmentGcOverlayMergeOp::LifetimeBatch {
-                            updates: vec![SegmentGcLifetimeUpdate {
-                                range: SegmentGcRecordRange::from(*record_ref),
-                                lifecycle: Some(*lifecycle),
-                            }],
-                        },
-                    );
-                }
+                self.push_gc_overlay_op(
+                    record_ref.segment_id,
+                    SegmentGcOverlayMergeOp::AddLiveBatch {
+                        records: vec![SegmentGcLiveRecord {
+                            range: SegmentGcRecordRange::from(*record_ref),
+                            lifecycle: *lifecycle,
+                        }],
+                    },
+                );
             }
             RefEvent::Retired { record_ref, .. } => {
                 self.push_gc_overlay_op(
@@ -206,25 +196,22 @@ impl CompactionEventBatch {
                 ..
             } => {
                 // Mapping is a physical move: the old range becomes collectable and the new range
-                // inherits the key's lifecycle, if any. The segment stats update mirrors this by
-                // retiring `from` and accounting `to` as freshly live bytes.
+                // inherits the key's lifecycle, if any.
                 self.push_gc_overlay_op(
                     from.segment_id,
                     SegmentGcOverlayMergeOp::RetireBatch {
                         ranges: vec![SegmentGcRecordRange::from(*from)],
                     },
                 );
-                if let Some(lifecycle) = lifecycle {
-                    self.push_gc_overlay_op(
-                        to.segment_id,
-                        SegmentGcOverlayMergeOp::LifetimeBatch {
-                            updates: vec![SegmentGcLifetimeUpdate {
-                                range: SegmentGcRecordRange::from(*to),
-                                lifecycle: Some(*lifecycle),
-                            }],
-                        },
-                    );
-                }
+                self.push_gc_overlay_op(
+                    to.segment_id,
+                    SegmentGcOverlayMergeOp::AddLiveBatch {
+                        records: vec![SegmentGcLiveRecord {
+                            range: SegmentGcRecordRange::from(*to),
+                            lifecycle: *lifecycle,
+                        }],
+                    },
+                );
             }
         }
     }

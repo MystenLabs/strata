@@ -115,6 +115,9 @@ pub(crate) fn remove_lifecycle_lsns_from_state(
     {
         state.head.lifetime = None;
     }
+    if state.head.expiry_lsn.is_some_and(|lsn| lsns.contains(&lsn)) {
+        state.head.expiry_lsn = None;
+    }
     if state
         .head
         .tombstone_lsn

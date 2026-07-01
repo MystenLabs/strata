@@ -15,8 +15,8 @@ use strata_store::{
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
-    StrataStoreMetrics,
+    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
+    StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -161,6 +161,7 @@ impl Config {
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
             accounting_sidecar_major_patch_bytes_threshold:
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+            gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             starting_epoch: self.starting_epoch,
         }
     }
@@ -341,10 +342,10 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
             let segment_id = parse_u64(&words[1])?;
             match store
                 .index()
-                .get_segment_stats(segment_id)
+                .get_segment_gc_overlay(segment_id)
                 .map_err(|error| error.to_string())?
             {
-                Some(stats) => println!("{stats:#?}"),
+                Some(overlay) => println!("{overlay:#?}"),
                 None => println!("not_found"),
             }
         }
@@ -604,7 +605,7 @@ fn help() -> &'static str {
   extend <key> <epoch>            alias for set-lifetime
   entry <key>                     print latest blob index entry
   segment <segment_id>            print segment state
-  stats <segment_id>              print segment stats
+  stats <segment_id>              print GC overlay summary/ranges
   sync                            fsync active segment and advance durable LSN
   durable-lsn                     print current durable LSN
   config                          print shell/store config

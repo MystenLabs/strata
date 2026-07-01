@@ -3,20 +3,20 @@
 //! Three readers need different breadcrumbs here:
 //! - Systems engineer: preserve the frontier contract. Payload/index writes become durable first;
 //!   the active delta log is made durable with that prefix; sidecar compaction then publishes
-//!   derived stats, ref states, ref events, and GC overlays from compaction events.
+//!   derived ref events and GC overlay operands from compaction events.
 //! - New contributor: the foreground writer never resolves blob keys for accounting. It appends
 //!   cheap deltas; `AccountingSidecar` ingests those deltas into compact files and applies
-//!   compaction events back to the main index for GC.
+//!   compaction events back to the main index as segment ref events and GC overlay operands.
 //! - Future maintainer: most choices below are defensive ordering choices. For example, advancing a
 //!   cursor before publishing its prepared sidecar manifest would make replay skip deltas after a
-//!   crash; applying event rows separately from the manifest would either duplicate or lose
+//!   crash; applying derived rows separately from the manifest would either duplicate or lose
 //!   accounting effects after restart.
 //!
 //! Inline comments call out those perspectives as `Systems invariant`, `Ramp-up`, and
 //! `Future-maintainer note` where the local code shape is otherwise surprising.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -26,21 +26,14 @@ use strata_accounting::{
     ActiveDeltaLogState, CompactionEventBatch, Manifest, RefEvent as AccountingRefEvent,
 };
 use strata_core::{
-    BlobLifecycle, Epoch, RecordRef, SegmentGcLifetimeUpdate, SegmentGcOverlayMergeOp,
-    SegmentGcRecordRange, SegmentId, SegmentRefEvent, SegmentRefEventKey, SegmentRefKey,
-    SegmentRefState, SegmentRefStatus, SegmentState, SegmentStats, StrataLsn,
+    BlobLifecycle, Epoch, GcRelocation, RecordRef, SegmentGcLifetimeUpdate, SegmentGcLiveRecord,
+    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, SegmentRefEvent, SegmentRefEventKey,
+    StrataLsn,
 };
 use strata_index::StrataIndex;
 use typed_store::rocks::DBBatch;
 
-use crate::{
-    Error, Result,
-    config::StrataStoreConfig,
-    stats::{
-        add_live_lifecycle_stats, expire_live_lifecycle_stats_through, lifecycle_is_expired,
-        remove_live_lifecycle_stats,
-    },
-};
+use crate::{Error, Result, config::StrataStoreConfig};
 
 #[derive(Debug)]
 pub(crate) enum AccountingCommand {
@@ -61,7 +54,7 @@ pub(crate) enum AccountingCommand {
 /// back into the main index.
 ///
 /// Failure example: if two sidecar runs raced, both could compact the same input run and publish
-/// duplicate segment-stat deltas.
+/// duplicate non-idempotent GC overlay allocations.
 #[derive(Debug)]
 pub(crate) struct AccountingWorker {
     pub(crate) config: StrataStoreConfig,
@@ -83,8 +76,9 @@ impl AccountingWorker {
         loop {
             match self.command_rx.recv_timeout(self.interval) {
                 Ok(AccountingCommand::Run) => {
-                    // Systems invariant: one sidecar pass at a time. Compaction events are signed
-                    // deltas, so duplicate application would corrupt segment stats.
+                    // Systems invariant: one sidecar pass at a time. Live-allocation overlay
+                    // operands are not idempotent, so duplicate application would corrupt GC
+                    // summary counters.
                     let _guard = self.run_lock.lock().expect("accounting run lock poisoned");
                     Self::run_sidecar(
                         &mut sidecar,
@@ -133,6 +127,10 @@ impl AccountingWorker {
 enum SidecarRunMode {
     Forced,
     Maintenance,
+}
+
+fn lifecycle_is_expired(lifecycle: Option<BlobLifecycle>, current_epoch: Epoch) -> bool {
+    lifecycle.is_some_and(|lifecycle| lifecycle.logical_end_epoch <= current_epoch)
 }
 
 #[cfg(test)]
@@ -199,7 +197,7 @@ impl AccountingSidecar {
         Ok(())
     }
 
-    /// Forces a catch-up pass for an explicit writer/sync nudge.
+    /// Forces one materializing pass for an explicit writer/sync nudge.
     ///
     /// This bypasses the sidecar size/count thresholds because callers waiting on durability expect
     /// any durable accounting deltas to be reflected in GC-facing rows promptly.
@@ -406,16 +404,16 @@ impl AccountingSidecar {
     /// this batch is durable. That check protects the in-memory sidecar mirror and its obsolete-file
     /// cleanup from stale local work; it does not make this RocksDB write conditional. Durable
     /// serialization comes from the single sidecar worker/run lock. Under that serialization, this
-    /// batch is the state transition: manifest, consumed cursor, derived ref/stat rows, and frontier
-    /// movement become visible together, then the WAL is fsynced before the in-memory sidecar mirror
-    /// is advanced.
+    /// batch is the state transition: manifest, consumed cursor, derived ref/overlay rows, and
+    /// frontier movement become visible together, then the WAL is fsynced before the in-memory
+    /// sidecar mirror is advanced.
     fn commit_sidecar_state(
         &self,
         manifest: Option<&Manifest>,
         cursor: Option<ActiveDeltaLogReadCursor>,
         event_batch: Option<&CompactionEventBatch>,
     ) -> Result<()> {
-        let mut context = SidecarAccountingContext::new(&self.index);
+        let mut context = SidecarAccountingContext::new(&self.index)?;
         if let Some(event_batch) = event_batch {
             context.apply_compaction_event_batch(event_batch)?;
         }
@@ -436,8 +434,13 @@ impl AccountingSidecar {
             self.index
                 .put_accounting_active_delta_log_consumed_cursor_batch(&mut batch, cursor)?;
         }
-        context.write_to_batch(&mut batch)?;
         let current_accounted_lsn = self.index.get_accounted_lsn()?;
+        if let Some(frontier) = frontier.as_ref()
+            && frontier.accounted_lsn > current_accounted_lsn
+        {
+            context.remove_relocations_through_lsn(frontier.accounted_lsn);
+        }
+        context.write_to_batch(&mut batch)?;
         if let Some(frontier) = frontier.as_ref()
             && frontier.accounted_lsn > current_accounted_lsn
         {
@@ -481,33 +484,31 @@ struct FrontierUpdate {
 /// main-index rows GC already consumes, while keeping the RocksDB commit atomic with the sidecar
 /// manifest/cursor update.
 ///
-/// Failure example: applying event rows outside the manifest commit would either duplicate signed
-/// stat deltas after a retry or lose them after a crash.
+/// Failure example: applying event rows outside the manifest commit would either duplicate
+/// non-idempotent overlay allocations after a retry or lose them after a crash.
 struct SidecarAccountingContext<'a> {
     index: &'a StrataIndex,
-    stats: BTreeMap<SegmentId, SegmentStats>,
-    ref_states: BTreeMap<SegmentRefKey, SegmentRefState>,
     ref_events: BTreeMap<SegmentRefEventKey, SegmentRefEvent>,
     gc_overlay_ops: BTreeMap<SegmentId, Vec<SegmentGcOverlayMergeOp>>,
-    states: BTreeMap<SegmentId, SegmentState>,
+    relocations: BTreeMap<RecordRef, GcRelocation>,
+    removed_relocations: BTreeSet<RecordRef>,
 }
 
 impl<'a> SidecarAccountingContext<'a> {
-    fn new(index: &'a StrataIndex) -> Self {
-        Self {
+    fn new(index: &'a StrataIndex) -> Result<Self> {
+        Ok(Self {
             index,
-            stats: BTreeMap::new(),
-            ref_states: BTreeMap::new(),
             ref_events: BTreeMap::new(),
             gc_overlay_ops: BTreeMap::new(),
-            states: BTreeMap::new(),
-        }
+            relocations: index.iter_gc_relocations()?.into_iter().collect(),
+            removed_relocations: BTreeSet::new(),
+        })
     }
 
     /// Applies all sidecar-produced ref events for one compaction.
     ///
-    /// The events are structural; this layer classifies them against the epoch that was active at
-    /// each event LSN so existing GC-facing `SegmentStats` buckets stay correct.
+    /// The events are structural; this layer translates them into ordered ref events and overlay
+    /// merge operands. The overlay fold owns summary counter updates.
     fn apply_compaction_event_batch(&mut self, batch: &CompactionEventBatch) -> Result<()> {
         for event in &batch.events {
             self.apply_ref_event(event)?;
@@ -518,7 +519,7 @@ impl<'a> SidecarAccountingContext<'a> {
     fn apply_ref_event(&mut self, event: &AccountingRefEvent) -> Result<()> {
         // The sidecar event stream is logical and key-oriented; the main index rows are
         // segment-oriented. This translation preserves that one event can fan out into several
-        // physical rows: ref state/event history, placement-aware stats, and GC overlay operands.
+        // physical rows: ordered ref events and GC overlay operands.
         match event {
             AccountingRefEvent::Live {
                 lsn,
@@ -542,23 +543,16 @@ impl<'a> SidecarAccountingContext<'a> {
             AccountingRefEvent::Mapped {
                 lsn,
                 from,
-                to,
                 lifecycle,
                 ..
-            } => {
-                // Main-index consumers already understand retire and live transitions. Decomposing a
-                // map here keeps relocated bytes indistinguishable from "old range stopped being
-                // protected, new range became protected" for stats, ref states, and overlay hints.
-                self.retire_ref(*lsn, *from, *lifecycle)?;
-                self.add_ref(*lsn, *to, *lifecycle)
-            }
+            } => self.retire_ref(*lsn, *from, *lifecycle),
         }
     }
 
     /// Advances the global accounting cursor as far as sidecar materialization permits.
     ///
     /// This still inspects `unaccounted_lsn_ops`, but only to compute a contiguous global cleanup
-    /// frontier. It does not resolve blob state or derive stats from blob keys.
+    /// frontier. It does not resolve blob state or derive GC state from blob keys.
     fn advance_frontier(
         &mut self,
         manifest: &Manifest,
@@ -606,19 +600,15 @@ impl<'a> SidecarAccountingContext<'a> {
 
     /// Stages all derived rows into the caller's sidecar metadata batch.
     fn write_to_batch(self, batch: &mut DBBatch) -> Result<()> {
-        for (segment_id, stats) in self.stats {
-            self.index
-                .put_segment_stats_batch(batch, segment_id, &stats)?;
-        }
-        for (key, state) in self.ref_states {
-            self.index.put_segment_ref_state_batch(batch, key, &state)?;
-        }
         for (key, event) in self.ref_events {
             self.index.put_segment_ref_event_batch(batch, key, &event)?;
         }
         for (segment_id, ops) in self.gc_overlay_ops {
             self.index
                 .merge_segment_gc_overlay_batch(batch, segment_id, ops)?;
+        }
+        for from in self.removed_relocations {
+            self.index.delete_gc_relocation_batch(batch, from)?;
         }
         Ok(())
     }
@@ -631,59 +621,44 @@ impl<'a> SidecarAccountingContext<'a> {
         lifecycle: Option<BlobLifecycle>,
     ) -> Result<()> {
         let epoch = self.epoch_at_lsn(lsn)?;
-        let state = self.segment_state(record_ref.segment_id)?.clone();
-        let stats = self.segment_stats(record_ref.segment_id)?;
-        stats.total_bytes = stats.total_bytes.saturating_add(record_ref.len);
         if lifecycle_is_expired(lifecycle, epoch) {
-            // Expired-on-arrival bytes are still part of the segment's physical footprint, so
-            // `total_bytes` increases, but they never enter a live bucket. The overlay receives a
-            // retire immediately so copy planning can skip the range without waiting for epoch
-            // advancement to revisit it.
-            stats.expired_bytes = stats.expired_bytes.saturating_add(record_ref.len);
-            self.put_ref_state(lsn, record_ref, SegmentRefStatus::Retired, lifecycle);
-            self.put_ref_event(lsn, record_ref, SegmentRefEvent::Retired);
-            self.retire_overlay(record_ref);
+            // Expired-on-arrival bytes are still part of the segment's physical footprint, but they
+            // never enter a live bucket. The overlay summary records them as expired immediately.
+            self.put_ref_event(lsn, record_ref, SegmentRefEvent::Expired);
+            self.stage_overlay_op(
+                record_ref.segment_id,
+                SegmentGcOverlayMergeOp::AddExpiredBatch {
+                    ranges: vec![SegmentGcRecordRange::from(record_ref)],
+                },
+            );
         } else {
-            add_live_ref(stats, &state, record_ref.len, lifecycle);
-            self.put_ref_state(lsn, record_ref, SegmentRefStatus::Live, lifecycle);
-            if lifecycle.is_some() {
-                self.set_lifetime_overlay(record_ref, lifecycle);
-            }
+            self.stage_overlay_op(
+                record_ref.segment_id,
+                SegmentGcOverlayMergeOp::AddLiveBatch {
+                    records: vec![SegmentGcLiveRecord {
+                        range: SegmentGcRecordRange::from(record_ref),
+                        lifecycle,
+                    }],
+                },
+            );
         }
         Ok(())
     }
 
     /// Retires a materialized payload ref.
     ///
-    /// Ref state, not just lifecycle, decides which aggregate bucket to move from. Sidecar events
-    /// can be applied before the global `accounted_lsn` frontier reaches their LSN, so epoch
-    /// expiration may not have been staged yet.
     fn retire_ref(
         &mut self,
         lsn: StrataLsn,
         record_ref: RecordRef,
-        lifecycle: Option<BlobLifecycle>,
+        _lifecycle: Option<BlobLifecycle>,
     ) -> Result<()> {
-        let previous = self.ref_state(record_ref)?;
-        if previous
-            .as_ref()
-            .is_some_and(|state| state.status == SegmentRefStatus::Live)
-        {
-            let previous_lifecycle = previous.as_ref().and_then(|state| state.lifecycle);
-            let epoch = self.epoch_at_lsn(lsn)?;
-            let segment = self.segment_state(record_ref.segment_id)?.clone();
-            let stats = self.segment_stats(record_ref.segment_id)?;
-            remove_live_ref(stats, &segment, record_ref.len, previous_lifecycle);
-            if lifecycle_is_expired(previous_lifecycle, epoch) {
-                stats.expired_bytes = stats.expired_bytes.saturating_add(record_ref.len);
-            } else {
-                stats.tombstoned_bytes = stats.tombstoned_bytes.saturating_add(record_ref.len);
-            }
-        }
-
-        self.put_ref_state(lsn, record_ref, SegmentRefStatus::Retired, lifecycle);
         self.put_ref_event(lsn, record_ref, SegmentRefEvent::Retired);
         self.retire_overlay(record_ref);
+        if let Some(relocation) = self.relocation_for(lsn, record_ref) {
+            self.put_ref_event(lsn, relocation.to, SegmentRefEvent::Retired);
+            self.retire_overlay(relocation.to);
+        }
         Ok(())
     }
 
@@ -700,95 +675,64 @@ impl<'a> SidecarAccountingContext<'a> {
         }
 
         let epoch = self.epoch_at_lsn(lsn)?;
-        let current = self.ref_state(record_ref)?;
-        let current_status = current
-            .as_ref()
-            .map_or(SegmentRefStatus::Retired, |state| state.status);
-        let old_counted_live = current_status == SegmentRefStatus::Live;
-        let new_expired = lifecycle_is_expired(new, epoch);
-        let segment = self.segment_state(record_ref.segment_id)?.clone();
-        let stats = self.segment_stats(record_ref.segment_id)?;
-
-        match (old_counted_live, new_expired) {
-            (true, false) => {
-                // Live before, live after: only the placement/lifetime bucket changes. The range
-                // stays copy-eligible, so the overlay is updated with the replacement hint.
-                remove_live_ref(stats, &segment, record_ref.len, old);
-                add_live_ref(stats, &segment, record_ref.len, new);
-                self.put_ref_state(lsn, record_ref, SegmentRefStatus::Live, new);
-                self.set_lifetime_overlay(record_ref, new);
+        if lifecycle_is_expired(old, epoch) {
+            return Ok(());
+        }
+        if lifecycle_is_expired(new, epoch) {
+            self.expire_ref(lsn, record_ref);
+            if let Some(relocation) = self.relocation_for(lsn, record_ref) {
+                self.expire_ref(lsn, relocation.to);
+            }
+        } else {
+            self.set_lifetime_overlay(record_ref, new);
+            self.put_ref_event(
+                lsn,
+                record_ref,
+                SegmentRefEvent::LifecycleChanged { lifecycle: new },
+            );
+            if let Some(relocation) = self.relocation_for(lsn, record_ref) {
+                self.set_lifetime_overlay(relocation.to, new);
                 self.put_ref_event(
                     lsn,
-                    record_ref,
+                    relocation.to,
                     SegmentRefEvent::LifecycleChanged { lifecycle: new },
                 );
-            }
-            (true, true) => {
-                // Live before, expired after: move the bytes out of live accounting and mark the
-                // physical range retired for GC. This is a lifecycle-driven retirement, not a user
-                // tombstone, so it lands in the expired bucket.
-                remove_live_ref(stats, &segment, record_ref.len, old);
-                stats.expired_bytes = stats.expired_bytes.saturating_add(record_ref.len);
-                self.put_ref_state(lsn, record_ref, SegmentRefStatus::Retired, new);
-                self.retire_overlay(record_ref);
-                self.put_ref_event(lsn, record_ref, SegmentRefEvent::Retired);
-            }
-            (false, false) => {
-                // Retired/expired before, live after: a lifetime extension can make a range
-                // copy-eligible again. Remove it from expired bytes, restore live bucket accounting,
-                // and overwrite the overlay's dead knowledge with a lifetime update.
-                stats.expired_bytes = stats.expired_bytes.saturating_sub(record_ref.len);
-                add_live_ref(stats, &segment, record_ref.len, new);
-                self.put_ref_state(lsn, record_ref, SegmentRefStatus::Live, new);
-                self.set_lifetime_overlay(record_ref, new);
-                self.put_ref_event(
-                    lsn,
-                    record_ref,
-                    SegmentRefEvent::LifecycleChanged { lifecycle: new },
-                );
-            }
-            (false, true) => {
-                // Still retired after the change. Write the latest lifecycle into ref state for
-                // audit/replay, but keep the overlay in retired form so GC continues to skip it.
-                self.put_ref_state(lsn, record_ref, SegmentRefStatus::Retired, new);
-                self.retire_overlay(record_ref);
             }
         }
         Ok(())
     }
 
-    /// Applies an epoch change to live lifecycle buckets and per-record ref states.
+    /// Applies an epoch change to live lifecycle buckets and copy-planning overlays.
     ///
-    /// Failure example: if this only updated aggregate stats, later GC overlay scans would still see
-    /// the expired records as live. If it only updated ref states, segment stats would continue to
-    /// report those bytes as pinned.
+    /// Failure example: if this only updated the overlay summary, GC publish reconciliation would
+    /// not have exact per-range ref events for records copied from an expiring segment.
     fn expire_live_refs(&mut self, lsn: StrataLsn, epoch: Epoch) -> Result<()> {
-        for (segment_id, state) in self.index.iter_segment_states()? {
-            let stats = self.segment_stats(segment_id)?;
-            expire_live_lifecycle_stats_through(stats, state.placement_class, epoch);
-        }
-        let mut ref_states = self.index.iter_all_segment_ref_state()?;
-        // Future-maintainer note: include updates already staged in this pass. Otherwise an LSN
-        // sequence like "put live, increment epoch" could miss the just-added ref because it has not
-        // been flushed to RocksDB yet.
-        for (key, state) in &self.ref_states {
-            if let Some(existing) = ref_states
-                .iter_mut()
-                .find(|(existing_key, _)| existing_key == key)
-            {
-                existing.1 = *state;
-            } else {
-                ref_states.push((*key, *state));
+        for (segment_id, _) in self.index.iter_segment_states()? {
+            let mut overlay = self
+                .index
+                .get_segment_gc_overlay(segment_id)?
+                .unwrap_or_default();
+            if let Some(ops) = self.gc_overlay_ops.get(&segment_id) {
+                overlay.apply_merge_ops(ops.clone());
             }
-        }
-        for (key, state) in ref_states {
-            if state.status == SegmentRefStatus::Live
-                && state
-                    .lifecycle
-                    .is_some_and(|lifecycle| lifecycle.logical_end_epoch <= epoch)
-            {
-                self.put_ref_state_key(lsn, key, SegmentRefStatus::Retired, state.lifecycle);
-                self.put_ref_event_key(lsn, key, SegmentRefEvent::Retired);
+            let lifetimes = overlay.lifetimes;
+            let mut expired = Vec::new();
+            for lifetime in lifetimes {
+                if lifetime.lifecycle.logical_end_epoch <= epoch {
+                    self.put_ref_event_range(
+                        lsn,
+                        segment_id,
+                        lifetime.range,
+                        SegmentRefEvent::Expired,
+                    );
+                    expired.push(lifetime.range);
+                }
+            }
+            if !expired.is_empty() {
+                self.stage_overlay_op(
+                    segment_id,
+                    SegmentGcOverlayMergeOp::ExpireBatch { ranges: expired },
+                );
             }
         }
         Ok(())
@@ -801,118 +745,35 @@ impl<'a> SidecarAccountingContext<'a> {
             .ok_or(Error::EpochNotInitialized)
     }
 
-    /// Loads and caches immutable segment state needed for placement-class-aware stats.
-    ///
-    /// Failure example: missing segment state means a blob version points at a segment accounting
-    /// cannot classify; silently defaulting would put bytes into the wrong placement bucket.
-    fn segment_state(&mut self, segment_id: SegmentId) -> Result<&SegmentState> {
-        if !self.states.contains_key(&segment_id) {
-            let state = self
-                .index
-                .get_segment_state(segment_id)?
-                .ok_or(Error::AccountingMissingSegmentState { segment_id })?;
-            self.states.insert(segment_id, state);
-        }
-        Ok(self.states.get(&segment_id).expect("state inserted above"))
-    }
-
-    /// Loads current segment stats or starts from zero, then returns the mutable staged copy.
-    ///
-    /// Failure example: reading from RocksDB for every transition would ignore earlier staged
-    /// changes in the same pass and can double-count when several LSNs touch one segment.
-    fn segment_stats(&mut self, segment_id: SegmentId) -> Result<&mut SegmentStats> {
-        if !self.stats.contains_key(&segment_id) {
-            let stats = self
-                .index
-                .get_segment_stats(segment_id)?
-                .unwrap_or_default();
-            self.stats.insert(segment_id, stats);
-        }
-        Ok(self
-            .stats
-            .get_mut(&segment_id)
-            .expect("stats inserted above"))
-    }
-
-    fn ref_state(&self, record_ref: RecordRef) -> Result<Option<SegmentRefState>> {
-        let key = SegmentRefKey {
-            segment_id: record_ref.segment_id,
-            offset: record_ref.offset,
-        };
-        if let Some(state) = self.ref_states.get(&key) {
-            return Ok(Some(*state));
-        }
-        Ok(self.index.get_segment_ref_state(key)?)
-    }
-
-    /// Stages the latest state for a physical record reference.
-    ///
-    /// Failure example: without this state, epoch expiration and GC cannot tell whether a specific
-    /// record offset is still live, retired, or only live until a future epoch.
-    fn put_ref_state(
-        &mut self,
-        lsn: StrataLsn,
-        record_ref: RecordRef,
-        status: SegmentRefStatus,
-        lifecycle: Option<BlobLifecycle>,
-    ) {
-        self.put_ref_state_key(
-            lsn,
-            SegmentRefKey {
-                segment_id: record_ref.segment_id,
-                offset: record_ref.offset,
-            },
-            status,
-            lifecycle,
-        );
-    }
-
     /// Stages an ordered event for a physical record reference.
     ///
-    /// Failure example: without events, incremental GC overlay consumers would need to rescan all
-    /// ref states after every accounting pass.
+    /// Failure example: without events, GC publish reconciliation could not see that a copied source
+    /// range was retired after the accounting snapshot used to prepare the plan.
     fn put_ref_event(&mut self, lsn: StrataLsn, record_ref: RecordRef, event: SegmentRefEvent) {
-        self.put_ref_event_key(
+        self.put_ref_event_range(
             lsn,
-            SegmentRefKey {
-                segment_id: record_ref.segment_id,
-                offset: record_ref.offset,
-            },
+            record_ref.segment_id,
+            SegmentGcRecordRange::from(record_ref),
             event,
         );
     }
 
-    /// Stages a ref state when the caller already has the compact segment/offset key.
-    ///
-    /// Failure example: epoch expiration works from `SegmentRefKey`s, not full `RecordRef`s, so
-    /// forcing callers to reconstruct a fake record length would invite accidental wrong lengths.
-    fn put_ref_state_key(
-        &mut self,
-        lsn: StrataLsn,
-        key: SegmentRefKey,
-        status: SegmentRefStatus,
-        lifecycle: Option<BlobLifecycle>,
-    ) {
-        self.ref_states.insert(
-            key,
-            SegmentRefState {
-                status,
-                lifecycle,
-                last_accounted_lsn: lsn,
-            },
-        );
-    }
-
-    /// Stages a ref event when the caller already has the compact segment/offset key.
+    /// Stages a ref event when the caller already has the segment-local range.
     ///
     /// Failure example: if events were keyed only by record offset, two segments with the same
     /// offset would collide and one event would disappear.
-    fn put_ref_event_key(&mut self, lsn: StrataLsn, key: SegmentRefKey, event: SegmentRefEvent) {
+    fn put_ref_event_range(
+        &mut self,
+        lsn: StrataLsn,
+        segment_id: SegmentId,
+        range: SegmentGcRecordRange,
+        event: SegmentRefEvent,
+    ) {
         self.ref_events.insert(
             SegmentRefEventKey {
-                segment_id: key.segment_id,
+                segment_id,
                 lsn,
-                offset: key.offset,
+                offset: range.offset,
             },
             event,
         );
@@ -923,53 +784,74 @@ impl<'a> SidecarAccountingContext<'a> {
     /// Failure example: without the overlay, sealed-segment GC would have to re-resolve blob
     /// history for every candidate record instead of reading compact per-segment hints.
     fn retire_overlay(&mut self, record_ref: RecordRef) {
-        self.gc_overlay_ops
-            .entry(record_ref.segment_id)
-            .or_default()
-            .push(SegmentGcOverlayMergeOp::RetireBatch {
+        self.retire_overlay_range(
+            record_ref.segment_id,
+            SegmentGcRecordRange::from(record_ref),
+        )
+    }
+
+    /// Stages a GC overlay retire operation when the caller already has a segment-local range.
+    fn retire_overlay_range(&mut self, segment_id: SegmentId, range: SegmentGcRecordRange) {
+        self.stage_overlay_op(
+            segment_id,
+            SegmentGcOverlayMergeOp::RetireBatch {
+                ranges: vec![range],
+            },
+        )
+    }
+
+    /// Stages a lifecycle-expiry transition for one physical record.
+    fn expire_ref(&mut self, lsn: StrataLsn, record_ref: RecordRef) {
+        self.put_ref_event(lsn, record_ref, SegmentRefEvent::Expired);
+        self.stage_overlay_op(
+            record_ref.segment_id,
+            SegmentGcOverlayMergeOp::ExpireBatch {
                 ranges: vec![SegmentGcRecordRange::from(record_ref)],
-            });
+            },
+        );
     }
 
     /// Stages a GC overlay operation that records or clears a record's lifetime hint.
     ///
-    /// Failure example: if lifetime changes updated only stats, GC could reclaim a record whose
-    /// logical lifetime was extended after the original put.
+    /// Failure example: if lifetime changes updated only summary counters, GC could reclaim a
+    /// record whose logical lifetime was extended after the original put.
     fn set_lifetime_overlay(&mut self, record_ref: RecordRef, lifecycle: Option<BlobLifecycle>) {
-        self.gc_overlay_ops
-            .entry(record_ref.segment_id)
-            .or_default()
-            .push(SegmentGcOverlayMergeOp::LifetimeBatch {
+        self.stage_overlay_op(
+            record_ref.segment_id,
+            SegmentGcOverlayMergeOp::LifetimeBatch {
                 updates: vec![SegmentGcLifetimeUpdate {
                     range: SegmentGcRecordRange::from(record_ref),
                     lifecycle,
                 }],
-            });
+            },
+        )
     }
-}
 
-/// Adds bytes to the live bucket selected by placement class and lifecycle.
-///
-/// Failure example: bypassing the shared stats helper here could classify exact-epoch bytes
-/// differently from the expiration path.
-fn add_live_ref(
-    stats: &mut SegmentStats,
-    state: &SegmentState,
-    record_len: u64,
-    lifecycle: Option<BlobLifecycle>,
-) {
-    add_live_lifecycle_stats(stats, state.placement_class, record_len, lifecycle);
-}
+    /// Returns the active relocation for a source ref if the event happened before its publish LSN.
+    fn relocation_for(&self, lsn: StrataLsn, record_ref: RecordRef) -> Option<GcRelocation> {
+        self.relocations
+            .get(&record_ref)
+            .copied()
+            .filter(|relocation| lsn < relocation.publish_lsn)
+    }
 
-/// Removes bytes from the live bucket selected by placement class and lifecycle.
-///
-/// Failure example: subtracting from a generic `live_bytes` counter would leave the per-lifetime
-/// buckets inconsistent with aggregate segment stats.
-fn remove_live_ref(
-    stats: &mut SegmentStats,
-    state: &SegmentState,
-    record_len: u64,
-    lifecycle: Option<BlobLifecycle>,
-) {
-    remove_live_lifecycle_stats(stats, state.placement_class, record_len, lifecycle);
+    /// Drops relocation rows whose `MapRef` has reached the accounted frontier.
+    fn remove_relocations_through_lsn(&mut self, accounted_lsn: StrataLsn) {
+        let expired = self
+            .relocations
+            .iter()
+            .filter_map(|(from, relocation)| {
+                (relocation.publish_lsn <= accounted_lsn).then_some(*from)
+            })
+            .collect::<Vec<_>>();
+        for from in expired {
+            self.relocations.remove(&from);
+            self.removed_relocations.insert(from);
+        }
+    }
+
+    /// Records an overlay merge operand for this commit.
+    fn stage_overlay_op(&mut self, segment_id: SegmentId, op: SegmentGcOverlayMergeOp) {
+        self.gc_overlay_ops.entry(segment_id).or_default().push(op);
+    }
 }

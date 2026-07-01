@@ -10,6 +10,7 @@ pub enum BlobUpdate {
         key: BlobKey,
         shard: ShardKey,
         record_ref: RecordRef,
+        current_epoch: Epoch,
         lifecycle: Option<BlobLifecycle>,
     },
     Tombstone {
@@ -20,6 +21,7 @@ pub enum BlobUpdate {
         lsn: StrataLsn,
         key: BlobKey,
         logical_end_epoch: Epoch,
+        current_epoch: Epoch,
     },
     MapRef {
         lsn: StrataLsn,
@@ -128,7 +130,7 @@ pub struct MaterializedBlobState {
     /// key whose last operation may have been a tombstone, lifecycle change, or pending map.
     pub head_lsn: StrataLsn,
     /// Presence here means a physical segment range is currently live for this key and must be
-    /// reflected in segment stats and GC overlay operations. Absence does not make the row
+    /// reflected in ref events and GC overlay operations. Absence does not make the row
     /// disposable, because tombstones and pending maps can still have future physical effects.
     pub payload: Option<LivePayload>,
     /// Lifecycle is key-level intent carried until there is a physical range to annotate. Keeping it
@@ -176,6 +178,7 @@ pub(crate) enum PatchUpdate {
         key: BlobKey,
         shard: ShardKey,
         record_ref: RecordRef,
+        current_epoch: Epoch,
         lifecycle: Option<BlobLifecycle>,
     },
     Tombstone {
@@ -186,6 +189,7 @@ pub(crate) enum PatchUpdate {
         lsn: StrataLsn,
         key: BlobKey,
         logical_end_epoch: Epoch,
+        current_epoch: Epoch,
     },
     MapRef {
         lsn: StrataLsn,
@@ -214,12 +218,14 @@ impl From<BlobUpdate> for PatchUpdate {
                 key,
                 shard,
                 record_ref,
+                current_epoch,
                 lifecycle,
             } => Self::Put {
                 lsn,
                 key,
                 shard,
                 record_ref,
+                current_epoch,
                 lifecycle,
             },
             BlobUpdate::Tombstone { lsn, key } => Self::Tombstone { lsn, key },
@@ -227,10 +233,12 @@ impl From<BlobUpdate> for PatchUpdate {
                 lsn,
                 key,
                 logical_end_epoch,
+                current_epoch,
             } => Self::SetLifetime {
                 lsn,
                 key,
                 logical_end_epoch,
+                current_epoch,
             },
             BlobUpdate::MapRef { lsn, key, from, to } => Self::MapRef { lsn, key, from, to },
         }
@@ -391,14 +399,15 @@ pub(crate) fn fold_patch_update(
 ) {
     // Patch updates are stored separately from delta updates because they are durable summaries, but
     // the state machine is identical. Converting at the boundary keeps all ref-event accounting in
-    // one fold implementation, which is important because segment stats and GC-overlay operands must
-    // stay in lockstep for each logical transition.
+    // one fold implementation, which is important because GC summary and overlay operands must stay
+    // in lockstep for each logical transition.
     match update {
         PatchUpdate::Put {
             lsn,
             key,
             shard,
             record_ref,
+            current_epoch,
             lifecycle,
         } => fold_update(
             state,
@@ -407,6 +416,7 @@ pub(crate) fn fold_patch_update(
                 key: key.clone(),
                 shard: *shard,
                 record_ref: *record_ref,
+                current_epoch: *current_epoch,
                 lifecycle: *lifecycle,
             },
             emit,
@@ -423,12 +433,14 @@ pub(crate) fn fold_patch_update(
             lsn,
             key,
             logical_end_epoch,
+            current_epoch,
         } => fold_update(
             state,
             &BlobUpdate::SetLifetime {
                 lsn: *lsn,
                 key: key.clone(),
                 logical_end_epoch: *logical_end_epoch,
+                current_epoch: *current_epoch,
             },
             emit,
         ),
@@ -460,13 +472,20 @@ pub(crate) fn fold_update(
             lsn,
             shard,
             record_ref,
+            current_epoch,
             lifecycle,
             ..
         } => {
             let current = state.get_or_insert_with(MaterializedBlobState::default);
+            let requested_lifecycle = *lifecycle;
+            let inherited_lifecycle = requested_lifecycle.or_else(|| {
+                current
+                    .lifecycle_value()
+                    .filter(|lifecycle| lifecycle.logical_end_epoch > *current_epoch)
+            });
             // A Put replaces the live physical record for the key. The previous payload is retired
             // at the new LSN before the new payload is announced live, which preserves the byte
-            // transition order expected by segment stats and the GC overlay.
+            // transition order expected by the GC summary and overlay.
             if let Some(payload) = current.payload.take() {
                 emit(RefEvent::Retired {
                     lsn: *lsn,
@@ -483,22 +502,24 @@ pub(crate) fn fold_update(
                 record_ref: *record_ref,
             });
             // A Put without explicit lifecycle inherits any prior key-level lifecycle. If there was
-            // no prior lifecycle, record the absence so the base row still reflects that this payload
-            // was observed and does not need a later inferred default.
-            if lifecycle.is_some() || current.lifecycle.is_none() {
+            // no prior active lifecycle, record the absence so the base row still reflects that this
+            // payload was observed and does not need a later inferred default.
+            if requested_lifecycle.is_some()
+                || current.lifecycle.is_none()
+                || current.lifecycle_value() != inherited_lifecycle
+            {
                 current.lifecycle = Some(LifecycleChange {
                     lsn: *lsn,
-                    new_lifecycle: *lifecycle,
+                    new_lifecycle: inherited_lifecycle,
                 });
             }
             current.tombstone = None;
-            let lifecycle = current.lifecycle_value();
             emit(RefEvent::Live {
                 lsn: *lsn,
                 key,
                 shard: *shard,
                 record_ref: *record_ref,
-                lifecycle,
+                lifecycle: inherited_lifecycle,
             });
             apply_pending_maps(update.key(), current, emit);
         }
@@ -522,14 +543,17 @@ pub(crate) fn fold_update(
         BlobUpdate::SetLifetime {
             lsn,
             logical_end_epoch,
+            current_epoch,
             ..
         } => {
             let current = state.get_or_insert_with(MaterializedBlobState::default);
             let old = current.lifecycle_value();
+            let old_expired = old.is_some_and(|old| old.logical_end_epoch <= *current_epoch);
+            let active_old = old.filter(|_| !old_expired);
             // Lifetime extension is key-level metadata, but GC can enforce it only on the currently
             // live record range. If no payload is live yet, the lifecycle is carried in state and
             // attached when a Put later materializes a physical range.
-            let new = old.map_or_else(
+            let new = active_old.map_or_else(
                 || BlobLifecycle::new(*logical_end_epoch),
                 |old| BlobLifecycle {
                     logical_end_epoch: *logical_end_epoch,
@@ -541,7 +565,8 @@ pub(crate) fn fold_update(
                 lsn: *lsn,
                 new_lifecycle: Some(new),
             });
-            if old != Some(new)
+            if !old_expired
+                && old != Some(new)
                 && let Some(payload) = &current.payload
             {
                 emit(RefEvent::LifecycleChanged {

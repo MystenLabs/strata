@@ -14,13 +14,6 @@ pub struct SegmentKey {
     pub segment_id: SegmentId,
 }
 
-/// Offset-keyed accounting state for one physical record in an ingest segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SegmentRefKey {
-    pub segment_id: SegmentId,
-    pub offset: u64,
-}
-
 /// LSN-ordered accounting event for one physical record in an ingest segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SegmentRefEventKey {
@@ -30,28 +23,30 @@ pub struct SegmentRefEventKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SegmentRefStatus {
-    Live,
-    Retired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SegmentRefState {
-    pub status: SegmentRefStatus,
-    pub lifecycle: Option<BlobLifecycle>,
-    pub last_accounted_lsn: StrataLsn,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentRefEvent {
+    /// The physical record stopped protecting a key because of overwrite, tombstone, or GC mapping.
     Retired,
+    /// The physical record stopped protecting a key because its lifecycle reached an epoch boundary.
+    Expired,
+    /// The physical record is still protected, but its routing lifecycle changed.
     LifecycleChanged { lifecycle: Option<BlobLifecycle> },
+}
+
+/// Durable forwarding entry installed while accounting catches up to a GC publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcRelocation {
+    /// Publish LSN of the `MapRef` that makes this relocation part of the ordered accounting log.
+    pub publish_lsn: StrataLsn,
+    /// Replacement physical record that already received the copied bytes.
+    pub to: crate::RecordRef,
 }
 
 /// Segment-local byte range for one encoded record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SegmentGcRecordRange {
+    /// Starting byte offset of the encoded record within the segment file.
     pub offset: u64,
+    /// Encoded record length, including header, payload, and key trailer bytes.
     pub len: u64,
 }
 
@@ -73,31 +68,334 @@ impl From<crate::RecordRef> for SegmentGcRecordRange {
 /// Known lifetime for a segment-local live or copy eligible record range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentGcLifetimeRange {
+    /// Physical record range the lifetime hint applies to.
     pub range: SegmentGcRecordRange,
+    /// Logical lifetime used by GC to route the range during copy.
     pub lifecycle: BlobLifecycle,
 }
 
 /// Lifetime update folded into a segment-local GC overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentGcLifetimeUpdate {
+    /// Physical record range whose routing hint changed.
     pub range: SegmentGcRecordRange,
+    /// New lifetime hint. `None` clears the hint while keeping the range copy-eligible.
     pub lifecycle: Option<BlobLifecycle>,
+}
+
+/// Live record allocation folded into a segment-local GC overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentGcLiveRecord {
+    /// Physical record range that has become protected by a live logical key.
+    pub range: SegmentGcRecordRange,
+    /// Optional logical lifetime known when the live range was materialized.
+    pub lifecycle: Option<BlobLifecycle>,
+}
+
+/// Cheap accounting summary used by GC planning.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SegmentGcSummary {
+    /// Total encoded bytes accounted for this segment by the GC overlay fold.
+    pub total_bytes: u64,
+    /// Bytes currently protected by live refs.
+    pub live_bytes: u64,
+    /// Bytes permanently retired by overwrite, tombstone, shard drop, or completed relocation.
+    pub retired_bytes: u64,
+    /// Bytes whose lifecycle has ended and are collectable unless already permanently retired.
+    pub expired_bytes: u64,
+    /// Number of currently live physical refs in this segment.
+    pub live_ref_count: u64,
+    /// Live bytes without a known end epoch, routed to spillover by default.
+    pub unknown_lifetime_bytes: u64,
+    /// Number of live refs without a known end epoch.
+    pub unknown_lifetime_ref_count: u64,
+    /// Earliest end epoch among live refs with known lifetimes.
+    pub min_live_end_epoch: Option<Epoch>,
+    /// Latest end epoch among live refs with known lifetimes.
+    pub max_live_end_epoch: Option<Epoch>,
+    /// Live bytes and ref counts grouped by logical end epoch for placement planning.
+    pub future_epoch_histogram: BTreeMap<Epoch, EpochBucket>,
+    /// Extension counts of refs added live to this segment. Refs stay in their bucket after they
+    /// expire: per-epoch extension counts are not tracked, so expiry sweeps cannot remove them.
+    pub extension_count_histogram: BTreeMap<u32, u64>,
+}
+
+impl SegmentGcSummary {
+    pub fn garbage_bytes(&self) -> u64 {
+        self.retired_bytes.saturating_add(self.expired_bytes)
+    }
+
+    pub fn garbage_ratio(&self) -> f64 {
+        if self.total_bytes == 0 {
+            0.0
+        } else {
+            self.garbage_bytes() as f64 / self.total_bytes as f64
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live_ref_count == 0
+    }
 }
 
 /// Stale tolerant segment local overlay used by GC copy planning.
 ///
-/// `dead` ranges are definitely skippable. Ranges absent from `dead` are eligible to copy, not
-/// necessarily proven live in the freshest blob-version view. `lifetimes` contains routing hints
-/// for eligible ranges with known expiry; absent lifetime means spillover/unknown routing.
+/// `retired` ranges are permanently skippable because the key no longer protects the bytes.
+/// `expired` ranges are skippable because their lifecycle ended and cannot be revived by a later
+/// lifetime update. Ranges absent from both are eligible to copy, not necessarily proven
+/// live in the freshest blob-version view. `lifetimes` contains routing hints for eligible ranges
+/// with known expiry; absent lifetime means spillover/unknown routing.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SegmentGcOverlay {
-    pub dead: Vec<SegmentGcRecordRange>,
+    /// Compact aggregate counters that let the planner score segments without scanning files.
+    pub summary: SegmentGcSummary,
+    /// Ranges expired by lifecycle. These are skippable and are not revivable by extension.
+    pub expired: Vec<SegmentGcRecordRange>,
+    /// Ranges permanently retired. These bytes should never be copied by GC.
+    pub retired: Vec<SegmentGcRecordRange>,
+    /// Routing hints for copy-eligible ranges with known logical lifetimes.
     pub lifetimes: Vec<SegmentGcLifetimeRange>,
+}
+
+impl SegmentGcOverlay {
+    /// Applies GC overlay merge operations in commit order and leaves the overlay canonical.
+    pub fn apply_merge_ops(&mut self, ops: impl IntoIterator<Item = SegmentGcOverlayMergeOp>) {
+        for op in ops {
+            self.apply_merge_op_unchecked(op);
+        }
+        self.normalize();
+    }
+
+    /// Applies one GC overlay merge operation and leaves the overlay canonical.
+    pub fn apply_merge_op(&mut self, op: SegmentGcOverlayMergeOp) {
+        self.apply_merge_op_unchecked(op);
+        self.normalize();
+    }
+
+    fn apply_merge_op_unchecked(&mut self, op: SegmentGcOverlayMergeOp) {
+        match op {
+            SegmentGcOverlayMergeOp::AddLiveBatch { records } => {
+                for record in records {
+                    self.add_live_record(record);
+                }
+            }
+            SegmentGcOverlayMergeOp::AddRetiredBatch { ranges } => {
+                for range in ranges {
+                    self.add_retired_record(range);
+                }
+            }
+            SegmentGcOverlayMergeOp::AddExpiredBatch { ranges } => {
+                for range in ranges {
+                    self.add_expired_record(range);
+                }
+            }
+            SegmentGcOverlayMergeOp::ExpireBatch { ranges } => {
+                for range in ranges {
+                    self.expire_range(range);
+                }
+            }
+            SegmentGcOverlayMergeOp::RetireBatch { ranges } => {
+                for range in ranges {
+                    self.retire_range(range);
+                }
+            }
+            SegmentGcOverlayMergeOp::LifetimeBatch { updates } => {
+                for update in updates {
+                    self.apply_lifetime_update(update);
+                }
+            }
+        }
+    }
+
+    fn add_live_record(&mut self, record: SegmentGcLiveRecord) {
+        if is_empty_gc_range(record.range) {
+            return;
+        }
+
+        subtract_gc_range(&mut self.expired, record.range);
+        subtract_gc_range(&mut self.retired, record.range);
+        remove_lifetimes_overlapping(&mut self.lifetimes, record.range);
+        add_live_summary(&mut self.summary, record.range.len, record.lifecycle);
+        self.summary.total_bytes = self.summary.total_bytes.saturating_add(record.range.len);
+        if let Some(lifecycle) = record.lifecycle {
+            self.lifetimes.push(SegmentGcLifetimeRange {
+                range: record.range,
+                lifecycle,
+            });
+        }
+    }
+
+    fn add_retired_record(&mut self, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) {
+            return;
+        }
+
+        if self
+            .retired
+            .iter()
+            .any(|retired| range_contains(*retired, range))
+        {
+            return;
+        }
+
+        let was_expired = self
+            .expired
+            .iter()
+            .any(|expired| range_contains(*expired, range));
+        if was_expired {
+            subtract_gc_range(&mut self.expired, range);
+            self.summary.expired_bytes = self.summary.expired_bytes.saturating_sub(range.len);
+        } else {
+            self.summary.total_bytes = self.summary.total_bytes.saturating_add(range.len);
+        }
+        subtract_gc_range(&mut self.expired, range);
+        remove_lifetimes_overlapping(&mut self.lifetimes, range);
+        self.summary.retired_bytes = self.summary.retired_bytes.saturating_add(range.len);
+        self.retired.push(range);
+        coalesce_gc_ranges(&mut self.retired);
+    }
+
+    fn add_expired_record(&mut self, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) {
+            return;
+        }
+
+        if self
+            .retired
+            .iter()
+            .any(|retired| range_contains(*retired, range))
+        {
+            return;
+        }
+        subtract_gc_range(&mut self.retired, range);
+        remove_lifetimes_overlapping(&mut self.lifetimes, range);
+        self.summary.total_bytes = self.summary.total_bytes.saturating_add(range.len);
+        self.summary.expired_bytes = self.summary.expired_bytes.saturating_add(range.len);
+        self.expired.push(range);
+        coalesce_gc_ranges(&mut self.expired);
+    }
+
+    fn expire_range(&mut self, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range)
+            || self
+                .retired
+                .iter()
+                .any(|retired| range_contains(*retired, range))
+            || self
+                .expired
+                .iter()
+                .any(|expired| range_contains(*expired, range))
+        {
+            return;
+        }
+
+        let lifecycle = self.lifecycle_for_range(range);
+        remove_live_summary(&mut self.summary, range.len, lifecycle);
+        self.summary.expired_bytes = self.summary.expired_bytes.saturating_add(range.len);
+        remove_lifetimes_overlapping(&mut self.lifetimes, range);
+        self.expired.push(range);
+        coalesce_gc_ranges(&mut self.expired);
+    }
+
+    fn retire_range(&mut self, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range)
+            || self
+                .retired
+                .iter()
+                .any(|retired| range_contains(*retired, range))
+        {
+            return;
+        }
+
+        if self
+            .expired
+            .iter()
+            .any(|expired| range_contains(*expired, range))
+        {
+            self.summary.expired_bytes = self.summary.expired_bytes.saturating_sub(range.len);
+            self.summary.retired_bytes = self.summary.retired_bytes.saturating_add(range.len);
+            subtract_gc_range(&mut self.expired, range);
+        } else {
+            let lifecycle = self.lifecycle_for_range(range);
+            remove_live_summary(&mut self.summary, range.len, lifecycle);
+            self.summary.retired_bytes = self.summary.retired_bytes.saturating_add(range.len);
+        }
+
+        remove_lifetimes_overlapping(&mut self.lifetimes, range);
+        self.retired.push(range);
+        coalesce_gc_ranges(&mut self.retired);
+    }
+
+    fn apply_lifetime_update(&mut self, update: SegmentGcLifetimeUpdate) {
+        if is_empty_gc_range(update.range) {
+            return;
+        }
+
+        if self
+            .retired
+            .iter()
+            .any(|retired| range_contains(*retired, update.range))
+        {
+            return;
+        }
+
+        if self
+            .expired
+            .iter()
+            .any(|expired| range_contains(*expired, update.range))
+        {
+            return;
+        }
+
+        let old = self.lifecycle_for_range(update.range);
+        if old == update.lifecycle {
+            return;
+        }
+        remove_live_summary(&mut self.summary, update.range.len, old);
+        add_live_summary(&mut self.summary, update.range.len, update.lifecycle);
+        remove_lifetimes_overlapping(&mut self.lifetimes, update.range);
+
+        if let Some(lifecycle) = update.lifecycle {
+            self.lifetimes.push(SegmentGcLifetimeRange {
+                range: update.range,
+                lifecycle,
+            });
+            self.lifetimes
+                .sort_by_key(|entry| (entry.range.offset, entry.range.len));
+        }
+    }
+
+    fn lifecycle_for_range(&self, range: SegmentGcRecordRange) -> Option<BlobLifecycle> {
+        self.lifetimes
+            .iter()
+            .find(|entry| range_contains(entry.range, range))
+            .map(|entry| entry.lifecycle)
+    }
+
+    fn normalize(&mut self) {
+        coalesce_gc_ranges(&mut self.retired);
+        coalesce_gc_ranges(&mut self.expired);
+        self.lifetimes.retain(|entry| {
+            !is_empty_gc_range(entry.range)
+                && !range_overlaps_any(entry.range, &self.retired)
+                && !range_overlaps_any(entry.range, &self.expired)
+        });
+        self.lifetimes
+            .sort_by_key(|entry| (entry.range.offset, entry.range.len));
+    }
 }
 
 /// Merge operand for `SegmentGcOverlay`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentGcOverlayMergeOp {
+    /// Accounts newly protected live ranges.
+    AddLiveBatch { records: Vec<SegmentGcLiveRecord> },
+    /// Accounts newly written ranges that were already permanently dead at materialization time.
+    AddRetiredBatch { ranges: Vec<SegmentGcRecordRange> },
+    /// Accounts newly written ranges that were already expired at materialization time.
+    AddExpiredBatch { ranges: Vec<SegmentGcRecordRange> },
+    /// Marks ranges as expired. Expired ranges are not revivable by later lifetime updates.
+    ExpireBatch { ranges: Vec<SegmentGcRecordRange> },
     /// Marks segment-local ranges as definitely not protecting live data. This is stronger than a
     /// lifetime hint and removes overlapping lifecycle overlay state when folded.
     RetireBatch { ranges: Vec<SegmentGcRecordRange> },
@@ -106,6 +404,174 @@ pub enum SegmentGcOverlayMergeOp {
     LifetimeBatch {
         updates: Vec<SegmentGcLifetimeUpdate>,
     },
+}
+
+fn add_live_summary(
+    summary: &mut SegmentGcSummary,
+    record_len: u64,
+    lifecycle: Option<BlobLifecycle>,
+) {
+    summary.live_bytes = summary.live_bytes.saturating_add(record_len);
+    summary.live_ref_count = summary.live_ref_count.saturating_add(1);
+    let Some(lifecycle) = lifecycle else {
+        summary.unknown_lifetime_bytes = summary.unknown_lifetime_bytes.saturating_add(record_len);
+        summary.unknown_lifetime_ref_count = summary.unknown_lifetime_ref_count.saturating_add(1);
+        return;
+    };
+    let bucket = summary
+        .future_epoch_histogram
+        .entry(lifecycle.logical_end_epoch)
+        .or_default();
+    bucket.refs = bucket.refs.saturating_add(1);
+    bucket.bytes = bucket.bytes.saturating_add(record_len);
+    increment_histogram(
+        &mut summary.extension_count_histogram,
+        lifecycle.extension_count,
+    );
+    refresh_live_epoch_bounds(summary);
+}
+
+fn remove_live_summary(
+    summary: &mut SegmentGcSummary,
+    record_len: u64,
+    lifecycle: Option<BlobLifecycle>,
+) {
+    summary.live_bytes = summary.live_bytes.saturating_sub(record_len);
+    summary.live_ref_count = summary.live_ref_count.saturating_sub(1);
+    let Some(lifecycle) = lifecycle else {
+        summary.unknown_lifetime_bytes = summary.unknown_lifetime_bytes.saturating_sub(record_len);
+        summary.unknown_lifetime_ref_count = summary.unknown_lifetime_ref_count.saturating_sub(1);
+        return;
+    };
+    if let Some(bucket) = summary
+        .future_epoch_histogram
+        .get_mut(&lifecycle.logical_end_epoch)
+    {
+        bucket.refs = bucket.refs.saturating_sub(1);
+        bucket.bytes = bucket.bytes.saturating_sub(record_len);
+        if bucket.refs == 0 {
+            summary
+                .future_epoch_histogram
+                .remove(&lifecycle.logical_end_epoch);
+        }
+    }
+    decrement_histogram(
+        &mut summary.extension_count_histogram,
+        lifecycle.extension_count,
+    );
+    refresh_live_epoch_bounds(summary);
+}
+
+fn refresh_live_epoch_bounds(summary: &mut SegmentGcSummary) {
+    summary.min_live_end_epoch = summary.future_epoch_histogram.keys().next().copied();
+    summary.max_live_end_epoch = summary.future_epoch_histogram.keys().next_back().copied();
+}
+
+fn increment_histogram<K>(histogram: &mut BTreeMap<K, u64>, key: K)
+where
+    K: Ord,
+{
+    *histogram.entry(key).or_default() += 1;
+}
+
+fn decrement_histogram<K>(histogram: &mut BTreeMap<K, u64>, key: K)
+where
+    K: Ord,
+{
+    let Some(count) = histogram.get_mut(&key) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        histogram.remove(&key);
+    }
+}
+
+fn coalesce_gc_ranges(ranges: &mut Vec<SegmentGcRecordRange>) {
+    ranges.retain(|range| !is_empty_gc_range(*range));
+    ranges.sort_by_key(|range| (range.offset, range.len));
+
+    let mut coalesced: Vec<SegmentGcRecordRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        let Some(last) = coalesced.last_mut() else {
+            coalesced.push(range);
+            continue;
+        };
+
+        let last_end = gc_range_end(*last);
+        let range_end = gc_range_end(range);
+        if range.offset <= last_end {
+            let new_end = last_end.max(range_end);
+            last.len = new_end.saturating_sub(last.offset);
+        } else {
+            coalesced.push(range);
+        }
+    }
+
+    *ranges = coalesced;
+}
+
+fn subtract_gc_range(ranges: &mut Vec<SegmentGcRecordRange>, removed: SegmentGcRecordRange) {
+    if is_empty_gc_range(removed) {
+        return;
+    }
+
+    let removed_end = gc_range_end(removed);
+    let mut remaining = Vec::with_capacity(ranges.len().saturating_add(1));
+    for range in ranges.drain(..) {
+        let range_end = gc_range_end(range);
+        if range_end <= removed.offset || range.offset >= removed_end {
+            remaining.push(range);
+            continue;
+        }
+
+        if range.offset < removed.offset {
+            remaining.push(SegmentGcRecordRange {
+                offset: range.offset,
+                len: removed.offset.saturating_sub(range.offset),
+            });
+        }
+        if range_end > removed_end {
+            remaining.push(SegmentGcRecordRange {
+                offset: removed_end,
+                len: range_end.saturating_sub(removed_end),
+            });
+        }
+    }
+
+    *ranges = remaining;
+}
+
+fn remove_lifetimes_overlapping(
+    lifetimes: &mut Vec<SegmentGcLifetimeRange>,
+    range: SegmentGcRecordRange,
+) {
+    lifetimes.retain(|entry| !gc_ranges_overlap(entry.range, range));
+}
+
+fn range_overlaps_any(range: SegmentGcRecordRange, ranges: &[SegmentGcRecordRange]) -> bool {
+    ranges
+        .iter()
+        .any(|candidate| gc_ranges_overlap(range, *candidate))
+}
+
+fn range_contains(container: SegmentGcRecordRange, contained: SegmentGcRecordRange) -> bool {
+    contained.offset >= container.offset && gc_range_end(contained) <= gc_range_end(container)
+}
+
+fn gc_ranges_overlap(left: SegmentGcRecordRange, right: SegmentGcRecordRange) -> bool {
+    !is_empty_gc_range(left)
+        && !is_empty_gc_range(right)
+        && left.offset < gc_range_end(right)
+        && right.offset < gc_range_end(left)
+}
+
+fn is_empty_gc_range(range: SegmentGcRecordRange) -> bool {
+    range.len == 0
+}
+
+fn gc_range_end(range: SegmentGcRecordRange) -> u64 {
+    range.offset.saturating_add(range.len)
 }
 
 /// Physical placement class for a segment.
@@ -150,41 +616,4 @@ pub struct SegmentState {
 pub struct EpochBucket {
     pub refs: u64,
     pub bytes: u64,
-}
-
-/// Cheap accounting used by GC planning.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SegmentStats {
-    pub total_bytes: u64,
-    pub live_bytes: u64,
-    pub tombstoned_bytes: u64,
-    pub expired_bytes: u64,
-    pub pinned_bytes: u64,
-    pub live_ref_count: u64,
-    pub unknown_lifetime_bytes: u64,
-    pub unknown_lifetime_ref_count: u64,
-    pub min_live_end_epoch: Option<Epoch>,
-    pub max_live_end_epoch: Option<Epoch>,
-    pub future_epoch_histogram: BTreeMap<Epoch, EpochBucket>,
-    /// Extension counts of refs added live to this segment. Refs stay in their bucket after they
-    /// expire: per-epoch extension counts are not tracked, so expiry sweeps cannot remove them.
-    pub extension_count_histogram: BTreeMap<u32, u64>,
-}
-
-impl SegmentStats {
-    pub fn garbage_bytes(&self) -> u64 {
-        self.tombstoned_bytes.saturating_add(self.expired_bytes)
-    }
-
-    pub fn garbage_ratio(&self) -> f64 {
-        if self.total_bytes == 0 {
-            0.0
-        } else {
-            self.garbage_bytes() as f64 / self.total_bytes as f64
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.live_ref_count == 0
-    }
 }

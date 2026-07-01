@@ -1,8 +1,7 @@
 pub(crate) mod gc_overlay;
 
 use strata_core::{
-    SegmentId, SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentRefKey, SegmentRefState,
-    SegmentState, SegmentStats, ShardKey,
+    SegmentId, SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardKey,
 };
 use typed_store::{Map, rocks::DBBatch};
 
@@ -46,87 +45,6 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn get_segment_stats(&self, segment_id: SegmentId) -> Result<Option<SegmentStats>> {
-        self.get_segment_stats_for_shard(STANDALONE_SHARD, segment_id)
-    }
-
-    pub fn get_segment_stats_for_shard(
-        &self,
-        shard: ShardKey,
-        segment_id: SegmentId,
-    ) -> Result<Option<SegmentStats>> {
-        Ok(self.segment_stats.get(&SegmentKey { shard, segment_id })?)
-    }
-
-    pub fn put_segment_stats(&self, segment_id: SegmentId, stats: &SegmentStats) -> Result<()> {
-        let mut batch = self.batch();
-        self.put_segment_stats_batch(&mut batch, segment_id, stats)?;
-        batch.write()?;
-        Ok(())
-    }
-
-    pub fn put_segment_stats_batch(
-        &self,
-        batch: &mut DBBatch,
-        segment_id: SegmentId,
-        stats: &SegmentStats,
-    ) -> Result<()> {
-        self.put_segment_stats_for_shard_batch(batch, STANDALONE_SHARD, segment_id, stats)
-    }
-
-    pub fn put_segment_stats_for_shard_batch(
-        &self,
-        batch: &mut DBBatch,
-        shard: ShardKey,
-        segment_id: SegmentId,
-        stats: &SegmentStats,
-    ) -> Result<()> {
-        // Segment stats are the aggregate accounting view; they intentionally live beside, not
-        // inside, the GC overlay. Stats answer "how many bytes are live/tombstoned/expired", while
-        // the overlay answers "which physical record ranges should copy planning skip or route."
-        batch
-            .insert_batch(
-                self.segment_stats(),
-                [(&SegmentKey { shard, segment_id }, stats)],
-            )
-            .map_err(Error::from)?;
-        Ok(())
-    }
-
-    pub fn iter_segment_stats_for_shard(
-        &self,
-        shard: ShardKey,
-    ) -> Result<Vec<(SegmentId, SegmentStats)>> {
-        self.segment_stats
-            .safe_iter()?
-            .filter_map(|result| match result {
-                Ok((key, stats)) if key.shard == shard => Some(Ok((key.segment_id, stats))),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
-    }
-
-    pub fn get_segment_ref_state(&self, key: SegmentRefKey) -> Result<Option<SegmentRefState>> {
-        Ok(self.segment_ref_state.get(&key)?)
-    }
-
-    pub fn put_segment_ref_state_batch(
-        &self,
-        batch: &mut DBBatch,
-        key: SegmentRefKey,
-        state: &SegmentRefState,
-    ) -> Result<()> {
-        // Ref state is the latest truth for one segment-local offset. It is kept separate from
-        // segment_ref_events so GC/reconciliation can query current liveness without replaying the
-        // event stream, while still retaining ordered event rows for races with copying.
-        batch
-            .insert_batch(self.segment_ref_state(), [(&key, state)])
-            .map_err(Error::from)?;
-        Ok(())
-    }
-
     pub fn put_segment_ref_event_batch(
         &self,
         batch: &mut DBBatch,
@@ -134,40 +52,33 @@ impl StrataIndex {
         event: &SegmentRefEvent,
     ) -> Result<()> {
         // Ref events are keyed by segment, LSN, and offset so a copied record can be reconciled
-        // against exactly the physical range it came from. They are not a replacement for ref state;
-        // they are the ordered evidence of transitions that happened while GC may have been running.
+        // against exactly the physical range it came from. They are the ordered evidence of
+        // transitions that happened while GC may have been running.
         batch
             .insert_batch(self.segment_ref_events(), [(&key, event)])
             .map_err(Error::from)?;
         Ok(())
     }
 
-    pub fn iter_segment_ref_state(
+    pub fn iter_segment_ref_events_since(
         &self,
         segment_id: SegmentId,
-    ) -> Result<Vec<(SegmentRefKey, SegmentRefState)>> {
-        let mut refs = self
-            .segment_ref_state
+        since_lsn: strata_core::StrataLsn,
+    ) -> Result<Vec<(SegmentRefEventKey, SegmentRefEvent)>> {
+        let mut events = self
+            .segment_ref_events
             .safe_iter()?
             .filter_map(|result| match result {
-                Ok((key, state)) if key.segment_id == segment_id => Some(Ok((key, state))),
+                Ok((key, event)) if key.segment_id == segment_id && key.lsn > since_lsn => {
+                    Some(Ok((key, event)))
+                }
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)?;
-        refs.sort_by_key(|(key, _)| key.offset);
-        Ok(refs)
-    }
-
-    pub fn iter_all_segment_ref_state(&self) -> Result<Vec<(SegmentRefKey, SegmentRefState)>> {
-        let mut refs = self
-            .segment_ref_state
-            .safe_iter()?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)?;
-        refs.sort_by_key(|(key, _)| (key.segment_id, key.offset));
-        Ok(refs)
+        events.sort_by_key(|(key, _)| (key.lsn, key.offset));
+        Ok(events)
     }
 
     pub fn iter_segment_states(&self) -> Result<Vec<(SegmentId, SegmentState)>> {

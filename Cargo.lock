@@ -8133,6 +8133,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-gc"
+version = "0.1.0"
+dependencies = [
+ "strata-core",
+]
+
+[[package]]
 name = "strata-index"
 version = "0.1.0"
 dependencies = [
@@ -8141,6 +8148,7 @@ dependencies = [
  "serde",
  "strata-accounting",
  "strata-core",
+ "strata-gc",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -8164,6 +8172,7 @@ dependencies = [
  "sha2 0.10.9",
  "strata-accounting",
  "strata-core",
+ "strata-gc",
  "strata-index",
  "strata-segment",
  "tempfile",

@@ -126,7 +126,10 @@ pub enum VersionMergeOp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobLifecycleAction {
-    SetLifetime { logical_end_epoch: Epoch },
+    SetLifetime {
+        logical_end_epoch: Epoch,
+        current_epoch: Epoch,
+    },
     Tombstone,
 }
 
@@ -145,12 +148,14 @@ pub enum BlobLifecycleMergeOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobLifetimeHead {
     pub lsn: StrataLsn,
+    pub current_epoch: Epoch,
     pub lifecycle: BlobLifecycle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BlobLifecycleHead {
     pub lifetime: Option<BlobLifetimeHead>,
+    pub expiry_lsn: Option<StrataLsn>,
     pub tombstone_lsn: Option<StrataLsn>,
 }
 
@@ -349,14 +354,25 @@ impl BlobLifecycleOp {
 impl BlobLifecycleHead {
     fn apply_op(&mut self, op: &BlobLifecycleOp) {
         match op.action {
-            BlobLifecycleAction::SetLifetime { logical_end_epoch } => {
-                let extension_count = self
-                    .lifetime
-                    .as_ref()
-                    .filter(|head| op.lsn > head.lsn)
-                    .map_or(0, |head| head.lifecycle.extension_count.saturating_add(1));
+            BlobLifecycleAction::SetLifetime {
+                logical_end_epoch,
+                current_epoch,
+            } => {
+                let previous = self.lifetime.as_ref().filter(|head| op.lsn > head.lsn);
+                let previous_expired =
+                    previous.is_some_and(|head| head.lifecycle.logical_end_epoch <= current_epoch);
+                if previous_expired && self.expiry_lsn.is_none_or(|expiry_lsn| op.lsn > expiry_lsn)
+                {
+                    self.expiry_lsn = Some(op.lsn);
+                }
+                let extension_count = if previous_expired {
+                    0
+                } else {
+                    previous.map_or(0, |head| head.lifecycle.extension_count.saturating_add(1))
+                };
                 self.lifetime = Some(BlobLifetimeHead {
                     lsn: op.lsn,
+                    current_epoch,
                     lifecycle: BlobLifecycle {
                         logical_end_epoch,
                         extension_count,
@@ -377,7 +393,10 @@ impl BlobLifecycleHead {
 
 impl BlobLifecycleState {
     pub fn is_empty(&self) -> bool {
-        self.head.lifetime.is_none() && self.head.tombstone_lsn.is_none() && self.tail.is_empty()
+        self.head.lifetime.is_none()
+            && self.head.expiry_lsn.is_none()
+            && self.head.tombstone_lsn.is_none()
+            && self.tail.is_empty()
     }
 
     pub fn append_op(&mut self, op: BlobLifecycleOp) {
@@ -409,6 +428,10 @@ impl BlobLifecycleState {
                 .as_ref()
                 .filter(|lifetime| lifetime.lsn <= max_lsn)
                 .cloned(),
+            expiry_lsn: self
+                .head
+                .expiry_lsn
+                .filter(|expiry_lsn| *expiry_lsn <= max_lsn),
             tombstone_lsn: self
                 .head
                 .tombstone_lsn
@@ -437,6 +460,7 @@ impl BlobLifecycleState {
                 lsn,
                 action: BlobLifecycleAction::SetLifetime {
                     logical_end_epoch: lifetime.lifecycle.logical_end_epoch,
+                    current_epoch: lifetime.current_epoch,
                 },
             });
         }

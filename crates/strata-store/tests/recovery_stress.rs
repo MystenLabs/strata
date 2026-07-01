@@ -18,8 +18,8 @@ use strata_store::{
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
-    StrataStoreMetrics,
+    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
+    StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
 use tempfile::tempdir;
 use typed_store::DBMetrics;
@@ -511,6 +511,7 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
             DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
         accounting_sidecar_major_patch_bytes_threshold:
             DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+        gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
         starting_epoch: 1,
     }
 }

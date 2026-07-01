@@ -310,6 +310,20 @@ impl AccountingIndex {
             match delta {
                 AccountingDelta::Blob(update) => blob_updates.push(update),
                 AccountingDelta::Epoch(change) => epoch_changes.push(change),
+                AccountingDelta::GcMapRefBatch { base_lsn, maps } => {
+                    for (index, map) in maps.into_iter().enumerate() {
+                        let offset = index as u64;
+                        let lsn = base_lsn
+                            .checked_add(offset)
+                            .ok_or(Error::LsnOverflow { base_lsn, offset })?;
+                        blob_updates.push(BlobUpdate::MapRef {
+                            lsn,
+                            key: map.key,
+                            from: map.from,
+                            to: map.to,
+                        });
+                    }
+                }
             }
         }
         if blob_updates.is_empty() && epoch_changes.is_empty() {

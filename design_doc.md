@@ -266,33 +266,41 @@ enum SegmentFileState {
 segment/state/{segment_id} -> SegmentState
 ```
 
-## 4.4 Segment Accounting Index
+## 4.4 Segment GC Accounting Overlay
 
 Each segment tracks enough accounting for GC to make cheap decisions:
 
 ```rust
-struct SegmentStats {
+struct SegmentGcSummary {
     total_bytes,
     live_bytes,
-    tombstoned_bytes,
+    retired_bytes,
     expired_bytes,
-    pinned_bytes,
     live_ref_count,
+    unknown_lifetime_bytes,
+    unknown_lifetime_ref_count,
     min_live_end_epoch,
     max_live_end_epoch,
     future_epoch_histogram,
     extension_count_histogram,
 }
+
+struct SegmentGcOverlay {
+    summary: SegmentGcSummary,
+    expired_ranges,
+    retired_ranges,
+    lifetime_hints,
+}
 ```
 
 ```rust
-segment/stats/{segment_id} -> SegmentStats
+segment_gc_overlay/{segment_id} -> SegmentGcOverlay
 ```
 
 The most important fields are:
 
 - `live_ref_count`: if zero, the segment can be deleted.
-- `pinned_bytes`: bytes physically in an expired or soon expiring class but logically live longer.
+- `retired_bytes` and `expired_bytes`: cheap garbage-ratio inputs without scanning the file.
 - `future_epoch_histogram`: helps choose exact future epoch vs spillover when relocation happens.
 
 This avoids scanning payload files just to decide what GC should do next.
@@ -381,7 +389,7 @@ For each affected sliver:
 ```rust
 RocksDB write batch:
     mark sliver tombstoned
-    update segment live/tombstone accounting
+    update GC overlay summary/ranges
 ```
 
 The payload bytes stay where they are until GC can reclaim them cheaply.
@@ -399,7 +407,7 @@ RocksDB write batch:
     update logical_end_epoch
     increment extension_count
     update last_extended_epoch
-    update segment pinned byte accounting
+    update GC overlay lifetime summary
     update future epoch histogram
 ```
 
@@ -479,7 +487,7 @@ else:
 
 ## **6.4 Garbage Ratio** Cleanup
 
-Garbage ratio cleanup looks for segments where dead bytes are high enough that rewriting live bytes is worth it.
+Garbage ratio cleanup looks for segments where retired/expired bytes are high enough that rewriting live bytes is worth it.
 
 This applies to:
 
@@ -824,7 +832,7 @@ background:
 
 # Addendum 2: Blob-Version LSM As The Accounting Engine
 
-This addendum records an alternative design direction discussed after the initial RocksDB-backed metadata plan. The goal is to avoid making accounting a separate component that repeatedly performs random metadata lookups over blob keys while still preserving the important correctness properties around live refs, segment stats, L0 organization, and GC.
+This addendum records an alternative design direction discussed after the initial RocksDB-backed metadata plan. The goal is to avoid making accounting a separate component that repeatedly performs random metadata lookups over blob keys while still preserving the important correctness properties around live refs, GC summaries, L0 organization, and GC.
 
 The short version:
 
@@ -868,17 +876,20 @@ That is the wrong shape:
 - it couples L0 byte movement to the current blob-index read path
 - it makes stats correctness depend on per-record lookups during background work
 
-The earlier proposal solved this by having accounting materialize segment-local ref state:
+The current design solves this by having accounting materialize segment-local GC overlay state and
+ordered ref events:
 
 ```
-segment_ref_state/{segment_id}/{offset} -> {
-  status: Live | Retired,
-  lifecycle: Option<BlobLifecycle>,
-  last_accounted_lsn
+segment_gc_overlay/{segment_id} -> {
+  dead: Vec<SegmentGcRecordRange>,
+  lifetimes: Vec<SegmentGcLifetimeRange>,
 }
+segment_ref_events/{segment_id}/{lsn}/{offset} -> SegmentRefEvent
 ```
 
-Then L0 can scan the data file and the segment-local state mostly sequentially.
+Then L0 can scan the data file and the segment-local overlay mostly sequentially. Ranges in
+`dead` are skipped, ranges in `lifetimes` carry exact-epoch routing hints, and ranges absent from
+both remain copy-eligible with unknown lifetime.
 
 The newer idea asks whether the separate accounting component can disappear if the blob-version index itself is implemented as a controlled LSM owned by Strata. In that design, accounting is not a separate random lookup pass. It is the side effect of merging ordered blob-version deltas into current blob state.
 
@@ -891,8 +902,8 @@ A compaction filter can drop or modify the key/value currently being compacted, 
 A merge operator can fold operands for the same key, but it produces a value for that key. It is not a transaction mechanism for updating other metadata keys such as:
 
 ```
-segment stats
-segment_ref_state
+segment_gc_overlay summary
+segment_gc_overlay
 segment_ref_events
 source segment state
 destination segment state
@@ -907,7 +918,7 @@ The deeper issue is ownership of the commit protocol. Strata needs transitions l
 blob K old ref is retired
 segment S live_bytes decreases
 segment S live_ref_count decreases
-segment_ref_state for S_ref becomes Retired
+segment_gc_overlay for S marks the ref range dead
 accounting/manifest progress advances
 ```
 
@@ -950,8 +961,8 @@ old current state for key
 + ordered deltas for key
 => new current state for key
 => ref retire/live/lifecycle side effects
-=> segment stats deltas
-=> segment_ref_state/event batches
+=> segment GC summary deltas
+=> segment_gc_overlay and segment_ref_event batches
 ```
 
 This lets the system discover transitions sequentially:
@@ -997,12 +1008,12 @@ current blob index:
 compacted blob-version base:
   may lag behind
 
-segment stats/ref-state:
+segment GC summary/ref events:
   either update synchronously on foreground operations
   or lag if they are derived only by blob-version compaction
 ```
 
-If segment stats are also updated synchronously by foreground operations, then GC can trust them immediately. If segment stats are derived later by LSM compaction, GC needs a way to distinguish known live/dead refs from unresolved refs.
+If GC summaries are also updated synchronously by foreground operations, then GC can trust them immediately. If GC summaries are derived later by LSM compaction, GC needs a way to distinguish known live/retired refs from unresolved refs.
 
 ## A2.5 PayloadRef And Ingest Shard Placement
 
@@ -1071,54 +1082,48 @@ enum PlacementClass {
 
 Do not rely only on a filesystem path to infer placement. Persist it in segment metadata.
 
-## A2.6 Segment Ref State In The LSM Model
+## A2.6 Segment GC Overlay In The LSM Model
 
-If shard is stored in the record header or in `PayloadRef::Ingest`, segment-local ref state does not need to repeat shard.
+If shard is stored in the record header or in `PayloadRef::Ingest`, segment-local GC metadata does
+not need to repeat shard.
 
 It only needs the facts that can change after the physical put:
 
 ```rust
-struct SegmentRefState {
-    status: SegmentRefStatus,
-    lifecycle: Option<BlobLifecycle>,
-    last_materialized_lsn: StrataLsn,
-}
-
-enum SegmentRefStatus {
-    Live,
-    Retired,
+struct SegmentGcOverlay {
+    dead: Vec<SegmentGcRecordRange>,
+    lifetimes: Vec<SegmentGcLifetimeRange>,
 }
 ```
 
 Unknown lifetime is represented as:
 
 ```rust
-status = Live
-lifecycle = None
+dead does not contain range
+lifetimes does not contain range
 ```
 
 L0 routes this to spillover:
 
 ```
-Live + Some(lifecycle) -> shard / exact_epoch
-Live + None            -> shard / spillover
-Retired                -> skip
+dead contains record range      -> skip
+lifetimes contains record range -> shard / exact_epoch
+otherwise                       -> shard / spillover
 ```
 
-Segment ref state should be chunked or batch-oriented, not necessarily one RocksDB row per physical record:
+Overlay and event updates should be batch-oriented, not one RocksDB row per physical record:
 
 ```
-segment_ref_state_chunk/{segment_id}/{chunk_id}
+segment_gc_overlay/{segment_id}
 segment_ref_event_batch/{segment_id}/{lsn_range_or_batch_id}
 ```
 
-The write path should avoid millions of tiny metadata writes for large segments. A state chunk can pack:
+The write path should avoid millions of tiny metadata writes for large segments. Overlay merge
+operands can pack:
 
 ```
-offsets or record indexes
-status bitmap
-lifecycle ids or epoch deltas
-last_materialized_lsn or compacted lsn range
+dead range batches
+lifetime update batches
 ```
 
 Event batches can pack changes:
@@ -1142,7 +1147,7 @@ enum SegmentRefEvent {
 The guiding rule:
 
 ```
-segment_ref_state_chunk is optimized for L0 sequential reads
+segment_gc_overlay is optimized for L0 sequential reads
 segment_ref_event_batch is optimized for append/fold by accounting or LSM compaction
 ```
 
@@ -1184,15 +1189,14 @@ This says all mutations up to the segment's max LSN have been folded into the ma
 Option B: per-segment pending counts.
 
 ```rust
-struct SegmentStats {
+struct SegmentGcSummary {
     total_bytes: u64,
     live_bytes: u64,
     retired_bytes: u64,
-    mapped_bytes: u64,
-    pending_bytes: u64,
+    expired_bytes: u64,
     live_ref_count: u64,
-    pending_ref_count: u64,
-    mapped_ref_count: u64,
+    unknown_lifetime_bytes: u64,
+    unknown_lifetime_ref_count: u64,
 }
 ```
 
@@ -1254,7 +1258,7 @@ That rule is unsafe if the materialized view might not include newer puts into S
 
 ```
 the view covers all refs in S
-or S.pending_ref_count == 0 and all segment stats are current
+or S.pending_ref_count == 0 and all GC summaries are current
 ```
 
 If the current blob index and segment counters are updated synchronously on every foreground mutation, then GC can trust the segment counters. If segment counters are compaction-derived, GC must respect pending counters or a materialized-through watermark.
@@ -1267,8 +1271,8 @@ It should still be mostly sequential:
 
 ```
 scan S.data sequentially
-scan/fold segment_ref_state_chunk for S sequentially
-skip retired refs
+scan/fold segment_gc_overlay for S sequentially
+skip retired and expired ranges
 route live refs by shard + lifecycle
 write destination retention segments
 publish precise ref mappings
@@ -1281,7 +1285,7 @@ source shard:
   record header or PayloadRef::Ingest.shard
 
 lifecycle:
-  segment_ref_state.lifecycle
+  segment_gc_overlay.lifetimes
 
 target:
   Some(lifecycle) -> shard / exact_epoch
@@ -1339,12 +1343,12 @@ claim source S:
 copy phase:
   no long metadata barrier
   scan source segment
-  scan segment ref state chunks
+  scan segment GC overlay
   write staged destination segments
   fsync destination segments
 ```
 
-The publish phase is short and serialized with whatever mutates blob-version refs and segment stats:
+The publish phase is short and serialized with whatever mutates blob-version refs and GC overlay state:
 
 ```
 publish phase:
@@ -1432,13 +1436,13 @@ Publish protocol:
 
 This keeps write volume batch-oriented without making partially published movement visible.
 
-## A2.12 Foreground-Synchronous Stats vs Compaction-Derived Stats
+## A2.12 Foreground-Synchronous GC Summary vs Compaction-Derived GC Summary
 
 There are two viable implementation choices.
 
-### Option A: Foreground Path Maintains Current Blob Index And Segment Stats
+### Option A: Foreground Path Maintains Current Blob Index And GC Summary
 
-Every user-visible mutation updates blob state and segment stats immediately:
+Every user-visible mutation updates blob state and GC summary immediately:
 
 ```
 Put new ref:
@@ -1465,8 +1469,8 @@ Lifetime extension:
 
 Benefits:
 
-- current read view and segment stats are both up to date
-- GC can trust segment stats immediately
+- current read view and GC summaries are both up to date
+- GC can trust GC summaries immediately
 - no global `accounted_lsn` needed for deletion safety
 
 Costs:
@@ -1475,7 +1479,7 @@ Costs:
 - overwrite/tombstone paths need to find the old current ref
 - more random metadata reads may be needed in the foreground path
 
-### Option B: Foreground Path Appends Deltas, LSM Compaction Derives Stats
+### Option B: Foreground Path Appends Deltas, LSM Compaction Derives GC Summary
 
 Foreground operations append deltas and possibly update a memtable/current overlay:
 
@@ -1485,7 +1489,7 @@ Tombstone(K)
 SetLifetime(K, epoch)
 ```
 
-The blob-version LSM read path remains current by merging overlays and runs. Segment stats are updated when LSM compaction folds deltas.
+The blob-version LSM read path remains current by merging overlays and runs. GC summaries are updated when LSM compaction folds deltas.
 
 Benefits:
 
@@ -1495,7 +1499,7 @@ Benefits:
 
 Costs:
 
-- segment stats may lag
+- GC summaries may lag
 - GC/L0 need pending counters or materialized view watermarks
 - publish and recovery need a Strata-owned manifest protocol
 
@@ -1532,8 +1536,8 @@ Compaction:
 ```
 base/current run + selected delta runs
   -> new base/current run
-  -> segment ref state/event batches
-  -> segment stats deltas
+  -> segment GC overlay/ref event batches
+  -> segment GC summary deltas
   -> new manifest generation
 ```
 
@@ -1647,12 +1651,12 @@ The main open questions are:
 ```
 Do we want to own a blob-version LSM at all, or keep using RocksDB metadata?
 
-If we own it, how much of the foreground path should update segment stats
-synchronously versus leaving stats derivation to LSM compaction?
+If we own it, how much of the foreground path should update GC summaries
+synchronously versus leaving summary derivation to LSM compaction?
 
 Is a one-layer LSM enough, or do blob-version deltas need multiple levels?
 
-What is the right unit for segment_ref_state chunks?
+What is the right unit for segment_gc_overlay merge batches?
   fixed record count
   fixed byte range
   variable compressed block
@@ -1688,9 +1692,9 @@ This may be a cleaner long-term architecture if Strata needs to minimize random 
 The important point is not the name `accounting_lsn`. The important point is explicit completeness:
 
 ```
-Either stats/ref-state are current synchronously,
+Either GC summaries/ref events are current synchronously,
 or unresolved physical refs are represented as pending,
 or a materialized-through watermark proves a view covers a segment.
 ```
 
-As long as unknown refs are never mistaken for dead refs, GC can run on older views and L0 can remain a mostly sequential byte mover.
+As long as unknown refs are never mistaken for retired refs, GC can run on older views and L0 can remain a mostly sequential byte mover.

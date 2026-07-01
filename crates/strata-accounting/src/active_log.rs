@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use strata_core::StrataLsn;
+use strata_core::{BlobKey, RecordRef, StrataLsn};
 
 use crate::run_io::{read_record_frame, write_record_frame};
 use crate::{BlobUpdate, EpochChange, Error, FORMAT_VERSION, Result};
@@ -16,8 +16,32 @@ const ACTIVE_DELTA_LOG_FILE_NAME: &str = "active-delta.log";
 /// Raw foreground accounting event appended in store-global LSN order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountingDelta {
+    /// One foreground blob mutation or metadata mutation with an explicit LSN.
     Blob(BlobUpdate),
+    /// Store-global epoch transition with an explicit LSN.
     Epoch(EpochChange),
+    /// One physical active-log frame containing many GC map refs.
+    ///
+    /// The frame occupies one append in `active-delta.log`, but each map still owns a logical LSN:
+    /// `base_lsn + index`. Keeping per-map logical LSNs avoids redefining the rest of accounting
+    /// around "many keys at one LSN" while avoiding one filesystem frame per copied GC record.
+    GcMapRefBatch {
+        /// Logical LSN assigned to `maps[0]`.
+        base_lsn: StrataLsn,
+        /// Ordered map refs whose logical LSN is derived from position in this vector.
+        maps: Vec<GcMapRefDelta>,
+    },
+}
+
+/// One logical `MapRef` inside a bulk GC active-log frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcMapRefDelta {
+    /// Blob key whose payload version is being remapped by GC.
+    pub key: BlobKey,
+    /// Source physical record copied out of a GC candidate segment.
+    pub from: RecordRef,
+    /// Destination physical record in the newly published GC output segment.
+    pub to: RecordRef,
 }
 
 impl AccountingDelta {
@@ -25,6 +49,11 @@ impl AccountingDelta {
         match self {
             Self::Blob(update) => update.lsn(),
             Self::Epoch(change) => change.lsn,
+            Self::GcMapRefBatch { base_lsn, maps } => maps
+                .len()
+                .checked_sub(1)
+                .and_then(|last| base_lsn.checked_add(last as u64))
+                .unwrap_or(*base_lsn),
         }
     }
 }
@@ -98,6 +127,8 @@ pub struct ActiveDeltaLog {
 pub struct ActiveDeltaLogPosition {
     write_offset: u64,
     max_lsn: Option<StrataLsn>,
+    durable_offset: u64,
+    durable_lsn: StrataLsn,
 }
 
 impl ActiveDeltaLog {
@@ -196,6 +227,8 @@ impl ActiveDeltaLog {
         ActiveDeltaLogPosition {
             write_offset: self.write_offset,
             max_lsn: self.max_lsn,
+            durable_offset: self.durable_offset,
+            durable_lsn: self.durable_lsn,
         }
     }
 
@@ -248,6 +281,8 @@ impl ActiveDeltaLog {
         truncate_open_file(self.writer.get_mut(), &self.path, position.write_offset)?;
         self.write_offset = position.write_offset;
         self.max_lsn = position.max_lsn;
+        self.durable_offset = position.durable_offset;
+        self.durable_lsn = position.durable_lsn;
         Ok(())
     }
 

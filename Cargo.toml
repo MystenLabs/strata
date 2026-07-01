@@ -3,6 +3,7 @@ members = [
     "crates/strata-bench",
     "crates/strata-accounting",
     "crates/strata-core",
+    "crates/strata-gc",
     "crates/strata-index",
     "crates/strata-segment",
     "crates/strata-store",
@@ -22,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 strata-accounting = { path = "crates/strata-accounting" }
 strata-core = { path = "crates/strata-core" }
+strata-gc = { path = "crates/strata-gc" }
 strata-index = { path = "crates/strata-index" }
 strata-segment = { path = "crates/strata-segment" }
 strata-store = { path = "crates/strata-store" }

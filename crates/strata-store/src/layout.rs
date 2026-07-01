@@ -1,11 +1,20 @@
 use std::{ffi::OsStr, path::PathBuf};
 
-use strata_core::SegmentId;
+use strata_core::{SegmentId, SegmentState};
 
 use crate::StrataStoreConfig;
 
 pub(crate) fn segment_path(config: &StrataStoreConfig, segment_id: SegmentId) -> PathBuf {
     config.ingest_dir().join(segment_file_name(segment_id))
+}
+
+pub(crate) fn segment_state_path(config: &StrataStoreConfig, state: &SegmentState) -> PathBuf {
+    let path = PathBuf::from(&state.path);
+    if path.is_absolute() {
+        path
+    } else {
+        config.namespace_dir().join(path)
+    }
 }
 
 pub(crate) fn relative_segment_path(config: &StrataStoreConfig, path: PathBuf) -> String {

@@ -63,7 +63,7 @@ impl StrataIndex {
         accounted_lsn: StrataLsn,
     ) -> Result<()> {
         // AccountedLsn is the store-global cursor for sidecar materialization. Once this row is
-        // committed, segment stats, ref states, ref events, and GC overlay operands are durable
+        // committed, segment ref events and GC overlay operands are durable
         // through this LSN.
         batch.insert_batch(
             self.store_state(),
@@ -76,7 +76,7 @@ impl StrataIndex {
     ///
     /// Blob-version compaction follows the durable LSN frontier, not this accounting frontier. The
     /// accounting cursor still controls when pending accounting rows can be removed and when derived
-    /// segment stats, ref states, ref events, and GC overlay operands are durable.
+    /// segment ref events and GC overlay operands are durable.
     pub fn commit_accounting_batch(
         &self,
         mut batch: DBBatch,

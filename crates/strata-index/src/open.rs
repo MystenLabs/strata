@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -16,9 +16,9 @@ use typed_store::{
 use crate::Result;
 
 use super::cf::{
-    ACCOUNTING_INDEX_CF, BLOB_VERSIONS_CF, EPOCH_CHANGES_CF, SEGMENT_GC_OVERLAY_CF,
-    SEGMENT_REF_EVENTS_CF, SEGMENT_REF_STATE_CF, SEGMENT_STATES_CF, SEGMENT_STATS_CF, SHARDS_CF,
-    STORE_STATE_CF, UNACCOUNTED_LSN_OPS_CF,
+    ACCOUNTING_INDEX_CF, BLOB_VERSIONS_CF, EPOCH_CHANGES_CF, GC_RELOCATIONS_CF,
+    SEGMENT_GC_OVERLAY_CF, SEGMENT_REF_EVENTS_CF, SEGMENT_STATES_CF, SHARDS_CF, STORE_STATE_CF,
+    UNACCOUNTED_LSN_OPS_CF,
 };
 use super::options::cf_options;
 use super::{StrataIndex, StrataIndexCfNames};
@@ -93,20 +93,6 @@ impl StrataIndex {
             &rw_options,
             true,
         )?;
-        let segment_stats = DBMap::reopen_with_class(
-            &db,
-            Some(&cf_names.segment_stats),
-            Some(SEGMENT_STATS_CF),
-            &rw_options,
-            true,
-        )?;
-        let segment_ref_state = DBMap::reopen_with_class(
-            &db,
-            Some(&cf_names.segment_ref_state),
-            Some(SEGMENT_REF_STATE_CF),
-            &rw_options,
-            true,
-        )?;
         let segment_ref_events = DBMap::reopen_with_class(
             &db,
             Some(&cf_names.segment_ref_events),
@@ -118,6 +104,13 @@ impl StrataIndex {
             &db,
             Some(&cf_names.segment_gc_overlay),
             Some(SEGMENT_GC_OVERLAY_CF),
+            &rw_options,
+            true,
+        )?;
+        let gc_relocations = DBMap::reopen_with_class(
+            &db,
+            Some(&cf_names.gc_relocations),
+            Some(GC_RELOCATIONS_CF),
             &rw_options,
             true,
         )?;
@@ -161,12 +154,12 @@ impl StrataIndex {
             cf_names,
             blob_compact_safe_lsn: compact_safe_lsn,
             shard_infos: shard_infos_cache,
+            accounting_snapshot_pins: Arc::new(Mutex::new(Default::default())),
             blob_versions,
             segment_states,
-            segment_stats,
-            segment_ref_state,
             segment_ref_events,
             segment_gc_overlay,
+            gc_relocations,
             shards,
             store_state,
             epoch_changes,

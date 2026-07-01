@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use strata_core::{
-    BlobKey, BlobVersionState, Epoch, SegmentGcOverlay, SegmentId, SegmentKey, SegmentRefEvent,
-    SegmentRefEventKey, SegmentRefKey, SegmentRefState, SegmentState, SegmentStats, ShardId,
-    ShardInfo, StoreStateKey, StrataLsn,
+    BlobKey, BlobVersionState, Epoch, GcRelocation, RecordRef, SegmentGcOverlay, SegmentId,
+    SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo,
+    StoreStateKey, StrataLsn,
 };
 use typed_store::rocks::{DBBatch, DBMap, RocksDB};
 
@@ -32,20 +32,16 @@ impl StrataIndex {
         &self.segment_states
     }
 
-    pub fn segment_stats(&self) -> &DBMap<SegmentKey, SegmentStats> {
-        &self.segment_stats
-    }
-
-    pub fn segment_ref_state(&self) -> &DBMap<SegmentRefKey, SegmentRefState> {
-        &self.segment_ref_state
-    }
-
     pub fn segment_ref_events(&self) -> &DBMap<SegmentRefEventKey, SegmentRefEvent> {
         &self.segment_ref_events
     }
 
     pub fn segment_gc_overlay(&self) -> &DBMap<SegmentId, SegmentGcOverlay> {
         &self.segment_gc_overlay
+    }
+
+    pub fn gc_relocations(&self) -> &DBMap<RecordRef, GcRelocation> {
+        &self.gc_relocations
     }
 
     pub fn shards(&self) -> &DBMap<ShardId, ShardInfo> {

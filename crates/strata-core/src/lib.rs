@@ -48,8 +48,8 @@ pub use record::{
     RECORD_VERSION, RecordHeader, RecordHeaderFields, encoded_record_len,
 };
 pub use segment::{
-    EpochBucket, PlacementClass, SegmentFileState, SegmentGcLifetimeRange, SegmentGcLifetimeUpdate,
-    SegmentGcOverlay, SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, SegmentKey,
-    SegmentRefEvent, SegmentRefEventKey, SegmentRefKey, SegmentRefState, SegmentRefStatus,
-    SegmentState, SegmentStats, VolumeId,
+    EpochBucket, GcRelocation, PlacementClass, SegmentFileState, SegmentGcLifetimeRange,
+    SegmentGcLifetimeUpdate, SegmentGcLiveRecord, SegmentGcOverlay, SegmentGcOverlayMergeOp,
+    SegmentGcRecordRange, SegmentGcSummary, SegmentId, SegmentKey, SegmentRefEvent,
+    SegmentRefEventKey, SegmentState, VolumeId,
 };

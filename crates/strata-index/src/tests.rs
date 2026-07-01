@@ -3,8 +3,10 @@ use std::{num::NonZeroU32, sync::Once};
 use strata_accounting::{AccountingIndex, AccountingIndexConfig};
 use strata_core::{
     BlobLifecycle, BlobLifecycleAction, BlobLifecycleMergeOp, BlobLifecycleOp, BlobState,
-    PlacementClass, RecordRef, SegmentFileState, ShardInfo, ShardKey, ShardState,
+    PlacementClass, RecordRef, SegmentFileState, SegmentGcLiveRecord, SegmentGcSummary, ShardInfo,
+    ShardKey, ShardState,
 };
+use strata_gc::{GcPlanner, GcPlannerConfig, GcScenario};
 use tempfile::tempdir;
 use typed_store::{DBMetrics, rocks::open_cf};
 
@@ -92,6 +94,10 @@ fn gc_lifetime(logical_end_epoch: Epoch) -> BlobLifecycle {
     }
 }
 
+fn gc_live(range: SegmentGcRecordRange, lifecycle: Option<BlobLifecycle>) -> SegmentGcLiveRecord {
+    SegmentGcLiveRecord { range, lifecycle }
+}
+
 #[tokio::test]
 async fn open_path_persists_blob_entry_across_reopen() {
     init_typed_store_metrics();
@@ -156,12 +162,6 @@ async fn batch_writes_across_index_cfs_atomically() {
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let entry = blob_entry(9, 256);
     let state = segment_state(9);
-    let stats = SegmentStats {
-        total_bytes: 1024,
-        live_bytes: 256,
-        live_ref_count: 1,
-        ..Default::default()
-    };
     let manifest = AccountingIndex::open(AccountingIndexConfig::new(
         dir.path().join("accounting-index"),
         NonZeroU32::new(1).unwrap(),
@@ -178,7 +178,13 @@ async fn batch_writes_across_index_cfs_atomically() {
         .unwrap();
     index.put_segment_state_batch(&mut batch, &state).unwrap();
     index
-        .put_segment_stats_batch(&mut batch, state.segment_id, &stats)
+        .merge_segment_gc_overlay_batch(
+            &mut batch,
+            state.segment_id,
+            vec![SegmentGcOverlayMergeOp::AddLiveBatch {
+                records: vec![gc_live(gc_range(256, 256), None)],
+            }],
+        )
         .unwrap();
     index
         .put_blob_unaccounted_lsn_op_batch(&mut batch, entry.lsn, &key)
@@ -196,7 +202,17 @@ async fn batch_writes_across_index_cfs_atomically() {
         index.get_segment_state(state.segment_id).unwrap(),
         Some(state)
     );
-    assert_eq!(index.get_segment_stats(9).unwrap(), Some(stats));
+    assert_eq!(
+        index.get_segment_gc_overlay(9).unwrap().unwrap().summary,
+        SegmentGcSummary {
+            total_bytes: 256,
+            live_bytes: 256,
+            live_ref_count: 1,
+            unknown_lifetime_bytes: 256,
+            unknown_lifetime_ref_count: 1,
+            ..Default::default()
+        }
+    );
     assert_eq!(
         index.iter_unaccounted_lsn_ops().unwrap(),
         vec![(entry.lsn, unaccounted(STANDALONE_SHARD, &key))]
@@ -206,6 +222,261 @@ async fn batch_writes_across_index_cfs_atomically() {
         index.get_accounting_index_manifest().unwrap(),
         Some(manifest)
     );
+}
+
+#[tokio::test]
+async fn accounting_snapshot_guard_pins_frontier_and_returns_later_ref_events() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let before_key = SegmentRefEventKey {
+        segment_id: 1,
+        lsn: 5,
+        offset: 10,
+    };
+
+    let mut batch = index.batch();
+    index.put_accounted_lsn_batch(&mut batch, 5).unwrap();
+    index
+        .put_segment_ref_event_batch(&mut batch, before_key, &SegmentRefEvent::Retired)
+        .unwrap();
+    batch.write().unwrap();
+
+    let snapshot = index.create_accounting_snapshot().unwrap();
+    assert_eq!(snapshot.accounted_lsn(), 5);
+    assert_eq!(snapshot.snapshot().accounted_lsn, 5);
+    assert_eq!(index.min_pinned_accounted_lsn(), Some(5));
+
+    let lifecycle = BlobLifecycle {
+        logical_end_epoch: 50,
+        extension_count: 0,
+    };
+    let later_retire = SegmentRefEventKey {
+        segment_id: 2,
+        lsn: 7,
+        offset: 30,
+    };
+    let later_lifecycle = SegmentRefEventKey {
+        segment_id: 1,
+        lsn: 6,
+        offset: 20,
+    };
+    let mut batch = index.batch();
+    index.put_accounted_lsn_batch(&mut batch, 7).unwrap();
+    index
+        .put_segment_ref_event_batch(&mut batch, later_retire, &SegmentRefEvent::Retired)
+        .unwrap();
+    index
+        .put_segment_ref_event_batch(
+            &mut batch,
+            later_lifecycle,
+            &SegmentRefEvent::LifecycleChanged {
+                lifecycle: Some(lifecycle),
+            },
+        )
+        .unwrap();
+    batch.write().unwrap();
+
+    assert_eq!(
+        index.accounting_changes_since(&snapshot).unwrap(),
+        vec![
+            AccountingRefEvent {
+                key: later_lifecycle,
+                event: SegmentRefEvent::LifecycleChanged {
+                    lifecycle: Some(lifecycle),
+                },
+            },
+            AccountingRefEvent {
+                key: later_retire,
+                event: SegmentRefEvent::Retired,
+            },
+        ]
+    );
+    assert_eq!(index.prune_accounting_ref_events_through_lsn(7).unwrap(), 1);
+    assert_eq!(index.accounting_changes_since_lsn(0).unwrap().len(), 2);
+
+    let next_snapshot = index.create_accounting_snapshot().unwrap();
+    assert_eq!(next_snapshot.accounted_lsn(), 7);
+    assert_eq!(index.min_pinned_accounted_lsn(), Some(5));
+
+    drop(snapshot);
+    assert_eq!(index.min_pinned_accounted_lsn(), Some(7));
+    assert_eq!(index.prune_accounting_ref_events_through_lsn(7).unwrap(), 2);
+    assert!(index.accounting_changes_since_lsn(0).unwrap().is_empty());
+
+    drop(next_snapshot);
+    assert_eq!(index.min_pinned_accounted_lsn(), None);
+}
+
+#[tokio::test]
+async fn gc_snapshot_requires_initialized_epoch() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let accounting_snapshot = index.create_accounting_snapshot().unwrap();
+
+    assert!(
+        index
+            .build_gc_snapshot(&accounting_snapshot)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn gc_snapshot_reads_segment_metadata_from_one_index_view() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let mut state = segment_state(9);
+    state.state = SegmentFileState::Sealed;
+    state.placement_class = PlacementClass::Spillover;
+    state.sealed_len = Some(1_000);
+    state.max_lsn = Some(7);
+    let mut summary = SegmentGcSummary {
+        total_bytes: 1_000,
+        live_bytes: 100,
+        retired_bytes: 900,
+        live_ref_count: 1,
+        ..Default::default()
+    };
+    summary.future_epoch_histogram.insert(
+        50,
+        strata_core::EpochBucket {
+            refs: 1,
+            bytes: 100,
+        },
+    );
+    summary.min_live_end_epoch = Some(50);
+    summary.max_live_end_epoch = Some(50);
+    summary.extension_count_histogram.insert(0, 1);
+
+    let mut batch = index.batch();
+    index.put_current_epoch_batch(&mut batch, 10).unwrap();
+    index.put_accounted_lsn_batch(&mut batch, 7).unwrap();
+    index.put_segment_state_batch(&mut batch, &state).unwrap();
+    index
+        .merge_segment_gc_overlay_batch(
+            &mut batch,
+            state.segment_id,
+            vec![
+                SegmentGcOverlayMergeOp::AddLiveBatch {
+                    records: vec![
+                        gc_live(gc_range(0, 900), None),
+                        gc_live(gc_range(900, 100), Some(gc_lifetime(50))),
+                    ],
+                },
+                SegmentGcOverlayMergeOp::RetireBatch {
+                    ranges: vec![gc_range(0, 900)],
+                },
+            ],
+        )
+        .unwrap();
+    batch.write().unwrap();
+
+    let accounting_snapshot = index.create_accounting_snapshot().unwrap();
+    let snapshot = index
+        .build_gc_snapshot(&accounting_snapshot)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(snapshot.current_epoch, 10);
+    assert_eq!(snapshot.accounted_lsn, 7);
+    assert_eq!(snapshot.segments.len(), 1);
+    assert_eq!(snapshot.segments[0].state, state);
+    assert_eq!(snapshot.segments[0].summary, summary);
+    assert!(!snapshot.segments[0].claimed);
+
+    let planner = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: 1_000,
+        min_reclaim_bytes: 100,
+        min_garbage_ratio_bps: 5000,
+        min_exact_epoch_bucket_bytes: 50,
+        min_exact_epoch_distance: 1,
+        max_exact_epoch_extension_count: 1,
+        min_join_output_bytes: 100,
+        max_join_sources: 4,
+    });
+    let plan = planner.plan(&snapshot).unwrap();
+    assert_eq!(plan.scenario, GcScenario::DeadRef);
+}
+
+#[tokio::test]
+async fn gc_snapshot_uses_pinned_accounting_frontier() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+
+    let mut batch = index.batch();
+    index.put_current_epoch_batch(&mut batch, 10).unwrap();
+    index.put_accounted_lsn_batch(&mut batch, 5).unwrap();
+    batch.write().unwrap();
+
+    let accounting_snapshot = index.create_accounting_snapshot().unwrap();
+
+    let mut state = segment_state(9);
+    state.state = SegmentFileState::Sealed;
+    state.placement_class = PlacementClass::Spillover;
+    state.sealed_len = Some(1_000);
+    state.max_lsn = Some(7);
+    let mut summary = SegmentGcSummary {
+        total_bytes: 1_000,
+        live_bytes: 100,
+        retired_bytes: 900,
+        live_ref_count: 1,
+        ..Default::default()
+    };
+    summary.future_epoch_histogram.insert(
+        50,
+        strata_core::EpochBucket {
+            refs: 1,
+            bytes: 100,
+        },
+    );
+    summary.min_live_end_epoch = Some(50);
+    summary.max_live_end_epoch = Some(50);
+    summary.extension_count_histogram.insert(0, 1);
+
+    let mut batch = index.batch();
+    index.put_accounted_lsn_batch(&mut batch, 7).unwrap();
+    index.put_segment_state_batch(&mut batch, &state).unwrap();
+    index
+        .merge_segment_gc_overlay_batch(
+            &mut batch,
+            state.segment_id,
+            vec![
+                SegmentGcOverlayMergeOp::AddLiveBatch {
+                    records: vec![
+                        gc_live(gc_range(0, 900), None),
+                        gc_live(gc_range(900, 100), Some(gc_lifetime(50))),
+                    ],
+                },
+                SegmentGcOverlayMergeOp::RetireBatch {
+                    ranges: vec![gc_range(0, 900)],
+                },
+            ],
+        )
+        .unwrap();
+    batch.write().unwrap();
+
+    let snapshot = index
+        .build_gc_snapshot(&accounting_snapshot)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(snapshot.accounted_lsn, 5);
+
+    let planner = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: 1_000,
+        min_reclaim_bytes: 100,
+        min_garbage_ratio_bps: 5000,
+        min_exact_epoch_bucket_bytes: 50,
+        min_exact_epoch_distance: 1,
+        max_exact_epoch_extension_count: 1,
+        min_join_output_bytes: 100,
+        max_join_sources: 4,
+    });
+    assert!(planner.plan(&snapshot).is_none());
 }
 
 #[tokio::test]
@@ -299,7 +570,7 @@ async fn map_blob_ref_merge_rewrites_exact_payload_ref() {
 }
 
 #[tokio::test]
-async fn segment_gc_overlay_merge_coalesces_dead_ranges() {
+async fn segment_gc_overlay_merge_coalesces_retired_ranges() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
@@ -317,7 +588,8 @@ async fn segment_gc_overlay_merge_coalesces_dead_ranges() {
     batch.write().unwrap();
 
     let overlay = index.get_segment_gc_overlay(7).unwrap().unwrap();
-    assert_eq!(overlay.dead, vec![gc_range(10, 10), gc_range(40, 3)]);
+    assert_eq!(overlay.retired, vec![gc_range(10, 10), gc_range(40, 3)]);
+    assert!(overlay.expired.is_empty());
     assert!(overlay.lifetimes.is_empty());
 }
 
@@ -335,11 +607,8 @@ async fn segment_gc_overlay_retire_removes_lifetime_hint() {
             &mut batch,
             7,
             vec![
-                SegmentGcOverlayMergeOp::LifetimeBatch {
-                    updates: vec![SegmentGcLifetimeUpdate {
-                        range,
-                        lifecycle: Some(lifecycle),
-                    }],
+                SegmentGcOverlayMergeOp::AddLiveBatch {
+                    records: vec![gc_live(range, Some(lifecycle))],
                 },
                 SegmentGcOverlayMergeOp::RetireBatch {
                     ranges: vec![range],
@@ -350,12 +619,68 @@ async fn segment_gc_overlay_retire_removes_lifetime_hint() {
     batch.write().unwrap();
 
     let overlay = index.get_segment_gc_overlay(7).unwrap().unwrap();
-    assert_eq!(overlay.dead, vec![range]);
+    assert_eq!(overlay.retired, vec![range]);
+    assert!(overlay.expired.is_empty());
     assert!(overlay.lifetimes.is_empty());
 }
 
 #[tokio::test]
-async fn segment_gc_overlay_lifetime_update_revives_dead_subrange() {
+async fn segment_gc_overlay_add_expired_record_accounts_garbage() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let range = gc_range(20, 8);
+
+    let mut batch = index.batch();
+    index
+        .merge_segment_gc_overlay_batch(
+            &mut batch,
+            7,
+            vec![SegmentGcOverlayMergeOp::AddExpiredBatch {
+                ranges: vec![range],
+            }],
+        )
+        .unwrap();
+    batch.write().unwrap();
+
+    let overlay = index.get_segment_gc_overlay(7).unwrap().unwrap();
+    assert_eq!(overlay.expired, vec![range]);
+    assert_eq!(overlay.summary.total_bytes, range.len);
+    assert_eq!(overlay.summary.live_bytes, 0);
+    assert_eq!(overlay.summary.expired_bytes, range.len);
+    assert_eq!(overlay.summary.garbage_bytes(), range.len);
+}
+
+#[tokio::test]
+async fn segment_gc_overlay_add_retired_record_accounts_garbage() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let range = gc_range(20, 8);
+
+    let mut batch = index.batch();
+    index
+        .merge_segment_gc_overlay_batch(
+            &mut batch,
+            7,
+            vec![SegmentGcOverlayMergeOp::AddRetiredBatch {
+                ranges: vec![range],
+            }],
+        )
+        .unwrap();
+    batch.write().unwrap();
+
+    let overlay = index.get_segment_gc_overlay(7).unwrap().unwrap();
+    assert!(overlay.expired.is_empty());
+    assert_eq!(overlay.retired, vec![range]);
+    assert_eq!(overlay.summary.total_bytes, range.len);
+    assert_eq!(overlay.summary.live_bytes, 0);
+    assert_eq!(overlay.summary.retired_bytes, range.len);
+    assert_eq!(overlay.summary.garbage_bytes(), range.len);
+}
+
+#[tokio::test]
+async fn segment_gc_overlay_lifetime_update_does_not_revive_expired_subrange() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
@@ -367,7 +692,10 @@ async fn segment_gc_overlay_lifetime_update_revives_dead_subrange() {
             &mut batch,
             7,
             vec![
-                SegmentGcOverlayMergeOp::RetireBatch {
+                SegmentGcOverlayMergeOp::AddLiveBatch {
+                    records: vec![gc_live(gc_range(0, 100), Some(gc_lifetime(50)))],
+                },
+                SegmentGcOverlayMergeOp::ExpireBatch {
                     ranges: vec![gc_range(0, 100)],
                 },
                 SegmentGcOverlayMergeOp::LifetimeBatch {
@@ -382,14 +710,12 @@ async fn segment_gc_overlay_lifetime_update_revives_dead_subrange() {
     batch.write().unwrap();
 
     let overlay = index.get_segment_gc_overlay(7).unwrap().unwrap();
-    assert_eq!(overlay.dead, vec![gc_range(0, 20), gc_range(30, 70)]);
-    assert_eq!(
-        overlay.lifetimes,
-        vec![SegmentGcLifetimeRange {
-            range: gc_range(20, 10),
-            lifecycle,
-        }]
-    );
+    assert!(overlay.retired.is_empty());
+    assert_eq!(overlay.expired, vec![gc_range(0, 100)]);
+    assert!(overlay.lifetimes.is_empty());
+    assert_eq!(overlay.summary.total_bytes, 100);
+    assert_eq!(overlay.summary.live_bytes, 0);
+    assert_eq!(overlay.summary.expired_bytes, 100);
 }
 
 #[tokio::test]
@@ -412,6 +738,7 @@ async fn blob_versions_pack_payload_and_lifecycle_state_together() {
                 lsn: 2,
                 action: BlobLifecycleAction::SetLifetime {
                     logical_end_epoch: 50,
+                    current_epoch: 42,
                 },
             }),
         )
@@ -439,6 +766,7 @@ async fn blob_versions_pack_payload_and_lifecycle_state_together() {
                 lsn: 2,
                 action: BlobLifecycleAction::SetLifetime {
                     logical_end_epoch: 50,
+                    current_epoch: 42,
                 },
             }]
         )
@@ -721,7 +1049,7 @@ async fn iterates_segment_states() {
 }
 
 #[tokio::test]
-async fn segment_state_and_stats_are_keyed_by_shard() {
+async fn segment_state_is_keyed_by_shard() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
@@ -731,14 +1059,6 @@ async fn segment_state_and_stats_are_keyed_by_shard() {
     };
     let standalone_state = segment_state(1);
     let shard_state = segment_state_for_shard(shard, 1);
-    let standalone_stats = SegmentStats {
-        total_bytes: 11,
-        ..Default::default()
-    };
-    let shard_stats = SegmentStats {
-        total_bytes: 22,
-        ..Default::default()
-    };
 
     let mut batch = index.batch();
     index
@@ -747,23 +1067,12 @@ async fn segment_state_and_stats_are_keyed_by_shard() {
     index
         .put_segment_state_batch(&mut batch, &shard_state)
         .unwrap();
-    index
-        .put_segment_stats_batch(&mut batch, 1, &standalone_stats)
-        .unwrap();
-    index
-        .put_segment_stats_for_shard_batch(&mut batch, shard, 1, &shard_stats)
-        .unwrap();
     batch.write().unwrap();
 
     assert_eq!(index.get_segment_state(1).unwrap(), Some(standalone_state));
     assert_eq!(
         index.get_segment_state_for_shard(shard, 1).unwrap(),
         Some(shard_state)
-    );
-    assert_eq!(index.get_segment_stats(1).unwrap(), Some(standalone_stats));
-    assert_eq!(
-        index.get_segment_stats_for_shard(shard, 1).unwrap(),
-        Some(shard_stats)
     );
 }
 
@@ -851,15 +1160,6 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
     entry.lsn = 1;
     let shard_state = segment_state_for_shard(shard, 1);
     let other_state = segment_state_for_shard(other_shard, 1);
-    let shard_stats = SegmentStats {
-        total_bytes: 11,
-        ..Default::default()
-    };
-    let other_stats = SegmentStats {
-        total_bytes: 22,
-        ..Default::default()
-    };
-
     let mut batch = index.batch();
     index
         .merge_blob_version_batch(&mut batch, &key, shard, &entry)
@@ -869,12 +1169,6 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
         .unwrap();
     index
         .put_segment_state_batch(&mut batch, &other_state)
-        .unwrap();
-    index
-        .put_segment_stats_for_shard_batch(&mut batch, shard, 1, &shard_stats)
-        .unwrap();
-    index
-        .put_segment_stats_for_shard_batch(&mut batch, other_shard, 1, &other_stats)
         .unwrap();
     index.put_next_lsn_batch(&mut batch, 5).unwrap();
     index.put_durable_lsn_batch(&mut batch, 4).unwrap();
@@ -901,12 +1195,6 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        index
-            .get_segment_stats_for_shard(shard, 1)
-            .unwrap()
-            .is_none()
-    );
     assert_eq!(index.get_next_lsn().unwrap(), 5);
     assert_eq!(index.get_durable_lsn().unwrap(), 4);
     assert_eq!(index.get_accounted_lsn().unwrap(), 3);
@@ -923,10 +1211,6 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
     assert_eq!(
         index.get_segment_state_for_shard(other_shard, 1).unwrap(),
         Some(other_state)
-    );
-    assert_eq!(
-        index.get_segment_stats_for_shard(other_shard, 1).unwrap(),
-        Some(other_stats)
     );
 }
 
