@@ -69,6 +69,14 @@ struct PrometheusMetrics {
     recovery_discarded_segments_total: IntCounter,
     recovery_rollback_ops_total: IntCounter,
     recovery_last_rollback_from: IntGauge,
+    gc_configured_workers: IntGauge,
+    gc_active_worker_limit: IntGauge,
+    gc_in_flight_workers: IntGauge,
+    gc_admitted_total: IntCounter,
+    gc_skipped_by_tuner_total: IntCounter,
+    gc_tuner_increases_total: IntCounter,
+    gc_tuner_decreases_total: IntCounter,
+    gc_tuner_health_state: IntGauge,
 }
 
 impl StrataStoreMetrics {
@@ -409,6 +417,54 @@ impl StrataStoreMetrics {
                     "recovery_last_rollback_from",
                     "Lowest Strata LSN rolled back by the most recent recovery rollback.",
                 )?,
+                gc_configured_workers: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_configured_workers",
+                    "Configured upper bound for background Strata GC workers.",
+                )?,
+                gc_active_worker_limit: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_active_worker_limit",
+                    "Current runtime limit for background Strata GC workers admitted concurrently.",
+                )?,
+                gc_in_flight_workers: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_in_flight_workers",
+                    "Current number of background Strata GC workers running an admitted attempt.",
+                )?,
+                gc_admitted_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_admitted_total",
+                    "Total background Strata GC attempts admitted by the runtime concurrency tuner.",
+                )?,
+                gc_skipped_by_tuner_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_skipped_by_tuner_total",
+                    "Total background Strata GC attempts skipped because the runtime concurrency limit was full.",
+                )?,
+                gc_tuner_increases_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_tuner_increases_total",
+                    "Total times the Strata GC runtime tuner increased active worker concurrency.",
+                )?,
+                gc_tuner_decreases_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_tuner_decreases_total",
+                    "Total times the Strata GC runtime tuner decreased active worker concurrency.",
+                )?,
+                gc_tuner_health_state: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_tuner_health_state",
+                    "Current Strata GC tuner health state: 0 healthy, 1 pressured, 2 cooldown.",
+                )?,
             })),
         })
     }
@@ -656,6 +712,64 @@ impl StrataStoreMetrics {
             .recovery_last_rollback_from
             .set(to_i64(rollback_from));
         metrics.recovery_rollback_ops_total.inc_by(ops);
+    }
+
+    pub(crate) fn initialize_gc_tuner(&self, configured_workers: usize, active_limit: usize) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics
+            .gc_configured_workers
+            .set(to_i64(configured_workers as u64));
+        metrics
+            .gc_active_worker_limit
+            .set(to_i64(active_limit as u64));
+        metrics.gc_in_flight_workers.set(0);
+        metrics.gc_tuner_health_state.set(0);
+    }
+
+    pub(crate) fn set_gc_active_worker_limit(&self, active_limit: usize) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .gc_active_worker_limit
+                .set(to_i64(active_limit as u64));
+        }
+    }
+
+    pub(crate) fn set_gc_in_flight_workers(&self, in_flight: usize) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_in_flight_workers.set(to_i64(in_flight as u64));
+        }
+    }
+
+    pub(crate) fn record_gc_admitted(&self) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_admitted_total.inc();
+        }
+    }
+
+    pub(crate) fn record_gc_skipped_by_tuner(&self) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_skipped_by_tuner_total.inc();
+        }
+    }
+
+    pub(crate) fn record_gc_tuner_increase(&self) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_tuner_increases_total.inc();
+        }
+    }
+
+    pub(crate) fn record_gc_tuner_decrease(&self) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_tuner_decreases_total.inc();
+        }
+    }
+
+    pub(crate) fn set_gc_tuner_health_state(&self, state: i64) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_tuner_health_state.set(state);
+        }
     }
 }
 

@@ -161,7 +161,8 @@ pub use config::{
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    DEFAULT_GC_INTERVAL, DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_WORKER_COUNT,
+    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
+    DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
     DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
 };
@@ -170,7 +171,9 @@ pub use gc::{
     GcAccountingLag, GcPublishResult, GcPublishedOutputSegment, GcPublishedRecord,
     GcStagedCopiedRecord, GcStagedOutputSegment, PreparedGcCopy, PreparedGcPlan,
 };
-use gc::{GcCommand, GcExecutor, GcSourceClaims, GcWorker};
+use gc::{
+    GcCommand, GcConcurrencyConfig, GcConcurrencyController, GcExecutor, GcSourceClaims, GcWorker,
+};
 use layout::{parse_segment_file_name, relative_segment_path, segment_path, segment_state_path};
 use metrics::PutMetric;
 pub use metrics::StrataStoreMetrics;
@@ -212,6 +215,7 @@ pub struct StrataStore {
     gc_handles: Vec<JoinHandle<()>>,
     pub(crate) accounting_lock: Arc<Mutex<()>>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
+    pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
     pub(crate) reader_cache: Arc<SegmentReaderCache>,
     metrics: StrataStoreMetrics,
 }
@@ -309,6 +313,10 @@ impl StrataStore {
         let (accounting_tx, accounting_rx) = mpsc::sync_channel(1);
         let accounting_lock = Arc::new(Mutex::new(()));
         let gc_claims = Arc::new(GcSourceClaims::default());
+        let gc_concurrency = Arc::new(GcConcurrencyController::new(
+            GcConcurrencyConfig::from_store_config(&config),
+            metrics.clone(),
+        ));
         let accounting_worker = AccountingWorker {
             config: config.clone(),
             index: index.clone(),
@@ -351,6 +359,7 @@ impl StrataStore {
             write_rx,
             store_scope: STORE_SCOPE,
             reader_cache: Arc::clone(&reader_cache),
+            gc_concurrency: Arc::clone(&gc_concurrency),
             metrics: metrics.clone(),
         };
         let writer_handle = thread::Builder::new()
@@ -368,6 +377,7 @@ impl StrataStore {
                     write_tx: write_tx.clone(),
                     accounting_lock: Arc::clone(&accounting_lock),
                     claims: Arc::clone(&gc_claims),
+                    gc_concurrency: Arc::clone(&gc_concurrency),
                     metrics: metrics.clone(),
                 },
                 planner: GcPlanner::new(config.gc_planner_config.clone()),
@@ -408,6 +418,7 @@ impl StrataStore {
             gc_handles,
             accounting_lock,
             gc_claims,
+            gc_concurrency,
             metrics,
         })
     }
@@ -422,6 +433,11 @@ impl StrataStore {
 
     pub fn metrics(&self) -> &StrataStoreMetrics {
         &self.metrics
+    }
+
+    /// Current number of background GC workers the runtime tuner may admit concurrently.
+    pub fn gc_active_worker_limit(&self) -> usize {
+        self.gc_concurrency.active_limit()
     }
 
     #[cfg(test)]
@@ -656,6 +672,8 @@ impl StrataStore {
         }
         self.metrics
             .record_write_queue_send(result.is_ok(), started.elapsed());
+        self.gc_concurrency
+            .observe_write_queue_send(started.elapsed());
         result
     }
 }
@@ -1079,6 +1097,7 @@ struct WriteCoordinator {
     write_rx: mpsc::Receiver<WriteCommand>,
     store_scope: ShardKey,
     reader_cache: Arc<SegmentReaderCache>,
+    gc_concurrency: Arc<GcConcurrencyController>,
     metrics: StrataStoreMetrics,
 }
 
@@ -2155,6 +2174,7 @@ impl WriteCoordinator {
                 if waiting {
                     self.metrics
                         .finish_seal_backpressure_wait(started.elapsed());
+                    self.gc_concurrency.set_seal_backpressure(false);
                 }
                 return Err(Error::SealFailed { segment_id });
             }
@@ -2162,12 +2182,14 @@ impl WriteCoordinator {
                 if waiting {
                     self.metrics
                         .finish_seal_backpressure_wait(started.elapsed());
+                    self.gc_concurrency.set_seal_backpressure(false);
                 }
                 return Ok(());
             }
             if !waiting {
                 waiting = true;
                 self.metrics.start_seal_backpressure_wait();
+                self.gc_concurrency.set_seal_backpressure(true);
             }
             thread::sleep(SEAL_BACKLOG_WAIT);
         }
@@ -2257,6 +2279,10 @@ impl WriteCoordinator {
         self.metrics.record_sync(
             Ok(durable_offset.saturating_sub(previous_durable_offset)),
             started.elapsed(),
+        );
+        self.gc_concurrency.observe_sync(
+            started.elapsed(),
+            durable_offset.saturating_sub(previous_durable_offset),
         );
         self.nudge_accounting();
         Ok(())
@@ -3530,6 +3556,26 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
     if config.gc_worker_count == 0 {
         return Err(Error::InvalidConfig("gc_worker_count must be non-zero"));
     }
+    if config.gc_initial_worker_count == 0 {
+        return Err(Error::InvalidConfig(
+            "gc_initial_worker_count must be non-zero",
+        ));
+    }
+    if config.gc_initial_worker_count > config.gc_worker_count {
+        return Err(Error::InvalidConfig(
+            "gc_initial_worker_count must not exceed gc_worker_count",
+        ));
+    }
+    if config.gc_tuning_window_cycles == 0 {
+        return Err(Error::InvalidConfig(
+            "gc_tuning_window_cycles must be non-zero",
+        ));
+    }
+    if config.gc_sync_impact_threshold.is_zero() {
+        return Err(Error::InvalidConfig(
+            "gc_sync_impact_threshold must be non-zero",
+        ));
+    }
     Ok(())
 }
 
@@ -3832,6 +3878,9 @@ mod tests {
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
             gc_interval: Duration::from_secs(3600),
             gc_worker_count: DEFAULT_GC_WORKER_COUNT,
+            gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
+            gc_tuning_window_cycles: DEFAULT_GC_TUNING_WINDOW_CYCLES,
+            gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
             gc_planner_config: GcPlannerConfig::default(),
             gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             starting_epoch: 42,
@@ -3903,6 +3952,18 @@ mod tests {
     fn wait_for_accounted_lsn(store: &StrataStore, expected_lsn: StrataLsn) {
         let started = Instant::now();
         loop {
+            let accounted_lsn = store.accounted_lsn().unwrap();
+            if accounted_lsn >= expected_lsn {
+                return;
+            }
+            {
+                let _guard = store
+                    .accounting_lock
+                    .lock()
+                    .expect("accounting run lock poisoned");
+                accounting::run_accounting_sidecar_once(store.index(), store.config(), true)
+                    .unwrap();
+            }
             let accounted_lsn = store.accounted_lsn().unwrap();
             if accounted_lsn >= expected_lsn {
                 return;
@@ -5096,6 +5157,26 @@ mod tests {
             gauge_value(&registry, "strata_store_seal_backpressure_current"),
             0
         );
+        assert_eq!(
+            gauge_value(&registry, "strata_store_gc_configured_workers"),
+            DEFAULT_GC_WORKER_COUNT as i64
+        );
+        assert_eq!(
+            gauge_value(&registry, "strata_store_gc_active_worker_limit"),
+            DEFAULT_GC_INITIAL_WORKER_COUNT as i64
+        );
+        assert_eq!(
+            gauge_value(&registry, "strata_store_gc_in_flight_workers"),
+            0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_gc_admitted_total"),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_gc_skipped_by_tuner_total"),
+            0.0
+        );
     }
 
     #[tokio::test]
@@ -5112,6 +5193,10 @@ mod tests {
 
         let registry = Registry::new();
         let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
+        let gc_concurrency = Arc::new(GcConcurrencyController::new(
+            GcConcurrencyConfig::from_store_config(&cfg),
+            metrics.clone(),
+        ));
         let active_writer = SegmentWriter::create(
             segment_path(&cfg, 2),
             2,
@@ -5139,6 +5224,7 @@ mod tests {
             write_rx,
             store_scope: STORE_SCOPE,
             reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
+            gc_concurrency,
             metrics,
         };
 
@@ -6298,6 +6384,7 @@ mod tests {
         let lsn_c = store.put(&key_c, b"payload-c").unwrap();
         store.sync().unwrap();
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         wait_for_accounted_lsn(&store, lsn_c);
 
         let ref_a = store
@@ -6395,6 +6482,7 @@ mod tests {
         store.sync().unwrap();
         let sealed_state =
             wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         let sealed_path = segment_state_path(store.config(), &sealed_state);
         assert!(sealed_path.exists());
         wait_for_accounted_lsn(&store, lsn_b);
@@ -6462,6 +6550,7 @@ mod tests {
         store.sync().unwrap();
         let sealed_state =
             wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         let sealed_path = segment_state_path(store.config(), &sealed_state);
         wait_for_accounted_lsn(&store, lsn_b);
 
@@ -6499,6 +6588,7 @@ mod tests {
         let mut cfg = config(dir.path(), "default");
         cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
         cfg.gc_worker_count = 2;
+        cfg.gc_initial_worker_count = 2;
         let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
         let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
         let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -6513,6 +6603,7 @@ mod tests {
         let second_segment_id = FIRST_SEGMENT_ID + 1;
         let second_state =
             wait_for_segment_state(store.index(), second_segment_id, SegmentFileState::Sealed);
+        store.sync().unwrap();
         let first_path = segment_state_path(store.config(), &first_state);
         let second_path = segment_state_path(store.config(), &second_state);
         wait_for_accounted_lsn(&store, lsn_c);
@@ -6663,6 +6754,7 @@ mod tests {
         let lsn_c = store.put(&key_c, b"payload-c").unwrap();
         store.sync().unwrap();
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         wait_for_accounted_lsn(&store, lsn_c);
 
         let ref_a = store
@@ -6764,6 +6856,7 @@ mod tests {
         let lsn_d = store.put(&key_d, b"payload-d").unwrap();
         store.sync().unwrap();
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         wait_for_accounted_lsn(&store, lsn_d);
 
         let tombstone_lsn = store.tombstone(&key_a).unwrap();
@@ -6843,6 +6936,7 @@ mod tests {
         let lsn_c = store.put(&key_c, b"payload-c").unwrap();
         store.sync().unwrap();
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         wait_for_accounted_lsn(&store, lsn_c);
 
         let ref_a = store
@@ -6939,6 +7033,7 @@ mod tests {
         let lifetime_b_lsn = store.extend(&key_b, 43).unwrap().unwrap();
         store.sync().unwrap();
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         wait_for_accounted_lsn(&store, lsn_c.max(lifetime_b_lsn));
 
         let ref_a = store
@@ -7035,6 +7130,7 @@ mod tests {
         let lsn_c = store.put(&key_c, b"payload-c").unwrap();
         store.sync().unwrap();
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+        store.sync().unwrap();
         wait_for_accounted_lsn(&store, lsn_c);
 
         let ref_a = store

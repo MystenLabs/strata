@@ -19,6 +19,9 @@ pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD: usize = 8;
 pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_GC_WORKER_COUNT: usize = 1;
+pub const DEFAULT_GC_INITIAL_WORKER_COUNT: usize = 1;
+pub const DEFAULT_GC_TUNING_WINDOW_CYCLES: u64 = 8;
+pub const DEFAULT_GC_SYNC_IMPACT_THRESHOLD: Duration = Duration::from_millis(250);
 pub const DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN: Option<StrataLsn> = None;
 
 /// Runtime configuration for one Strata store namespace.
@@ -43,8 +46,18 @@ pub struct StrataStoreConfig {
     pub accounting_sidecar_major_patch_bytes_threshold: u64,
     /// Background GC cadence for one planning/copy/publish attempt.
     pub gc_interval: Duration,
-    /// Number of background GC workers that may plan/copy disjoint source segments concurrently.
+    /// Maximum number of background GC workers that may plan/copy disjoint source segments
+    /// concurrently.
     pub gc_worker_count: usize,
+    /// Initial number of GC workers admitted by the runtime concurrency tuner.
+    pub gc_initial_worker_count: usize,
+    /// Completed admitted GC attempts per normal tuner decision window.
+    pub gc_tuning_window_cycles: u64,
+    /// Foreground sync latency above which GC concurrency starts being treated as suspicious.
+    ///
+    /// The tuner also compares against the best observed baseline, so this is a lower bound for
+    /// pressure detection rather than the only signal.
+    pub gc_sync_impact_threshold: Duration,
     /// Policy knobs used by the background GC planner.
     pub gc_planner_config: GcPlannerConfig,
     /// Optional GC admission limit measured as `durable_lsn - accounted_lsn`.

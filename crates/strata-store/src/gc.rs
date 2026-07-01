@@ -159,6 +159,354 @@ impl GcAccountingLag {
     }
 }
 
+const GC_TUNER_HEALTHY: i64 = 0;
+const GC_TUNER_PRESSURED: i64 = 1;
+const GC_TUNER_COOLDOWN: i64 = 2;
+const GC_IMPACT_FACTOR_BPS: u128 = 12_500;
+const GC_IMPACT_HARD_FACTOR_BPS: u128 = 20_000;
+const GC_IMPROVEMENT_FACTOR_BPS: u128 = 9_500;
+const GC_WRITE_QUEUE_IMPACT_THRESHOLD: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GcConcurrencyConfig {
+    pub(crate) max_workers: usize,
+    pub(crate) initial_workers: usize,
+    pub(crate) tuning_window_cycles: u64,
+    pub(crate) sync_impact_threshold: Duration,
+}
+
+impl GcConcurrencyConfig {
+    pub(crate) fn from_store_config(config: &crate::StrataStoreConfig) -> Self {
+        Self {
+            max_workers: config.gc_worker_count,
+            initial_workers: config.gc_initial_worker_count,
+            tuning_window_cycles: config.gc_tuning_window_cycles,
+            sync_impact_threshold: config.gc_sync_impact_threshold,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct GcConcurrencyController {
+    config: GcConcurrencyConfig,
+    metrics: StrataStoreMetrics,
+    state: Mutex<GcConcurrencyState>,
+}
+
+// This controller intentionally starts with the coarse knob: how many GC workers may run at once.
+// The next control surface should be a byte/copy budget, because one admitted worker can still
+// issue enough sequential copy I/O to affect foreground sync latency.
+#[derive(Debug)]
+struct GcConcurrencyState {
+    active_limit: usize,
+    in_flight: usize,
+    cycles_since_tune: u64,
+    sync_latency_nanos: TunedSignal,
+    write_queue_send_nanos: TunedSignal,
+    seal_backpressure_current: bool,
+    mode: GcTuningMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcTuningMode {
+    Probing,
+    BackingOff { previous_signal_nanos: u128 },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TunedSignal {
+    ewma_nanos: Option<u128>,
+    best_ewma_nanos: Option<u128>,
+}
+
+impl TunedSignal {
+    fn observe(&mut self, sample_nanos: u128) {
+        let ewma = match self.ewma_nanos {
+            Some(current) => current.saturating_mul(7).saturating_add(sample_nanos) / 8,
+            None => sample_nanos,
+        };
+        self.ewma_nanos = Some(ewma);
+        self.best_ewma_nanos = Some(self.best_ewma_nanos.map_or(ewma, |best| best.min(ewma)));
+    }
+
+    fn current(&self) -> Option<u128> {
+        self.ewma_nanos
+    }
+
+    fn degraded(&self, threshold: Duration) -> bool {
+        let Some(current) = self.ewma_nanos else {
+            return false;
+        };
+        let threshold_nanos = threshold.as_nanos();
+        if current <= threshold_nanos {
+            return false;
+        }
+        let Some(best) = self.best_ewma_nanos else {
+            return current.saturating_mul(10_000)
+                > threshold_nanos.saturating_mul(GC_IMPACT_HARD_FACTOR_BPS);
+        };
+        current.saturating_mul(10_000) > best.saturating_mul(GC_IMPACT_FACTOR_BPS)
+            || current.saturating_mul(10_000)
+                > threshold_nanos.saturating_mul(GC_IMPACT_HARD_FACTOR_BPS)
+    }
+}
+
+impl GcConcurrencyController {
+    pub(crate) fn new(config: GcConcurrencyConfig, metrics: StrataStoreMetrics) -> Self {
+        let active_limit = config.initial_workers.min(config.max_workers).max(1);
+        metrics.initialize_gc_tuner(config.max_workers, active_limit);
+        Self {
+            config,
+            metrics,
+            state: Mutex::new(GcConcurrencyState {
+                active_limit,
+                in_flight: 0,
+                cycles_since_tune: 0,
+                sync_latency_nanos: TunedSignal::default(),
+                write_queue_send_nanos: TunedSignal::default(),
+                seal_backpressure_current: false,
+                mode: GcTuningMode::Probing,
+            }),
+        }
+    }
+
+    pub(crate) fn active_limit(&self) -> usize {
+        self.state
+            .lock()
+            .expect("gc concurrency lock poisoned")
+            .active_limit
+    }
+
+    pub(crate) fn try_admit(self: &Arc<Self>) -> Option<GcRunPermit> {
+        let mut state = self.state.lock().expect("gc concurrency lock poisoned");
+        if state.in_flight >= state.active_limit {
+            self.metrics.record_gc_skipped_by_tuner();
+            return None;
+        }
+        state.in_flight += 1;
+        self.metrics.record_gc_admitted();
+        self.metrics.set_gc_in_flight_workers(state.in_flight);
+        Some(GcRunPermit {
+            controller: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn observe_sync(&self, elapsed: Duration, bytes: u64) {
+        let mut state = self.state.lock().expect("gc concurrency lock poisoned");
+        let sample_nanos = sync_impact_sample_nanos(elapsed, bytes);
+        state.sync_latency_nanos.observe(sample_nanos);
+    }
+
+    pub(crate) fn observe_write_queue_send(&self, elapsed: Duration) {
+        let mut state = self.state.lock().expect("gc concurrency lock poisoned");
+        state
+            .write_queue_send_nanos
+            .observe(elapsed.as_nanos().max(1));
+    }
+
+    pub(crate) fn set_seal_backpressure(&self, current: bool) {
+        let mut state = self.state.lock().expect("gc concurrency lock poisoned");
+        state.seal_backpressure_current = current;
+        if current {
+            self.metrics.set_gc_tuner_health_state(GC_TUNER_PRESSURED);
+        } else if !self.workload_pressured(&state) {
+            self.metrics.set_gc_tuner_health_state(GC_TUNER_HEALTHY);
+        }
+    }
+
+    fn finish_run(&self) {
+        let mut state = self.state.lock().expect("gc concurrency lock poisoned");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        state.cycles_since_tune = state.cycles_since_tune.saturating_add(1);
+        self.metrics.set_gc_in_flight_workers(state.in_flight);
+        let window = tuning_window_cycles(self.config.tuning_window_cycles, state.mode);
+        if state.cycles_since_tune >= window {
+            state.cycles_since_tune = 0;
+            self.tune_locked(&mut state);
+        }
+    }
+
+    fn tune_locked(&self, state: &mut GcConcurrencyState) {
+        let pressured = self.workload_pressured(state);
+        let signal = current_pressure_signal_nanos(state);
+        match state.mode {
+            GcTuningMode::Probing => {
+                if pressured {
+                    let changed = self.decrease_locked(state);
+                    state.mode = GcTuningMode::BackingOff {
+                        previous_signal_nanos: signal.unwrap_or(0),
+                    };
+                    self.metrics.set_gc_tuner_health_state(if changed {
+                        GC_TUNER_COOLDOWN
+                    } else {
+                        GC_TUNER_PRESSURED
+                    });
+                } else {
+                    let changed = self.increase_locked(state);
+                    self.metrics.set_gc_tuner_health_state(if changed {
+                        GC_TUNER_COOLDOWN
+                    } else {
+                        GC_TUNER_HEALTHY
+                    });
+                }
+            }
+            GcTuningMode::BackingOff {
+                previous_signal_nanos,
+            } => {
+                let current_signal = signal.unwrap_or(previous_signal_nanos);
+                if pressured
+                    && state.active_limit > 1
+                    && signal_improved(current_signal, previous_signal_nanos)
+                {
+                    let changed = self.decrease_locked(state);
+                    state.mode = GcTuningMode::BackingOff {
+                        previous_signal_nanos: current_signal,
+                    };
+                    self.metrics.set_gc_tuner_health_state(if changed {
+                        GC_TUNER_COOLDOWN
+                    } else {
+                        GC_TUNER_PRESSURED
+                    });
+                } else {
+                    state.mode = GcTuningMode::Probing;
+                    self.metrics.set_gc_tuner_health_state(if pressured {
+                        GC_TUNER_PRESSURED
+                    } else {
+                        GC_TUNER_HEALTHY
+                    });
+                }
+            }
+        }
+    }
+
+    fn workload_pressured(&self, state: &GcConcurrencyState) -> bool {
+        state.seal_backpressure_current
+            || state
+                .sync_latency_nanos
+                .degraded(self.config.sync_impact_threshold)
+            || state
+                .write_queue_send_nanos
+                .degraded(GC_WRITE_QUEUE_IMPACT_THRESHOLD)
+    }
+
+    fn increase_locked(&self, state: &mut GcConcurrencyState) -> bool {
+        if state.active_limit >= self.config.max_workers {
+            return false;
+        }
+        state.active_limit += 1;
+        self.metrics.set_gc_active_worker_limit(state.active_limit);
+        self.metrics.record_gc_tuner_increase();
+        true
+    }
+
+    fn decrease_locked(&self, state: &mut GcConcurrencyState) -> bool {
+        if state.active_limit <= 1 {
+            return false;
+        }
+        state.active_limit -= 1;
+        self.metrics.set_gc_active_worker_limit(state.active_limit);
+        self.metrics.record_gc_tuner_decrease();
+        true
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct GcRunPermit {
+    controller: Arc<GcConcurrencyController>,
+}
+
+impl Drop for GcRunPermit {
+    fn drop(&mut self) {
+        self.controller.finish_run();
+    }
+}
+
+fn sync_impact_sample_nanos(elapsed: Duration, bytes: u64) -> u128 {
+    let elapsed_nanos = elapsed.as_nanos().max(1);
+    const MIB: u128 = 1024 * 1024;
+    if bytes >= MIB as u64 {
+        elapsed_nanos.saturating_mul(MIB) / bytes as u128
+    } else {
+        elapsed_nanos
+    }
+}
+
+fn tuning_window_cycles(normal_window: u64, mode: GcTuningMode) -> u64 {
+    match mode {
+        GcTuningMode::Probing => normal_window.max(1),
+        GcTuningMode::BackingOff { .. } => (normal_window / 2).max(1),
+    }
+}
+
+fn current_pressure_signal_nanos(state: &GcConcurrencyState) -> Option<u128> {
+    state
+        .sync_latency_nanos
+        .current()
+        .or_else(|| state.write_queue_send_nanos.current())
+}
+
+fn signal_improved(current: u128, previous: u128) -> bool {
+    if previous == 0 {
+        return false;
+    }
+    current.saturating_mul(10_000) < previous.saturating_mul(GC_IMPROVEMENT_FACTOR_BPS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller_config(max_workers: usize, initial_workers: usize) -> GcConcurrencyConfig {
+        GcConcurrencyConfig {
+            max_workers,
+            initial_workers,
+            tuning_window_cycles: 2,
+            sync_impact_threshold: Duration::from_millis(100),
+        }
+    }
+
+    #[test]
+    fn gc_concurrency_controller_limits_admitted_workers() {
+        let controller = Arc::new(GcConcurrencyController::new(
+            controller_config(2, 1),
+            StrataStoreMetrics::default(),
+        ));
+
+        let permit = controller.try_admit().unwrap();
+
+        assert!(controller.try_admit().is_none());
+        assert_eq!(controller.active_limit(), 1);
+        drop(permit);
+    }
+
+    #[test]
+    fn gc_concurrency_controller_increases_after_healthy_window() {
+        let controller = Arc::new(GcConcurrencyController::new(
+            controller_config(2, 1),
+            StrataStoreMetrics::default(),
+        ));
+
+        drop(controller.try_admit().unwrap());
+        drop(controller.try_admit().unwrap());
+
+        assert_eq!(controller.active_limit(), 2);
+    }
+
+    #[test]
+    fn gc_concurrency_controller_decreases_after_sync_pressure() {
+        let controller = Arc::new(GcConcurrencyController::new(
+            controller_config(2, 2),
+            StrataStoreMetrics::default(),
+        ));
+        controller.observe_sync(Duration::from_millis(300), 0);
+
+        drop(controller.try_admit().unwrap());
+        drop(controller.try_admit().unwrap());
+
+        assert_eq!(controller.active_limit(), 1);
+    }
+}
+
 /// In-memory ownership table for source segments currently used by GC jobs.
 #[derive(Debug, Default)]
 pub(crate) struct GcSourceClaims {
@@ -233,7 +581,9 @@ impl GcWorker {
         loop {
             match self.command_rx.recv_timeout(self.interval) {
                 Ok(GcCommand::Run) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = self.executor.run_once(&self.planner);
+                    if let Some(_permit) = self.executor.gc_concurrency.try_admit() {
+                        let _ = self.executor.run_once(&self.planner);
+                    }
                 }
                 Ok(GcCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -248,6 +598,7 @@ pub(crate) struct GcExecutor {
     pub(crate) write_tx: mpsc::SyncSender<WriteCommand>,
     pub(crate) accounting_lock: Arc<Mutex<()>>,
     pub(crate) claims: Arc<GcSourceClaims>,
+    pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
     pub(crate) metrics: StrataStoreMetrics,
 }
 
@@ -263,6 +614,7 @@ impl StrataStore {
                 .clone(),
             accounting_lock: Arc::clone(&self.accounting_lock),
             claims: Arc::clone(&self.gc_claims),
+            gc_concurrency: Arc::clone(&self.gc_concurrency),
             metrics: self.metrics.clone(),
         })
     }
@@ -349,6 +701,8 @@ impl GcExecutor {
         }
         self.metrics
             .record_write_queue_send(result.is_ok(), started.elapsed());
+        self.gc_concurrency
+            .observe_write_queue_send(started.elapsed());
         result
     }
 
