@@ -493,6 +493,18 @@ mod tests {
     }
 
     #[test]
+    fn gc_failure_backoff_keeps_cadence_then_doubles_up_to_cap() {
+        let interval = Duration::from_secs(60);
+
+        assert_eq!(gc_failure_backoff(interval, 0), interval);
+        assert_eq!(gc_failure_backoff(interval, 1), interval);
+        assert_eq!(gc_failure_backoff(interval, 2), interval * 2);
+        assert_eq!(gc_failure_backoff(interval, 3), interval * 4);
+        assert_eq!(gc_failure_backoff(interval, 5), interval * 16);
+        assert_eq!(gc_failure_backoff(interval, u32::MAX), interval * 16);
+    }
+
+    #[test]
     fn gc_concurrency_controller_decreases_after_sync_pressure() {
         let controller = Arc::new(GcConcurrencyController::new(
             controller_config(2, 2),
@@ -576,19 +588,52 @@ pub(crate) struct GcWorker {
     pub(crate) command_rx: mpsc::Receiver<GcCommand>,
 }
 
+/// Largest failure backoff multiplier is `2^GC_FAILURE_BACKOFF_MAX_EXPONENT` times the configured
+/// GC interval. Backoff only stretches the timer tick; explicit `GcCommand::Run` requests still run
+/// immediately so an operator or test can force a retry.
+const GC_FAILURE_BACKOFF_MAX_EXPONENT: u32 = 4;
+
 impl GcWorker {
     pub(crate) fn run(self) {
+        // Consecutive failures are tracked per worker so one worker stuck on a persistently
+        // failing plan backs off without slowing down other workers. The shared metrics gauge is
+        // store-level: any successful attempt resets it, so it only stays elevated when GC as a
+        // whole cannot make progress.
+        let mut consecutive_failures: u32 = 0;
         loop {
-            match self.command_rx.recv_timeout(self.interval) {
+            let wait = gc_failure_backoff(self.interval, consecutive_failures);
+            match self.command_rx.recv_timeout(wait) {
                 Ok(GcCommand::Run) | Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(_permit) = self.executor.gc_concurrency.try_admit() {
-                        let _ = self.executor.run_once(&self.planner);
+                        match self.executor.run_once(&self.planner) {
+                            Ok(_) => {
+                                consecutive_failures = 0;
+                                self.executor.metrics.record_gc_run_success();
+                            }
+                            Err(_) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                self.executor.metrics.record_gc_run_failure();
+                            }
+                        }
                     }
                 }
                 Ok(GcCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
+}
+
+/// Stretches the worker's timer tick after consecutive failures.
+///
+/// A GC attempt that fails deterministically (for example a plan that keeps aborting on a stale
+/// view) would otherwise burn a full plan/scan cycle every interval forever. The first failure
+/// keeps the normal cadence; each further failure doubles the wait up to the capped exponent.
+fn gc_failure_backoff(interval: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures <= 1 {
+        return interval;
+    }
+    let exponent = (consecutive_failures - 1).min(GC_FAILURE_BACKOFF_MAX_EXPONENT);
+    interval.saturating_mul(2_u32.saturating_pow(exponent))
 }
 
 #[derive(Clone)]

@@ -73,6 +73,8 @@ struct PrometheusMetrics {
     gc_active_worker_limit: IntGauge,
     gc_in_flight_workers: IntGauge,
     gc_admitted_total: IntCounter,
+    gc_run_failures_total: IntCounter,
+    gc_consecutive_run_failures: IntGauge,
     gc_skipped_by_tuner_total: IntCounter,
     gc_tuner_increases_total: IntCounter,
     gc_tuner_decreases_total: IntCounter,
@@ -441,6 +443,18 @@ impl StrataStoreMetrics {
                     "gc_admitted_total",
                     "Total background Strata GC attempts admitted by the runtime concurrency tuner.",
                 )?,
+                gc_run_failures_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_run_failures_total",
+                    "Total admitted background Strata GC attempts that ended in an error.",
+                )?,
+                gc_consecutive_run_failures: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_consecutive_run_failures",
+                    "Consecutive failed background Strata GC attempts since the last success; alert when this keeps growing.",
+                )?,
                 gc_skipped_by_tuner_total: register_counter(
                     registry,
                     &labels,
@@ -726,6 +740,7 @@ impl StrataStoreMetrics {
             .set(to_i64(active_limit as u64));
         metrics.gc_in_flight_workers.set(0);
         metrics.gc_tuner_health_state.set(0);
+        metrics.gc_consecutive_run_failures.set(0);
     }
 
     pub(crate) fn set_gc_active_worker_limit(&self, active_limit: usize) {
@@ -745,6 +760,19 @@ impl StrataStoreMetrics {
     pub(crate) fn record_gc_admitted(&self) {
         if let Some(metrics) = &self.inner {
             metrics.gc_admitted_total.inc();
+        }
+    }
+
+    pub(crate) fn record_gc_run_failure(&self) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_run_failures_total.inc();
+            metrics.gc_consecutive_run_failures.inc();
+        }
+    }
+
+    pub(crate) fn record_gc_run_success(&self) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_consecutive_run_failures.set(0);
         }
     }
 
@@ -840,4 +868,51 @@ fn lsn_from_i64(value: i64) -> StrataLsn {
 
 fn to_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::proto::MetricType;
+
+    fn metric_value(registry: &Registry, name: &str) -> f64 {
+        let family = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .expect("metric family registered");
+        let metric = &family.metric[0];
+        match family.type_() {
+            MetricType::COUNTER => metric.counter.value(),
+            MetricType::GAUGE => metric.gauge.value(),
+            other => panic!("unexpected metric type {other:?} for {name}"),
+        }
+    }
+
+    #[test]
+    fn gc_run_outcomes_count_failures_and_reset_consecutive_on_success() {
+        let registry = Registry::new();
+        let metrics = StrataStoreMetrics::new(&registry, "test").unwrap();
+
+        metrics.record_gc_run_failure();
+        metrics.record_gc_run_failure();
+        assert_eq!(
+            metric_value(&registry, "strata_store_gc_run_failures_total"),
+            2.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_gc_consecutive_run_failures"),
+            2.0
+        );
+
+        metrics.record_gc_run_success();
+        assert_eq!(
+            metric_value(&registry, "strata_store_gc_run_failures_total"),
+            2.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_gc_consecutive_run_failures"),
+            0.0
+        );
+    }
 }
