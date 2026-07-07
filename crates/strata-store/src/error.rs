@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use strata_core::{
-    BlobKey, Epoch, SegmentFileState, SegmentId, ShardGeneration, ShardId, ShardState,
-    StrataLsn,
+    BlobKey, Epoch, SegmentFileState, SegmentId, ShardGeneration, ShardId, ShardState, StrataLsn,
 };
 
 /// Result type used by `strata-store`.

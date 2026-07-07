@@ -18,7 +18,8 @@ use strata_index::{AccountingSnapshotGuard, StrataIndex};
 use strata_segment::{SegmentReader, SegmentScanner, SegmentWriter};
 
 use crate::{
-    Error, GcPublishRequest, Result, SegmentIdAllocator, StoreHalt, StrataStore, WriteCommand,
+    Error, GcIoLimiter, GcPublishRequest, Result, SegmentIdAllocator, StoreHalt, StrataStore,
+    WriteCommand,
     layout::{relative_segment_path, segment_path, segment_state_path},
     metrics::StrataStoreMetrics,
     seal::sha256_file_prefix,
@@ -247,10 +248,23 @@ const GC_TUNER_COOLDOWN: i64 = 2;
 const GC_IMPACT_FACTOR_BPS: u128 = 12_500;
 /// Absolute hard pressure multiplier over the configured latency threshold.
 const GC_IMPACT_HARD_FACTOR_BPS: u128 = 20_000;
+/// Old-baseline weight when adapting the GC foreground-latency baseline upward.
+const GC_BASELINE_DECAY_OLD_WEIGHT: u128 = 63;
+/// New-sample weight when adapting the GC foreground-latency baseline upward.
+const GC_BASELINE_DECAY_NEW_WEIGHT: u128 = 1;
+/// Total weight for upward baseline adaptation.
+const GC_BASELINE_DECAY_WEIGHT_TOTAL: u128 =
+    GC_BASELINE_DECAY_OLD_WEIGHT + GC_BASELINE_DECAY_NEW_WEIGHT;
 /// Relative EWMA decrease that counts as improvement during backoff.
 const GC_IMPROVEMENT_FACTOR_BPS: u128 = 9_500;
 /// Write-queue send latency above which enqueueing itself is considered pressured.
 const GC_WRITE_QUEUE_IMPACT_THRESHOLD: Duration = Duration::from_millis(10);
+/// Basis-point denominator used for GC rate budget adjustment factors.
+const GC_RATE_FACTOR_DENOMINATOR: u64 = 10_000;
+/// Foreground pressure halves the active GC byte budget until the configured floor.
+const GC_RATE_DECREASE_FACTOR_BPS: u64 = 5_000;
+/// Healthy windows double the active GC byte budget until the configured ceiling.
+const GC_RATE_INCREASE_FACTOR_BPS: u64 = 20_000;
 
 /// Runtime GC concurrency-tuning knobs derived from `StrataStoreConfig`.
 ///
@@ -266,6 +280,10 @@ pub(crate) struct GcConcurrencyConfig {
     pub(crate) tuning_window_cycles: u64,
     /// Sync-latency floor for considering foreground durability work impacted.
     pub(crate) sync_impact_threshold: Duration,
+    /// Healthy upper bound for store-wide GC disk I/O.
+    pub(crate) max_io_bytes_per_sec: u64,
+    /// Pressure lower bound for store-wide GC disk I/O.
+    pub(crate) min_io_bytes_per_sec: u64,
 }
 
 impl GcConcurrencyConfig {
@@ -276,6 +294,8 @@ impl GcConcurrencyConfig {
             initial_workers: config.gc_initial_worker_count,
             tuning_window_cycles: config.gc_tuning_window_cycles,
             sync_impact_threshold: config.gc_sync_impact_threshold,
+            max_io_bytes_per_sec: config.gc_io_bytes_per_sec,
+            min_io_bytes_per_sec: config.gc_min_io_bytes_per_sec,
         }
     }
 }
@@ -295,13 +315,15 @@ pub(crate) struct GcConcurrencyController {
     state: Mutex<GcConcurrencyState>,
 }
 
-// This controller intentionally starts with the coarse knob: how many GC workers may run at once.
-// The next control surface should be a byte/copy budget, because one admitted worker can still
-// issue enough sequential copy I/O to affect foreground sync latency.
+// Worker count bounds how many GC attempts may run concurrently; the byte budget bounds how much
+// aggregate disk I/O those admitted workers may issue. Both are needed because one admitted worker
+// can still issue enough sequential copy I/O to affect foreground sync latency.
 #[derive(Debug)]
 struct GcConcurrencyState {
     /// Current maximum number of workers allowed to run concurrently.
     active_limit: usize,
+    /// Current store-wide GC I/O byte budget.
+    active_io_bytes_per_sec: u64,
     /// Number of workers currently holding `GcRunPermit`s.
     in_flight: usize,
     /// Admitted attempts completed since the last tuning decision.
@@ -312,6 +334,8 @@ struct GcConcurrencyState {
     write_queue_send_nanos: TunedSignal,
     /// Whether foreground writes are currently stalled on seal backlog capacity.
     seal_backpressure_current: bool,
+    /// Whether a foreground pressure sample overlapped an admitted GC attempt in this tune window.
+    pressure_observed_during_gc: bool,
     /// Current probe/backoff phase.
     mode: GcTuningMode,
 }
@@ -325,24 +349,29 @@ enum GcTuningMode {
     BackingOff { previous_signal_nanos: u128 },
 }
 
-/// One EWMA foreground-health signal and its best observed baseline.
+/// One EWMA foreground-health signal and its recent-best latency baseline.
 #[derive(Debug, Clone, Copy, Default)]
 struct TunedSignal {
     /// Current exponentially weighted moving average.
     ewma_nanos: Option<u128>,
-    /// Best EWMA seen since controller creation.
-    best_ewma_nanos: Option<u128>,
+    /// Decaying baseline used to decide whether the current EWMA is unexpectedly slow.
+    baseline_ewma_nanos: Option<u128>,
 }
 
 impl TunedSignal {
     /// Updates the EWMA with a new nanosecond sample.
     fn observe(&mut self, sample_nanos: u128) {
         let ewma = match self.ewma_nanos {
+            // Smooth noisy foreground samples while still letting sustained latency shifts move the
+            // signal. This is a 7/8 old + 1/8 new EWMA.
             Some(current) => current.saturating_mul(7).saturating_add(sample_nanos) / 8,
             None => sample_nanos,
         };
         self.ewma_nanos = Some(ewma);
-        self.best_ewma_nanos = Some(self.best_ewma_nanos.map_or(ewma, |best| best.min(ewma)));
+        self.baseline_ewma_nanos = Some(
+            self.baseline_ewma_nanos
+                .map_or(ewma, |baseline| decayed_latency_baseline(baseline, ewma)),
+        );
     }
 
     /// Returns the current EWMA if at least one sample has been observed.
@@ -359,11 +388,11 @@ impl TunedSignal {
         if current <= threshold_nanos {
             return false;
         }
-        let Some(best) = self.best_ewma_nanos else {
+        let Some(baseline) = self.baseline_ewma_nanos else {
             return current.saturating_mul(10_000)
                 > threshold_nanos.saturating_mul(GC_IMPACT_HARD_FACTOR_BPS);
         };
-        current.saturating_mul(10_000) > best.saturating_mul(GC_IMPACT_FACTOR_BPS)
+        current.saturating_mul(10_000) > baseline.saturating_mul(GC_IMPACT_FACTOR_BPS)
             || current.saturating_mul(10_000)
                 > threshold_nanos.saturating_mul(GC_IMPACT_HARD_FACTOR_BPS)
     }
@@ -373,17 +402,26 @@ impl GcConcurrencyController {
     /// Creates a controller with its active limit set to the configured initial worker count.
     pub(crate) fn new(config: GcConcurrencyConfig, metrics: StrataStoreMetrics) -> Self {
         let active_limit = config.initial_workers.min(config.max_workers).max(1);
-        metrics.initialize_gc_tuner(config.max_workers, active_limit);
+        let active_io_bytes_per_sec = config.max_io_bytes_per_sec;
+        metrics.initialize_gc_tuner(
+            config.max_workers,
+            active_limit,
+            config.max_io_bytes_per_sec,
+            config.min_io_bytes_per_sec,
+            active_io_bytes_per_sec,
+        );
         Self {
             config,
             metrics,
             state: Mutex::new(GcConcurrencyState {
                 active_limit,
+                active_io_bytes_per_sec,
                 in_flight: 0,
                 cycles_since_tune: 0,
                 sync_latency_nanos: TunedSignal::default(),
                 write_queue_send_nanos: TunedSignal::default(),
                 seal_backpressure_current: false,
+                pressure_observed_during_gc: false,
                 mode: GcTuningMode::Probing,
             }),
         }
@@ -395,6 +433,14 @@ impl GcConcurrencyController {
             .lock()
             .expect("gc concurrency lock poisoned")
             .active_limit
+    }
+
+    /// Returns the current store-wide GC I/O budget chosen by the runtime tuner.
+    pub(crate) fn active_io_bytes_per_sec(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("gc concurrency lock poisoned")
+            .active_io_bytes_per_sec
     }
 
     /// Attempts to reserve one active GC worker slot.
@@ -424,6 +470,7 @@ impl GcConcurrencyController {
         let mut state = self.state.lock().expect("gc concurrency lock poisoned");
         let sample_nanos = sync_impact_sample_nanos(elapsed, bytes);
         state.sync_latency_nanos.observe(sample_nanos);
+        self.record_pressure_overlap_locked(&mut state);
     }
 
     /// Records time spent enqueueing a command into the writer queue.
@@ -432,12 +479,16 @@ impl GcConcurrencyController {
         state
             .write_queue_send_nanos
             .observe(elapsed.as_nanos().max(1));
+        self.record_pressure_overlap_locked(&mut state);
     }
 
     /// Records whether foreground writes are currently blocked by seal backlog pressure.
     pub(crate) fn set_seal_backpressure(&self, current: bool) {
         let mut state = self.state.lock().expect("gc concurrency lock poisoned");
         state.seal_backpressure_current = current;
+        if current {
+            self.record_pressure_overlap_locked(&mut state);
+        }
         if current {
             self.metrics.set_gc_tuner_health_state(GC_TUNER_PRESSURED);
         } else if !self.workload_pressured(&state) {
@@ -466,11 +517,15 @@ impl GcConcurrencyController {
     /// improvement has stopped.
     fn tune_locked(&self, state: &mut GcConcurrencyState) {
         let pressured = self.workload_pressured(state);
+        let attributed_pressure = pressured && state.pressure_observed_during_gc;
+        state.pressure_observed_during_gc = false;
         let signal = current_pressure_signal_nanos(state);
         match state.mode {
             GcTuningMode::Probing => {
-                if pressured {
-                    let changed = self.decrease_locked(state);
+                if attributed_pressure {
+                    let worker_changed = self.decrease_locked(state);
+                    let io_budget_changed = self.decrease_io_budget_locked(state);
+                    let changed = worker_changed || io_budget_changed;
                     state.mode = GcTuningMode::BackingOff {
                         previous_signal_nanos: signal.unwrap_or(0),
                     };
@@ -479,8 +534,12 @@ impl GcConcurrencyController {
                     } else {
                         GC_TUNER_PRESSURED
                     });
+                } else if pressured {
+                    self.metrics.set_gc_tuner_health_state(GC_TUNER_PRESSURED);
                 } else {
-                    let changed = self.increase_locked(state);
+                    let worker_changed = self.increase_locked(state);
+                    let io_budget_changed = self.increase_io_budget_locked(state);
+                    let changed = worker_changed || io_budget_changed;
                     self.metrics.set_gc_tuner_health_state(if changed {
                         GC_TUNER_COOLDOWN
                     } else {
@@ -492,11 +551,15 @@ impl GcConcurrencyController {
                 previous_signal_nanos,
             } => {
                 let current_signal = signal.unwrap_or(previous_signal_nanos);
-                if pressured
-                    && state.active_limit > 1
+                let can_back_off_more = state.active_limit > 1
+                    || state.active_io_bytes_per_sec > self.config.min_io_bytes_per_sec;
+                if attributed_pressure
+                    && can_back_off_more
                     && signal_improved(current_signal, previous_signal_nanos)
                 {
-                    let changed = self.decrease_locked(state);
+                    let worker_changed = self.decrease_locked(state);
+                    let io_budget_changed = self.decrease_io_budget_locked(state);
+                    let changed = worker_changed || io_budget_changed;
                     state.mode = GcTuningMode::BackingOff {
                         previous_signal_nanos: current_signal,
                     };
@@ -528,6 +591,13 @@ impl GcConcurrencyController {
                 .degraded(GC_WRITE_QUEUE_IMPACT_THRESHOLD)
     }
 
+    /// Records that foreground pressure was observed while GC was actually active.
+    fn record_pressure_overlap_locked(&self, state: &mut GcConcurrencyState) {
+        if state.in_flight > 0 && self.workload_pressured(state) {
+            state.pressure_observed_during_gc = true;
+        }
+    }
+
     /// Raises active GC concurrency by one worker when below the configured max.
     fn increase_locked(&self, state: &mut GcConcurrencyState) -> bool {
         if state.active_limit >= self.config.max_workers {
@@ -547,6 +617,46 @@ impl GcConcurrencyController {
         state.active_limit -= 1;
         self.metrics.set_gc_active_worker_limit(state.active_limit);
         self.metrics.record_gc_tuner_decrease();
+        true
+    }
+
+    /// Raises active GC I/O budget toward the configured healthy ceiling.
+    fn increase_io_budget_locked(&self, state: &mut GcConcurrencyState) -> bool {
+        if state.active_io_bytes_per_sec >= self.config.max_io_bytes_per_sec {
+            return false;
+        }
+        let scaled = state
+            .active_io_bytes_per_sec
+            .saturating_mul(GC_RATE_INCREASE_FACTOR_BPS)
+            / GC_RATE_FACTOR_DENOMINATOR;
+        let next = scaled
+            .max(state.active_io_bytes_per_sec.saturating_add(1))
+            .min(self.config.max_io_bytes_per_sec);
+        if next == state.active_io_bytes_per_sec {
+            return false;
+        }
+        state.active_io_bytes_per_sec = next;
+        self.metrics.set_gc_active_io_bytes_per_sec(next);
+        true
+    }
+
+    /// Lowers active GC I/O budget toward the configured pressure floor.
+    fn decrease_io_budget_locked(&self, state: &mut GcConcurrencyState) -> bool {
+        if state.active_io_bytes_per_sec <= self.config.min_io_bytes_per_sec {
+            return false;
+        }
+        let scaled = state
+            .active_io_bytes_per_sec
+            .saturating_mul(GC_RATE_DECREASE_FACTOR_BPS)
+            / GC_RATE_FACTOR_DENOMINATOR;
+        let next = scaled
+            .max(self.config.min_io_bytes_per_sec)
+            .min(state.active_io_bytes_per_sec.saturating_sub(1));
+        if next == state.active_io_bytes_per_sec {
+            return false;
+        }
+        state.active_io_bytes_per_sec = next;
+        self.metrics.set_gc_active_io_bytes_per_sec(next);
         true
     }
 }
@@ -577,6 +687,25 @@ fn sync_impact_sample_nanos(elapsed: Duration, bytes: u64) -> u128 {
     } else {
         elapsed_nanos
     }
+}
+
+/// Updates the latency baseline used by foreground-pressure detection.
+///
+/// The baseline drops immediately when latency improves, but rises slowly when the workload changes.
+/// Example: a quiet store may learn a 50ms sync baseline. If the real foreground workload later makes
+/// 120ms syncs normal, an all-time best baseline would blame GC forever because 120ms is more than
+/// 50ms * 1.25. This decayed baseline gradually moves toward 120ms. A later GC-induced jump from a
+/// recent 120ms baseline to 220ms is still detected as pressure.
+fn decayed_latency_baseline(baseline: u128, current: u128) -> u128 {
+    if current <= baseline {
+        return current;
+    }
+
+    let decayed = baseline
+        .saturating_mul(GC_BASELINE_DECAY_OLD_WEIGHT)
+        .saturating_add(current.saturating_mul(GC_BASELINE_DECAY_NEW_WEIGHT))
+        / GC_BASELINE_DECAY_WEIGHT_TOTAL;
+    decayed.max(baseline.saturating_add(1)).min(current)
 }
 
 /// Chooses the number of completed GC attempts required before the next tuning decision.
@@ -761,6 +890,8 @@ pub(crate) struct GcExecutor {
     pub(crate) claims: Arc<GcSourceClaims>,
     /// Runtime GC admission controller shared with foreground paths.
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
+    /// Store-wide byte limiter for GC scan/copy/checksum I/O.
+    pub(crate) gc_io_limiter: Arc<GcIoLimiter>,
     /// Shared monotonic allocator for durable segment ids.
     pub(crate) segment_ids: SegmentIdAllocator,
     /// Terminal store state shared with foreground writer paths.
@@ -784,6 +915,7 @@ impl StrataStore {
             accounting_lock: Arc::clone(&self.accounting_lock),
             claims: Arc::clone(&self.gc_claims),
             gc_concurrency: Arc::clone(&self.gc_concurrency),
+            gc_io_limiter: Arc::clone(&self.gc_io_limiter),
             segment_ids: self.segment_ids.clone(),
             store_halt: self.store_halt.clone(),
             metrics: self.metrics.clone(),
@@ -858,6 +990,8 @@ impl GcExecutor {
     /// `Ok(None)` means no eligible plan was admitted or selected. Errors are operational failures
     /// from file I/O, index access, or writer publication.
     pub(crate) fn run_once(&self, planner: &GcPlanner) -> Result<Option<GcPublishResult>> {
+        self.gc_io_limiter
+            .set_bytes_per_sec(self.gc_concurrency.active_io_bytes_per_sec());
         let Some(prepared) = self.prepare_gc_plan(planner)? else {
             return Ok(None);
         };
@@ -945,6 +1079,13 @@ impl GcExecutor {
             .get_segment_gc_overlay(segment_id)?
             .unwrap_or_default();
         let path = gc_source_segment_path(&self.config, &state);
+        let scan_bytes = fs::metadata(&path)
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        self.gc_io_limiter.acquire(scan_bytes);
         let mut scanner = SegmentScanner::open(&path, segment_id)?;
         let prefix = scanner.scan_valid_prefix()?;
 
@@ -1213,6 +1354,7 @@ impl GcExecutor {
                 .get_mut(&record.destination_class)
                 .expect("staged output inserted above");
             let staged = append_gc_record_to_staged_output(
+                &self.gc_io_limiter,
                 output,
                 &mut outputs,
                 staging_dir,
@@ -1228,7 +1370,7 @@ impl GcExecutor {
         }
 
         for (_, output) in open_outputs {
-            outputs.push(output.finish()?);
+            outputs.push(output.finish(&self.gc_io_limiter)?);
         }
         outputs.sort_by_key(|output| output.staged_segment_id);
         copied_records
@@ -1265,6 +1407,7 @@ impl GcExecutor {
                 .get_mut(&record_ref.segment_id)
                 .expect("reader inserted above")
         };
+        self.gc_io_limiter.acquire(record_ref.len);
         Ok(reader.read_payload(record_ref)?)
     }
 }
@@ -1284,9 +1427,10 @@ struct OpenStagedOutput {
 
 impl OpenStagedOutput {
     /// Seals the temporary file and records the digest needed for final segment metadata.
-    fn finish(mut self) -> Result<GcStagedOutputSegment> {
+    fn finish(mut self, io_limiter: &GcIoLimiter) -> Result<GcStagedOutputSegment> {
         let sealed_len = self.writer.seal()?;
         let path = self.writer.path().to_path_buf();
+        io_limiter.acquire(sealed_len);
         let sealed_sha256 = sha256_file_prefix(&path, sealed_len)?;
         Ok(GcStagedOutputSegment {
             staged_segment_id: self.writer.segment_id(),
@@ -1323,6 +1467,7 @@ fn create_staged_output(
 /// If the current output is full, it is sealed and pushed into `finished_outputs`, then a
 /// replacement output for the same destination class is opened before retrying the append.
 fn append_gc_record_to_staged_output(
+    io_limiter: &GcIoLimiter,
     output: &mut OpenStagedOutput,
     finished_outputs: &mut Vec<GcStagedOutputSegment>,
     staging_dir: &std::path::Path,
@@ -1331,6 +1476,7 @@ fn append_gc_record_to_staged_output(
     payload: &[u8],
     segment_max_bytes: u64,
 ) -> Result<RecordRef> {
+    io_limiter.acquire(record.from.len);
     match output
         .writer
         .append_for_shard(&record.key, record.payload_lsn, record.shard, payload)
@@ -1343,7 +1489,7 @@ fn append_gc_record_to_staged_output(
                 record.destination_class,
                 segment_max_bytes,
             )?;
-            let finished = std::mem::replace(output, replacement).finish()?;
+            let finished = std::mem::replace(output, replacement).finish(io_limiter)?;
             finished_outputs.push(finished);
             *next_staged_segment_id = output.next_staged_segment_id;
             let outcome = output.writer.append_for_shard(

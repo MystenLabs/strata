@@ -485,6 +485,8 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
         gc_tuning_window_cycles: DEFAULT_GC_TUNING_WINDOW_CYCLES,
         gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
+        gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
+        gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
         gc_planner_config: GcPlannerConfig::default(),
         gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
         starting_epoch: 42,
@@ -1787,6 +1789,18 @@ async fn metrics_track_core_store_operations() {
     assert_eq!(
         gauge_value(&registry, "strata_store_gc_active_worker_limit"),
         DEFAULT_GC_INITIAL_WORKER_COUNT as i64
+    );
+    assert_eq!(
+        gauge_value(&registry, "strata_store_gc_configured_io_bytes_per_sec"),
+        DEFAULT_GC_IO_BYTES_PER_SEC as i64
+    );
+    assert_eq!(
+        gauge_value(&registry, "strata_store_gc_min_io_bytes_per_sec"),
+        DEFAULT_GC_MIN_IO_BYTES_PER_SEC as i64
+    );
+    assert_eq!(
+        gauge_value(&registry, "strata_store_gc_active_io_bytes_per_sec"),
+        DEFAULT_GC_IO_BYTES_PER_SEC as i64
     );
     assert_eq!(
         gauge_value(&registry, "strata_store_gc_in_flight_workers"),
@@ -4280,10 +4294,7 @@ async fn recovery_rejects_missing_active_delta_log_for_durable_lsn() {
         let mut batch = store.index().batch();
         store
             .index()
-            .put_accounting_active_delta_log_state_batch(
-                &mut batch,
-                ActiveDeltaLogState::default(),
-            )
+            .put_accounting_active_delta_log_state_batch(&mut batch, ActiveDeltaLogState::default())
             .unwrap();
         batch.write_with_sync(true).unwrap();
     }

@@ -71,6 +71,9 @@ struct PrometheusMetrics {
     recovery_last_rollback_from: IntGauge,
     gc_configured_workers: IntGauge,
     gc_active_worker_limit: IntGauge,
+    gc_configured_io_bytes_per_sec: IntGauge,
+    gc_min_io_bytes_per_sec: IntGauge,
+    gc_active_io_bytes_per_sec: IntGauge,
     gc_in_flight_workers: IntGauge,
     gc_admitted_total: IntCounter,
     gc_run_failures_total: IntCounter,
@@ -431,6 +434,24 @@ impl StrataStoreMetrics {
                     "gc_active_worker_limit",
                     "Current runtime limit for background Strata GC workers admitted concurrently.",
                 )?,
+                gc_configured_io_bytes_per_sec: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_configured_io_bytes_per_sec",
+                    "Configured healthy upper bound for background Strata GC disk I/O bytes per second.",
+                )?,
+                gc_min_io_bytes_per_sec: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_min_io_bytes_per_sec",
+                    "Configured lower bound for background Strata GC disk I/O bytes per second under foreground pressure.",
+                )?,
+                gc_active_io_bytes_per_sec: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_active_io_bytes_per_sec",
+                    "Current runtime background Strata GC disk I/O budget in bytes per second.",
+                )?,
                 gc_in_flight_workers: register_gauge(
                     registry,
                     &labels,
@@ -728,7 +749,14 @@ impl StrataStoreMetrics {
         metrics.recovery_rollback_ops_total.inc_by(ops);
     }
 
-    pub(crate) fn initialize_gc_tuner(&self, configured_workers: usize, active_limit: usize) {
+    pub(crate) fn initialize_gc_tuner(
+        &self,
+        configured_workers: usize,
+        active_limit: usize,
+        configured_io_bytes_per_sec: u64,
+        min_io_bytes_per_sec: u64,
+        active_io_bytes_per_sec: u64,
+    ) {
         let Some(metrics) = &self.inner else {
             return;
         };
@@ -738,6 +766,15 @@ impl StrataStoreMetrics {
         metrics
             .gc_active_worker_limit
             .set(to_i64(active_limit as u64));
+        metrics
+            .gc_configured_io_bytes_per_sec
+            .set(to_i64(configured_io_bytes_per_sec));
+        metrics
+            .gc_min_io_bytes_per_sec
+            .set(to_i64(min_io_bytes_per_sec));
+        metrics
+            .gc_active_io_bytes_per_sec
+            .set(to_i64(active_io_bytes_per_sec));
         metrics.gc_in_flight_workers.set(0);
         metrics.gc_tuner_health_state.set(0);
         metrics.gc_consecutive_run_failures.set(0);
@@ -748,6 +785,14 @@ impl StrataStoreMetrics {
             metrics
                 .gc_active_worker_limit
                 .set(to_i64(active_limit as u64));
+        }
+    }
+
+    pub(crate) fn set_gc_active_io_bytes_per_sec(&self, bytes_per_sec: u64) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .gc_active_io_bytes_per_sec
+                .set(to_i64(bytes_per_sec));
         }
     }
 

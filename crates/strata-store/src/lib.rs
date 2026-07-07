@@ -122,6 +122,7 @@ mod accounting;
 mod config;
 mod error;
 mod gc;
+mod gc_rate_limiter;
 mod layout;
 mod metrics;
 mod read;
@@ -163,7 +164,8 @@ pub use config::{
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
+    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
+    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
     DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
@@ -177,6 +179,7 @@ use gc::{
     GcCommand, GcConcurrencyConfig, GcConcurrencyController, GcExecutor, GcPrepublishedCopy,
     GcPrepublishedOutputSegment, GcSourceClaims, GcWorker,
 };
+use gc_rate_limiter::GcIoLimiter;
 use layout::{parse_segment_file_name, relative_segment_path, segment_path, segment_state_path};
 use metrics::PutMetric;
 pub use metrics::StrataStoreMetrics;
@@ -219,6 +222,7 @@ pub struct StrataStore {
     pub(crate) accounting_lock: Arc<Mutex<()>>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
+    pub(crate) gc_io_limiter: Arc<GcIoLimiter>,
     pub(crate) segment_ids: SegmentIdAllocator,
     pub(crate) reader_cache: Arc<SegmentReaderCache>,
     pub(crate) store_halt: StoreHalt,
@@ -375,6 +379,7 @@ impl StrataStore {
         let (accounting_tx, accounting_rx) = mpsc::sync_channel(1);
         let accounting_lock = Arc::new(Mutex::new(()));
         let gc_claims = Arc::new(GcSourceClaims::default());
+        let gc_io_limiter = Arc::new(GcIoLimiter::new(config.gc_io_bytes_per_sec));
         let store_halt = StoreHalt::default();
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
@@ -444,6 +449,7 @@ impl StrataStore {
                     accounting_lock: Arc::clone(&accounting_lock),
                     claims: Arc::clone(&gc_claims),
                     gc_concurrency: Arc::clone(&gc_concurrency),
+                    gc_io_limiter: Arc::clone(&gc_io_limiter),
                     segment_ids: segment_ids.clone(),
                     store_halt: store_halt.clone(),
                     metrics: metrics.clone(),
@@ -487,6 +493,7 @@ impl StrataStore {
             accounting_lock,
             gc_claims,
             gc_concurrency,
+            gc_io_limiter,
             segment_ids,
             store_halt,
             metrics,
@@ -508,6 +515,11 @@ impl StrataStore {
     /// Current number of background GC workers the runtime tuner may admit concurrently.
     pub fn gc_active_worker_limit(&self) -> usize {
         self.gc_concurrency.active_limit()
+    }
+
+    /// Current store-wide background GC I/O budget selected by the runtime tuner.
+    pub fn gc_active_io_bytes_per_sec(&self) -> u64 {
+        self.gc_concurrency.active_io_bytes_per_sec()
     }
 
     #[cfg(test)]
@@ -3211,7 +3223,9 @@ fn rollback_lost_operations(
     let states = index.iter_segment_states()?;
     let mut rollback_from = None;
     for (lsn, key) in index.iter_unaccounted_lsn_ops()? {
-        if lsn <= durable_lsn || unaccounted_non_durable_operation_survived_recovery(index, lsn, &key, &states)? {
+        if lsn <= durable_lsn
+            || unaccounted_non_durable_operation_survived_recovery(index, lsn, &key, &states)?
+        {
             continue;
         }
         rollback_from = Some(rollback_from.map_or(lsn, |current: StrataLsn| current.min(lsn)));
@@ -3387,7 +3401,7 @@ fn unaccounted_non_durable_operation_survived_recovery(
 /// For normal puts, it checks the payload ref survived.
 /// For GC MapRefs, it checks the destination ref survived.
 /// Without this, MapRef only LSNs would look like “metadata-only survived” even if the destination segment is missing/truncated.
-/// Prepublish should make destination bytes survive before MapRef is written. 
+/// Prepublish should make destination bytes survive before MapRef is written.
 /// map_refs_survived is the recovery assertion/enforcement of that invariant, not the primary mechanism that makes it true.
 fn map_refs_survived(map_refs: &[MapRefOp], states: &[(SegmentId, SegmentState)]) -> Result<bool> {
     for map_ref in map_refs {
@@ -3578,6 +3592,19 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
     if config.gc_sync_impact_threshold.is_zero() {
         return Err(Error::InvalidConfig(
             "gc_sync_impact_threshold must be non-zero",
+        ));
+    }
+    if config.gc_io_bytes_per_sec == 0 {
+        return Err(Error::InvalidConfig("gc_io_bytes_per_sec must be non-zero"));
+    }
+    if config.gc_min_io_bytes_per_sec == 0 {
+        return Err(Error::InvalidConfig(
+            "gc_min_io_bytes_per_sec must be non-zero",
+        ));
+    }
+    if config.gc_min_io_bytes_per_sec > config.gc_io_bytes_per_sec {
+        return Err(Error::InvalidConfig(
+            "gc_min_io_bytes_per_sec must not exceed gc_io_bytes_per_sec",
         ));
     }
     Ok(())
