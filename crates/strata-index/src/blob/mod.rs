@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use strata_core::{
     BlobEntry, BlobKey, BlobLifecycleHead, BlobLifecycleMergeOp, BlobLifecycleOp,
-    BlobLifecycleState, BlobVersionKey, BlobVersionState, ShardHead, ShardKey, StrataLsn,
+    BlobLifecycleState, BlobVersionKey, BlobVersionState, MapRefOp, ShardHead, ShardKey, StrataLsn,
     VersionMergeOp, VersionOp, VersionState,
 };
 use typed_store::{Map, rocks::DBBatch};
@@ -151,6 +151,7 @@ impl StrataIndex {
         batch: &mut DBBatch,
         key: &BlobKey,
         shard: ShardKey,
+        publish_lsn: StrataLsn,
         payload_lsn: StrataLsn,
         from: strata_core::RecordRef,
         to: strata_core::RecordRef,
@@ -163,6 +164,7 @@ impl StrataIndex {
             batch,
             key,
             VersionMergeOp::MapRef {
+                publish_lsn,
                 shard,
                 payload_lsn,
                 from,
@@ -193,6 +195,14 @@ impl StrataIndex {
         };
 
         Ok(state.versions.ops_at_lsn(lsn))
+    }
+
+    pub fn blob_map_refs_at_lsn(&self, key: &BlobKey, lsn: StrataLsn) -> Result<Vec<MapRefOp>> {
+        let Some(state) = self.get_blob_state(key)? else {
+            return Ok(Vec::new());
+        };
+
+        Ok(state.versions.map_refs_at_lsn(lsn))
     }
 
     pub fn blob_ops_at_lsn(
@@ -230,19 +240,9 @@ impl StrataIndex {
             return Ok(None);
         };
 
-        let mut latest = state
-            .heads
-            .get(&STANDALONE_SHARD)
-            .map(|head| (head.head_lsn, head.entry.clone()));
-
-        for op in state.tail.iter().filter(|op| op.shard == STANDALONE_SHARD) {
-            if latest
-                .as_ref()
-                .is_none_or(|(latest_lsn, _)| op.lsn() > *latest_lsn)
-            {
-                latest = Some((op.lsn(), op.entry.clone()));
-            }
-        }
+        let latest = state
+            .resolve_head(STANDALONE_SHARD)
+            .map(|head| (head.head_lsn, head.entry));
 
         Ok(latest.map(|(lsn, entry)| {
             (
@@ -268,21 +268,7 @@ impl StrataIndex {
             return Ok(None);
         };
 
-        if let Some(op) = state
-            .tail
-            .iter()
-            .rev()
-            .find(|op| op.shard == shard && op.lsn() == key.lsn)
-        {
-            return Ok(Some(op.entry.clone()));
-        }
-
-        Ok(state
-            .heads
-            .get(&shard)
-            .into_iter()
-            .find(|head| head.head_lsn == key.lsn)
-            .map(|head| head.entry.clone()))
+        Ok(state.version_at_lsn(shard, key.lsn))
     }
 
     pub fn remove_blob_versions_batch(
@@ -315,6 +301,10 @@ impl StrataIndex {
                 .versions
                 .tail
                 .retain(|op| op.shard != shard || !lsns.contains(&op.lsn()));
+            state
+                .versions
+                .maps
+                .retain(|op| op.shard != shard || !lsns.contains(&op.publish_lsn));
             state
                 .versions
                 .heads
@@ -353,22 +343,28 @@ impl StrataIndex {
         let mut versions = Vec::new();
         for result in self.blob_versions.safe_iter()? {
             let (key, state) = result?;
-            for head in state.versions.heads.values() {
+            for (shard, head) in &state.versions.heads {
+                let Some(entry) = state.versions.version_at_lsn(*shard, head.head_lsn) else {
+                    continue;
+                };
                 versions.push((
                     BlobVersionKey {
                         key: key.clone(),
                         lsn: head.head_lsn,
                     },
-                    head.entry.clone(),
+                    entry,
                 ));
             }
-            for op in state.versions.tail {
+            for op in &state.versions.tail {
+                let Some(entry) = state.versions.version_at_lsn(op.shard, op.lsn()) else {
+                    continue;
+                };
                 versions.push((
                     BlobVersionKey {
                         key: key.clone(),
                         lsn: op.lsn(),
                     },
-                    op.entry.clone(),
+                    entry,
                 ));
             }
         }

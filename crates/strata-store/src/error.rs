@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use strata_core::{
     BlobKey, Epoch, SegmentFileState, SegmentId, ShardGeneration, ShardId, ShardState,
+    StrataLsn,
 };
 
 /// Result type used by `strata-store`.
@@ -62,6 +63,9 @@ pub enum Error {
     #[error("gc queue is closed")]
     GcQueueClosed,
 
+    #[error("store is halted after terminal failure: {reason}")]
+    StoreHalted { reason: String },
+
     #[error("epoch metadata is not initialized")]
     EpochNotInitialized,
 
@@ -91,9 +95,6 @@ pub enum Error {
         current_generation: ShardGeneration,
         state: ShardState,
     },
-
-    #[error("segment {segment_id} failed sealing")]
-    SealFailed { segment_id: SegmentId },
 
     #[error("segment {segment_id} has no index state for accounting")]
     AccountingMissingSegmentState { segment_id: SegmentId },
@@ -186,5 +187,13 @@ pub enum Error {
         segment_id: SegmentId,
         expected_write_offset: u64,
         recovered_write_offset: u64,
+    },
+
+    #[error(
+        "recovery found active accounting delta log only through LSN {active_delta_log_lsn}, below durable LSN {durable_lsn}"
+    )]
+    RecoveryDurableAccountingGap {
+        durable_lsn: StrataLsn,
+        active_delta_log_lsn: StrataLsn,
     },
 }

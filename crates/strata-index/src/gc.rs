@@ -114,4 +114,21 @@ impl StrataIndex {
         }
         Ok(removed)
     }
+
+    /// Removes relocation rows whose publish LSN is being rolled back during recovery.
+    pub fn remove_gc_relocations_from_lsn_batch(
+        &self,
+        batch: &mut DBBatch,
+        rollback_from: StrataLsn,
+    ) -> Result<usize> {
+        let rows = self.iter_gc_relocations()?;
+        let mut removed = 0;
+        for (from, relocation) in rows {
+            if relocation.publish_lsn >= rollback_from {
+                self.delete_gc_relocation_batch(batch, from)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
 }

@@ -83,8 +83,7 @@ impl StrataIndex {
         accounted_lsn: StrataLsn,
     ) -> Result<()> {
         self.put_accounted_lsn_batch(&mut batch, accounted_lsn)?;
-        batch.write()?;
-        self.flush_wal(true)?;
+        batch.write_with_sync(true)?;
         Ok(())
     }
 
@@ -181,6 +180,18 @@ impl StrataIndex {
         self.iter_unaccounted_lsn_ops_from(0)
     }
 
+    /// Iterates over the unaccounted LSN ops from a given LSN.
+    /// 
+    /// LSN ops which have not gone through accounting are returned. Accounting
+    /// can only go through all the ops until the durable LSN. This is possible
+    /// durable_lsn = 100
+    /// accounted_lsn = 97
+    /// unaccounted_lsn_ops:
+    /// 98  -> blob-a
+    /// 99  -> blob-b
+    /// 100 -> blob-c
+    /// 101 -> blob-d
+    /// 102 -> blob-e
     pub fn iter_unaccounted_lsn_ops_from(
         &self,
         min_lsn: StrataLsn,

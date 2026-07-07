@@ -13,6 +13,17 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[error(
+        "append rollback failed for {path} at offset {offset} after write error: {write_error}; rollback error: {rollback_error}"
+    )]
+    AppendRollbackFailed {
+        path: PathBuf,
+        offset: u64,
+        write_error: std::io::Error,
+        #[source]
+        rollback_error: std::io::Error,
+    },
+
     #[error("core format error: {0}")]
     Core(#[from] strata_core::Error),
 

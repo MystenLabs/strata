@@ -71,11 +71,6 @@ pub enum GcSelectionError {
     ///
     /// `DeleteSegment` and `ReclassifySegment` plans do not need record selection.
     NoCopyAction,
-    /// The plan mixes copy actions with non-copy actions.
-    ///
-    /// The current selector expects one copy operation per plan. Supporting mixed plans later should
-    /// be explicit because publish validation gets more complicated.
-    MixedCopyAndNonCopyActions,
     /// Two routes describe the same `(source segment, end epoch)` bucket.
     DuplicateRoute {
         source_segment_id: u64,
@@ -89,9 +84,6 @@ impl fmt::Display for GcSelectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoCopyAction => write!(f, "GC plan does not contain a copy action"),
-            Self::MixedCopyAndNonCopyActions => {
-                write!(f, "GC plan mixes copy and non-copy actions")
-            }
             Self::DuplicateRoute {
                 source_segment_id,
                 end_epoch,
@@ -201,44 +193,27 @@ impl RouteTable {
 }
 
 fn route_table(plan: &GcPlan) -> Result<RouteTable, GcSelectionError> {
-    let mut saw_copy = false;
     let mut routes = BTreeMap::new();
     let mut expected_bytes = 0_u64;
 
-    for action in &plan.actions {
-        match action {
-            GcAction::MoveLiveBytes {
-                routes: action_routes,
-                ..
-            }
-            | GcAction::MoveEpochBytes {
-                routes: action_routes,
-                ..
-            } => {
-                saw_copy = true;
-                for route in action_routes {
-                    let key = RouteKey::from_route(route);
-                    if routes.insert(key, route.clone()).is_some() {
-                        return Err(GcSelectionError::DuplicateRoute {
-                            source_segment_id: key.source_segment_id,
-                            end_epoch: key.end_epoch,
-                        });
-                    }
-                    expected_bytes = expected_bytes.saturating_add(route.bytes);
-                }
-            }
-            GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {
-                if saw_copy || plan.actions.len() > 1 {
-                    return Err(GcSelectionError::MixedCopyAndNonCopyActions);
-                }
-                return Err(GcSelectionError::NoCopyAction);
-            }
+    let action_routes = match &plan.action {
+        GcAction::MoveLiveBytes { routes, .. } | GcAction::MoveEpochBytes { routes, .. } => routes,
+        GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {
+            return Err(GcSelectionError::NoCopyAction);
         }
+    };
+
+    for route in action_routes {
+        let key = RouteKey::from_route(route);
+        if routes.insert(key, route.clone()).is_some() {
+            return Err(GcSelectionError::DuplicateRoute {
+                source_segment_id: key.source_segment_id,
+                end_epoch: key.end_epoch,
+            });
+        }
+        expected_bytes = expected_bytes.saturating_add(route.bytes);
     }
 
-    if !saw_copy {
-        return Err(GcSelectionError::NoCopyAction);
-    }
     Ok(RouteTable {
         by_key: routes,
         expected_bytes,
@@ -295,10 +270,10 @@ mod tests {
         let copied_bytes = routes.iter().map(|route| route.bytes).sum();
         GcPlan {
             scenario: GcScenario::DeadRef,
-            actions: vec![GcAction::MoveLiveBytes {
+            action: GcAction::MoveLiveBytes {
                 source_segment_id: 1,
                 routes,
-            }],
+            },
             copied_bytes,
             expected_reclaim_bytes: 900,
             score: 1,
@@ -380,7 +355,7 @@ mod tests {
         let routes = vec![route(1, Some(50), 100), route(2, Some(50), 120)];
         let plan = GcPlan {
             scenario: GcScenario::JoinMultiple,
-            actions: vec![GcAction::MoveEpochBytes { epoch: 50, routes }],
+            action: GcAction::MoveEpochBytes { epoch: 50, routes },
             copied_bytes: 220,
             expected_reclaim_bytes: 0,
             score: 1,

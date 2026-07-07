@@ -122,7 +122,20 @@ impl SegmentWriter {
             IoSlice::new(encoded_record.payload),
             IoSlice::new(encoded_record.key),
         ];
-        write_all_vectored(&mut self.file, &mut slices).at_path(&self.path)?;
+        if let Err(write_error) = write_all_vectored(&mut self.file, &mut slices) {
+            if let Err(rollback_error) = self.rollback_failed_append(record_offset) {
+                return Err(Error::AppendRollbackFailed {
+                    path: self.path.clone(),
+                    offset: record_offset,
+                    write_error,
+                    rollback_error,
+                });
+            }
+            return Err(Error::Io {
+                path: self.path.clone(),
+                source: write_error,
+            });
+        }
         self.write_offset = attempted_size;
 
         Ok(AppendOutcome {
@@ -160,6 +173,12 @@ impl SegmentWriter {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    fn rollback_failed_append(&mut self, offset: u64) -> std::io::Result<()> {
+        self.file.set_len(offset)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        Ok(())
+    }
 }
 
 fn write_all_vectored(file: &mut File, mut bufs: &mut [IoSlice<'_>]) -> std::io::Result<()> {
@@ -171,4 +190,34 @@ fn write_all_vectored(file: &mut File, mut bufs: &mut [IoSlice<'_>]) -> std::io:
         IoSlice::advance_slices(&mut bufs, written);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Seek, Write};
+
+    use strata_core::{BlobKey, PlacementClass};
+    use tempfile::tempdir;
+
+    use super::SegmentWriter;
+
+    #[test]
+    fn rollback_failed_append_truncates_and_repositions_writer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("000001.data");
+        let key = BlobKey::new(b"alpha".to_vec()).unwrap();
+        let mut writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
+
+        writer.append(&key, 0, b"first").unwrap();
+        let offset = writer.write_offset();
+        writer.file.write_all(b"partial-tail").unwrap();
+        assert!(writer.file.metadata().unwrap().len() > offset);
+
+        writer.rollback_failed_append(offset).unwrap();
+
+        assert_eq!(writer.file.metadata().unwrap().len(), offset);
+        assert_eq!(writer.file.stream_position().unwrap(), offset);
+        let outcome = writer.append(&key, 1, b"second").unwrap();
+        assert_eq!(outcome.record_ref.offset, offset);
+    }
 }

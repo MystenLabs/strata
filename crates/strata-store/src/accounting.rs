@@ -114,11 +114,20 @@ impl AccountingWorker {
             // manifest is being initialized. Retry later instead of killing the worker.
             *sidecar = AccountingSidecar::open(config.clone(), index.clone()).ok();
         }
-        if let Some(sidecar) = sidecar.as_mut() {
-            let _ = match mode {
-                SidecarRunMode::Forced => sidecar.run_forced(),
-                SidecarRunMode::Maintenance => sidecar.run(),
+        let failed = if let Some(current_sidecar) = sidecar.as_mut() {
+            let result = match mode {
+                SidecarRunMode::Forced => current_sidecar.run_forced(),
+                SidecarRunMode::Maintenance => current_sidecar.run(),
             };
+            result.is_err()
+        } else {
+            false
+        };
+        if failed {
+            // A sidecar run may have written immutable run files or even committed its synced
+            // RocksDB batch before reporting an error. Reopen from durable metadata on the next
+            // pass so the in-memory manifest never drifts from RocksDB.
+            *sidecar = None;
         }
     }
 }
@@ -449,8 +458,9 @@ impl AccountingSidecar {
             self.index
                 .put_accounted_lsn_batch(&mut batch, frontier.accounted_lsn)?;
         }
-        batch.write().map_err(strata_index::Error::from)?;
-        self.index.flush_wal(true)?;
+        batch
+            .write_with_sync(true)
+            .map_err(strata_index::Error::from)?;
         Ok(())
     }
 }
@@ -543,9 +553,10 @@ impl<'a> SidecarAccountingContext<'a> {
             AccountingRefEvent::Mapped {
                 lsn,
                 from,
+                to,
                 lifecycle,
                 ..
-            } => self.retire_ref(*lsn, *from, *lifecycle),
+            } => self.map_ref(*lsn, *from, *to, *lifecycle),
         }
     }
 
@@ -657,9 +668,22 @@ impl<'a> SidecarAccountingContext<'a> {
         self.retire_overlay(record_ref);
         if let Some(relocation) = self.relocation_for(lsn, record_ref) {
             self.put_ref_event(lsn, relocation.to, SegmentRefEvent::Retired);
-            self.retire_overlay(relocation.to);
+            self.add_retired_overlay(relocation.to);
         }
         Ok(())
+    }
+
+    /// Materializes a GC relocation after its `MapRef` reaches accounting.
+    fn map_ref(
+        &mut self,
+        lsn: StrataLsn,
+        from: RecordRef,
+        to: RecordRef,
+        lifecycle: Option<BlobLifecycle>,
+    ) -> Result<()> {
+        self.put_ref_event(lsn, from, SegmentRefEvent::Retired);
+        self.retire_overlay(from);
+        self.add_ref(lsn, to, lifecycle)
     }
 
     /// Applies a lifecycle change for an already materialized payload ref.
@@ -680,9 +704,6 @@ impl<'a> SidecarAccountingContext<'a> {
         }
         if lifecycle_is_expired(new, epoch) {
             self.expire_ref(lsn, record_ref);
-            if let Some(relocation) = self.relocation_for(lsn, record_ref) {
-                self.expire_ref(lsn, relocation.to);
-            }
         } else {
             self.set_lifetime_overlay(record_ref, new);
             self.put_ref_event(
@@ -690,14 +711,6 @@ impl<'a> SidecarAccountingContext<'a> {
                 record_ref,
                 SegmentRefEvent::LifecycleChanged { lifecycle: new },
             );
-            if let Some(relocation) = self.relocation_for(lsn, record_ref) {
-                self.set_lifetime_overlay(relocation.to, new);
-                self.put_ref_event(
-                    lsn,
-                    relocation.to,
-                    SegmentRefEvent::LifecycleChanged { lifecycle: new },
-                );
-            }
         }
         Ok(())
     }
@@ -787,6 +800,17 @@ impl<'a> SidecarAccountingContext<'a> {
         self.retire_overlay_range(
             record_ref.segment_id,
             SegmentGcRecordRange::from(record_ref),
+        )
+    }
+
+    /// Accounts a newly materialized range that was already terminal before its `MapRef` was
+    /// materialized.
+    fn add_retired_overlay(&mut self, record_ref: RecordRef) {
+        self.stage_overlay_op(
+            record_ref.segment_id,
+            SegmentGcOverlayMergeOp::AddRetiredBatch {
+                ranges: vec![SegmentGcRecordRange::from(record_ref)],
+            },
         )
     }
 

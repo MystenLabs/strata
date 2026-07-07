@@ -18,10 +18,11 @@ use strata_index::{AccountingSnapshotGuard, StrataIndex};
 use strata_segment::{SegmentReader, SegmentScanner, SegmentWriter};
 
 use crate::{
-    Error, GcPublishRequest, Result, StrataStore, WriteCommand,
-    layout::{segment_path, segment_state_path},
+    Error, GcPublishRequest, Result, SegmentIdAllocator, StoreHalt, StrataStore, WriteCommand,
+    layout::{relative_segment_path, segment_path, segment_state_path},
     metrics::StrataStoreMetrics,
     seal::sha256_file_prefix,
+    sync_parent_dir,
 };
 
 /// Store-local preparation for one GC attempt.
@@ -47,8 +48,8 @@ pub struct PreparedGcPlan {
 /// Bytes copied into GC staging files, ready for a later publish/finalize step.
 ///
 /// The output files are not yet durable segment rows and the staged `RecordRef.segment_id` values
-/// are local to this object. The publish step must assign real segment ids, install sealed segment
-/// state rows, and translate staged offsets into final `MapRef` destinations atomically.
+/// are local to this object. Publishing first preprotects those files as pending output segment
+/// rows, then the writer translates staged offsets into final `MapRef` destinations atomically.
 #[derive(Debug)]
 pub struct PreparedGcCopy {
     /// In-memory accounting frontier pin used for publish reconciliation.
@@ -64,12 +65,27 @@ pub struct PreparedGcCopy {
     pub claim: Option<GcSourceClaimGuard>,
 }
 
+/// GC copy bundle after output files have durable segment ids and protected segment rows.
+#[derive(Debug)]
+pub(crate) struct GcPrepublishedCopy {
+    /// In-memory accounting frontier pin used for publish reconciliation.
+    pub(crate) accounting_snapshot: AccountingSnapshotGuard,
+    /// Aggregate plan whose selected bytes were copied.
+    pub(crate) plan: GcPlan,
+    /// Protected output segments already installed as pending GC output rows.
+    pub(crate) outputs: Vec<GcPrepublishedOutputSegment>,
+    /// Source-to-staged-record mapping for later `MapRef` publication.
+    pub(crate) copied_records: Vec<GcStagedCopiedRecord>,
+    /// In-memory source segment claim held until publish completes or this copy is dropped.
+    pub(crate) _claim: Option<GcSourceClaimGuard>,
+}
+
 /// Result of publishing staged GC copies into durable Strata metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcPublishResult {
     /// Accounted frontier observed while accounting was paused for publish reconciliation.
     pub reconciled_accounted_lsn: StrataLsn,
-    /// Output segment files made visible by this publish.
+    /// Output segment files finalized by this publish.
     pub output_segments: Vec<GcPublishedOutputSegment>,
     /// Source refs that were mapped to replacement refs.
     pub published_records: Vec<GcPublishedRecord>,
@@ -120,6 +136,68 @@ pub struct GcStagedOutputSegment {
     pub sealed_sha256: [u8; 32],
 }
 
+/// One GC output segment after it has been renamed into the segment directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GcPrepublishedOutputSegment {
+    /// Local id used by staged record refs before final publication.
+    pub(crate) staged_segment_id: SegmentId,
+    /// Durable segment id assigned before entering the writer queue.
+    pub(crate) segment_id: SegmentId,
+    /// Final on-disk path.
+    pub(crate) path: PathBuf,
+    /// Placement class to install when the output becomes sealed.
+    pub(crate) placement_class: PlacementClass,
+    /// Number of sealed bytes in the file.
+    pub(crate) sealed_len: u64,
+    /// SHA-256 digest of the sealed bytes.
+    pub(crate) sealed_sha256: [u8; 32],
+}
+
+impl GcPrepublishedOutputSegment {
+    pub(crate) fn pending_state(&self, config: &crate::StrataStoreConfig) -> SegmentState {
+        self.segment_state(config, SegmentFileState::PendingGcOutput)
+    }
+
+    pub(crate) fn sealed_state(&self, config: &crate::StrataStoreConfig) -> SegmentState {
+        self.segment_state(config, SegmentFileState::Sealed)
+    }
+
+    pub(crate) fn deleted_state(&self, config: &crate::StrataStoreConfig) -> SegmentState {
+        self.segment_state(config, SegmentFileState::Deleted)
+    }
+
+    pub(crate) fn published_output(&self) -> GcPublishedOutputSegment {
+        GcPublishedOutputSegment {
+            staged_segment_id: self.staged_segment_id,
+            segment_id: self.segment_id,
+            path: self.path.clone(),
+            placement_class: self.placement_class,
+            sealed_len: self.sealed_len,
+        }
+    }
+
+    fn segment_state(
+        &self,
+        config: &crate::StrataStoreConfig,
+        state: SegmentFileState,
+    ) -> SegmentState {
+        SegmentState {
+            shard: crate::STORE_SCOPE,
+            segment_id: self.segment_id,
+            volume_id: 0,
+            path: relative_segment_path(config, self.path.clone()),
+            placement_class: self.placement_class,
+            state,
+            write_offset: self.sealed_len,
+            durable_offset: self.sealed_len,
+            min_lsn: None,
+            max_lsn: None,
+            sealed_len: Some(self.sealed_len),
+            sealed_sha256: Some(self.sealed_sha256),
+        }
+    }
+}
+
 /// One copied record and the staged offset where its replacement bytes landed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcStagedCopiedRecord {
@@ -159,23 +237,39 @@ impl GcAccountingLag {
     }
 }
 
+/// Metric value meaning the GC tuner currently sees no foreground pressure.
 const GC_TUNER_HEALTHY: i64 = 0;
+/// Metric value meaning the GC tuner currently sees foreground pressure.
 const GC_TUNER_PRESSURED: i64 = 1;
+/// Metric value meaning the GC tuner recently changed active worker concurrency.
 const GC_TUNER_COOLDOWN: i64 = 2;
+/// Relative EWMA increase that counts as foreground impact.
 const GC_IMPACT_FACTOR_BPS: u128 = 12_500;
+/// Absolute hard pressure multiplier over the configured latency threshold.
 const GC_IMPACT_HARD_FACTOR_BPS: u128 = 20_000;
+/// Relative EWMA decrease that counts as improvement during backoff.
 const GC_IMPROVEMENT_FACTOR_BPS: u128 = 9_500;
+/// Write-queue send latency above which enqueueing itself is considered pressured.
 const GC_WRITE_QUEUE_IMPACT_THRESHOLD: Duration = Duration::from_millis(10);
 
+/// Runtime GC concurrency-tuning knobs derived from `StrataStoreConfig`.
+///
+/// `max_workers` is the number of GC worker threads created at open time. The controller never
+/// spawns or stops threads; it only changes how many of those workers may enter a GC attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GcConcurrencyConfig {
+    /// Upper bound for simultaneously admitted GC workers.
     pub(crate) max_workers: usize,
+    /// Initial runtime admission limit.
     pub(crate) initial_workers: usize,
+    /// Number of admitted GC attempts between normal tuning decisions.
     pub(crate) tuning_window_cycles: u64,
+    /// Sync-latency floor for considering foreground durability work impacted.
     pub(crate) sync_impact_threshold: Duration,
 }
 
 impl GcConcurrencyConfig {
+    /// Extracts the GC concurrency subset from the store-wide config.
     pub(crate) fn from_store_config(config: &crate::StrataStoreConfig) -> Self {
         Self {
             max_workers: config.gc_worker_count,
@@ -186,10 +280,18 @@ impl GcConcurrencyConfig {
     }
 }
 
+/// Shared runtime admission controller for background GC attempts.
+///
+/// GC workers call `try_admit` before running planner/copy/publish work. Foreground paths feed
+/// sync, write-queue, and seal-backpressure observations into this object. The tuner then performs
+/// additive probing while healthy and backs off when foreground pressure is visible.
 #[derive(Debug)]
 pub(crate) struct GcConcurrencyController {
+    /// Immutable tuning bounds and thresholds.
     config: GcConcurrencyConfig,
+    /// Metrics updated whenever the active limit or state changes.
     metrics: StrataStoreMetrics,
+    /// Mutable admission/tuning state shared by GC and foreground writer threads.
     state: Mutex<GcConcurrencyState>,
 }
 
@@ -198,28 +300,42 @@ pub(crate) struct GcConcurrencyController {
 // issue enough sequential copy I/O to affect foreground sync latency.
 #[derive(Debug)]
 struct GcConcurrencyState {
+    /// Current maximum number of workers allowed to run concurrently.
     active_limit: usize,
+    /// Number of workers currently holding `GcRunPermit`s.
     in_flight: usize,
+    /// Admitted attempts completed since the last tuning decision.
     cycles_since_tune: u64,
+    /// Normalized foreground sync latency signal.
     sync_latency_nanos: TunedSignal,
+    /// Write-queue enqueue latency signal.
     write_queue_send_nanos: TunedSignal,
+    /// Whether foreground writes are currently stalled on seal backlog capacity.
     seal_backpressure_current: bool,
+    /// Current probe/backoff phase.
     mode: GcTuningMode,
 }
 
+/// Tuner phase used to choose window length and next adjustment direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcTuningMode {
+    /// Cautiously increase concurrency after healthy windows.
     Probing,
+    /// Decrease concurrency while the pressure signal keeps improving after a prior decrease.
     BackingOff { previous_signal_nanos: u128 },
 }
 
+/// One EWMA foreground-health signal and its best observed baseline.
 #[derive(Debug, Clone, Copy, Default)]
 struct TunedSignal {
+    /// Current exponentially weighted moving average.
     ewma_nanos: Option<u128>,
+    /// Best EWMA seen since controller creation.
     best_ewma_nanos: Option<u128>,
 }
 
 impl TunedSignal {
+    /// Updates the EWMA with a new nanosecond sample.
     fn observe(&mut self, sample_nanos: u128) {
         let ewma = match self.ewma_nanos {
             Some(current) => current.saturating_mul(7).saturating_add(sample_nanos) / 8,
@@ -229,10 +345,12 @@ impl TunedSignal {
         self.best_ewma_nanos = Some(self.best_ewma_nanos.map_or(ewma, |best| best.min(ewma)));
     }
 
+    /// Returns the current EWMA if at least one sample has been observed.
     fn current(&self) -> Option<u128> {
         self.ewma_nanos
     }
 
+    /// Returns true when this signal is both above the configured floor and worse than baseline.
     fn degraded(&self, threshold: Duration) -> bool {
         let Some(current) = self.ewma_nanos else {
             return false;
@@ -252,6 +370,7 @@ impl TunedSignal {
 }
 
 impl GcConcurrencyController {
+    /// Creates a controller with its active limit set to the configured initial worker count.
     pub(crate) fn new(config: GcConcurrencyConfig, metrics: StrataStoreMetrics) -> Self {
         let active_limit = config.initial_workers.min(config.max_workers).max(1);
         metrics.initialize_gc_tuner(config.max_workers, active_limit);
@@ -270,6 +389,7 @@ impl GcConcurrencyController {
         }
     }
 
+    /// Returns the current runtime admission limit.
     pub(crate) fn active_limit(&self) -> usize {
         self.state
             .lock()
@@ -277,6 +397,11 @@ impl GcConcurrencyController {
             .active_limit
     }
 
+    /// Attempts to reserve one active GC worker slot.
+    ///
+    /// A returned `GcRunPermit` must be held for the whole GC attempt so `in_flight` accurately
+    /// reflects active copy/publish pressure. `None` means the current runtime limit is already
+    /// full, so the caller should skip this cycle.
     pub(crate) fn try_admit(self: &Arc<Self>) -> Option<GcRunPermit> {
         let mut state = self.state.lock().expect("gc concurrency lock poisoned");
         if state.in_flight >= state.active_limit {
@@ -291,12 +416,17 @@ impl GcConcurrencyController {
         })
     }
 
+    /// Records foreground sync latency.
+    ///
+    /// Large foreground flushes are normalized by MiB so ordinary large writes do not look like GC
+    /// interference solely because they took longer in absolute time.
     pub(crate) fn observe_sync(&self, elapsed: Duration, bytes: u64) {
         let mut state = self.state.lock().expect("gc concurrency lock poisoned");
         let sample_nanos = sync_impact_sample_nanos(elapsed, bytes);
         state.sync_latency_nanos.observe(sample_nanos);
     }
 
+    /// Records time spent enqueueing a command into the writer queue.
     pub(crate) fn observe_write_queue_send(&self, elapsed: Duration) {
         let mut state = self.state.lock().expect("gc concurrency lock poisoned");
         state
@@ -304,6 +434,7 @@ impl GcConcurrencyController {
             .observe(elapsed.as_nanos().max(1));
     }
 
+    /// Records whether foreground writes are currently blocked by seal backlog pressure.
     pub(crate) fn set_seal_backpressure(&self, current: bool) {
         let mut state = self.state.lock().expect("gc concurrency lock poisoned");
         state.seal_backpressure_current = current;
@@ -314,6 +445,7 @@ impl GcConcurrencyController {
         }
     }
 
+    /// Releases one active slot and performs a tuning decision if the current window ended.
     fn finish_run(&self) {
         let mut state = self.state.lock().expect("gc concurrency lock poisoned");
         state.in_flight = state.in_flight.saturating_sub(1);
@@ -326,6 +458,12 @@ impl GcConcurrencyController {
         }
     }
 
+    /// Adjusts `active_limit` according to the current pressure state.
+    ///
+    /// Healthy probing increases by one worker per normal window. A pressured window decreases by
+    /// one worker and enters a shorter backoff window. Backoff continues only while the pressure
+    /// signal is still improving, which prevents walking concurrency down forever after the useful
+    /// improvement has stopped.
     fn tune_locked(&self, state: &mut GcConcurrencyState) {
         let pressured = self.workload_pressured(state);
         let signal = current_pressure_signal_nanos(state);
@@ -379,6 +517,7 @@ impl GcConcurrencyController {
         }
     }
 
+    /// Returns true if any foreground signal currently indicates user-visible pressure.
     fn workload_pressured(&self, state: &GcConcurrencyState) -> bool {
         state.seal_backpressure_current
             || state
@@ -389,6 +528,7 @@ impl GcConcurrencyController {
                 .degraded(GC_WRITE_QUEUE_IMPACT_THRESHOLD)
     }
 
+    /// Raises active GC concurrency by one worker when below the configured max.
     fn increase_locked(&self, state: &mut GcConcurrencyState) -> bool {
         if state.active_limit >= self.config.max_workers {
             return false;
@@ -399,6 +539,7 @@ impl GcConcurrencyController {
         true
     }
 
+    /// Lowers active GC concurrency by one worker while preserving at least one active worker.
     fn decrease_locked(&self, state: &mut GcConcurrencyState) -> bool {
         if state.active_limit <= 1 {
             return false;
@@ -410,6 +551,9 @@ impl GcConcurrencyController {
     }
 }
 
+/// RAII guard for one admitted background GC attempt.
+///
+/// Dropping the guard updates the controller's `in_flight` count and may trigger a tuning decision.
 #[derive(Debug)]
 pub(crate) struct GcRunPermit {
     controller: Arc<GcConcurrencyController>,
@@ -421,6 +565,10 @@ impl Drop for GcRunPermit {
     }
 }
 
+/// Produces the latency sample used for foreground sync impact detection.
+///
+/// Small flushes are kept as raw latency. Larger flushes are normalized to latency per MiB so the
+/// tuner responds to unusually slow durability work, not merely to high foreground write volume.
 fn sync_impact_sample_nanos(elapsed: Duration, bytes: u64) -> u128 {
     let elapsed_nanos = elapsed.as_nanos().max(1);
     const MIB: u128 = 1024 * 1024;
@@ -431,6 +579,7 @@ fn sync_impact_sample_nanos(elapsed: Duration, bytes: u64) -> u128 {
     }
 }
 
+/// Chooses the number of completed GC attempts required before the next tuning decision.
 fn tuning_window_cycles(normal_window: u64, mode: GcTuningMode) -> u64 {
     match mode {
         GcTuningMode::Probing => normal_window.max(1),
@@ -438,6 +587,7 @@ fn tuning_window_cycles(normal_window: u64, mode: GcTuningMode) -> u64 {
     }
 }
 
+/// Returns the primary pressure signal used to compare backoff improvement.
 fn current_pressure_signal_nanos(state: &GcConcurrencyState) -> Option<u128> {
     state
         .sync_latency_nanos
@@ -445,6 +595,7 @@ fn current_pressure_signal_nanos(state: &GcConcurrencyState) -> Option<u128> {
         .or_else(|| state.write_queue_send_nanos.current())
 }
 
+/// Returns true when the current pressure signal improved materially from the previous one.
 fn signal_improved(current: u128, previous: u128) -> bool {
     if previous == 0 {
         return false;
@@ -453,79 +604,20 @@ fn signal_improved(current: u128, previous: u128) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn controller_config(max_workers: usize, initial_workers: usize) -> GcConcurrencyConfig {
-        GcConcurrencyConfig {
-            max_workers,
-            initial_workers,
-            tuning_window_cycles: 2,
-            sync_impact_threshold: Duration::from_millis(100),
-        }
-    }
-
-    #[test]
-    fn gc_concurrency_controller_limits_admitted_workers() {
-        let controller = Arc::new(GcConcurrencyController::new(
-            controller_config(2, 1),
-            StrataStoreMetrics::default(),
-        ));
-
-        let permit = controller.try_admit().unwrap();
-
-        assert!(controller.try_admit().is_none());
-        assert_eq!(controller.active_limit(), 1);
-        drop(permit);
-    }
-
-    #[test]
-    fn gc_concurrency_controller_increases_after_healthy_window() {
-        let controller = Arc::new(GcConcurrencyController::new(
-            controller_config(2, 1),
-            StrataStoreMetrics::default(),
-        ));
-
-        drop(controller.try_admit().unwrap());
-        drop(controller.try_admit().unwrap());
-
-        assert_eq!(controller.active_limit(), 2);
-    }
-
-    #[test]
-    fn gc_failure_backoff_keeps_cadence_then_doubles_up_to_cap() {
-        let interval = Duration::from_secs(60);
-
-        assert_eq!(gc_failure_backoff(interval, 0), interval);
-        assert_eq!(gc_failure_backoff(interval, 1), interval);
-        assert_eq!(gc_failure_backoff(interval, 2), interval * 2);
-        assert_eq!(gc_failure_backoff(interval, 3), interval * 4);
-        assert_eq!(gc_failure_backoff(interval, 5), interval * 16);
-        assert_eq!(gc_failure_backoff(interval, u32::MAX), interval * 16);
-    }
-
-    #[test]
-    fn gc_concurrency_controller_decreases_after_sync_pressure() {
-        let controller = Arc::new(GcConcurrencyController::new(
-            controller_config(2, 2),
-            StrataStoreMetrics::default(),
-        ));
-        controller.observe_sync(Duration::from_millis(300), 0);
-
-        drop(controller.try_admit().unwrap());
-        drop(controller.try_admit().unwrap());
-
-        assert_eq!(controller.active_limit(), 1);
-    }
-}
+mod tests;
 
 /// In-memory ownership table for source segments currently used by GC jobs.
+/// This is needed to prevent multiple GC jobs from accessing the same source segment concurrently.
 #[derive(Debug, Default)]
 pub(crate) struct GcSourceClaims {
     claimed: Mutex<BTreeSet<SegmentId>>,
 }
 
 impl GcSourceClaims {
+    /// Attempts to claim every source segment in `segments`.
+    ///
+    /// The claim is all-or-nothing. If any source is already owned by another in-flight GC job,
+    /// the planner should try a different plan or skip this cycle.
     pub(crate) fn try_claim(
         self: &Arc<Self>,
         segments: BTreeSet<SegmentId>,
@@ -544,6 +636,7 @@ impl GcSourceClaims {
         })
     }
 
+    /// Marks claimed segments inside a planner snapshot so pure planning can skip them.
     fn mark_snapshot(&self, snapshot: &mut GcSnapshot) {
         let claimed = self.claimed.lock().expect("gc source claims lock poisoned");
         for segment in &mut snapshot.segments {
@@ -555,9 +648,14 @@ impl GcSourceClaims {
 }
 
 /// Releases in-memory GC source claims when dropped.
+///
+/// Claims are intentionally not durable. They protect only concurrent workers in this process; all
+/// correctness-sensitive validation still happens against durable metadata during publish.
 #[derive(Debug)]
 pub struct GcSourceClaimGuard {
+    /// Shared ownership table to update on drop.
     claims: Arc<GcSourceClaims>,
+    /// Source segment ids owned by this guard.
     segments: BTreeSet<SegmentId>,
 }
 
@@ -581,10 +679,18 @@ pub(crate) enum GcCommand {
     Shutdown,
 }
 
+/// Background GC worker loop.
+///
+/// Each worker owns one command receiver. Requests are broadcast by sending `GcCommand::Run` to all
+/// workers, but the shared concurrency controller decides how many may actually enter a GC attempt.
 pub(crate) struct GcWorker {
+    /// Store-local executor used for planning, copying, and publishing.
     pub(crate) executor: GcExecutor,
+    /// Pure planner policy used by this worker.
     pub(crate) planner: GcPlanner,
+    /// Periodic wakeup interval for opportunistic GC.
     pub(crate) interval: Duration,
+    /// Control channel for immediate run requests and shutdown.
     pub(crate) command_rx: mpsc::Receiver<GcCommand>,
 }
 
@@ -594,6 +700,7 @@ pub(crate) struct GcWorker {
 const GC_FAILURE_BACKOFF_MAX_EXPONENT: u32 = 4;
 
 impl GcWorker {
+    /// Runs the worker until shutdown or channel disconnect.
     pub(crate) fn run(self) {
         // Consecutive failures are tracked per worker so one worker stuck on a persistently
         // failing plan backs off without slowing down other workers. The shared metrics gauge is
@@ -636,19 +743,36 @@ fn gc_failure_backoff(interval: Duration, consecutive_failures: u32) -> Duration
     interval.saturating_mul(2_u32.saturating_pow(exponent))
 }
 
+/// Store-local executor for one GC attempt.
+///
+/// This object bridges pure planning with real files and durable store metadata. It is cheap to
+/// clone because it holds shared handles/channels, not open staging state.
 #[derive(Clone)]
 pub(crate) struct GcExecutor {
+    /// Store configuration snapshot.
     pub(crate) config: crate::StrataStoreConfig,
+    /// Metadata/index handle used for snapshots and validation.
     pub(crate) index: StrataIndex,
+    /// Writer queue used to serialize GC publish with foreground writes.
     pub(crate) write_tx: mpsc::SyncSender<WriteCommand>,
+    /// Accounting run lock used to pause accounting during publish reconciliation.
     pub(crate) accounting_lock: Arc<Mutex<()>>,
+    /// In-process source segment ownership table.
     pub(crate) claims: Arc<GcSourceClaims>,
+    /// Runtime GC admission controller shared with foreground paths.
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
+    /// Shared monotonic allocator for durable segment ids.
+    pub(crate) segment_ids: SegmentIdAllocator,
+    /// Terminal store state shared with foreground writer paths.
+    pub(crate) store_halt: StoreHalt,
+    /// Store metrics sink.
     pub(crate) metrics: StrataStoreMetrics,
 }
 
 impl StrataStore {
+    /// Builds an executor view over this store handle.
     fn gc_executor(&self) -> Result<GcExecutor> {
+        self.store_halt.check()?;
         Ok(GcExecutor {
             config: self.config.clone(),
             index: self.index.clone(),
@@ -660,12 +784,15 @@ impl StrataStore {
             accounting_lock: Arc::clone(&self.accounting_lock),
             claims: Arc::clone(&self.gc_claims),
             gc_concurrency: Arc::clone(&self.gc_concurrency),
+            segment_ids: self.segment_ids.clone(),
+            store_halt: self.store_halt.clone(),
             metrics: self.metrics.clone(),
         })
     }
 
     /// Wakes the production GC worker for one immediate attempt.
     pub fn request_gc(&self) -> Result<()> {
+        self.store_halt.check()?;
         if self.gc_txs.is_empty() {
             return Err(Error::GcQueueClosed);
         }
@@ -726,29 +853,16 @@ impl StrataStore {
 }
 
 impl GcExecutor {
+    /// Runs one complete GC attempt: prepare, copy, then publish.
+    ///
+    /// `Ok(None)` means no eligible plan was admitted or selected. Errors are operational failures
+    /// from file I/O, index access, or writer publication.
     pub(crate) fn run_once(&self, planner: &GcPlanner) -> Result<Option<GcPublishResult>> {
         let Some(prepared) = self.prepare_gc_plan(planner)? else {
             return Ok(None);
         };
         let copy = self.copy_prepared_gc_plan(prepared)?;
         self.publish_prepared_gc_copy(copy).map(Some)
-    }
-
-    fn send_write_command(&self, command: WriteCommand) -> Result<()> {
-        let started = Instant::now();
-        self.metrics.enqueue_write_command();
-        let result = self
-            .write_tx
-            .send(command)
-            .map_err(|_| Error::WriteQueueClosed);
-        if result.is_err() {
-            self.metrics.dequeue_write_command();
-        }
-        self.metrics
-            .record_write_queue_send(result.is_ok(), started.elapsed());
-        self.gc_concurrency
-            .observe_write_queue_send(started.elapsed());
-        result
     }
 
     /// Reports the accounting lag GC would use for admission control.
@@ -807,6 +921,7 @@ impl GcExecutor {
         Ok(None)
     }
 
+    /// Scans all copy sources named by a plan and selects the exact records to rewrite.
     fn select_gc_copy_records(&self, plan: &GcPlan) -> Result<GcCopySelection> {
         let mut records = Vec::new();
         for segment_id in copy_source_segment_ids(plan) {
@@ -815,6 +930,11 @@ impl GcExecutor {
         select_copy_records(plan, &records).map_err(Error::from)
     }
 
+    /// Reads one source segment and returns copy-eligible records with overlay-derived lifecycle.
+    ///
+    /// Expired and retired record ranges are skipped. Partial overlay ranges are rejected because
+    /// GC copies whole records; a range covering only part of a record means the overlay is corrupt
+    /// or was built with inconsistent record boundaries.
     fn scan_gc_source_segment(&self, segment_id: SegmentId) -> Result<Vec<GcSourceRecord>> {
         let state = self
             .index
@@ -913,25 +1033,159 @@ impl GcExecutor {
 
     /// Publishes staged GC copies through the serialized writer path.
     ///
-    /// This method pauses accounting before it enters the writer queue, so the writer thread never
-    /// blocks waiting for a long-running sidecar pass. The writer still assigns the final LSN range
-    /// and commits metadata in order with user writes; any user writes that were already ahead of
-    /// this command in the queue have lower LSNs and are handled later by relocation forwarding.
+    /// Output files are first renamed into final segment paths and protected by pending segment
+    /// rows outside the writer queue. Accounting is paused only while the writer reconciles the
+    /// snapshot and publishes MapRefs.
     pub fn publish_prepared_gc_copy(&self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
-        let _accounting_guard = self
-            .accounting_lock
-            .lock()
-            .expect("accounting run lock poisoned");
+        let copy = self.prepublish_gc_outputs(copy)?;
+        let prepublished_outputs = copy.outputs.clone();
+        let result = {
+            let _accounting_guard = self
+                .accounting_lock
+                .lock()
+                .expect("accounting run lock poisoned");
+            self.publish_prepublished_gc_copy(copy)
+        };
+
+        match result {
+            Ok(result) => {
+                remove_unpublished_prepublished_outputs(
+                    &prepublished_outputs,
+                    &result.output_segments,
+                )?;
+                Ok(result)
+            }
+            Err(error) => {
+                if self.store_halt.error().is_none() {
+                    let _ = abandon_prepublished_outputs(
+                        &self.config,
+                        &self.index,
+                        &prepublished_outputs,
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_prepublished_gc_copy(&self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
+        self.store_halt.check()?;
+        let started = Instant::now();
+        self.metrics.enqueue_write_command();
         let (response_tx, response_rx) = mpsc::channel();
-        self.send_write_command(WriteCommand::GcPublish(GcPublishRequest {
-            copy,
-            response_tx,
-        }))?;
+        let command = WriteCommand::GcPublish(GcPublishRequest { copy, response_tx });
+        if let Err(error) = self.write_tx.send(command) {
+            self.metrics.dequeue_write_command();
+            self.metrics
+                .record_write_queue_send(false, started.elapsed());
+            return match error.0 {
+                WriteCommand::GcPublish(request) => {
+                    let _ = abandon_prepublished_outputs(
+                        &self.config,
+                        &self.index,
+                        &request.copy.outputs,
+                    );
+                    Err(Error::WriteQueueClosed)
+                }
+                _ => Err(Error::WriteQueueClosed),
+            };
+        }
+        self.metrics
+            .record_write_queue_send(true, started.elapsed());
+        self.gc_concurrency
+            .observe_write_queue_send(started.elapsed());
         response_rx
             .recv()
             .map_err(|_| Error::WriteResponseDropped)?
     }
 
+    fn prepublish_gc_outputs(&self, copy: PreparedGcCopy) -> Result<GcPrepublishedCopy> {
+        let PreparedGcCopy {
+            accounting_snapshot,
+            plan,
+            outputs,
+            copied_records,
+            claim,
+        } = copy;
+        let outputs = self.prepublish_gc_output_segments(outputs)?;
+        Ok(GcPrepublishedCopy {
+            accounting_snapshot,
+            plan,
+            outputs,
+            copied_records,
+            _claim: claim,
+        })
+    }
+
+    fn prepublish_gc_output_segments(
+        &self,
+        outputs: Vec<GcStagedOutputSegment>,
+    ) -> Result<Vec<GcPrepublishedOutputSegment>> {
+        if outputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut prepublished = Vec::with_capacity(outputs.len());
+        let result = (|| {
+            for output in &outputs {
+                let segment_id = self.segment_ids.allocate()?;
+                let final_path = segment_path(&self.config, segment_id);
+                if final_path.exists() {
+                    if self.index.get_segment_state(segment_id)?.is_none() {
+                        fs::remove_file(&final_path).map_err(|source| Error::Io {
+                            path: final_path.clone(),
+                            source,
+                        })?;
+                    } else {
+                        return Err(Error::GcOutputSegmentExists {
+                            segment_id,
+                            path: final_path,
+                        });
+                    }
+                }
+                fs::rename(&output.path, &final_path).map_err(|source| Error::Io {
+                    path: final_path.clone(),
+                    source,
+                })?;
+                sync_parent_dir(&final_path)?;
+                if output.path.parent() != final_path.parent() {
+                    sync_parent_dir(&output.path)?;
+                }
+                prepublished.push(GcPrepublishedOutputSegment {
+                    staged_segment_id: output.staged_segment_id,
+                    segment_id,
+                    path: final_path,
+                    placement_class: output.placement_class,
+                    sealed_len: output.sealed_len,
+                    sealed_sha256: output.sealed_sha256,
+                });
+            }
+
+            let mut batch = self.index.batch();
+            for output in &prepublished {
+                self.index
+                    .put_segment_state_batch(&mut batch, &output.pending_state(&self.config))?;
+            }
+            batch
+                .write_with_sync(true)
+                .map_err(strata_index::Error::from)?;
+            Ok::<_, Error>(())
+        })();
+
+        match result {
+            Ok(()) => Ok(prepublished),
+            Err(error) => {
+                let _ = remove_gc_prepublished_output_files(&prepublished);
+                let _ = remove_gc_staging_output_files(&outputs);
+                Err(error)
+            }
+        }
+    }
+
+    /// Copies selected records into temporary sealed segment files grouped by destination class.
+    ///
+    /// Staging output uses local segment ids starting at one. Publish later assigns durable segment
+    /// ids and translates staged refs into final refs while holding the writer ordering domain.
     fn copy_gc_records_to_staging(
         &self,
         staging_dir: &std::path::Path,
@@ -982,6 +1236,7 @@ impl GcExecutor {
         Ok((outputs, copied_records))
     }
 
+    /// Reads the payload for one source record, reusing open readers per source segment.
     fn read_gc_source_payload(
         &self,
         readers: &mut BTreeMap<SegmentId, SegmentReader>,
@@ -1014,15 +1269,21 @@ impl GcExecutor {
     }
 }
 
+/// Writable GC output segment that has not been sealed yet.
 #[derive(Debug)]
 struct OpenStagedOutput {
+    /// Segment writer for the temporary staging file.
     writer: SegmentWriter,
+    /// Logical destination class this output accepts.
     destination_class: DestinationClass,
+    /// Final placement class to install if this output is published.
     placement_class: PlacementClass,
+    /// Next local staging id to allocate after this output.
     next_staged_segment_id: SegmentId,
 }
 
 impl OpenStagedOutput {
+    /// Seals the temporary file and records the digest needed for final segment metadata.
     fn finish(mut self) -> Result<GcStagedOutputSegment> {
         let sealed_len = self.writer.seal()?;
         let path = self.writer.path().to_path_buf();
@@ -1038,6 +1299,7 @@ impl OpenStagedOutput {
     }
 }
 
+/// Creates one open staging segment for a destination class.
 fn create_staged_output(
     staging_dir: &std::path::Path,
     staged_segment_id: SegmentId,
@@ -1056,6 +1318,10 @@ fn create_staged_output(
     })
 }
 
+/// Appends one copied record to an open staging output.
+///
+/// If the current output is full, it is sealed and pushed into `finished_outputs`, then a
+/// replacement output for the same destination class is opened before retrying the append.
 fn append_gc_record_to_staged_output(
     output: &mut OpenStagedOutput,
     finished_outputs: &mut Vec<GcStagedOutputSegment>,
@@ -1092,6 +1358,11 @@ fn append_gc_record_to_staged_output(
     }
 }
 
+/// Allocates a unique per-attempt staging directory under the store namespace.
+///
+/// The directory name includes process id, wall-clock seed, and retry counter. It is intentionally
+/// not durable metadata; failed copy attempts remove it best-effort, and recovery can discard stale
+/// staging directories because they are not referenced by segment state.
 fn create_gc_staging_dir(config: &crate::StrataStoreConfig) -> Result<PathBuf> {
     let root = config.namespace_dir().join("gc-staging");
     fs::create_dir_all(&root).map_err(|source| Error::Io {
@@ -1115,6 +1386,70 @@ fn create_gc_staging_dir(config: &crate::StrataStoreConfig) -> Result<PathBuf> {
     ))
 }
 
+fn remove_unpublished_prepublished_outputs(
+    prepublished: &[GcPrepublishedOutputSegment],
+    published: &[GcPublishedOutputSegment],
+) -> Result<()> {
+    let published_ids = published
+        .iter()
+        .map(|output| output.segment_id)
+        .collect::<BTreeSet<_>>();
+    let unpublished = prepublished
+        .iter()
+        .filter(|output| !published_ids.contains(&output.segment_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unpublished.is_empty() {
+        return Ok(());
+    }
+    remove_gc_prepublished_output_files(&unpublished)
+}
+
+fn abandon_prepublished_outputs(
+    config: &crate::StrataStoreConfig,
+    index: &StrataIndex,
+    outputs: &[GcPrepublishedOutputSegment],
+) -> Result<()> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+
+    let mut batch = index.batch();
+    for output in outputs {
+        index.put_segment_state_batch(&mut batch, &output.deleted_state(config))?;
+    }
+    batch
+        .write_with_sync(true)
+        .map_err(strata_index::Error::from)?;
+    remove_gc_prepublished_output_files(outputs)
+}
+
+fn remove_gc_staging_output_files(outputs: &[GcStagedOutputSegment]) -> Result<()> {
+    for output in outputs {
+        remove_gc_output_file(&output.path)?;
+    }
+    Ok(())
+}
+
+fn remove_gc_prepublished_output_files(outputs: &[GcPrepublishedOutputSegment]) -> Result<()> {
+    for output in outputs {
+        remove_gc_output_file(&output.path)?;
+    }
+    Ok(())
+}
+
+fn remove_gc_output_file(path: &std::path::Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent_dir(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Converts a planner destination class into the physical placement class used by segment state.
 fn placement_class_for_destination(destination_class: DestinationClass) -> PlacementClass {
     match destination_class {
         DestinationClass::ExactEpoch(epoch) => PlacementClass::ExactEpoch(epoch),
@@ -1122,12 +1457,19 @@ fn placement_class_for_destination(destination_class: DestinationClass) -> Place
     }
 }
 
+/// Overlay-derived copy disposition for a single source record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverlayRecordState {
+    /// The record is known expired or retired and must not be copied.
     Skip,
+    /// The record is live enough to copy, with an optional known lifecycle.
     CopyEligible { lifecycle: Option<BlobLifecycle> },
 }
 
+/// Classifies one record according to the segment GC overlay.
+///
+/// Overlay ranges must either fully contain a record or not overlap it. Partial overlap is rejected
+/// because GC only rewrites whole encoded records and cannot split payload liveness.
 fn overlay_lifecycle_for_record(
     segment_id: SegmentId,
     overlay: &SegmentGcOverlay,
@@ -1156,6 +1498,7 @@ fn overlay_lifecycle_for_record(
     Ok(OverlayRecordState::CopyEligible { lifecycle })
 }
 
+/// Builds the error returned when an overlay range cuts through a record boundary.
 fn partial_overlay_error(segment_id: SegmentId, record: SegmentGcRecordRange) -> Error {
     Error::GcOverlayPartialRecordRange {
         segment_id,
@@ -1164,18 +1507,25 @@ fn partial_overlay_error(segment_id: SegmentId, record: SegmentGcRecordRange) ->
     }
 }
 
+/// Returns true when `container` fully covers `contained`.
 fn range_contains(container: SegmentGcRecordRange, contained: SegmentGcRecordRange) -> bool {
     container.offset <= contained.offset && range_end(container) >= range_end(contained)
 }
 
+/// Returns true when two half-open byte ranges overlap.
 fn ranges_overlap(left: SegmentGcRecordRange, right: SegmentGcRecordRange) -> bool {
     left.offset < range_end(right) && right.offset < range_end(left)
 }
 
+/// Computes the exclusive end offset for a record range.
 fn range_end(range: SegmentGcRecordRange) -> u64 {
     range.offset.saturating_add(range.len)
 }
 
+/// Resolves the on-disk path for a GC source segment.
+///
+/// Older or synthetic test states may not carry `SegmentState.path`; in that case the ingest layout
+/// path is derived from the segment id.
 fn gc_source_segment_path(
     config: &crate::StrataStoreConfig,
     state: &SegmentState,
@@ -1187,43 +1537,41 @@ fn gc_source_segment_path(
     }
 }
 
+/// Returns true if any plan action requires source record copying.
 fn plan_has_copy_action(plan: &GcPlan) -> bool {
-    plan.actions.iter().any(|action| {
-        matches!(
-            action,
-            GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. }
-        )
-    })
+    matches!(
+        &plan.action,
+        GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. }
+    )
 }
 
+/// Returns source segment ids that must be scanned and copied for a plan.
 fn copy_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
     let mut source_ids = BTreeSet::new();
-    for action in &plan.actions {
-        match action {
-            GcAction::MoveLiveBytes {
-                source_segment_id, ..
-            } => {
-                source_ids.insert(*source_segment_id);
-            }
-            GcAction::MoveEpochBytes { routes, .. } => {
-                source_ids.extend(routes.iter().map(|route| route.source_segment_id));
-            }
-            GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {}
+    match &plan.action {
+        GcAction::MoveLiveBytes {
+            source_segment_id, ..
+        } => {
+            source_ids.insert(*source_segment_id);
         }
+        GcAction::MoveEpochBytes { routes, .. } => {
+            source_ids.extend(routes.iter().map(|route| route.source_segment_id));
+        }
+        GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {}
     }
     source_ids
 }
 
+/// Returns every source segment id a plan must claim before execution.
+///
+/// This includes metadata-only actions such as delete and reclassify, not just copy sources.
 fn gc_plan_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
     let mut source_ids = copy_source_segment_ids(plan);
-    for action in &plan.actions {
-        match action {
-            GcAction::DeleteSegment { segment_id }
-            | GcAction::ReclassifySegment { segment_id, .. } => {
-                source_ids.insert(*segment_id);
-            }
-            GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {}
+    match &plan.action {
+        GcAction::DeleteSegment { segment_id } | GcAction::ReclassifySegment { segment_id, .. } => {
+            source_ids.insert(*segment_id);
         }
+        GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {}
     }
     source_ids
 }

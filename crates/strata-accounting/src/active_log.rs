@@ -257,11 +257,13 @@ impl ActiveDeltaLog {
     }
 
     pub fn append(&mut self, delta: &AccountingDelta) -> Result<()> {
-        write_record_frame(&mut self.writer, delta, &self.path)?;
-        self.write_offset = self
+        let frame_len = frame_len(delta)?;
+        let next_offset = self
             .write_offset
-            .checked_add(frame_len(delta)?)
+            .checked_add(frame_len)
             .ok_or(Error::RunFrameTooLarge { len: usize::MAX })?;
+        write_record_frame(&mut self.writer, delta, &self.path)?;
+        self.write_offset = next_offset;
         self.max_lsn = Some(self.max_lsn.map_or(delta.lsn(), |max| max.max(delta.lsn())));
         Ok(())
     }

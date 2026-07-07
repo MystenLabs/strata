@@ -85,13 +85,19 @@ pub(crate) fn prune_obsolete_shard_versions(
     // let stale handles survive a drop/recreate boundary.
     let initial_heads = state.heads.len();
     let initial_tail = state.tail.len();
+    let initial_maps = state.maps.len();
     state
         .heads
         .retain(|shard, _| !shard_generation_is_obsolete(*shard, shard_infos));
     state
         .tail
         .retain(|op| !shard_generation_is_obsolete(op.shard, shard_infos));
-    state.heads.len() != initial_heads || state.tail.len() != initial_tail
+    state
+        .maps
+        .retain(|op| !shard_generation_is_obsolete(op.shard, shard_infos));
+    state.heads.len() != initial_heads
+        || state.tail.len() != initial_tail
+        || state.maps.len() != initial_maps
 }
 
 pub(crate) fn remove_version_lsns_from_state(state: &mut VersionState, lsns: &BTreeSet<StrataLsn>) {
@@ -99,6 +105,7 @@ pub(crate) fn remove_version_lsns_from_state(state: &mut VersionState, lsns: &BT
     // to writes whose durable record was lost, so both unresolved tails and already-folded heads must
     // be stripped without disturbing neighboring committed history.
     state.tail.retain(|op| !lsns.contains(&op.lsn()));
+    state.maps.retain(|op| !lsns.contains(&op.publish_lsn));
     state.heads.retain(|_, head| !lsns.contains(&head.head_lsn));
 }
 

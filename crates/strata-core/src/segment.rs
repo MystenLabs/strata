@@ -588,9 +588,8 @@ pub enum SegmentFileState {
     Open,
     Sealing,
     Sealed,
-    SealFailed,
-    Deleting,
     Deleted,
+    PendingGcOutput,
 }
 
 /// Durable metadata for one segment file.

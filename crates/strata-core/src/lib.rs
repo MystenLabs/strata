@@ -39,8 +39,8 @@ pub use key::{BlobKey, BlobKeyError};
 pub use lifecycle::{
     BlobEntry, BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp,
     BlobLifecycleOp, BlobLifecycleState, BlobLifetimeHead, BlobState, BlobVersionKey,
-    BlobVersionState, Epoch, Generation, RecordRef, ShardGeneration, ShardHead, ShardId, ShardInfo,
-    ShardKey, ShardLsnKey, ShardState, ShardStoreStateKey, StoreStateKey, StrataLsn,
+    BlobVersionState, Epoch, Generation, MapRefOp, RecordRef, ShardGeneration, ShardHead, ShardId,
+    ShardInfo, ShardKey, ShardLsnKey, ShardState, ShardStoreStateKey, StoreStateKey, StrataLsn,
     StrataStoreState, VersionMergeOp, VersionOp, VersionState,
 };
 pub use record::{

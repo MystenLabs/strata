@@ -242,7 +242,7 @@ pub struct GcPlan {
     /// Why this plan was chosen.
     pub scenario: GcScenario,
     /// Declarative operations to execute.
-    pub actions: Vec<GcAction>,
+    pub action: GcAction,
     /// Estimated bytes the executor would write.
     pub copied_bytes: u64,
     /// Estimated source bytes made reclaimable by the plan.
@@ -303,9 +303,9 @@ impl GcPlanner {
             .filter(|segment| segment.summary.live_ref_count == 0)
             .map(|segment| GcPlan {
                 scenario: GcScenario::EmptyDelete,
-                actions: vec![GcAction::DeleteSegment {
+                action: GcAction::DeleteSegment {
                     segment_id: segment.segment_id(),
-                }],
+                },
                 copied_bytes: 0,
                 expected_reclaim_bytes: segment.summary.total_bytes,
                 score: i128::from(segment.summary.total_bytes) * 10_000,
@@ -330,10 +330,10 @@ impl GcPlanner {
                 }
                 Some(GcPlan {
                     scenario: GcScenario::L0Compaction,
-                    actions: vec![GcAction::MoveLiveBytes {
+                    action: GcAction::MoveLiveBytes {
                         source_segment_id: segment.segment_id(),
                         routes,
-                    }],
+                    },
                     copied_bytes,
                     expected_reclaim_bytes: segment.summary.total_bytes,
                     score: score_rewrite(segment.summary.total_bytes, copied_bytes, 1_500),
@@ -360,10 +360,10 @@ impl GcPlanner {
                 let routes = self.route_segment_live_bytes(snapshot, segment);
                 Some(GcPlan {
                     scenario: GcScenario::DeadRef,
-                    actions: vec![GcAction::MoveLiveBytes {
+                    action: GcAction::MoveLiveBytes {
                         source_segment_id: segment.segment_id(),
                         routes,
-                    }],
+                    },
                     copied_bytes,
                     expected_reclaim_bytes: segment.summary.garbage_bytes(),
                     score: score_rewrite(segment.summary.garbage_bytes(), copied_bytes, 2_000),
@@ -417,7 +417,7 @@ impl GcPlanner {
                 }
                 Some(GcPlan {
                     scenario: GcScenario::JoinMultiple,
-                    actions: vec![GcAction::MoveEpochBytes { epoch, routes }],
+                    action: GcAction::MoveEpochBytes { epoch, routes },
                     copied_bytes,
                     expected_reclaim_bytes: 0,
                     score: i128::from(copied_bytes) + i128::from(source_count as u64) * 8_000_000,
@@ -442,10 +442,10 @@ impl GcPlanner {
                 if segment.summary.live_bytes > self.config.max_copy_bytes_per_plan {
                     GcPlan {
                         scenario: GcScenario::PinnedEpochExpiry,
-                        actions: vec![GcAction::ReclassifySegment {
+                        action: GcAction::ReclassifySegment {
                             segment_id: segment.segment_id(),
                             placement_class: PlacementClass::Spillover,
-                        }],
+                        },
                         copied_bytes: 0,
                         expected_reclaim_bytes: 0,
                         score: i128::from(segment.summary.live_bytes),
@@ -454,10 +454,10 @@ impl GcPlanner {
                     let routes = self.route_segment_live_bytes(snapshot, segment);
                     GcPlan {
                         scenario: GcScenario::PinnedEpochExpiry,
-                        actions: vec![GcAction::MoveLiveBytes {
+                        action: GcAction::MoveLiveBytes {
                             source_segment_id: segment.segment_id(),
                             routes,
-                        }],
+                        },
                         copied_bytes: segment.summary.live_bytes,
                         expected_reclaim_bytes: segment.summary.garbage_bytes(),
                         score: score_rewrite(
@@ -641,10 +641,7 @@ mod tests {
         let plan = planner().plan(&snapshot(vec![empty])).unwrap();
 
         assert_eq!(plan.scenario, GcScenario::EmptyDelete);
-        assert_eq!(
-            plan.actions,
-            vec![GcAction::DeleteSegment { segment_id: 1 }]
-        );
+        assert_eq!(plan.action, GcAction::DeleteSegment { segment_id: 1 });
         assert_eq!(plan.copied_bytes, 0);
         assert_eq!(plan.expected_reclaim_bytes, 500);
     }
@@ -662,7 +659,7 @@ mod tests {
         let plan = planner().plan(&snapshot).unwrap();
 
         assert_eq!(plan.scenario, GcScenario::DeadRef);
-        let GcAction::MoveLiveBytes { routes, .. } = &plan.actions[0] else {
+        let GcAction::MoveLiveBytes { routes, .. } = &plan.action else {
             panic!("expected move action");
         };
         assert_eq!(routes.len(), 1);
@@ -686,7 +683,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.scenario, GcScenario::L0Compaction);
-        let GcAction::MoveLiveBytes { routes, .. } = &plan.actions[0] else {
+        let GcAction::MoveLiveBytes { routes, .. } = &plan.action else {
             panic!("expected move action");
         };
         assert_eq!(routes[0].destination_class, DestinationClass::Spillover);
@@ -708,7 +705,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.scenario, GcScenario::JoinMultiple);
-        let GcAction::MoveEpochBytes { epoch, routes } = &plan.actions[0] else {
+        let GcAction::MoveEpochBytes { epoch, routes } = &plan.action else {
             panic!("expected join action");
         };
         assert_eq!(*epoch, 40);
@@ -730,11 +727,11 @@ mod tests {
 
         assert_eq!(plan.scenario, GcScenario::PinnedEpochExpiry);
         assert_eq!(
-            plan.actions,
-            vec![GcAction::ReclassifySegment {
+            plan.action,
+            GcAction::ReclassifySegment {
                 segment_id: 1,
                 placement_class: PlacementClass::Spillover,
-            }]
+            }
         );
         assert_eq!(plan.copied_bytes, 0);
     }

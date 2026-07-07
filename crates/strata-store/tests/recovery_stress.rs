@@ -260,9 +260,7 @@ fn inject_post_crash_fault(
             state.placement_class == PlacementClass::Ingest
                 && matches!(
                     state.state,
-                    SegmentFileState::Open
-                        | SegmentFileState::Sealing
-                        | SegmentFileState::SealFailed
+                    SegmentFileState::Open | SegmentFileState::Sealing
                 )
         })
         .map(|(segment_id, state)| (*segment_id, state.clone()))
@@ -433,7 +431,7 @@ fn validate_segment_states(cfg: &StrataStoreConfig, store: &StrataStore, fault: 
                     "sealed segment length mismatch after recovery; fault={fault:?}"
                 );
             }
-            SegmentFileState::Open | SegmentFileState::Sealing | SegmentFileState::SealFailed => {
+            SegmentFileState::Open | SegmentFileState::Sealing => {
                 if let Ok(metadata) = fs::metadata(segment_path(cfg, segment_id)) {
                     assert!(
                         metadata.len() >= state.write_offset,
@@ -441,7 +439,9 @@ fn validate_segment_states(cfg: &StrataStoreConfig, store: &StrataStore, fault: 
                     );
                 }
             }
-            SegmentFileState::Deleting => {}
+            SegmentFileState::PendingGcOutput => {
+                panic!("pending GC output survived recovery; segment={segment_id} fault={fault:?}");
+            }
         }
     }
 }
@@ -475,12 +475,7 @@ fn validate_blob_versions(store: &StrataStore, fault: Option<&str>) {
             state.write_offset
         );
         assert!(
-            !matches!(
-                state.state,
-                SegmentFileState::Deleted
-                    | SegmentFileState::Deleting
-                    | SegmentFileState::SealFailed
-            ),
+            state.state != SegmentFileState::Deleted,
             "blob version lsn={} points at unreadable segment {} state {:?}; fault={fault:?}",
             version_key.lsn,
             record_ref.segment_id,

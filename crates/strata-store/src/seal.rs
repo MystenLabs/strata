@@ -3,12 +3,12 @@ use std::{fs, io::Read, path::Path, sync::mpsc};
 use sha2::{Digest, Sha256};
 use strata_accounting::ActiveDeltaLogState;
 use strata_core::{
-    BlobKey, SegmentFileState, SegmentId, SegmentKey, SegmentState, ShardKey, StrataLsn,
+    BlobKey, MapRefOp, SegmentFileState, SegmentId, SegmentKey, SegmentState, ShardKey, StrataLsn,
 };
 use strata_index::StrataIndex;
 
 use crate::{
-    Error, Result, STORE_SCOPE, SealedSegmentIntegrityPolicy, StrataStoreConfig,
+    Error, Result, STORE_SCOPE, SealedSegmentIntegrityPolicy, StoreHalt, StrataStoreConfig,
     StrataStoreMetrics, accounting::AccountingCommand, active_segment_state_from_path,
     layout::segment_path, unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
@@ -33,6 +33,7 @@ pub(crate) struct SealWorker {
     pub(crate) seal_rx: mpsc::Receiver<SealCommand>,
     pub(crate) accounting_tx: mpsc::SyncSender<AccountingCommand>,
     pub(crate) metrics: StrataStoreMetrics,
+    pub(crate) store_halt: StoreHalt,
 }
 
 impl SealWorker {
@@ -40,9 +41,13 @@ impl SealWorker {
         while let Ok(command) = self.seal_rx.recv() {
             match command {
                 SealCommand::Seal(task) => {
-                    if self.seal_segment(task).is_err() {
+                    if let Err(error) = self.seal_segment(task) {
                         self.metrics.record_seal_error();
-                        let _ = self.mark_seal_failed(task.segment_id);
+                        self.store_halt.halt(format!(
+                            "fatal strata seal worker error sealing segment {}: {}",
+                            task.segment_id, error
+                        ));
+                        break;
                     }
                 }
                 SealCommand::Shutdown => break,
@@ -95,31 +100,17 @@ impl SealWorker {
             let durable_lsn =
                 durable_lsn_with_accounting_frontier(&self.index, Some(&state), None)?;
             self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
-            batch.write().map_err(strata_index::Error::from)?;
+            batch
+                .write_with_sync(true)
+                .map_err(strata_index::Error::from)?;
             durable_lsn
         };
-        self.index.flush_wal(true)?;
         self.index.set_blob_compact_safe_lsn(durable_lsn);
         self.metrics.record_segment_sealed();
         self.metrics.set_durable_lsn(durable_lsn);
         self.metrics
             .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
         let _ = self.accounting_tx.try_send(AccountingCommand::Run);
-        Ok(())
-    }
-
-    pub(crate) fn mark_seal_failed(&self, segment_id: SegmentId) -> Result<()> {
-        let Some(mut state) = self.index.get_segment_state(segment_id)? else {
-            return Ok(());
-        };
-        if state.state == SegmentFileState::Sealed {
-            return Ok(());
-        }
-        state.state = SegmentFileState::SealFailed;
-        let mut batch = self.index.batch();
-        self.index.put_segment_state_batch(&mut batch, &state)?;
-        batch.write().map_err(strata_index::Error::from)?;
-        self.index.flush_wal(true)?;
         Ok(())
     }
 }
@@ -246,6 +237,34 @@ pub(crate) fn active_segment_durable_offset(
         .map_or(0, |state| state.durable_offset))
 }
 
+/// Computes the store durable LSN while requiring the active accounting delta log to cover the
+/// same committed prefix.
+///
+/// Foreground sync fsyncs the segment file and `active-delta.log` first, then publishes
+/// `store_state[DurableLsn]` and `accounting_index[ActiveDeltaLogState]` in one synced RocksDB
+/// batch. That single batch is what keeps recovery from seeing a new store durable LSN without the
+/// matching accounting-log state row. The batch atomicity does not replace the filesystem ordering:
+/// if we persisted the metadata before fsyncing either file, a crash could leave `durable_lsn`
+/// pointing at missing payload bytes or missing accounting deltas.
+///
+/// The final `max(current_durable_lsn)` is a monotonicity floor, not a way to newly publish an LSN
+/// past the accounting log. In a healthy store, the persisted delta-log frontier is never below the
+/// already-published store durable LSN; otherwise accounting could be unable to replay the missing
+/// LSNs. Normal foreground sync and recovery callers first raise the in-memory
+/// `ActiveDeltaLogState::durable_lsn` to at least `current_durable_lsn`, then commit the store
+/// durable LSN and `ActiveDeltaLogState` together. The max only prevents this helper from moving a
+/// public durable promise backward if it is called while repairing or observing pre-existing skew.
+///
+/// Examples:
+/// - current durable LSN is 5, payload is durable through LSN 10, but `active-delta.log` is durable
+///   only through LSN 8: return 8.
+/// - current durable LSN is already 9, payload is durable through LSN 10, but the provided
+///   delta-log frontier is 8: return 9. That is not a healthy steady state; it preserves the
+///   existing durable promise while the caller repairs or rejects the skew.
+/// - `active-delta.log` is durable through LSN 12, but payload is durable only through LSN 10:
+///   return 10. The accounting log may be ahead, the store cannot publish the extra LSNs yet.
+/// - both are durable through LSN 10: return 10, and the store durable LSN plus
+///   `ActiveDeltaLogState` become visible together in the metadata batch.
 pub(crate) fn durable_lsn_with_accounting_frontier(
     index: &StrataIndex,
     override_state: Option<&SegmentState>,
@@ -261,6 +280,21 @@ pub(crate) fn durable_lsn_with_accounting_frontier(
         .max(current_durable_lsn))
 }
 
+/// Walks the contiguous store LSN stream using only payload/metadata durability.
+///
+/// This is the payload side of `durable_lsn_with_accounting_frontier`, the accounting delta-log
+/// clamp happens afterwards. The scan starts at the current durable LSN and advances one LSN at a
+/// time. A later durable-looking operation cannot skip over a missing or non-durable earlier LSN,
+/// because `durable_lsn` is a contiguous crash-recoverable prefix.
+///
+/// Examples:
+/// - current durable LSN is 5, LSN 6 is a blob op whose record end offset is covered by the
+///   segment's durable offset, and LSN 7 is an epoch change: advance to 7.
+/// - LSN 8 has no unaccounted blob op and no epoch change: stop at 7, even if LSN 9 has durable
+///   bytes.
+/// - LSN 6 has a record ending at offset 8192 but the segment durable offset is only 4096: stop at
+///   5. Syncing the accounting delta log cannot make the store publish LSN 6 without the payload
+///   bytes being durable too.
 fn compute_durable_lsn(
     index: &StrataIndex,
     current_durable_lsn: StrataLsn,
@@ -318,8 +352,12 @@ fn unaccounted_lsn_is_durable(
     states: &[(SegmentKey, SegmentState)],
 ) -> Result<bool> {
     let (ops, lifecycle_ops) = index.blob_ops_at_lsn(key, lsn)?;
+    let map_refs = index.blob_map_refs_at_lsn(key, lsn)?;
+    if !map_refs_are_durable(&map_refs, states)? {
+        return Ok(false);
+    }
     if ops.is_empty() {
-        return Ok(!lifecycle_ops.is_empty());
+        return Ok(!lifecycle_ops.is_empty() || !map_refs.is_empty());
     };
     for op in ops {
         let Some(record_ref) = op.entry.record_ref else {
@@ -336,12 +374,34 @@ fn unaccounted_lsn_is_durable(
             .iter()
             .find(|(candidate, _)| *candidate == segment_key)
             .is_some_and(|(_, state)| {
-                !matches!(
-                    state.state,
-                    SegmentFileState::SealFailed
-                        | SegmentFileState::Deleting
-                        | SegmentFileState::Deleted
-                ) && state.durable_offset >= record_end_offset
+                state.state != SegmentFileState::Deleted
+                    && state.durable_offset >= record_end_offset
+            });
+        if !is_durable {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn map_refs_are_durable(
+    map_refs: &[MapRefOp],
+    states: &[(SegmentKey, SegmentState)],
+) -> Result<bool> {
+    for map_ref in map_refs {
+        let Some(record_end_offset) = map_ref.to.end_offset() else {
+            return Err(strata_segment::Error::RangeOverflow.into());
+        };
+        let segment_key = SegmentKey {
+            shard: STORE_SCOPE,
+            segment_id: map_ref.to.segment_id,
+        };
+        let is_durable = states
+            .iter()
+            .find(|(candidate, _)| *candidate == segment_key)
+            .is_some_and(|(_, state)| {
+                state.state != SegmentFileState::Deleted
+                    && state.durable_offset >= record_end_offset
             });
         if !is_durable {
             return Ok(false);

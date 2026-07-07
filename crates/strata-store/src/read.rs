@@ -290,8 +290,5 @@ impl StrataStore {
 }
 
 pub(crate) fn segment_state_is_readable(state: SegmentFileState) -> bool {
-    !matches!(
-        state,
-        SegmentFileState::Deleting | SegmentFileState::Deleted
-    )
+    state != SegmentFileState::Deleted
 }

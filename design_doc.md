@@ -255,7 +255,6 @@ struct SegmentState {
 enum SegmentFileState {
     Open,
     Sealed,
-    Deleting,
     Deleted,
 }
 ```

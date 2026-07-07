@@ -3,8 +3,8 @@ use std::{num::NonZeroU32, sync::Once};
 use strata_accounting::{AccountingIndex, AccountingIndexConfig};
 use strata_core::{
     BlobLifecycle, BlobLifecycleAction, BlobLifecycleMergeOp, BlobLifecycleOp, BlobState,
-    PlacementClass, RecordRef, SegmentFileState, SegmentGcLiveRecord, SegmentGcSummary, ShardInfo,
-    ShardKey, ShardState,
+    GcRelocation, PlacementClass, RecordRef, SegmentFileState, SegmentGcLiveRecord,
+    SegmentGcSummary, ShardInfo, ShardKey, ShardState,
 };
 use strata_gc::{GcPlanner, GcPlannerConfig, GcScenario};
 use tempfile::tempdir;
@@ -141,7 +141,7 @@ async fn shard_info_persists_across_reopen() {
     let shard_id = 17;
     let info = ShardInfo {
         current_generation: 4,
-        state: ShardState::Dropping,
+        state: ShardState::Dropped,
     };
 
     {
@@ -555,7 +555,51 @@ async fn map_blob_ref_merge_rewrites_exact_payload_ref() {
         .merge_blob_version_batch(&mut batch, &key, shard, &entry)
         .unwrap();
     index
-        .map_blob_ref_batch(&mut batch, &key, shard, entry.lsn, from, to)
+        .map_blob_ref_batch(&mut batch, &key, shard, 4, entry.lsn, from, to)
+        .unwrap();
+    batch.write().unwrap();
+
+    let map_refs = index.blob_map_refs_at_lsn(&key, 4).unwrap();
+    assert_eq!(map_refs.len(), 1);
+    assert_eq!(map_refs[0].publish_lsn, 4);
+    assert_eq!(map_refs[0].payload_lsn, entry.lsn);
+    assert_eq!(map_refs[0].from, from);
+    assert_eq!(map_refs[0].to, to);
+    assert_eq!(
+        index
+            .get_blob_version_for_shard(&version_key(&key, entry.lsn), shard)
+            .unwrap()
+            .unwrap()
+            .record_ref,
+        Some(to)
+    );
+}
+
+#[tokio::test]
+async fn rollback_removes_map_blob_ref_by_publish_lsn() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let shard = ShardKey {
+        id: 7,
+        generation: 1,
+    };
+    let mut entry = blob_entry(1, 10);
+    entry.lsn = 3;
+    let from = entry.record_ref.unwrap();
+    let to = RecordRef {
+        segment_id: 2,
+        offset: 20,
+        len: from.len,
+    };
+
+    let mut batch = index.batch();
+    index
+        .merge_blob_version_batch(&mut batch, &key, shard, &entry)
+        .unwrap();
+    index
+        .map_blob_ref_batch(&mut batch, &key, shard, 4, entry.lsn, from, to)
         .unwrap();
     batch.write().unwrap();
 
@@ -567,6 +611,87 @@ async fn map_blob_ref_merge_rewrites_exact_payload_ref() {
             .record_ref,
         Some(to)
     );
+
+    let mut batch = index.batch();
+    index
+        .remove_blob_ops_at_lsns_batch(&mut batch, &[(key.clone(), 4)])
+        .unwrap();
+    batch.write().unwrap();
+
+    assert_eq!(
+        index
+            .get_blob_version_for_shard(&version_key(&key, entry.lsn), shard)
+            .unwrap()
+            .unwrap()
+            .record_ref,
+        Some(from)
+    );
+}
+
+#[tokio::test]
+async fn rollback_prunes_gc_relocations_by_publish_lsn() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let from_a = RecordRef {
+        segment_id: 1,
+        offset: 0,
+        len: 10,
+    };
+    let from_b = RecordRef {
+        segment_id: 1,
+        offset: 10,
+        len: 10,
+    };
+    let to_a = RecordRef {
+        segment_id: 2,
+        offset: 0,
+        len: 10,
+    };
+    let to_b = RecordRef {
+        segment_id: 2,
+        offset: 10,
+        len: 10,
+    };
+
+    let mut batch = index.batch();
+    index
+        .put_gc_relocation_batch(
+            &mut batch,
+            from_a,
+            &GcRelocation {
+                publish_lsn: 4,
+                to: to_a,
+            },
+        )
+        .unwrap();
+    index
+        .put_gc_relocation_batch(
+            &mut batch,
+            from_b,
+            &GcRelocation {
+                publish_lsn: 6,
+                to: to_b,
+            },
+        )
+        .unwrap();
+    batch.write().unwrap();
+
+    let mut batch = index.batch();
+    let removed = index
+        .remove_gc_relocations_from_lsn_batch(&mut batch, 5)
+        .unwrap();
+    batch.write().unwrap();
+
+    assert_eq!(removed, 1);
+    assert_eq!(
+        index.get_gc_relocation(from_a).unwrap(),
+        Some(GcRelocation {
+            publish_lsn: 4,
+            to: to_a,
+        })
+    );
+    assert_eq!(index.get_gc_relocation(from_b).unwrap(), None);
 }
 
 #[tokio::test]

@@ -31,17 +31,10 @@ impl StrataIndex {
 
     /// Publishes a shard registry update to the process local durable view.
     ///
-    /// This must only be called after the matching RocksDB batch is written and the RocksDB WAL has
-    /// been synced. The cache is consumed by blob version merge operators, compaction filters, and
-    /// read resolution to decide whether a shard generation is obsolete. Those decisions can be
-    /// destructive: compaction may remove packed blob version entries for an obsolete generation.
-    ///
-    /// A direct RocksDB read is too early for that purpose. After `batch.write()` but before
-    /// `flush_wal(true)`, the new shard row is visible to reads but may still be lost by crash
-    /// recovery. For example, suppose the durable state is `shard 7 -> Active generation 0`, and a
-    /// drop writes `shard 7 -> Dropped generation 0` but crashes before the WAL sync. If compaction
-    /// used the visible but not durable row, it could prune generation-0 blob metadata. Recovery may
-    /// then restore `Active generation 0`, leaving the shard current but its blob metadata removed.
+    /// This must only be called after the matching RocksDB batch is written with WAL sync. The
+    /// cache is consumed by blob version merge operators, compaction filters, and read resolution to
+    /// decide whether a shard generation is obsolete. Those decisions can be destructive:
+    /// compaction may remove packed blob version entries for an obsolete generation.
     ///
     /// Keeping this cache behind the WAL sync frontier gives pruning logic a view that should still
     /// be true after recovery.
@@ -67,8 +60,7 @@ impl StrataIndex {
     pub fn put_shard_info(&self, shard_id: ShardId, info: ShardInfo) -> Result<()> {
         let mut batch = self.batch();
         self.put_shard_info_batch(&mut batch, shard_id, info)?;
-        batch.write()?;
-        self.flush_wal(true)?;
+        batch.write_with_sync(true)?;
         // Update the cache only after the durable registry write succeeds. A cache entry that races
         // ahead of RocksDB could make this process prune or hide a generation that recovery would
         // still consider current after a crash.
