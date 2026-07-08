@@ -26,14 +26,14 @@ use strata_accounting::{
     ActiveDeltaLogState, CompactionEventBatch, Manifest, RefEvent as AccountingRefEvent,
 };
 use strata_core::{
-    BlobLifecycle, Epoch, GcRelocation, RecordRef, SegmentGcLifetimeUpdate, SegmentGcLiveRecord,
-    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, SegmentRefEvent, SegmentRefEventKey,
-    StrataLsn,
+    BlobLifecycle, Epoch, GcRelocation, RecordRef, SegmentFileState, SegmentGcLifetimeUpdate,
+    SegmentGcLiveRecord, SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, SegmentRefEvent,
+    SegmentRefEventKey, StrataLsn,
 };
 use strata_index::StrataIndex;
 use typed_store::rocks::DBBatch;
 
-use crate::{Error, Result, config::StrataStoreConfig};
+use crate::{Error, Result, config::StrataStoreConfig, gc::GcCommand};
 
 #[derive(Debug)]
 pub(crate) enum AccountingCommand {
@@ -62,6 +62,7 @@ pub(crate) struct AccountingWorker {
     pub(crate) interval: Duration,
     pub(crate) command_rx: mpsc::Receiver<AccountingCommand>,
     pub(crate) run_lock: Arc<Mutex<()>>,
+    pub(crate) gc_txs: Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
 }
 
 impl AccountingWorker {
@@ -84,6 +85,7 @@ impl AccountingWorker {
                         &mut sidecar,
                         &self.config,
                         &self.index,
+                        &self.gc_txs,
                         SidecarRunMode::Forced,
                     );
                 }
@@ -93,6 +95,7 @@ impl AccountingWorker {
                         &mut sidecar,
                         &self.config,
                         &self.index,
+                        &self.gc_txs,
                         SidecarRunMode::Maintenance,
                     );
                 }
@@ -107,6 +110,7 @@ impl AccountingWorker {
         sidecar: &mut Option<AccountingSidecar>,
         config: &StrataStoreConfig,
         index: &StrataIndex,
+        gc_txs: &Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
         mode: SidecarRunMode,
     ) {
         if sidecar.is_none() {
@@ -119,7 +123,15 @@ impl AccountingWorker {
                 SidecarRunMode::Forced => current_sidecar.run_forced(),
                 SidecarRunMode::Maintenance => current_sidecar.run(),
             };
-            result.is_err()
+            match result {
+                Ok(should_nudge_gc) => {
+                    if should_nudge_gc {
+                        nudge_gc(gc_txs);
+                    }
+                    false
+                }
+                Err(_) => true,
+            }
         } else {
             false
         };
@@ -129,6 +141,13 @@ impl AccountingWorker {
             // pass so the in-memory manifest never drifts from RocksDB.
             *sidecar = None;
         }
+    }
+}
+
+fn nudge_gc(gc_txs: &Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>) {
+    let gc_txs = gc_txs.lock().expect("gc tx list lock poisoned");
+    for gc_tx in gc_txs.iter() {
+        let _ = gc_tx.send(GcCommand::Run);
     }
 }
 
@@ -197,23 +216,23 @@ impl AccountingSidecar {
     ///
     /// `force` becomes true on a wall-clock cadence so low-write stores still eventually compact
     /// small runs. Without that, a quiet store could accumulate many tiny delta files forever.
-    fn run(&mut self) -> Result<()> {
+    fn run(&mut self) -> Result<bool> {
         let force = self.last_forced_run.elapsed() >= self.config.accounting_sidecar_interval;
-        self.run_once_materializing(force)?;
+        let should_nudge_gc = self.run_once_materializing(force)?;
         if force {
             self.last_forced_run = Instant::now();
         }
-        Ok(())
+        Ok(should_nudge_gc)
     }
 
     /// Forces one materializing pass for an explicit writer/sync nudge.
     ///
     /// This bypasses the sidecar size/count thresholds because callers waiting on durability expect
     /// any durable accounting deltas to be reflected in GC-facing rows promptly.
-    fn run_forced(&mut self) -> Result<()> {
-        self.run_once_materializing(true)?;
+    fn run_forced(&mut self) -> Result<bool> {
+        let should_nudge_gc = self.run_once_materializing(true)?;
         self.last_forced_run = Instant::now();
-        Ok(())
+        Ok(should_nudge_gc)
     }
 
     /// Ingests new active-log deltas first, then compacts sidecar files.
@@ -222,8 +241,8 @@ impl AccountingSidecar {
     /// compact stale partitions while a large active-log backlog continues to grow.
     #[cfg(test)]
     fn run_once(&mut self, force: bool) -> Result<()> {
-        self.ingest_active_delta_log(force)?;
-        self.compact_sidecar(force, false)?;
+        let _ = self.ingest_active_delta_log(force)?;
+        let _ = self.compact_sidecar(force, false)?;
         Ok(())
     }
 
@@ -231,10 +250,10 @@ impl AccountingSidecar {
     ///
     /// Major compaction is what materializes patch state into ordered ref events, so production
     /// forced passes must bypass major thresholds as well as ingest/delta thresholds.
-    fn run_once_materializing(&mut self, force: bool) -> Result<()> {
-        self.ingest_active_delta_log(force)?;
-        self.compact_sidecar(force, force)?;
-        Ok(())
+    fn run_once_materializing(&mut self, force: bool) -> Result<bool> {
+        let mut should_nudge_gc = self.ingest_active_delta_log(force)?;
+        should_nudge_gc |= self.compact_sidecar(force, force)?;
+        Ok(should_nudge_gc)
     }
 
     /// Copies durable active-log deltas into immutable sidecar runs and advances the read cursor.
@@ -277,10 +296,11 @@ impl AccountingSidecar {
         // Systems invariant: publish manifest + cursor before applying the in-memory manifest.
         // The run files were already written by `prepare_accounting_deltas`; if we crash after this
         // batch, reopening from RocksDB sees the new manifest and cursor together.
-        self.commit_sidecar_state(Some(&manifest), Some(next_cursor), None)?;
+        let should_nudge_gc =
+            self.commit_sidecar_state(Some(&manifest), Some(next_cursor), None)?;
         self.accounting_index
             .apply_prepared_accounting_deltas(prepared)?;
-        Ok(true)
+        Ok(should_nudge_gc)
     }
 
     /// Compacts sidecar delta and patch runs partition by partition.
@@ -292,7 +312,7 @@ impl AccountingSidecar {
         &mut self,
         force_delta_compaction: bool,
         force_major_compaction: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let partitions = self
             .accounting_index
             .manifest()
@@ -300,6 +320,7 @@ impl AccountingSidecar {
             .keys()
             .copied()
             .collect::<Vec<_>>();
+        let mut should_nudge_gc = false;
 
         // Future-maintainer note: collect keys first because each application updates the manifest.
         // Iterating the map directly while mutating it would either fail borrowing or skip work.
@@ -308,7 +329,11 @@ impl AccountingSidecar {
                 let prepared = self.accounting_index.prepare_compact_partition(partition)?;
                 if !prepared.event_batch.input_run_ids.is_empty() {
                     let manifest = prepared.manifest().clone();
-                    self.commit_sidecar_state(Some(&manifest), None, Some(&prepared.event_batch))?;
+                    should_nudge_gc |= self.commit_sidecar_state(
+                        Some(&manifest),
+                        None,
+                        Some(&prepared.event_batch),
+                    )?;
                     self.accounting_index.apply_prepared_compaction(prepared)?;
                 }
             }
@@ -319,13 +344,17 @@ impl AccountingSidecar {
                     .prepare_major_compact_partition(partition)?;
                 if prepared.output.is_some() {
                     let manifest = prepared.manifest().clone();
-                    self.commit_sidecar_state(Some(&manifest), None, Some(&prepared.event_batch))?;
+                    should_nudge_gc |= self.commit_sidecar_state(
+                        Some(&manifest),
+                        None,
+                        Some(&prepared.event_batch),
+                    )?;
                     self.accounting_index
                         .apply_prepared_major_compaction(prepared)?;
                 }
             }
         }
-        Ok(())
+        Ok(should_nudge_gc)
     }
 
     /// Decides whether delta runs should be compacted into a patch run.
@@ -421,7 +450,7 @@ impl AccountingSidecar {
         manifest: Option<&Manifest>,
         cursor: Option<ActiveDeltaLogReadCursor>,
         event_batch: Option<&CompactionEventBatch>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut context = SidecarAccountingContext::new(&self.index)?;
         if let Some(event_batch) = event_batch {
             context.apply_compaction_event_batch(event_batch)?;
@@ -449,6 +478,19 @@ impl AccountingSidecar {
         {
             context.remove_relocations_through_lsn(frontier.accounted_lsn);
         }
+        let should_nudge_gc = if let Some(frontier) = frontier.as_ref()
+            && frontier.accounted_lsn > current_accounted_lsn
+        {
+            frontier.materialized_epoch_change
+                || accounting_frontier_unblocks_empty_delete(
+                    &self.index,
+                    &context,
+                    current_accounted_lsn,
+                    frontier.accounted_lsn,
+                )?
+        } else {
+            false
+        };
         context.write_to_batch(&mut batch)?;
         if let Some(frontier) = frontier.as_ref()
             && frontier.accounted_lsn > current_accounted_lsn
@@ -461,8 +503,34 @@ impl AccountingSidecar {
         batch
             .write_with_sync(true)
             .map_err(strata_index::Error::from)?;
-        Ok(())
+        Ok(should_nudge_gc)
     }
+}
+
+fn accounting_frontier_unblocks_empty_delete(
+    index: &StrataIndex,
+    context: &SidecarAccountingContext<'_>,
+    previous_lsn: StrataLsn,
+    accounted_lsn: StrataLsn,
+) -> Result<bool> {
+    for (_, state) in index.iter_segment_states()? {
+        if state.state == SegmentFileState::Sealed
+            && state
+                .max_lsn
+                .is_some_and(|max_lsn| previous_lsn < max_lsn && max_lsn <= accounted_lsn)
+        {
+            let mut overlay = index
+                .get_segment_gc_overlay(state.segment_id)?
+                .unwrap_or_default();
+            if let Some(ops) = context.gc_overlay_ops.get(&state.segment_id) {
+                overlay.apply_merge_ops(ops.clone());
+            }
+            if overlay.summary.live_ref_count == 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Interprets a zero count threshold as disabled.
@@ -486,6 +554,7 @@ fn bytes_threshold_reached(value: u64, threshold: u64) -> bool {
 struct FrontierUpdate {
     accounted_lsn: StrataLsn,
     consumed_lsns: Vec<StrataLsn>,
+    materialized_epoch_change: bool,
 }
 
 /// Scratchpad for one sidecar commit.
@@ -572,6 +641,7 @@ impl<'a> SidecarAccountingContext<'a> {
         let durable_lsn = self.index.get_durable_lsn()?;
         let mut accounted_lsn = self.index.get_accounted_lsn()?;
         let mut consumed_lsns = Vec::new();
+        let mut materialized_epoch_change = false;
 
         loop {
             let Some(next_lsn) = accounted_lsn.checked_add(1) else {
@@ -596,6 +666,7 @@ impl<'a> SidecarAccountingContext<'a> {
 
             if let Some(epoch) = self.index.get_epoch_change(next_lsn)? {
                 self.expire_live_refs(next_lsn, epoch)?;
+                materialized_epoch_change = true;
                 accounted_lsn = next_lsn;
                 continue;
             }
@@ -606,6 +677,7 @@ impl<'a> SidecarAccountingContext<'a> {
         Ok(FrontierUpdate {
             accounted_lsn,
             consumed_lsns,
+            materialized_epoch_change,
         })
     }
 

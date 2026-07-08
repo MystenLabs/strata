@@ -200,6 +200,14 @@ pub enum GcAction {
         /// Source segment to delete.
         segment_id: SegmentId,
     },
+    /// Unlink several empty segments after metadata marks them deleted in one commit.
+    ///
+    /// This is the batched form of `DeleteSegment`. It is valid only when the executor revalidates
+    /// every named segment before publishing the metadata transition.
+    DeleteSegments {
+        /// Source segments to delete.
+        segment_ids: Vec<SegmentId>,
+    },
     /// Move all currently planned live bytes out of one source segment.
     ///
     /// This is used for L0, DeadRef, and small pinned-epoch drains. The exact copied records are
@@ -296,21 +304,41 @@ impl GcPlanner {
     }
 
     fn empty_delete_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
-        snapshot
+        let mut candidates = snapshot
             .segments
             .iter()
             .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
             .filter(|segment| segment.summary.live_ref_count == 0)
-            .map(|segment| GcPlan {
-                scenario: GcScenario::EmptyDelete,
-                action: GcAction::DeleteSegment {
-                    segment_id: segment.segment_id(),
-                },
-                copied_bytes: 0,
-                expected_reclaim_bytes: segment.summary.total_bytes,
-                score: i128::from(segment.summary.total_bytes) * 10_000,
+            .map(|segment| {
+                (
+                    segment.segment_id(),
+                    segment.summary.total_bytes,
+                    i128::from(segment.summary.total_bytes) * 10_000,
+                )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        candidates.sort_by_key(|(segment_id, _, _)| *segment_id);
+        let expected_reclaim_bytes = candidates
+            .iter()
+            .map(|(_, reclaim_bytes, _)| *reclaim_bytes)
+            .sum();
+        let score = candidates.iter().map(|(_, _, score)| *score).sum();
+        let segment_ids = candidates
+            .into_iter()
+            .map(|(segment_id, _, _)| segment_id)
+            .collect();
+
+        vec![GcPlan {
+            scenario: GcScenario::EmptyDelete,
+            action: GcAction::DeleteSegments { segment_ids },
+            copied_bytes: 0,
+            expected_reclaim_bytes,
+            score,
+        }]
     }
 
     fn l0_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
@@ -641,9 +669,31 @@ mod tests {
         let plan = planner().plan(&snapshot(vec![empty])).unwrap();
 
         assert_eq!(plan.scenario, GcScenario::EmptyDelete);
-        assert_eq!(plan.action, GcAction::DeleteSegment { segment_id: 1 });
+        assert_eq!(
+            plan.action,
+            GcAction::DeleteSegments {
+                segment_ids: vec![1]
+            }
+        );
         assert_eq!(plan.copied_bytes, 0);
         assert_eq!(plan.expected_reclaim_bytes, 500);
+    }
+
+    #[test]
+    fn planner_batches_all_empty_deletes() {
+        let first = sealed_segment(1, PlacementClass::ExactEpoch(20), summary(500, 0, 500));
+        let second = sealed_segment(2, PlacementClass::ExactEpoch(20), summary(700, 0, 700));
+        let plan = planner().plan(&snapshot(vec![second, first])).unwrap();
+
+        assert_eq!(plan.scenario, GcScenario::EmptyDelete);
+        assert_eq!(
+            plan.action,
+            GcAction::DeleteSegments {
+                segment_ids: vec![1, 2]
+            }
+        );
+        assert_eq!(plan.copied_bytes, 0);
+        assert_eq!(plan.expected_reclaim_bytes, 1_200);
     }
 
     #[test]

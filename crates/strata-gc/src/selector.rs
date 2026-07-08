@@ -69,7 +69,7 @@ pub struct GcCopySelection {
 pub enum GcSelectionError {
     /// The plan contains no copy action.
     ///
-    /// `DeleteSegment` and `ReclassifySegment` plans do not need record selection.
+    /// `DeleteSegment`, `DeleteSegments`, and `ReclassifySegment` plans do not need record selection.
     NoCopyAction,
     /// Two routes describe the same `(source segment, end epoch)` bucket.
     DuplicateRoute {
@@ -198,7 +198,9 @@ fn route_table(plan: &GcPlan) -> Result<RouteTable, GcSelectionError> {
 
     let action_routes = match &plan.action {
         GcAction::MoveLiveBytes { routes, .. } | GcAction::MoveEpochBytes { routes, .. } => routes,
-        GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {
+        GcAction::DeleteSegment { .. }
+        | GcAction::DeleteSegments { .. }
+        | GcAction::ReclassifySegment { .. } => {
             return Err(GcSelectionError::NoCopyAction);
         }
     };

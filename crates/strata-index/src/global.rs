@@ -181,7 +181,7 @@ impl StrataIndex {
     }
 
     /// Iterates over the unaccounted LSN ops from a given LSN.
-    /// 
+    ///
     /// LSN ops which have not gone through accounting are returned. Accounting
     /// can only go through all the ops until the durable LSN. This is possible
     /// durable_lsn = 100

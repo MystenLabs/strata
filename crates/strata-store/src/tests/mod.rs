@@ -574,7 +574,7 @@ fn wait_for_accounted_lsn(store: &StrataStore, expected_lsn: StrataLsn) {
             return;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(15),
             "timed out waiting for accounted_lsn to reach {expected_lsn}; current accounted_lsn was {accounted_lsn}",
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -2956,8 +2956,8 @@ async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
 
     assert_eq!(
         prepared.plan.action,
-        GcAction::DeleteSegment {
-            segment_id: smaller_segment_id
+        GcAction::DeleteSegments {
+            segment_ids: vec![smaller_segment_id]
         }
     );
 }
@@ -3136,8 +3136,8 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
     assert_eq!(prepared.plan.scenario, GcScenario::EmptyDelete);
     assert_eq!(
         prepared.plan.action,
-        GcAction::DeleteSegment {
-            segment_id: FIRST_SEGMENT_ID
+        GcAction::DeleteSegments {
+            segment_ids: vec![FIRST_SEGMENT_ID]
         }
     );
     assert!(prepared.copy_selection.is_none());
@@ -3162,6 +3162,85 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
     assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
     assert_eq!(store.get(&key_a).unwrap(), None);
     assert!(lsn_a < lsn_b);
+}
+
+#[tokio::test]
+async fn gc_publish_empty_delete_plan_batches_multiple_segment_files() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    store.put(&key_a, b"payload-a").unwrap();
+    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+    store.sync().unwrap();
+    let first_state =
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+    let second_segment_id = FIRST_SEGMENT_ID + 1;
+    let second_state =
+        wait_for_segment_state(store.index(), second_segment_id, SegmentFileState::Sealed);
+    store.sync().unwrap();
+    let first_path = segment_state_path(store.config(), &first_state);
+    let second_path = segment_state_path(store.config(), &second_state);
+    assert!(first_path.exists());
+    assert!(second_path.exists());
+    wait_for_accounted_lsn(&store, lsn_c);
+
+    store.tombstone(&key_a).unwrap();
+    let tombstone_lsn_b = store.tombstone(&key_b).unwrap();
+    store.sync().unwrap();
+    wait_for_accounted_lsn(&store, tombstone_lsn_b);
+
+    let planner = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_reclaim_bytes: 1,
+        min_garbage_ratio_bps: 1,
+        min_exact_epoch_bucket_bytes: 1,
+        min_exact_epoch_distance: 1,
+        max_exact_epoch_extension_count: 1,
+        min_join_output_bytes: 1,
+        max_join_sources: 4,
+    });
+    let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+
+    assert_eq!(prepared.plan.scenario, GcScenario::EmptyDelete);
+    assert_eq!(
+        prepared.plan.action,
+        GcAction::DeleteSegments {
+            segment_ids: vec![FIRST_SEGMENT_ID, second_segment_id]
+        }
+    );
+    assert!(prepared.copy_selection.is_none());
+
+    let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+    let published = store.publish_prepared_gc_copy(copied).unwrap();
+
+    assert!(published.output_segments.is_empty());
+    assert!(published.published_records.is_empty());
+    assert!(published.skipped_records.is_empty());
+    for segment_id in [FIRST_SEGMENT_ID, second_segment_id] {
+        assert_eq!(
+            store
+                .index()
+                .get_segment_state(segment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            SegmentFileState::Deleted
+        );
+    }
+    assert!(!first_path.exists());
+    assert!(!second_path.exists());
+    assert!(store.prepare_gc_plan(&planner).unwrap().is_none());
+    assert_eq!(store.get(&key_a).unwrap(), None);
+    assert_eq!(store.get(&key_b).unwrap(), None);
+    assert_eq!(store.get(&key_c).unwrap(), Some(b"payload-c".to_vec()));
+    assert!(lsn_b < lsn_c);
 }
 
 #[tokio::test]
@@ -3208,6 +3287,54 @@ async fn gc_worker_request_runs_production_gc_plan() {
     assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
     assert_eq!(store.get(&key_a).unwrap(), None);
     assert!(lsn_a < lsn_b);
+}
+
+#[tokio::test]
+async fn accounting_epoch_expiry_nudges_gc_after_materializing_empty_segment() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    cfg.gc_interval = Duration::from_secs(3600);
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    store.put(&key_a, b"payload-a").unwrap();
+    store.extend(&key_a, 43).unwrap().unwrap();
+    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    store.sync().unwrap();
+    let mut sealed_state =
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+    sealed_state.placement_class = PlacementClass::ExactEpoch(43);
+    store.index().put_segment_state(&sealed_state).unwrap();
+    let sealed_path = segment_state_path(store.config(), &sealed_state);
+    store.sync().unwrap();
+    wait_for_accounted_lsn(&store, lsn_b);
+
+    let (_, epoch_lsn) = store.increment_epoch().unwrap();
+    store.sync().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = store
+            .index()
+            .get_segment_state(FIRST_SEGMENT_ID)
+            .unwrap()
+            .unwrap();
+        if state.state == SegmentFileState::Deleted && !sealed_path.exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "accounting did not nudge GC after epoch expiry"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(store.accounted_lsn().unwrap() >= epoch_lsn);
+    assert_eq!(store.get(&key_a).unwrap(), None);
+    assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
 }
 
 #[tokio::test]

@@ -378,6 +378,7 @@ impl StrataStore {
         let (seal_tx, seal_rx) = mpsc::channel();
         let (accounting_tx, accounting_rx) = mpsc::sync_channel(1);
         let accounting_lock = Arc::new(Mutex::new(()));
+        let accounting_gc_txs = Arc::new(Mutex::new(Vec::new()));
         let gc_claims = Arc::new(GcSourceClaims::default());
         let gc_io_limiter = Arc::new(GcIoLimiter::new(config.gc_io_bytes_per_sec));
         let store_halt = StoreHalt::default();
@@ -391,6 +392,7 @@ impl StrataStore {
             interval: config.accounting_interval,
             command_rx: accounting_rx,
             run_lock: Arc::clone(&accounting_lock),
+            gc_txs: Arc::clone(&accounting_gc_txs),
         };
         let accounting_handle = thread::Builder::new()
             .name(format!("strata-accounting-{}", config.namespace))
@@ -463,6 +465,10 @@ impl StrataStore {
                 .spawn(move || gc_worker.run())
             {
                 Ok(gc_handle) => {
+                    accounting_gc_txs
+                        .lock()
+                        .expect("gc tx list lock poisoned")
+                        .push(gc_tx.clone());
                     gc_txs.push(gc_tx);
                     gc_handles.push(gc_handle);
                 }
@@ -1083,6 +1089,7 @@ enum PostCommitAction {
     MaybeNudgeAccounting {
         latest_lsn: StrataLsn,
         threshold: usize,
+        force: bool,
         accounting_tx: mpsc::SyncSender<AccountingCommand>,
     },
     EnqueueSeal {
@@ -1103,9 +1110,10 @@ impl PostCommitAction {
             Self::MaybeNudgeAccounting {
                 latest_lsn,
                 threshold,
+                force,
                 accounting_tx,
             } => {
-                if threshold == 0 || latest_lsn % threshold as u64 == 0 {
+                if force || threshold == 0 || latest_lsn % threshold as u64 == 0 {
                     let _ = accounting_tx.try_send(AccountingCommand::Run);
                 }
             }
@@ -1125,11 +1133,13 @@ impl PostCommitAction {
 fn accounting_nudge_action(
     latest_lsn: StrataLsn,
     threshold: usize,
+    force: bool,
     accounting_tx: mpsc::SyncSender<AccountingCommand>,
 ) -> PostCommitAction {
     PostCommitAction::MaybeNudgeAccounting {
         latest_lsn,
         threshold,
+        force,
         accounting_tx,
     }
 }
@@ -1504,10 +1514,12 @@ impl WriteCoordinator {
             return Err(());
         }
         self.run_rollover_post_commit(pending_rollovers);
+        let force_accounting_nudge = prepared.result.last_epoch().is_some();
         if let Some(last_lsn) = prepared.result.last_lsn() {
             accounting_nudge_action(
                 last_lsn,
                 self.config.accounting_unaccounted_threshold,
+                force_accounting_nudge,
                 self.accounting_tx.clone(),
             )
             .run();
@@ -1569,7 +1581,9 @@ impl WriteCoordinator {
     fn submit_gc_publish(&mut self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
         let reconciled_accounted_lsn = self.index.get_accounted_lsn()?;
         match &copy.plan.action {
-            GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {
+            GcAction::DeleteSegment { .. }
+            | GcAction::DeleteSegments { .. }
+            | GcAction::ReclassifySegment { .. } => {
                 if !copy.outputs.is_empty() || !copy.copied_records.is_empty() {
                     return Err(Error::GcInvalidPlan(
                         "metadata action cannot include staged outputs or copied records",
@@ -1748,7 +1762,10 @@ impl WriteCoordinator {
     fn apply_gc_metadata_action(&self, action: &GcAction) -> Result<()> {
         match action {
             GcAction::DeleteSegment { segment_id } => {
-                self.delete_empty_gc_segment(*segment_id)?;
+                self.delete_empty_gc_segments(&[*segment_id])?;
+            }
+            GcAction::DeleteSegments { segment_ids } => {
+                self.delete_empty_gc_segments(segment_ids)?;
             }
             GcAction::ReclassifySegment {
                 segment_id,
@@ -1765,44 +1782,58 @@ impl WriteCoordinator {
         Ok(())
     }
 
-    fn delete_empty_gc_segment(&self, segment_id: SegmentId) -> Result<()> {
-        let mut state = self
-            .index
-            .get_segment_state(segment_id)?
-            .ok_or(Error::GcMissingSourceSegment { segment_id })?;
-        if state.state == SegmentFileState::Deleted {
-            self.reader_cache.evict(segment_id);
+    fn delete_empty_gc_segments(&self, segment_ids: &[SegmentId]) -> Result<()> {
+        let mut states = Vec::with_capacity(segment_ids.len());
+        let mut states_to_commit = Vec::new();
+        for segment_id in segment_ids {
+            let mut state = self.index.get_segment_state(*segment_id)?.ok_or(
+                Error::GcMissingSourceSegment {
+                    segment_id: *segment_id,
+                },
+            )?;
+            if state.state == SegmentFileState::Deleted {
+                states.push(state);
+                continue;
+            }
+            if state.state != SegmentFileState::Sealed {
+                return Err(Error::GcSourceSegmentNotSealed {
+                    segment_id: *segment_id,
+                    state: state.state,
+                });
+            }
+
+            let summary = self
+                .index
+                .get_segment_gc_overlay(*segment_id)?
+                .unwrap_or_default()
+                .summary;
+            if summary.live_ref_count != 0 {
+                return Err(Error::GcSourceSegmentNotEmpty {
+                    segment_id: *segment_id,
+                    live_ref_count: summary.live_ref_count,
+                });
+            }
+
+            state.state = SegmentFileState::Deleted;
+            states_to_commit.push(state.clone());
+            states.push(state);
+        }
+
+        if !states_to_commit.is_empty() {
+            let mut batch = self.index.batch();
+            for state in &states_to_commit {
+                self.index.put_segment_state_batch(&mut batch, state)?;
+            }
+            batch
+                .write_with_sync(true)
+                .map_err(strata_index::Error::from)?;
+        }
+
+        for state in &states {
+            self.reader_cache.evict(state.segment_id);
             self.metrics.record_reader_cache_eviction();
-            return unlink_gc_segment_file(&self.config, &state);
         }
-        if state.state != SegmentFileState::Sealed {
-            return Err(Error::GcSourceSegmentNotSealed {
-                segment_id,
-                state: state.state,
-            });
-        }
-
-        let summary = self
-            .index
-            .get_segment_gc_overlay(segment_id)?
-            .unwrap_or_default()
-            .summary;
-        if summary.live_ref_count != 0 {
-            return Err(Error::GcSourceSegmentNotEmpty {
-                segment_id,
-                live_ref_count: summary.live_ref_count,
-            });
-        }
-
-        state.state = SegmentFileState::Deleted;
-        let mut batch = self.index.batch();
-        self.index.put_segment_state_batch(&mut batch, &state)?;
-        batch
-            .write_with_sync(true)
-            .map_err(strata_index::Error::from)?;
-        self.reader_cache.evict(segment_id);
-        self.metrics.record_reader_cache_eviction();
-        unlink_gc_segment_file(&self.config, &state)
+        unlink_gc_segment_files(&self.config, &states)
     }
 
     fn reclassify_gc_segment(
@@ -2554,29 +2585,53 @@ fn gc_publish_accounting_delta(records: &[GcPublishedRecord]) -> Option<Accounti
     })
 }
 
-fn unlink_gc_segment_file(config: &StrataStoreConfig, state: &SegmentState) -> Result<()> {
-    let path = if state.path.is_empty() {
+fn gc_segment_file_path(config: &StrataStoreConfig, state: &SegmentState) -> std::path::PathBuf {
+    if state.path.is_empty() {
         segment_path(config, state.segment_id)
     } else {
         segment_state_path(config, state)
-    };
-    match fs::remove_file(&path) {
-        Ok(()) => sync_parent_dir(&path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(Error::Io { path, source }),
     }
+}
+
+fn unlink_gc_segment_file(config: &StrataStoreConfig, state: &SegmentState) -> Result<()> {
+    unlink_gc_segment_files(config, std::slice::from_ref(state))
+}
+
+fn unlink_gc_segment_files(config: &StrataStoreConfig, states: &[SegmentState]) -> Result<()> {
+    let mut parents = BTreeSet::new();
+    for state in states {
+        let path = gc_segment_file_path(config, state);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    parents.insert(parent.to_path_buf());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(Error::Io { path, source }),
+        }
+    }
+
+    for parent in parents {
+        sync_dir(&parent)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    let dir = fs::File::open(parent).map_err(|source| Error::Io {
-        path: parent.to_path_buf(),
+    sync_dir(parent)
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    let dir = fs::File::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
         source,
     })?;
     dir.sync_all().map_err(|source| Error::Io {
-        path: parent.to_path_buf(),
+        path: path.to_path_buf(),
         source,
     })
 }

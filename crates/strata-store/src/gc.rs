@@ -827,6 +827,11 @@ pub(crate) struct GcWorker {
 /// GC interval. Backoff only stretches the timer tick; explicit `GcCommand::Run` requests still run
 /// immediately so an operator or test can force a retry.
 const GC_FAILURE_BACKOFF_MAX_EXPONENT: u32 = 4;
+/// Maximum number of selected plans one worker drains from a single wakeup.
+///
+/// Copy plans are still governed by the shared byte limiter, but metadata-only plans can otherwise
+/// run without consuming byte tokens. This cap keeps one wake from monopolizing a worker forever.
+const GC_MAX_PLANS_PER_WAKE: usize = 64;
 
 impl GcWorker {
     /// Runs the worker until shutdown or channel disconnect.
@@ -841,7 +846,7 @@ impl GcWorker {
             match self.command_rx.recv_timeout(wait) {
                 Ok(GcCommand::Run) | Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(_permit) = self.executor.gc_concurrency.try_admit() {
-                        match self.executor.run_once(&self.planner) {
+                        match self.run_ready_plans() {
                             Ok(_) => {
                                 consecutive_failures = 0;
                                 self.executor.metrics.record_gc_run_success();
@@ -856,6 +861,15 @@ impl GcWorker {
                 Ok(GcCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+    }
+
+    fn run_ready_plans(&self) -> Result<()> {
+        for _ in 0..GC_MAX_PLANS_PER_WAKE {
+            if self.executor.run_once(&self.planner)?.is_none() {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1703,7 +1717,9 @@ fn copy_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
         GcAction::MoveEpochBytes { routes, .. } => {
             source_ids.extend(routes.iter().map(|route| route.source_segment_id));
         }
-        GcAction::DeleteSegment { .. } | GcAction::ReclassifySegment { .. } => {}
+        GcAction::DeleteSegment { .. }
+        | GcAction::DeleteSegments { .. }
+        | GcAction::ReclassifySegment { .. } => {}
     }
     source_ids
 }
@@ -1714,7 +1730,13 @@ fn copy_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
 fn gc_plan_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
     let mut source_ids = copy_source_segment_ids(plan);
     match &plan.action {
-        GcAction::DeleteSegment { segment_id } | GcAction::ReclassifySegment { segment_id, .. } => {
+        GcAction::DeleteSegment { segment_id } => {
+            source_ids.insert(*segment_id);
+        }
+        GcAction::DeleteSegments { segment_ids } => {
+            source_ids.extend(segment_ids.iter().copied());
+        }
+        GcAction::ReclassifySegment { segment_id, .. } => {
             source_ids.insert(*segment_id);
         }
         GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {}
