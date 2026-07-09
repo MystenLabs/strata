@@ -146,11 +146,11 @@ use strata_accounting::{
 #[cfg(test)]
 use strata_core::SegmentGcLiveRecord;
 use strata_core::{
-    BlobEntry, BlobKey, BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead,
-    BlobLifecycleMergeOp, BlobLifecycleOp, BlobState, BlobVersionKey, Epoch, GcRelocation,
-    MapRefOp, PlacementClass, RecordRef, SegmentFileState, SegmentGcOverlayMergeOp,
+    BlobKey, BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp,
+    BlobLifecycleOp, BlobState, BlobVersionKey, Epoch, GcRelocation, MapRefOp, PlacementClass,
+    PutEntry, PutMergeOp, PutOp, RecordRef, SegmentFileState, SegmentGcOverlayMergeOp,
     SegmentGcRecordRange, SegmentId, SegmentRefEvent, SegmentState, ShardId, ShardInfo, ShardKey,
-    ShardState, StrataLsn, VersionMergeOp, VersionOp, encoded_record_len,
+    ShardState, StrataLsn, encoded_record_len,
 };
 use strata_gc::GcAction;
 use strata_index::StrataIndex;
@@ -1800,7 +1800,7 @@ impl WriteCoordinator {
         );
         let result = prepared.result;
         let _ = profile_phase(
-            profile.as_deref_mut(),
+            profile,
             |profile, elapsed| profile.response_send += elapsed,
             || response_tx.send(Ok(result.clone())),
         );
@@ -1898,14 +1898,11 @@ impl WriteCoordinator {
         }
 
         let mut output_plan = self.plan_gc_output_segments(&copy.outputs, &survivors)?;
-        let published_records = match assign_gc_publish_lsns(
+        let published_records = assign_gc_publish_lsns(
             self.index.get_next_lsn()?,
             &survivors,
             &output_plan.staged_to_final_segment_id,
-        ) {
-            Ok(published_records) => published_records,
-            Err(error) => return Err(error),
-        };
+        )?;
         apply_gc_output_lsn_bounds(&mut output_plan.segment_states, &published_records);
         let skipped_output_ranges =
             skipped_gc_output_ranges(&skipped_records, &output_plan.staged_to_final_segment_id);
@@ -1946,11 +1943,13 @@ impl WriteCoordinator {
                 self.index.map_blob_ref_batch(
                     &mut batch,
                     &record.source.key,
-                    record.source.shard,
-                    record.publish_lsn,
-                    record.source.payload_lsn,
-                    record.source.from,
-                    record.to,
+                    MapRefOp {
+                        publish_lsn: record.publish_lsn,
+                        shard: record.source.shard,
+                        payload_lsn: record.source.payload_lsn,
+                        from: record.source.from,
+                        to: record.to,
+                    },
                 )?;
                 self.index.put_blob_unaccounted_lsn_op_batch(
                     &mut batch,
@@ -2352,7 +2351,7 @@ impl WriteCoordinator {
                 } => {
                     let record_ref =
                         record_ref.expect("put record ref must be filled before commit");
-                    let entry = BlobEntry {
+                    let entry = PutEntry {
                         record_ref: Some(record_ref),
                         lsn: *lsn,
                         generation: *lsn,
@@ -2361,7 +2360,7 @@ impl WriteCoordinator {
                     self.index.apply_blob_version_merge_op_batch(
                         &mut batch,
                         key,
-                        VersionMergeOp::Append(VersionOp {
+                        PutMergeOp::Append(PutOp {
                             shard: *shard,
                             entry,
                         }),
@@ -2663,7 +2662,7 @@ impl WriteCoordinator {
             durable_offset.saturating_sub(previous_durable_offset),
         );
         profile_phase(
-            profile.as_deref_mut(),
+            profile,
             |profile, elapsed| profile.accounting_nudge += elapsed,
             || self.nudge_accounting(),
         );
@@ -3474,14 +3473,13 @@ fn apply_recovered_segment_prefix(
             key: record.key.clone(),
             lsn: record.header.generation,
         };
-        let ops = index.blob_version_ops_at_lsn(&version_key.key, version_key.lsn)?;
-        let Some(entry) = ops
-            .into_iter()
-            .map(|op| op.entry)
-            .find(|entry| entry.record_ref == Some(record.record_ref))
-        else {
+        let Some(op) = index.blob_version_op_at_lsn(&version_key.key, version_key.lsn)? else {
             continue;
         };
+        let entry = op.entry;
+        if entry.record_ref != Some(record.record_ref) {
+            continue;
+        }
         recovered_record_count = recovered_record_count.saturating_add(1);
 
         state.min_lsn = Some(
@@ -3737,32 +3735,30 @@ fn unaccounted_non_durable_operation_survived_recovery(
     key: &BlobKey,
     states: &[(SegmentId, SegmentState)],
 ) -> Result<bool> {
-    let (ops, lifecycle_ops) = index.blob_ops_at_lsn(key, lsn)?;
-    let map_refs = index.blob_map_refs_at_lsn(key, lsn)?;
-    if !map_refs_survived(&map_refs, states)? {
+    let (op, lifecycle_op) = index.blob_ops_at_lsn(key, lsn)?;
+    let map_ref = index.blob_map_ref_at_lsn(key, lsn)?;
+    if !map_ref_survived(map_ref.as_ref(), states)? {
         return Ok(false);
     }
-    if ops.is_empty() {
+    let Some(op) = op else {
         // There is no survival check for lifecycle ops like tombstone or epoch extension.
-        // If map refs is non-empty, right above we already checked it survived.
-        return Ok(!lifecycle_ops.is_empty() || !map_refs.is_empty());
-    }
-    for op in ops {
-        let Some(record_ref) = op.entry.record_ref else {
-            continue;
-        };
-        let Some(record_end_offset) = record_ref.end_offset() else {
-            return Err(strata_segment::Error::RangeOverflow.into());
-        };
-        let survived = states
-            .iter()
-            .find(|(candidate, _)| *candidate == record_ref.segment_id)
-            .is_some_and(|(_, state)| {
-                state.state != SegmentFileState::Deleted && state.write_offset >= record_end_offset
-            });
-        if !survived {
-            return Ok(false);
-        }
+        // If map ref is present, right above we already checked it survived.
+        return Ok(lifecycle_op.is_some() || map_ref.is_some());
+    };
+    let Some(record_ref) = op.entry.record_ref else {
+        return Ok(true);
+    };
+    let Some(record_end_offset) = record_ref.end_offset() else {
+        return Err(strata_segment::Error::RangeOverflow.into());
+    };
+    let survived = states
+        .iter()
+        .find(|(candidate, _)| *candidate == record_ref.segment_id)
+        .is_some_and(|(_, state)| {
+            state.state != SegmentFileState::Deleted && state.write_offset >= record_end_offset
+        });
+    if !survived {
+        return Ok(false);
     }
     Ok(true)
 }
@@ -3770,29 +3766,29 @@ fn unaccounted_non_durable_operation_survived_recovery(
 /// Used during crash recovery rollback. It answers a simple question:
 /// For this unaccounted GC publish LSN, did the destination bytes that MapRef points to survive the crash?
 /// Prepublish makes the segment file durable before MapRef, so in the normal intended path the segment should survive.
-/// map_refs_survived still matters because recovery code is defensive and generic:
+/// map_ref_survived still matters because recovery code is defensive and generic:
 /// Recovery uses one rule for all unaccounted LSNs.
 /// For normal puts, it checks the payload ref survived.
 /// For GC MapRefs, it checks the destination ref survived.
 /// Without this, MapRef only LSNs would look like “metadata-only survived” even if the destination segment is missing/truncated.
 /// Prepublish should make destination bytes survive before MapRef is written.
-/// map_refs_survived is the recovery assertion/enforcement of that invariant, not the primary mechanism that makes it true.
-fn map_refs_survived(map_refs: &[MapRefOp], states: &[(SegmentId, SegmentState)]) -> Result<bool> {
-    for map_ref in map_refs {
-        let Some(record_end_offset) = map_ref.to.end_offset() else {
-            return Err(strata_segment::Error::RangeOverflow.into());
-        };
-        let survived = states
-            .iter()
-            .find(|(candidate, _)| *candidate == map_ref.to.segment_id)
-            .is_some_and(|(_, state)| {
-                state.state != SegmentFileState::Deleted && state.write_offset >= record_end_offset
-            });
-        if !survived {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+/// map_ref_survived is the recovery assertion/enforcement of that invariant, not the primary mechanism that makes it true.
+fn map_ref_survived(
+    map_ref: Option<&MapRefOp>,
+    states: &[(SegmentId, SegmentState)],
+) -> Result<bool> {
+    let Some(map_ref) = map_ref else {
+        return Ok(true);
+    };
+    let Some(record_end_offset) = map_ref.to.end_offset() else {
+        return Err(strata_segment::Error::RangeOverflow.into());
+    };
+    Ok(states
+        .iter()
+        .find(|(candidate, _)| *candidate == map_ref.to.segment_id)
+        .is_some_and(|(_, state)| {
+            state.state != SegmentFileState::Deleted && state.write_offset >= record_end_offset
+        }))
 }
 
 /// Makes the active segment visible in the index at open time, before any write happens. This is

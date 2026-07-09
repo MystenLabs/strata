@@ -1467,16 +1467,15 @@ impl<'a> GcStagingCopier<'a> {
             .open_outputs
             .get_mut(&record.destination_class)
             .expect("staged output inserted above");
-        let staged = append_gc_record_to_staged_output(
-            self.io_limiter,
-            output,
-            &mut self.outputs,
-            self.staging_dir,
-            &mut self.next_staged_segment_id,
-            &record,
-            payload,
-            self.segment_max_bytes,
-        )?;
+        let mut append_context = GcStagedOutputAppendContext {
+            io_limiter: self.io_limiter,
+            finished_outputs: &mut self.outputs,
+            staging_dir: self.staging_dir,
+            next_staged_segment_id: &mut self.next_staged_segment_id,
+            segment_max_bytes: self.segment_max_bytes,
+        };
+        let staged =
+            append_gc_record_to_staged_output(&mut append_context, output, &record, payload)?;
         self.copied_bytes = self
             .copied_bytes
             .checked_add(record.from.len)
@@ -1553,17 +1552,21 @@ fn create_staged_output(
 ///
 /// If the current output is full, it is sealed and pushed into `finished_outputs`, then a
 /// replacement output for the same destination class is opened before retrying the append.
+struct GcStagedOutputAppendContext<'a> {
+    io_limiter: &'a GcIoLimiter,
+    finished_outputs: &'a mut Vec<GcStagedOutputSegment>,
+    staging_dir: &'a Path,
+    next_staged_segment_id: &'a mut SegmentId,
+    segment_max_bytes: u64,
+}
+
 fn append_gc_record_to_staged_output(
-    io_limiter: &GcIoLimiter,
+    context: &mut GcStagedOutputAppendContext<'_>,
     output: &mut OpenStagedOutput,
-    finished_outputs: &mut Vec<GcStagedOutputSegment>,
-    staging_dir: &std::path::Path,
-    next_staged_segment_id: &mut SegmentId,
     record: &GcCopyRecord,
     payload: &[u8],
-    segment_max_bytes: u64,
 ) -> Result<RecordRef> {
-    io_limiter.acquire(record.from.len);
+    context.io_limiter.acquire(record.from.len);
     match output
         .writer
         .append_for_shard(&record.key, record.payload_lsn, record.shard, payload)
@@ -1571,14 +1574,14 @@ fn append_gc_record_to_staged_output(
         Ok(outcome) => Ok(outcome.record_ref),
         Err(strata_segment::Error::SegmentFull { .. }) => {
             let replacement = create_staged_output(
-                staging_dir,
-                *next_staged_segment_id,
+                context.staging_dir,
+                *context.next_staged_segment_id,
                 record.destination_class,
-                segment_max_bytes,
+                context.segment_max_bytes,
             )?;
-            let finished = std::mem::replace(output, replacement).finish(io_limiter)?;
-            finished_outputs.push(finished);
-            *next_staged_segment_id = output.next_staged_segment_id;
+            let finished = std::mem::replace(output, replacement).finish(context.io_limiter)?;
+            context.finished_outputs.push(finished);
+            *context.next_staged_segment_id = output.next_staged_segment_id;
             let outcome = output.writer.append_for_shard(
                 &record.key,
                 record.payload_lsn,

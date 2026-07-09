@@ -6,8 +6,8 @@ use std::{
 use rocksdb::MergeOperands;
 use serde::{Deserialize, Serialize};
 use strata_core::{
-    BlobLifecycleMergeOp, BlobLifecycleState, BlobVersionState, ShardId, ShardInfo, StrataLsn,
-    VersionMergeOp, VersionState,
+    BlobLifecycleMergeOp, BlobLifecycleState, BlobVersionState, PutMergeOp, PutState, ShardId,
+    ShardInfo, StrataLsn,
 };
 
 use crate::{Error, Result};
@@ -16,7 +16,7 @@ use super::super::shard::shard_generation_is_obsolete;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum BlobVersionMergeOp {
-    Version(VersionMergeOp),
+    Version(PutMergeOp),
     Lifecycle(BlobLifecycleMergeOp),
 }
 
@@ -77,7 +77,7 @@ fn apply_blob_version_merge_op(state: &mut BlobVersionState, op: BlobVersionMerg
 }
 
 pub(crate) fn prune_obsolete_shard_versions(
-    state: &mut VersionState,
+    state: &mut PutState,
     shard_infos: &BTreeMap<ShardId, ShardInfo>,
 ) -> bool {
     // This is not ordinary history compaction. Obsolete generations name physical writers that are
@@ -100,7 +100,7 @@ pub(crate) fn prune_obsolete_shard_versions(
         || state.maps.len() != initial_maps
 }
 
-pub(crate) fn remove_version_lsns_from_state(state: &mut VersionState, lsns: &BTreeSet<StrataLsn>) {
+pub(crate) fn remove_version_lsns_from_state(state: &mut PutState, lsns: &BTreeSet<StrataLsn>) {
     // Recovery rollback removes by exact LSN instead of compacting by frontier. These ops belonged
     // to writes whose durable record was lost, so both unresolved tails and already-folded heads must
     // be stripped without disturbing neighboring committed history.

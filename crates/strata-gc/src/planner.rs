@@ -483,11 +483,11 @@ impl GcPlanner {
             .segments
             .iter()
             .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
-            .filter_map(|segment| match segment.state.placement_class {
-                PlacementClass::ExactEpoch(epoch) if epoch <= snapshot.current_epoch => {
-                    Some(segment)
-                }
-                _ => None,
+            .filter(|segment| {
+                matches!(
+                    segment.state.placement_class,
+                    PlacementClass::ExactEpoch(epoch) if epoch <= snapshot.current_epoch
+                )
             })
             .filter(|segment| segment.summary.live_bytes > 0)
             .map(|segment| {

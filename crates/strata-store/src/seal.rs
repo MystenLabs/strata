@@ -351,61 +351,55 @@ fn unaccounted_lsn_is_durable(
     key: &BlobKey,
     states: &[(SegmentKey, SegmentState)],
 ) -> Result<bool> {
-    let (ops, lifecycle_ops) = index.blob_ops_at_lsn(key, lsn)?;
-    let map_refs = index.blob_map_refs_at_lsn(key, lsn)?;
-    if !map_refs_are_durable(&map_refs, states)? {
+    let (op, lifecycle_op) = index.blob_ops_at_lsn(key, lsn)?;
+    let map_ref = index.blob_map_ref_at_lsn(key, lsn)?;
+    if !map_ref_is_durable(map_ref.as_ref(), states)? {
         return Ok(false);
     }
-    if ops.is_empty() {
-        return Ok(!lifecycle_ops.is_empty() || !map_refs.is_empty());
+
+    let Some(op) = op else {
+        return Ok(lifecycle_op.is_some() || map_ref.is_some());
     };
-    for op in ops {
-        let Some(record_ref) = op.entry.record_ref else {
-            continue;
-        };
-        let Some(record_end_offset) = record_ref.end_offset() else {
-            return Err(strata_segment::Error::RangeOverflow.into());
-        };
-        let segment_key = SegmentKey {
-            shard: STORE_SCOPE,
-            segment_id: record_ref.segment_id,
-        };
-        let is_durable = states
-            .iter()
-            .find(|(candidate, _)| *candidate == segment_key)
-            .is_some_and(|(_, state)| {
-                state.state != SegmentFileState::Deleted
-                    && state.durable_offset >= record_end_offset
-            });
-        if !is_durable {
-            return Ok(false);
-        }
+    let Some(record_ref) = op.entry.record_ref else {
+        return Ok(true);
+    };
+    let Some(record_end_offset) = record_ref.end_offset() else {
+        return Err(strata_segment::Error::RangeOverflow.into());
+    };
+    let segment_key = SegmentKey {
+        shard: STORE_SCOPE,
+        segment_id: record_ref.segment_id,
+    };
+    let is_durable = states
+        .iter()
+        .find(|(candidate, _)| *candidate == segment_key)
+        .is_some_and(|(_, state)| {
+            state.state != SegmentFileState::Deleted && state.durable_offset >= record_end_offset
+        });
+    if !is_durable {
+        return Ok(false);
     }
     Ok(true)
 }
 
-fn map_refs_are_durable(
-    map_refs: &[MapRefOp],
+fn map_ref_is_durable(
+    map_ref: Option<&MapRefOp>,
     states: &[(SegmentKey, SegmentState)],
 ) -> Result<bool> {
-    for map_ref in map_refs {
-        let Some(record_end_offset) = map_ref.to.end_offset() else {
-            return Err(strata_segment::Error::RangeOverflow.into());
-        };
-        let segment_key = SegmentKey {
-            shard: STORE_SCOPE,
-            segment_id: map_ref.to.segment_id,
-        };
-        let is_durable = states
-            .iter()
-            .find(|(candidate, _)| *candidate == segment_key)
-            .is_some_and(|(_, state)| {
-                state.state != SegmentFileState::Deleted
-                    && state.durable_offset >= record_end_offset
-            });
-        if !is_durable {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    let Some(map_ref) = map_ref else {
+        return Ok(true);
+    };
+    let Some(record_end_offset) = map_ref.to.end_offset() else {
+        return Err(strata_segment::Error::RangeOverflow.into());
+    };
+    let segment_key = SegmentKey {
+        shard: STORE_SCOPE,
+        segment_id: map_ref.to.segment_id,
+    };
+    Ok(states
+        .iter()
+        .find(|(candidate, _)| *candidate == segment_key)
+        .is_some_and(|(_, state)| {
+            state.state != SegmentFileState::Deleted && state.durable_offset >= record_end_offset
+        }))
 }

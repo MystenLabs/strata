@@ -718,24 +718,15 @@ impl AccountingIndex {
 
     fn write_run(&self, run_id: RunId, run: &RunFile) -> Result<RunMeta> {
         match &run.records {
-            RunRecords::State(records) => self.write_framed_run(
-                run_id,
-                run.kind,
-                run.partition,
-                records.iter().map(|record| Ok(record)),
-            ),
-            RunRecords::Patch(records) => self.write_framed_run(
-                run_id,
-                run.kind,
-                run.partition,
-                records.iter().map(|record| Ok(record)),
-            ),
-            RunRecords::Delta(records) => self.write_framed_run(
-                run_id,
-                run.kind,
-                run.partition,
-                records.iter().map(|record| Ok(record)),
-            ),
+            RunRecords::State(records) => {
+                self.write_framed_run(run_id, run.kind, run.partition, records.iter().map(Ok))
+            }
+            RunRecords::Patch(records) => {
+                self.write_framed_run(run_id, run.kind, run.partition, records.iter().map(Ok))
+            }
+            RunRecords::Delta(records) => {
+                self.write_framed_run(run_id, run.kind, run.partition, records.iter().map(Ok))
+            }
         }
     }
 

@@ -588,16 +588,16 @@ fn run_segment_append(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     }
 
     let elapsed = started.elapsed();
-    print_report(
+    print_report(ReportInputs {
         config,
         elapsed,
-        &timings,
-        None,
-        Some(&phases),
-        None,
-        None,
-        None,
-    )?;
+        timings: &timings,
+        profile: None,
+        phases: Some(&phases),
+        store: None,
+        rocksdb: None,
+        profile_capture: None,
+    })?;
     Ok(())
 }
 
@@ -626,16 +626,16 @@ fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = started.elapsed();
-    print_report(
+    print_report(ReportInputs {
         config,
         elapsed,
-        &timings,
-        None,
-        Some(&phases),
-        Some(&store),
-        None,
-        Some(&profile_capture),
-    )?;
+        timings: &timings,
+        profile: None,
+        phases: Some(&phases),
+        store: Some(&store),
+        rocksdb: None,
+        profile_capture: Some(&profile_capture),
+    })?;
     Ok(())
 }
 
@@ -664,16 +664,16 @@ fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let elapsed = started.elapsed();
-    print_report(
+    print_report(ReportInputs {
         config,
         elapsed,
-        &timings,
-        None,
-        Some(&phases),
-        Some(&store),
-        None,
-        Some(&profile_capture),
-    )?;
+        timings: &timings,
+        profile: None,
+        phases: Some(&phases),
+        store: Some(&store),
+        rocksdb: None,
+        profile_capture: Some(&profile_capture),
+    })?;
     Ok(())
 }
 
@@ -732,16 +732,16 @@ fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = started.elapsed();
-    print_report(
+    print_report(ReportInputs {
         config,
         elapsed,
-        &timings,
-        profile_summary.as_ref(),
-        Some(&phases),
-        Some(&store),
-        None,
-        None,
-    )?;
+        timings: &timings,
+        profile: profile_summary.as_ref(),
+        phases: Some(&phases),
+        store: Some(&store),
+        rocksdb: None,
+        profile_capture: None,
+    })?;
     Ok(())
 }
 
@@ -767,16 +767,16 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
     }
 
     let elapsed = started.elapsed();
-    print_report(
+    print_report(ReportInputs {
         config,
         elapsed,
-        &timings,
-        None,
-        Some(&phases),
-        None,
-        Some(&db),
-        None,
-    )?;
+        timings: &timings,
+        profile: None,
+        phases: Some(&phases),
+        store: None,
+        rocksdb: Some(&db),
+        profile_capture: None,
+    })?;
     Ok(())
 }
 
@@ -809,16 +809,16 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
     }
 
     let elapsed = started.elapsed();
-    print_report(
+    print_report(ReportInputs {
         config,
         elapsed,
-        &timings,
-        None,
-        Some(&phases),
-        None,
-        Some(&db),
-        None,
-    )?;
+        timings: &timings,
+        profile: None,
+        phases: Some(&phases),
+        store: None,
+        rocksdb: Some(&db),
+        profile_capture: None,
+    })?;
     Ok(())
 }
 
@@ -850,16 +850,29 @@ fn should_sync(sync_every: usize, completed_ops: usize) -> bool {
     sync_every != 0 && completed_ops.is_multiple_of(sync_every)
 }
 
-fn print_report(
-    config: &Config,
+struct ReportInputs<'a> {
+    config: &'a Config,
     elapsed: Duration,
-    timings: &[Duration],
-    profile: Option<&StoreGetProfileSummary>,
-    phases: Option<&PhaseTimings>,
-    store: Option<&StrataStore>,
-    rocksdb: Option<&DB>,
-    profile_capture: Option<&ProfileCapture>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    timings: &'a [Duration],
+    profile: Option<&'a StoreGetProfileSummary>,
+    phases: Option<&'a PhaseTimings>,
+    store: Option<&'a StrataStore>,
+    rocksdb: Option<&'a DB>,
+    profile_capture: Option<&'a ProfileCapture>,
+}
+
+fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let ReportInputs {
+        config,
+        elapsed,
+        timings,
+        profile,
+        phases,
+        store,
+        rocksdb,
+        profile_capture,
+    } = inputs;
+
     let mut sorted = timings.to_vec();
     sorted.sort_unstable();
 
@@ -1219,7 +1232,7 @@ fn print_rocksdb_metrics(db: &DB) {
         }
         Err(error) => println!(
             "rocksdb_live_files_error={}",
-            sanitize_property_value(&error.to_string())
+            sanitize_property_value(error.as_ref())
         ),
     }
 
@@ -1235,10 +1248,7 @@ fn print_rocksdb_int_property(db: &DB, label: &str, property_name: &str) {
     match db.property_int_value(property_name) {
         Ok(Some(value)) => println!("{label}={value}"),
         Ok(None) => println!("{label}=unavailable"),
-        Err(error) => println!(
-            "{label}=error:{}",
-            sanitize_property_value(&error.to_string())
-        ),
+        Err(error) => println!("{label}=error:{}", sanitize_property_value(error.as_ref())),
     }
 }
 
@@ -1246,10 +1256,7 @@ fn print_rocksdb_string_property(db: &DB, label: &str, property_name: &str) {
     match db.property_value(property_name) {
         Ok(Some(value)) => println!("{label}={}", sanitize_property_value(&value)),
         Ok(None) => println!("{label}=unavailable"),
-        Err(error) => println!(
-            "{label}=error:{}",
-            sanitize_property_value(&error.to_string())
-        ),
+        Err(error) => println!("{label}=error:{}", sanitize_property_value(error.as_ref())),
     }
 }
 

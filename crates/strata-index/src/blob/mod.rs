@@ -4,9 +4,9 @@ pub(crate) mod merge;
 use std::collections::{BTreeMap, BTreeSet};
 
 use strata_core::{
-    BlobEntry, BlobKey, BlobLifecycleHead, BlobLifecycleMergeOp, BlobLifecycleOp,
-    BlobLifecycleState, BlobVersionKey, BlobVersionState, MapRefOp, ShardHead, ShardKey, StrataLsn,
-    VersionMergeOp, VersionOp, VersionState,
+    BlobKey, BlobLifecycleHead, BlobLifecycleMergeOp, BlobLifecycleOp, BlobLifecycleState,
+    BlobVersionKey, BlobVersionState, MapRefOp, PutEntry, PutHead, PutMergeOp, PutOp, PutState,
+    ShardKey, StrataLsn,
 };
 use typed_store::{Map, rocks::DBBatch};
 
@@ -36,7 +36,7 @@ impl StrataIndex {
         Ok(self.blob_versions.get(key)?)
     }
 
-    pub fn get_blob_version_state(&self, key: &BlobKey) -> Result<Option<VersionState>> {
+    pub fn get_blob_version_state(&self, key: &BlobKey) -> Result<Option<PutState>> {
         Ok(self
             .get_blob_state(key)?
             .and_then(|state| (!state.versions.is_empty()).then_some(state.versions)))
@@ -60,7 +60,7 @@ impl StrataIndex {
             }))
     }
 
-    pub fn resolve_blob_head(&self, key: &BlobKey, shard: ShardKey) -> Result<Option<ShardHead>> {
+    pub fn resolve_blob_head(&self, key: &BlobKey, shard: ShardKey) -> Result<Option<PutHead>> {
         // The cache check is part of stale write prevention for readers as well as writers. If a
         // shard generation was dropped, any packed value that still contains its old head is treated
         // as physically unreachable even before RocksDB compaction has pruned it.
@@ -72,7 +72,7 @@ impl StrataIndex {
             .and_then(|state| state.versions.resolve_head(shard)))
     }
 
-    pub fn get_blob_entry(&self, key: &BlobKey) -> Result<Option<BlobEntry>> {
+    pub fn get_blob_entry(&self, key: &BlobKey) -> Result<Option<PutEntry>> {
         Ok(self.latest_blob_version(key)?.map(|(_, entry)| entry))
     }
 
@@ -80,7 +80,7 @@ impl StrataIndex {
         Ok(self.latest_blob_version(key)?.is_some())
     }
 
-    pub fn put_blob_entry(&self, key: &BlobKey, entry: &BlobEntry) -> Result<()> {
+    pub fn put_blob_entry(&self, key: &BlobKey, entry: &PutEntry) -> Result<()> {
         let mut batch = self.batch();
         self.put_blob_entry_batch(&mut batch, key, entry)?;
         batch.write()?;
@@ -91,7 +91,7 @@ impl StrataIndex {
         &self,
         batch: &mut DBBatch,
         key: &BlobKey,
-        entry: &BlobEntry,
+        entry: &PutEntry,
     ) -> Result<()> {
         self.put_blob_version_batch(batch, key, entry)
     }
@@ -114,7 +114,7 @@ impl StrataIndex {
         &self,
         batch: &mut DBBatch,
         key: &BlobKey,
-        entry: &BlobEntry,
+        entry: &PutEntry,
     ) -> Result<()> {
         self.merge_blob_version_batch(batch, key, STANDALONE_SHARD, entry)
     }
@@ -124,9 +124,9 @@ impl StrataIndex {
         batch: &mut DBBatch,
         key: &BlobKey,
         shard: ShardKey,
-        entry: &BlobEntry,
+        entry: &PutEntry,
     ) -> Result<()> {
-        let op = VersionMergeOp::Append(VersionOp {
+        let op = PutMergeOp::Append(PutOp {
             shard,
             entry: entry.clone(),
         });
@@ -137,7 +137,7 @@ impl StrataIndex {
         &self,
         batch: &mut DBBatch,
         key: &BlobKey,
-        op: VersionMergeOp,
+        op: PutMergeOp,
     ) -> Result<()> {
         let operand = encode_blob_version_merge_operand(EncodedBlobVersionMergeOperand::Op(
             BlobVersionMergeOp::Version(op),
@@ -150,11 +150,7 @@ impl StrataIndex {
         &self,
         batch: &mut DBBatch,
         key: &BlobKey,
-        shard: ShardKey,
-        publish_lsn: StrataLsn,
-        payload_lsn: StrataLsn,
-        from: strata_core::RecordRef,
-        to: strata_core::RecordRef,
+        op: MapRefOp,
     ) -> Result<()> {
         // MapRef is recorded as ordered history, not resolved here. The index does not know whether
         // `from` is still in the tail, already folded into a head, or hidden behind later lifecycle
@@ -163,12 +159,12 @@ impl StrataIndex {
         self.apply_blob_version_merge_op_batch(
             batch,
             key,
-            VersionMergeOp::MapRef {
-                publish_lsn,
-                shard,
-                payload_lsn,
-                from,
-                to,
+            PutMergeOp::MapRef {
+                publish_lsn: op.publish_lsn,
+                shard: op.shard,
+                payload_lsn: op.payload_lsn,
+                from: op.from,
+                to: op.to,
             },
         )
     }
@@ -189,53 +185,50 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn blob_version_ops_at_lsn(&self, key: &BlobKey, lsn: StrataLsn) -> Result<Vec<VersionOp>> {
+    pub fn blob_version_op_at_lsn(&self, key: &BlobKey, lsn: StrataLsn) -> Result<Option<PutOp>> {
         let Some(state) = self.get_blob_state(key)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
-        Ok(state.versions.ops_at_lsn(lsn))
+        Ok(state.versions.op_at_lsn(lsn))
     }
 
-    pub fn blob_map_refs_at_lsn(&self, key: &BlobKey, lsn: StrataLsn) -> Result<Vec<MapRefOp>> {
+    pub fn blob_map_ref_at_lsn(&self, key: &BlobKey, lsn: StrataLsn) -> Result<Option<MapRefOp>> {
         let Some(state) = self.get_blob_state(key)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
-        Ok(state.versions.map_refs_at_lsn(lsn))
+        Ok(state.versions.map_ref_at_lsn(lsn))
     }
 
     pub fn blob_ops_at_lsn(
         &self,
         key: &BlobKey,
         lsn: StrataLsn,
-    ) -> Result<(Vec<VersionOp>, Vec<BlobLifecycleOp>)> {
+    ) -> Result<(Option<PutOp>, Option<BlobLifecycleOp>)> {
         let Some(state) = self.get_blob_state(key)? else {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((None, None));
         };
 
         Ok((
-            state.versions.ops_at_lsn(lsn),
-            state.lifecycle.ops_at_lsn(lsn),
+            state.versions.op_at_lsn(lsn),
+            state.lifecycle.op_at_lsn(lsn),
         ))
     }
 
-    pub fn blob_lifecycle_ops_at_lsn(
+    pub fn blob_lifecycle_op_at_lsn(
         &self,
         key: &BlobKey,
         lsn: StrataLsn,
-    ) -> Result<Vec<BlobLifecycleOp>> {
+    ) -> Result<Option<BlobLifecycleOp>> {
         let Some(state) = self.get_blob_state(key)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
-        Ok(state.lifecycle.ops_at_lsn(lsn))
+        Ok(state.lifecycle.op_at_lsn(lsn))
     }
 
-    pub fn latest_blob_version(
-        &self,
-        key: &BlobKey,
-    ) -> Result<Option<(BlobVersionKey, BlobEntry)>> {
+    pub fn latest_blob_version(&self, key: &BlobKey) -> Result<Option<(BlobVersionKey, PutEntry)>> {
         let Some(state) = self.get_blob_version_state(key)? else {
             return Ok(None);
         };
@@ -255,20 +248,24 @@ impl StrataIndex {
         }))
     }
 
-    pub fn get_blob_version(&self, key: &BlobVersionKey) -> Result<Option<BlobEntry>> {
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn get_blob_version(&self, key: &BlobVersionKey) -> Result<Option<PutEntry>> {
         self.get_blob_version_for_shard(key, STANDALONE_SHARD)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn get_blob_version_for_shard(
         &self,
         key: &BlobVersionKey,
         shard: ShardKey,
-    ) -> Result<Option<BlobEntry>> {
+    ) -> Result<Option<PutEntry>> {
         let Some(state) = self.get_blob_version_state(&key.key)? else {
             return Ok(None);
         };
 
-        Ok(state.version_at_lsn(shard, key.lsn))
+        Ok(state.entry_at_lsn(shard, key.lsn))
     }
 
     pub fn remove_blob_versions_batch(
@@ -339,12 +336,14 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn iter_blob_versions(&self) -> Result<Vec<(BlobVersionKey, BlobEntry)>> {
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn iter_blob_versions(&self) -> Result<Vec<(BlobVersionKey, PutEntry)>> {
         let mut versions = Vec::new();
         for result in self.blob_versions.safe_iter()? {
             let (key, state) = result?;
             for (shard, head) in &state.versions.heads {
-                let Some(entry) = state.versions.version_at_lsn(*shard, head.head_lsn) else {
+                let Some(entry) = state.versions.entry_at_lsn(*shard, head.head_lsn) else {
                     continue;
                 };
                 versions.push((
@@ -356,7 +355,7 @@ impl StrataIndex {
                 ));
             }
             for op in &state.versions.tail {
-                let Some(entry) = state.versions.version_at_lsn(op.shard, op.lsn()) else {
+                let Some(entry) = state.versions.entry_at_lsn(op.shard, op.lsn()) else {
                     continue;
                 };
                 versions.push((

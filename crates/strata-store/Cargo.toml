@@ -22,4 +22,5 @@ tokio.workspace = true
 typed-store.workspace = true
 
 [dev-dependencies]
+strata-index = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true

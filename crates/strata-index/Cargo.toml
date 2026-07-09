@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+test-utils = ["strata-core/test-utils"]
+
 [dependencies]
 bcs.workspace = true
 rocksdb.workspace = true
@@ -16,5 +20,6 @@ thiserror.workspace = true
 typed-store.workspace = true
 
 [dev-dependencies]
+strata-core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio.workspace = true

@@ -144,7 +144,7 @@ async fn durable_frontier_advances_across_durable_gc_map_ref() {
         offset: 0,
         len: TEST_RECORD_LEN,
     };
-    let entry = BlobEntry {
+    let entry = PutEntry {
         record_ref: Some(from),
         lsn: 1,
         generation: 1,
@@ -172,7 +172,17 @@ async fn durable_frontier_advances_across_durable_gc_map_ref() {
         .merge_blob_version_batch(&mut batch, &key, STANDALONE_SHARD, &entry)
         .unwrap();
     index
-        .map_blob_ref_batch(&mut batch, &key, STANDALONE_SHARD, 2, entry.lsn, from, to)
+        .map_blob_ref_batch(
+            &mut batch,
+            &key,
+            MapRefOp {
+                publish_lsn: 2,
+                shard: STANDALONE_SHARD,
+                payload_lsn: entry.lsn,
+                from,
+                to,
+            },
+        )
         .unwrap();
     index
         .put_blob_unaccounted_lsn_op_batch(&mut batch, 2, &key)
@@ -244,7 +254,7 @@ async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
         offset: TEST_RECORD_LEN,
         len: TEST_RECORD_LEN,
     };
-    let entry = BlobEntry {
+    let entry = PutEntry {
         record_ref: Some(from_hidden),
         lsn: 4,
         generation: 1,
@@ -280,11 +290,13 @@ async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
         .map_blob_ref_batch(
             &mut batch,
             &key,
-            STANDALONE_SHARD,
-            6,
-            entry.lsn,
-            from_hidden,
-            to_hidden,
+            MapRefOp {
+                publish_lsn: 6,
+                shard: STANDALONE_SHARD,
+                payload_lsn: entry.lsn,
+                from: from_hidden,
+                to: to_hidden,
+            },
         )
         .unwrap();
     index
@@ -855,34 +867,30 @@ async fn store_blob_ops_apply_to_all_active_logical_shard_heads() {
     assert_eq!(
         store
             .index()
-            .blob_version_ops_at_lsn(&key, extend_lsn)
+            .blob_version_op_at_lsn(&key, extend_lsn)
+            .unwrap(),
+        None
+    );
+    assert!(
+        store
+            .index()
+            .blob_lifecycle_op_at_lsn(&key, extend_lsn)
             .unwrap()
-            .len(),
-        0
+            .is_some()
     );
     assert_eq!(
         store
             .index()
-            .blob_lifecycle_ops_at_lsn(&key, extend_lsn)
-            .unwrap()
-            .len(),
-        1
+            .blob_version_op_at_lsn(&key, tombstone_lsn)
+            .unwrap(),
+        None
     );
-    assert_eq!(
+    assert!(
         store
             .index()
-            .blob_version_ops_at_lsn(&key, tombstone_lsn)
+            .blob_lifecycle_op_at_lsn(&key, tombstone_lsn)
             .unwrap()
-            .len(),
-        0
-    );
-    assert_eq!(
-        store
-            .index()
-            .blob_lifecycle_ops_at_lsn(&key, tombstone_lsn)
-            .unwrap()
-            .len(),
-        1
+            .is_some()
     );
     assert_eq!(store.get_from_shard(10, &key).unwrap(), None);
     assert_eq!(store.get_from_shard(20, &key).unwrap(), None);
@@ -1535,11 +1543,13 @@ async fn read_retries_once_when_not_found_segment_was_deleted() {
                     .map_blob_ref_batch(
                         &mut batch,
                         &key,
-                        STANDALONE_SHARD,
-                        payload_lsn + 1,
-                        payload_lsn,
-                        old_ref,
-                        new_ref,
+                        MapRefOp {
+                            publish_lsn: payload_lsn + 1,
+                            shard: STANDALONE_SHARD,
+                            payload_lsn,
+                            from: old_ref,
+                            to: new_ref,
+                        },
                     )
                     .unwrap();
                 batch.write().unwrap();
@@ -4673,7 +4683,7 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
                 .put_blob_version_batch(
                     &mut batch,
                     key,
-                    &BlobEntry {
+                    &PutEntry {
                         record_ref: Some(record_ref),
                         lsn,
                         generation: lsn,
@@ -4761,7 +4771,7 @@ async fn absolute_consistency_recovery_fails_on_unsealed_gap() {
                 .put_blob_version_batch(
                     &mut batch,
                     key,
-                    &BlobEntry {
+                    &PutEntry {
                         record_ref: Some(record_ref),
                         lsn,
                         generation: lsn,

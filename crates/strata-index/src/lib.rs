@@ -65,16 +65,15 @@ pub use error::{Error, Result};
 #[cfg(test)]
 pub(crate) use open::unique_metric_conf;
 
-#[cfg(test)]
-use strata_core::{
-    BlobEntry, BlobLifecycleState, BlobVersionKey, SegmentGcLifetimeUpdate,
-    SegmentGcOverlayMergeOp, SegmentGcRecordRange, ShardHead, StrataStoreState, VersionOp,
-    VersionState,
-};
 use strata_core::{
     BlobKey, BlobVersionState, Epoch, GcRelocation, RecordRef, SegmentGcOverlay, SegmentId,
     SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo, ShardKey,
     StoreStateKey, StrataLsn,
+};
+#[cfg(test)]
+use strata_core::{
+    BlobLifecycleState, BlobVersionKey, PutEntry, PutHead, PutOp, PutState,
+    SegmentGcLifetimeUpdate, SegmentGcOverlayMergeOp, SegmentGcRecordRange, StrataStoreState,
 };
 use typed_store::rocks::{DBMap, RocksDB};
 

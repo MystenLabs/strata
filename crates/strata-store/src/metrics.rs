@@ -521,7 +521,7 @@ impl StrataStoreMetrics {
     pub(crate) fn internal_profile_enabled(&self) -> bool {
         #[cfg(feature = "internal-profiling")]
         {
-            return self.profile_sink.is_some();
+            self.profile_sink.is_some()
         }
 
         #[cfg(not(feature = "internal-profiling"))]

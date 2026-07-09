@@ -28,21 +28,27 @@
 
 mod checksum;
 mod error;
+mod ids;
 mod key;
 mod lifecycle;
+mod put;
 mod record;
 mod segment;
 
 pub use checksum::{Checksum, ChecksumAlgorithm};
 pub use error::{Error, Result};
+pub use ids::{
+    BlobState, Epoch, Generation, RecordRef, ShardGeneration, ShardId, ShardInfo, ShardKey,
+    ShardState, StrataLsn,
+};
 pub use key::{BlobKey, BlobKeyError};
 pub use lifecycle::{
-    BlobEntry, BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp,
-    BlobLifecycleOp, BlobLifecycleState, BlobLifetimeHead, BlobState, BlobVersionKey,
-    BlobVersionState, Epoch, Generation, MapRefOp, RecordRef, ShardGeneration, ShardHead, ShardId,
-    ShardInfo, ShardKey, ShardLsnKey, ShardState, ShardStoreStateKey, StoreStateKey, StrataLsn,
-    StrataStoreState, VersionMergeOp, VersionOp, VersionState,
+    BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp, BlobLifecycleOp,
+    BlobLifecycleState, BlobLifetimeHead, BlobVersionKey, BlobVersionState, ShardLsnKey,
+    ShardStoreStateKey, StoreStateKey, StrataStoreState,
 };
+pub use put::PutEntry;
+pub use put::{MapRefOp, PutHead, PutMergeOp, PutOp, PutState};
 pub use record::{
     DEFAULT_RECORD_SHARD, DecodedRecord, EncodedRecordParts, FIXED_RECORD_HEADER_LEN, RECORD_MAGIC,
     RECORD_VERSION, RecordHeader, RecordHeaderFields, encoded_record_len,
@@ -53,3 +59,7 @@ pub use segment::{
     SegmentGcRecordRange, SegmentGcSummary, SegmentId, SegmentKey, SegmentRefEvent,
     SegmentRefEventKey, SegmentState, VolumeId,
 };
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

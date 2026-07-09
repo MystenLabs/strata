@@ -3,8 +3,8 @@ use std::{num::NonZeroU32, sync::Once};
 use strata_accounting::{AccountingIndex, AccountingIndexConfig};
 use strata_core::{
     BlobLifecycle, BlobLifecycleAction, BlobLifecycleMergeOp, BlobLifecycleOp, BlobState,
-    GcRelocation, PlacementClass, RecordRef, SegmentFileState, SegmentGcLiveRecord,
-    SegmentGcSummary, ShardInfo, ShardKey, ShardState,
+    GcRelocation, MapRefOp, PlacementClass, PutMergeOp, RecordRef, SegmentFileState,
+    SegmentGcLiveRecord, SegmentGcSummary, ShardInfo, ShardKey, ShardState,
 };
 use strata_gc::{GcPlanner, GcPlannerConfig, GcScenario};
 use tempfile::tempdir;
@@ -20,8 +20,8 @@ fn init_typed_store_metrics() {
     });
 }
 
-fn blob_entry(segment_id: SegmentId, offset: u64) -> BlobEntry {
-    BlobEntry {
+fn blob_entry(segment_id: SegmentId, offset: u64) -> PutEntry {
+    PutEntry {
         record_ref: Some(RecordRef {
             segment_id,
             offset,
@@ -65,7 +65,7 @@ fn unaccounted(_shard: ShardKey, key: &BlobKey) -> BlobKey {
     key.clone()
 }
 
-fn put_version_state(index: &StrataIndex, key: &BlobKey, state: &VersionState) {
+fn put_version_state(index: &StrataIndex, key: &BlobKey, state: &PutState) {
     let blob_state = BlobVersionState {
         versions: state.clone(),
         lifecycle: BlobLifecycleState::default(),
@@ -75,6 +75,10 @@ fn put_version_state(index: &StrataIndex, key: &BlobKey, state: &VersionState) {
         .insert_batch(index.blob_versions(), [(key, &blob_state)])
         .unwrap();
     batch.write().unwrap();
+}
+
+fn append_put(state: &mut PutState, shard: ShardKey, entry: PutEntry) {
+    state.apply_merge_op(PutMergeOp::Append(PutOp { shard, entry }));
 }
 
 fn compact_blob_versions(index: &StrataIndex) {
@@ -561,16 +565,25 @@ async fn map_blob_ref_merge_rewrites_exact_payload_ref() {
         .merge_blob_version_batch(&mut batch, &key, shard, &entry)
         .unwrap();
     index
-        .map_blob_ref_batch(&mut batch, &key, shard, 4, entry.lsn, from, to)
+        .map_blob_ref_batch(
+            &mut batch,
+            &key,
+            MapRefOp {
+                publish_lsn: 4,
+                shard,
+                payload_lsn: entry.lsn,
+                from,
+                to,
+            },
+        )
         .unwrap();
     batch.write().unwrap();
 
-    let map_refs = index.blob_map_refs_at_lsn(&key, 4).unwrap();
-    assert_eq!(map_refs.len(), 1);
-    assert_eq!(map_refs[0].publish_lsn, 4);
-    assert_eq!(map_refs[0].payload_lsn, entry.lsn);
-    assert_eq!(map_refs[0].from, from);
-    assert_eq!(map_refs[0].to, to);
+    let map_ref = index.blob_map_ref_at_lsn(&key, 4).unwrap().unwrap();
+    assert_eq!(map_ref.publish_lsn, 4);
+    assert_eq!(map_ref.payload_lsn, entry.lsn);
+    assert_eq!(map_ref.from, from);
+    assert_eq!(map_ref.to, to);
     assert_eq!(
         index
             .get_blob_version_for_shard(&version_key(&key, entry.lsn), shard)
@@ -605,7 +618,17 @@ async fn rollback_removes_map_blob_ref_by_publish_lsn() {
         .merge_blob_version_batch(&mut batch, &key, shard, &entry)
         .unwrap();
     index
-        .map_blob_ref_batch(&mut batch, &key, shard, 4, entry.lsn, from, to)
+        .map_blob_ref_batch(
+            &mut batch,
+            &key,
+            MapRefOp {
+                publish_lsn: 4,
+                shard,
+                payload_lsn: entry.lsn,
+                from,
+                to,
+            },
+        )
         .unwrap();
     batch.write().unwrap();
 
@@ -892,14 +915,14 @@ async fn blob_versions_pack_payload_and_lifecycle_state_together() {
     assert_eq!(
         index.blob_ops_at_lsn(&key, 2).unwrap(),
         (
-            Vec::new(),
-            vec![BlobLifecycleOp {
+            None,
+            Some(BlobLifecycleOp {
                 lsn: 2,
                 action: BlobLifecycleAction::SetLifetime {
                     logical_end_epoch: 50,
                     current_epoch: 42,
                 },
-            }]
+            })
         )
     );
 }
@@ -984,22 +1007,13 @@ async fn blob_versions_compaction_filter_removes_dropped_shard_generation() {
         .put_shard_info(kept_shard.id, ShardInfo::active(0))
         .unwrap();
 
-    let mut mixed_state = VersionState::default();
-    mixed_state.append_op(VersionOp {
-        shard: dropped_shard,
-        entry: dropped_entry.clone(),
-    });
-    mixed_state.append_op(VersionOp {
-        shard: kept_shard,
-        entry: kept_entry.clone(),
-    });
+    let mut mixed_state = PutState::default();
+    append_put(&mut mixed_state, dropped_shard, dropped_entry.clone());
+    append_put(&mut mixed_state, kept_shard, kept_entry.clone());
     put_version_state(&index, &mixed_key, &mixed_state);
 
-    let mut dropped_only_state = VersionState::default();
-    dropped_only_state.append_op(VersionOp {
-        shard: dropped_shard,
-        entry: dropped_entry,
-    });
+    let mut dropped_only_state = PutState::default();
+    append_put(&mut dropped_only_state, dropped_shard, dropped_entry);
     put_version_state(&index, &dropped_only_key, &dropped_only_state);
 
     index
@@ -1059,19 +1073,16 @@ async fn blob_versions_compaction_filter_removes_stale_shard_generation() {
         )
         .unwrap();
 
-    let mut state = VersionState::default();
+    let mut state = PutState::default();
     state.heads.insert(
         stale_shard,
-        ShardHead {
+        PutHead {
             head_lsn: stale_entry.lsn,
             payload_lsn: Some(stale_entry.lsn),
             entry: stale_entry,
         },
     );
-    state.append_op(VersionOp {
-        shard: current_shard,
-        entry: current_entry.clone(),
-    });
+    append_put(&mut state, current_shard, current_entry.clone());
     put_version_state(&index, &key, &state);
     compact_blob_versions(&index);
 

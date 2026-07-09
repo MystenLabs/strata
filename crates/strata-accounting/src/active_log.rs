@@ -573,7 +573,7 @@ fn frame_len(delta: &AccountingDelta) -> Result<u64> {
     let frame_len = encoded_len
         .checked_add(std::mem::size_of::<u32>())
         .ok_or(Error::RunFrameTooLarge { len: encoded_len })?;
-    Ok(u64::try_from(frame_len).map_err(|_| Error::RunFrameTooLarge { len: frame_len })?)
+    u64::try_from(frame_len).map_err(|_| Error::RunFrameTooLarge { len: frame_len })
 }
 
 fn truncate_file(path: &Path, len: u64) -> Result<()> {
