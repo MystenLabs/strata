@@ -647,11 +647,18 @@ impl StrataStore {
     /// two puts could both publish `next_lsn = 42` while their bytes landed at different offsets.
     fn write_batch(&self, ops: Vec<BatchOp>) -> Result<BatchWriteResult> {
         let (response_tx, response_rx) = mpsc::channel();
-        let command = WriteCommand::Batch(BatchWriteRequest { ops, response_tx });
-        self.send_write_command(command)?;
-        response_rx
+        let (profile, profile_rx) = self.profile_channel();
+        let command = WriteCommand::Batch(BatchWriteRequest {
+            ops,
+            response_tx,
+            profile,
+        });
+        let queue_send = self.send_write_command(command)?;
+        let result = response_rx
             .recv()
-            .map_err(|_| Error::WriteResponseDropped)?
+            .map_err(|_| Error::WriteResponseDropped)??;
+        self.finish_write_profile(profile_rx, queue_send)?;
+        Ok(result)
     }
 
     /// Drops the cached file descriptor for a segment.
@@ -701,10 +708,17 @@ impl StrataStore {
     /// durability is batched here. See `WriteCoordinator::sync_data` for the ordering invariant.
     pub fn sync(&self) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.send_write_command(WriteCommand::Sync(response_tx))?;
+        let (profile, profile_rx) = self.profile_channel();
+        let command = WriteCommand::Sync(SyncRequest {
+            response_tx,
+            profile,
+        });
+        let queue_send = self.send_write_command(command)?;
         response_rx
             .recv()
-            .map_err(|_| Error::WriteResponseDropped)?
+            .map_err(|_| Error::WriteResponseDropped)??;
+        self.finish_sync_profile(profile_rx, queue_send)?;
+        Ok(())
     }
 
     /// Every operation with `lsn <= durable_lsn` survives a crash. This is the value callers
@@ -741,7 +755,7 @@ impl StrataStore {
     /// Failure mode avoided: if the writer has exited, this converts the broken channel into a
     /// store error and immediately undoes the queued metric. Otherwise a caller could block on a
     /// response that will never be sent while dashboards show phantom queued work.
-    fn send_write_command(&self, command: WriteCommand) -> Result<()> {
+    fn send_write_command(&self, command: WriteCommand) -> Result<Duration> {
         self.store_halt.check()?;
         let started = Instant::now();
         self.metrics.enqueue_write_command();
@@ -753,11 +767,50 @@ impl StrataStore {
         if result.is_err() {
             self.metrics.dequeue_write_command();
         }
+        let elapsed = started.elapsed();
         self.metrics
-            .record_write_queue_send(result.is_ok(), started.elapsed());
-        self.gc_concurrency
-            .observe_write_queue_send(started.elapsed());
-        result
+            .record_write_queue_send(result.is_ok(), elapsed);
+        self.gc_concurrency.observe_write_queue_send(elapsed);
+        result.map(|_| elapsed)
+    }
+
+    fn profile_channel<P>(&self) -> (ProfileRequest<P>, Option<mpsc::Receiver<P>>) {
+        if !self.metrics.internal_profile_enabled() {
+            return (ProfileRequest::default(), None);
+        }
+
+        let (tx, rx) = mpsc::channel();
+        (ProfileRequest::enabled(tx), Some(rx))
+    }
+
+    fn finish_write_profile(
+        &self,
+        profile_rx: Option<mpsc::Receiver<StoreWriteProfile>>,
+        queue_send: Duration,
+    ) -> Result<()> {
+        let Some(profile_rx) = profile_rx else {
+            return Ok(());
+        };
+        let mut profile = profile_rx.recv().map_err(|_| Error::WriteResponseDropped)?;
+        profile.queue_send = queue_send;
+        profile.queue_wait = profile.queue_wait.saturating_sub(queue_send);
+        self.metrics.record_write_profile(profile);
+        Ok(())
+    }
+
+    fn finish_sync_profile(
+        &self,
+        profile_rx: Option<mpsc::Receiver<StoreSyncProfile>>,
+        queue_send: Duration,
+    ) -> Result<()> {
+        let Some(profile_rx) = profile_rx else {
+            return Ok(());
+        };
+        let mut profile = profile_rx.recv().map_err(|_| Error::WriteResponseDropped)?;
+        profile.queue_send = queue_send;
+        profile.queue_wait = profile.queue_wait.saturating_sub(queue_send);
+        self.metrics.record_sync_profile(profile);
+        Ok(())
     }
 }
 
@@ -799,7 +852,7 @@ enum WriteCommand {
     Batch(BatchWriteRequest),
     DropShard(DropShardRequest),
     GcPublish(GcPublishRequest),
-    Sync(mpsc::Sender<Result<()>>),
+    Sync(SyncRequest),
     Shutdown,
 }
 
@@ -810,9 +863,46 @@ struct AddShardRequest {
 }
 
 #[derive(Debug)]
+struct ProfileRequest<P> {
+    enqueued_at: Option<Instant>,
+    tx: Option<mpsc::Sender<P>>,
+}
+
+impl<P> Default for ProfileRequest<P> {
+    fn default() -> Self {
+        Self {
+            enqueued_at: None,
+            tx: None,
+        }
+    }
+}
+
+impl<P> ProfileRequest<P> {
+    fn enabled(tx: mpsc::Sender<P>) -> Self {
+        Self {
+            enqueued_at: Some(Instant::now()),
+            tx: Some(tx),
+        }
+    }
+
+    fn queue_wait(&self, started: Instant) -> Option<Duration> {
+        self.tx
+            .as_ref()
+            .map(|_| started.saturating_duration_since(self.enqueued_at.unwrap_or(started)))
+    }
+
+    fn send(self, profile: P) {
+        if let Some(tx) = self.tx {
+            let _ = tx.send(profile);
+        }
+    }
+}
+
+#[derive(Debug)]
 struct BatchWriteRequest {
     ops: Vec<BatchOp>,
     response_tx: mpsc::Sender<Result<BatchWriteResult>>,
+    profile: ProfileRequest<StoreWriteProfile>,
 }
 
 #[derive(Debug)]
@@ -827,6 +917,12 @@ pub(crate) struct GcPublishRequest {
     copy: GcPrepublishedCopy,
     /// One-shot response channel back to the caller that requested GC publication.
     response_tx: mpsc::Sender<Result<GcPublishResult>>,
+}
+
+#[derive(Debug)]
+struct SyncRequest {
+    response_tx: mpsc::Sender<Result<()>>,
+    profile: ProfileRequest<StoreSyncProfile>,
 }
 
 #[derive(Debug)]
@@ -884,6 +980,83 @@ impl BatchWriteResult {
     pub fn last_epoch(&self) -> Option<Epoch> {
         self.op_epochs.iter().rev().find_map(|epoch| *epoch)
     }
+}
+
+/// Temporary write-path timings for benchmark diagnosis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreWriteProfile {
+    /// Time spent blocked in the client-side bounded queue send.
+    pub queue_send: Duration,
+    /// Time from client submission until the writer starts the command, excluding `queue_send`.
+    pub queue_wait: Duration,
+    pub prepare_batch: Duration,
+    pub segment_capacity: Duration,
+    pub segment_append: Duration,
+    pub accounting_delta_append: Duration,
+    pub index_batch_commit: Duration,
+    pub rollover_post_commit: Duration,
+    pub accounting_nudge: Duration,
+    pub response_send: Duration,
+    pub writer_total: Duration,
+}
+
+/// Temporary sync-path timings for benchmark diagnosis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreSyncProfile {
+    /// Time spent blocked in the client-side bounded queue send.
+    pub queue_send: Duration,
+    /// Time from client submission until the writer starts the command, excluding `queue_send`.
+    pub queue_wait: Duration,
+    pub segment_sync: Duration,
+    pub accounting_delta_sync: Duration,
+    /// Includes durable segment state assembly, durable LSN computation, and batch construction.
+    pub durable_lsn_compute: Duration,
+    /// RocksDB batch commit with synchronous WAL durability.
+    pub index_batch_commit: Duration,
+    pub state_update: Duration,
+    pub accounting_nudge: Duration,
+    pub response_send: Duration,
+    pub writer_total: Duration,
+}
+
+#[cfg(feature = "internal-profiling")]
+pub trait StoreProfileSink: Send + Sync + std::fmt::Debug {
+    fn record_write(&self, profile: StoreWriteProfile);
+    fn record_sync(&self, profile: StoreSyncProfile);
+}
+
+impl ProfileRequest<StoreWriteProfile> {
+    fn begin(&self, started: Instant) -> Option<StoreWriteProfile> {
+        self.queue_wait(started)
+            .map(|queue_wait| StoreWriteProfile {
+                queue_wait,
+                ..StoreWriteProfile::default()
+            })
+    }
+}
+
+impl ProfileRequest<StoreSyncProfile> {
+    fn begin(&self, started: Instant) -> Option<StoreSyncProfile> {
+        self.queue_wait(started).map(|queue_wait| StoreSyncProfile {
+            queue_wait,
+            ..StoreSyncProfile::default()
+        })
+    }
+}
+
+fn profile_phase<P, T>(
+    profile: Option<&mut P>,
+    record_elapsed: impl FnOnce(&mut P, Duration),
+    action: impl FnOnce() -> T,
+) -> T {
+    let Some(profile) = profile else {
+        return action();
+    };
+
+    let started = Instant::now();
+    let result = action();
+    record_elapsed(profile, started.elapsed());
+    result
 }
 
 #[derive(Debug)]
@@ -1218,9 +1391,8 @@ impl WriteCoordinator {
                 WriteCommand::GcPublish(request) => {
                     self.process_gc_publish(request);
                 }
-                WriteCommand::Sync(response_tx) => {
-                    let result = self.sync_data();
-                    let _ = response_tx.send(result);
+                WriteCommand::Sync(request) => {
+                    self.process_sync(request);
                 }
                 WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
             }
@@ -1241,8 +1413,8 @@ impl WriteCoordinator {
             WriteCommand::GcPublish(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
-            WriteCommand::Sync(response_tx) => {
-                let _ = response_tx.send(Err(error));
+            WriteCommand::Sync(request) => {
+                let _ = request.response_tx.send(Err(error));
             }
             WriteCommand::Shutdown => {}
         }
@@ -1345,13 +1517,18 @@ impl WriteCoordinator {
     /// whether the batch committed or was rejected during validation. Recording during append would
     /// count a write as successful before the index commit that makes it visible.
     fn process_batch(&mut self, request: BatchWriteRequest) {
+        let BatchWriteRequest {
+            ops,
+            response_tx,
+            profile: profile_request,
+        } = request;
         let started = Instant::now();
-        let put_count = request
-            .ops
+        let put_count = ops
             .iter()
             .filter(|op| matches!(op, BatchOp::Put { .. }))
             .count();
-        match self.submit_batch(request) {
+        let mut profile = profile_request.begin(started);
+        match self.submit_batch(ops, response_tx, profile.as_mut()) {
             Ok((result, put_metrics)) => {
                 for metric in put_metrics {
                     self.metrics.record_put(Ok(metric), started.elapsed());
@@ -1369,6 +1546,31 @@ impl WriteCoordinator {
                 }
             }
         }
+        if let Some(mut profile) = profile {
+            profile.writer_total = started.elapsed();
+            profile_request.send(profile);
+        }
+    }
+
+    fn process_sync(&mut self, request: SyncRequest) {
+        let SyncRequest {
+            response_tx,
+            profile: profile_request,
+        } = request;
+        let started = Instant::now();
+        let mut profile = profile_request.begin(started);
+        let result = self.sync_data(profile.as_mut());
+        if let Some(profile) = profile.as_mut() {
+            profile.writer_total = started.elapsed();
+        }
+        let _ = profile_phase(
+            profile.as_mut(),
+            |profile, elapsed| profile.response_send = elapsed,
+            || response_tx.send(result),
+        );
+        if let Some(profile) = profile {
+            profile_request.send(profile);
+        }
     }
 
     /// Full write transaction for a batch: validate, reserve LSNs, append payload bytes, append
@@ -1380,19 +1582,32 @@ impl WriteCoordinator {
     /// published bytes or rollovers
     fn submit_batch(
         &mut self,
-        request: BatchWriteRequest,
+        ops: Vec<BatchOp>,
+        response_tx: mpsc::Sender<Result<BatchWriteResult>>,
+        mut profile: Option<&mut StoreWriteProfile>,
     ) -> std::result::Result<(BatchWriteResult, Vec<PutMetric>), ()> {
-        let response_tx = request.response_tx;
-        if request.ops.is_empty() {
+        if ops.is_empty() {
             let result = BatchWriteResult::default();
-            let _ = response_tx.send(Ok(result.clone()));
+            let _ = profile_phase(
+                profile.as_deref_mut(),
+                |profile, elapsed| profile.response_send += elapsed,
+                || response_tx.send(Ok(result.clone())),
+            );
             return Ok((result, Vec::new()));
         }
 
-        let mut prepared = match self.prepare_batch(request.ops) {
+        let mut prepared = match profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.prepare_batch += elapsed,
+            || self.prepare_batch(ops),
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = response_tx.send(Err(error));
+                let _ = profile_phase(
+                    profile.as_deref_mut(),
+                    |profile, elapsed| profile.response_send += elapsed,
+                    || response_tx.send(Err(error)),
+                );
                 return Err(());
             }
         };
@@ -1415,13 +1630,22 @@ impl WriteCoordinator {
                 continue;
             };
 
-            if let Err(error) = self.ensure_segment_capacity(*record_bytes) {
+            let capacity_result = profile_phase(
+                profile.as_deref_mut(),
+                |profile, elapsed| profile.segment_capacity += elapsed,
+                || self.ensure_segment_capacity(*record_bytes),
+            );
+            if let Err(error) = capacity_result {
                 match error {
                     error @ Error::Segment(
                         strata_segment::Error::SegmentFull { .. }
                         | strata_segment::Error::RangeOverflow,
                     ) => {
-                        let _ = response_tx.send(Err(error));
+                        let _ = profile_phase(
+                            profile.as_deref_mut(),
+                            |profile, elapsed| profile.response_send += elapsed,
+                            || response_tx.send(Err(error)),
+                        );
                         return Err(());
                     }
                     error => {
@@ -1431,18 +1655,25 @@ impl WriteCoordinator {
                             appended_records,
                             appended_bytes,
                         );
-                        let _ = response_tx.send(Err(error));
+                        let _ = profile_phase(
+                            profile.as_deref_mut(),
+                            |profile, elapsed| profile.response_send += elapsed,
+                            || response_tx.send(Err(error)),
+                        );
                         return Err(());
                     }
                 }
             }
 
-            let outcome = match self.active_writer.append_for_shard(
-                &*key,
-                *lsn,
-                *shard,
-                payload.as_ref(),
-            ) {
+            let append_result = profile_phase(
+                profile.as_deref_mut(),
+                |profile, elapsed| profile.segment_append += elapsed,
+                || {
+                    self.active_writer
+                        .append_for_shard(&*key, *lsn, *shard, payload.as_ref())
+                },
+            );
+            let outcome = match append_result {
                 Ok(outcome) => outcome,
                 Err(
                     error @ (strata_segment::Error::SegmentFull { .. }
@@ -1456,7 +1687,11 @@ impl WriteCoordinator {
                         appended_records,
                         appended_bytes,
                     );
-                    let _ = response_tx.send(Err(error));
+                    let _ = profile_phase(
+                        profile.as_deref_mut(),
+                        |profile, elapsed| profile.response_send += elapsed,
+                        || response_tx.send(Err(error)),
+                    );
                     return Err(());
                 }
                 Err(error) => {
@@ -1468,7 +1703,11 @@ impl WriteCoordinator {
                     if terminal {
                         self.halt_writer_error("segment append", &error);
                     }
-                    let _ = response_tx.send(Err(error));
+                    let _ = profile_phase(
+                        profile.as_deref_mut(),
+                        |profile, elapsed| profile.response_send += elapsed,
+                        || response_tx.send(Err(error)),
+                    );
                     return Err(());
                 }
             };
@@ -1495,36 +1734,64 @@ impl WriteCoordinator {
         }
 
         let pending_rollovers = self.take_pending_rollovers();
-        if let Err(error) = self.append_accounting_deltas(&prepared) {
+        let accounting_result = profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.accounting_delta_append += elapsed,
+            || self.append_accounting_deltas(&prepared),
+        );
+        if let Err(error) = accounting_result {
             self.halt_submit_batch_failure(
                 "accounting delta append",
                 &error,
                 appended_records,
                 appended_bytes,
             );
-            let _ = response_tx.send(Err(error));
+            let _ = profile_phase(
+                profile.as_deref_mut(),
+                |profile, elapsed| profile.response_send += elapsed,
+                || response_tx.send(Err(error)),
+            );
             return Err(());
         }
-        if let Err(error) = self.commit_write_batch(&pending_rollovers, &prepared) {
+        let commit_result = profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.index_batch_commit += elapsed,
+            || self.commit_write_batch(&pending_rollovers, &prepared),
+        );
+        if let Err(error) = commit_result {
             self.halt_submit_batch_failure(
                 "index batch commit",
                 &error,
                 appended_records,
                 appended_bytes,
             );
-            let _ = response_tx.send(Err(error));
+            let _ = profile_phase(
+                profile.as_deref_mut(),
+                |profile, elapsed| profile.response_send += elapsed,
+                || response_tx.send(Err(error)),
+            );
             return Err(());
         }
-        self.run_rollover_post_commit(pending_rollovers);
+        profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.rollover_post_commit += elapsed,
+            || self.run_rollover_post_commit(pending_rollovers),
+        );
         let force_accounting_nudge = prepared.result.last_epoch().is_some();
         if let Some(last_lsn) = prepared.result.last_lsn() {
-            accounting_nudge_action(
-                last_lsn,
-                self.config.accounting_unaccounted_threshold,
-                force_accounting_nudge,
-                self.accounting_tx.clone(),
-            )
-            .run();
+            profile_phase(
+                profile.as_deref_mut(),
+                |profile, elapsed| profile.accounting_nudge += elapsed,
+                || {
+                    accounting_nudge_action(
+                        last_lsn,
+                        self.config.accounting_unaccounted_threshold,
+                        force_accounting_nudge,
+                        self.accounting_tx.clone(),
+                    )
+                    .run()
+                },
+            );
         }
         self.metrics.set_active_segment(
             self.active_writer.segment_id(),
@@ -1532,7 +1799,11 @@ impl WriteCoordinator {
             self.durable_offset,
         );
         let result = prepared.result;
-        let _ = response_tx.send(Ok(result.clone()));
+        let _ = profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.response_send += elapsed,
+            || response_tx.send(Ok(result.clone())),
+        );
         Ok((result, put_metrics))
     }
 
@@ -2292,71 +2563,97 @@ impl WriteCoordinator {
     /// The durable LSN frontier itself is computed by walking unaccounted ops forward while their
     /// record bytes are covered by fsynced offsets (see `seal::compute_durable_lsn`), then clamped
     /// to the accounting delta log frontier.
-    fn sync_data(&mut self) -> Result<()> {
+    fn sync_data(&mut self, mut profile: Option<&mut StoreSyncProfile>) -> Result<()> {
         let started = Instant::now();
         let previous_durable_offset = self.durable_offset;
         let durable_offset = self.active_writer.write_offset();
-        if let Err(error) = self.active_writer.sync_data() {
+        let segment_sync_result = profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.segment_sync += elapsed,
+            || self.active_writer.sync_data(),
+        );
+        if let Err(error) = segment_sync_result {
             self.metrics.record_sync(Err(()), started.elapsed());
             return Err(error.into());
         }
-        if let Err(error) = self.active_accounting_delta_log.sync_data() {
+        let accounting_sync_result = profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.accounting_delta_sync += elapsed,
+            || self.active_accounting_delta_log.sync_data(),
+        );
+        if let Err(error) = accounting_sync_result {
             self.metrics.record_sync(Err(()), started.elapsed());
             return Err(error.into());
         }
 
-        let durable_lsn = {
-            let mut state = self.active_segment_state.clone();
-            if let Some(existing) = self
-                .index
-                .get_segment_state(self.active_writer.segment_id())?
-            {
-                state.volume_id = existing.volume_id;
-                state.path = existing.path;
-                state.placement_class = existing.placement_class;
-                state.state = existing.state;
-                state.min_lsn = existing.min_lsn;
-                state.max_lsn = existing.max_lsn;
-                state.sealed_len = existing.sealed_len;
-                state.sealed_sha256 = existing.sealed_sha256;
-            }
-            state.write_offset = self.active_writer.write_offset();
-            state.durable_offset = durable_offset;
-            let mut batch = self.index.batch();
-            self.index.put_segment_state_batch(&mut batch, &state)?;
-            let current_durable_lsn = self.index.get_durable_lsn()?;
-            let mut active_delta_state = self.active_accounting_delta_log.state();
-            active_delta_state.durable_lsn =
-                active_delta_state.durable_lsn.max(current_durable_lsn);
-            let durable_lsn = durable_lsn_with_accounting_frontier(
-                &self.index,
-                Some(&state),
-                Some(active_delta_state),
-            )?;
-            self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
-            self.index
-                .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
-            if let Err(error) = batch
-                .write_with_sync(true)
-                .map_err(strata_index::Error::from)
-            {
-                let error = Error::from(error);
-                self.metrics.record_sync(Err(()), started.elapsed());
-                self.halt_writer_error("sync metadata commit", &error);
-                return Err(error);
-            }
-            self.active_segment_state = state;
-            durable_lsn
-        };
-        self.index.set_blob_compact_safe_lsn(durable_lsn);
-        self.durable_offset = durable_offset;
-        self.active_segment_state.durable_offset = durable_offset;
-        self.metrics.set_active_segment(
-            self.active_writer.segment_id(),
-            self.active_writer.write_offset(),
-            self.durable_offset,
+        let (state, batch, durable_lsn) = profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.durable_lsn_compute += elapsed,
+            || {
+                let mut state = self.active_segment_state.clone();
+                if let Some(existing) = self
+                    .index
+                    .get_segment_state(self.active_writer.segment_id())?
+                {
+                    state.volume_id = existing.volume_id;
+                    state.path = existing.path;
+                    state.placement_class = existing.placement_class;
+                    state.state = existing.state;
+                    state.min_lsn = existing.min_lsn;
+                    state.max_lsn = existing.max_lsn;
+                    state.sealed_len = existing.sealed_len;
+                    state.sealed_sha256 = existing.sealed_sha256;
+                }
+                state.write_offset = self.active_writer.write_offset();
+                state.durable_offset = durable_offset;
+                let mut batch = self.index.batch();
+                self.index.put_segment_state_batch(&mut batch, &state)?;
+                let current_durable_lsn = self.index.get_durable_lsn()?;
+                let mut active_delta_state = self.active_accounting_delta_log.state();
+                active_delta_state.durable_lsn =
+                    active_delta_state.durable_lsn.max(current_durable_lsn);
+                let durable_lsn = durable_lsn_with_accounting_frontier(
+                    &self.index,
+                    Some(&state),
+                    Some(active_delta_state),
+                )?;
+                self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
+                self.index
+                    .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+                Ok::<_, Error>((state, batch, durable_lsn))
+            },
+        )?;
+        let commit_result = profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.index_batch_commit += elapsed,
+            || {
+                batch
+                    .write_with_sync(true)
+                    .map_err(strata_index::Error::from)
+            },
         );
-        self.metrics.set_durable_lsn(durable_lsn);
+        if let Err(error) = commit_result {
+            let error = Error::from(error);
+            self.metrics.record_sync(Err(()), started.elapsed());
+            self.halt_writer_error("sync metadata commit", &error);
+            return Err(error);
+        }
+        self.active_segment_state = state;
+        profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.state_update += elapsed,
+            || {
+                self.index.set_blob_compact_safe_lsn(durable_lsn);
+                self.durable_offset = durable_offset;
+                self.active_segment_state.durable_offset = durable_offset;
+                self.metrics.set_active_segment(
+                    self.active_writer.segment_id(),
+                    self.active_writer.write_offset(),
+                    self.durable_offset,
+                );
+                self.metrics.set_durable_lsn(durable_lsn);
+            },
+        );
         self.metrics.record_sync(
             Ok(durable_offset.saturating_sub(previous_durable_offset)),
             started.elapsed(),
@@ -2365,7 +2662,11 @@ impl WriteCoordinator {
             started.elapsed(),
             durable_offset.saturating_sub(previous_durable_offset),
         );
-        self.nudge_accounting();
+        profile_phase(
+            profile.as_deref_mut(),
+            |profile, elapsed| profile.accounting_nudge += elapsed,
+            || self.nudge_accounting(),
+        );
         Ok(())
     }
 

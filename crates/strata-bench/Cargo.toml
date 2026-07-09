@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 default-run = "strata-bench"
 
+[features]
+default = ["internal-profiling"]
+internal-profiling = ["strata-store/internal-profiling"]
+
 [dependencies]
 rocksdb.workspace = true
 strata-core.workspace = true

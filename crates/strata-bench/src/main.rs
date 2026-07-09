@@ -18,16 +18,18 @@
 //! The benchmark is not part of the storage protocol. It should keep using public crate APIs so
 //! benchmark results reflect what callers can actually exercise.
 
+#[cfg(feature = "internal-profiling")]
+use std::sync::Mutex;
 use std::{
     env, fs, hint,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rocksdb::{DB, Options};
-use strata_core::{BlobKey, Epoch, PlacementClass};
+use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
 use strata_segment::SegmentWriter;
 use strata_store::{
     DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
@@ -42,6 +44,8 @@ use strata_store::{
     DEFAULT_SEGMENT_MAX_BYTES, GcPlannerConfig, ReadOptions, SealedSegmentIntegrityPolicy,
     StoreGetProfile, StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
+#[cfg(feature = "internal-profiling")]
+use strata_store::{StoreProfileSink, StoreSyncProfile, StoreWriteProfile};
 
 const DEFAULT_NAMESPACE: &str = "default";
 const DEFAULT_PAYLOAD_SIZE: usize = 1 << 20;
@@ -180,6 +184,7 @@ struct Config {
     rocksdb_min_blob_size: u64,
     rocksdb_blob_file_size: u64,
     rocksdb_blob_gc: bool,
+    rocksdb_disable_auto_compactions: bool,
     sync_every: usize,
     keep_data: bool,
     root_was_defaulted: bool,
@@ -206,6 +211,7 @@ impl Config {
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
             rocksdb_blob_gc: true,
+            rocksdb_disable_auto_compactions: false,
             sync_every: 0,
             keep_data: false,
             root_was_defaulted: true,
@@ -271,6 +277,12 @@ impl Config {
                 "--rocksdb-blob-gc" => {
                     config.rocksdb_blob_gc =
                         parse_bool(&next_value(&mut args, "--rocksdb-blob-gc")?)?
+                }
+                "--rocksdb-disable-auto-compactions" => {
+                    config.rocksdb_disable_auto_compactions = parse_bool(&next_value(
+                        &mut args,
+                        "--rocksdb-disable-auto-compactions",
+                    )?)?
                 }
                 "--sync-every" => {
                     config.sync_every = parse_usize(&next_value(&mut args, "--sync-every")?)?
@@ -371,6 +383,159 @@ impl StoreGetProfileSummary {
     }
 }
 
+#[derive(Debug)]
+struct PhaseTimings {
+    primary_name: &'static str,
+    primary: Vec<Duration>,
+    sync: Vec<Duration>,
+}
+
+impl PhaseTimings {
+    fn new(primary_name: &'static str, capacity: usize) -> Self {
+        Self {
+            primary_name,
+            primary: Vec::with_capacity(capacity),
+            sync: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PathSummary {
+    bytes: u64,
+    file_count: u64,
+    directory_count: u64,
+    data_file_count: u64,
+    sst_file_count: u64,
+    blob_file_count: u64,
+    log_file_count: u64,
+    manifest_file_count: u64,
+}
+
+#[cfg(feature = "internal-profiling")]
+#[derive(Debug, Default, Clone, Copy)]
+struct StoreWriteProfileSummary {
+    count: usize,
+    queue_send: Duration,
+    queue_wait: Duration,
+    prepare_batch: Duration,
+    segment_capacity: Duration,
+    segment_append: Duration,
+    accounting_delta_append: Duration,
+    index_batch_commit: Duration,
+    rollover_post_commit: Duration,
+    accounting_nudge: Duration,
+    response_send: Duration,
+    writer_total: Duration,
+}
+
+#[cfg(feature = "internal-profiling")]
+impl StoreWriteProfileSummary {
+    fn add(&mut self, profile: StoreWriteProfile) {
+        self.count += 1;
+        self.queue_send += profile.queue_send;
+        self.queue_wait += profile.queue_wait;
+        self.prepare_batch += profile.prepare_batch;
+        self.segment_capacity += profile.segment_capacity;
+        self.segment_append += profile.segment_append;
+        self.accounting_delta_append += profile.accounting_delta_append;
+        self.index_batch_commit += profile.index_batch_commit;
+        self.rollover_post_commit += profile.rollover_post_commit;
+        self.accounting_nudge += profile.accounting_nudge;
+        self.response_send += profile.response_send;
+        self.writer_total += profile.writer_total;
+    }
+}
+
+#[cfg(feature = "internal-profiling")]
+#[derive(Debug, Default, Clone, Copy)]
+struct StoreSyncProfileSummary {
+    count: usize,
+    queue_send: Duration,
+    queue_wait: Duration,
+    segment_sync: Duration,
+    accounting_delta_sync: Duration,
+    durable_lsn_compute: Duration,
+    index_batch_commit: Duration,
+    state_update: Duration,
+    accounting_nudge: Duration,
+    response_send: Duration,
+    writer_total: Duration,
+}
+
+#[cfg(feature = "internal-profiling")]
+impl StoreSyncProfileSummary {
+    fn add(&mut self, profile: StoreSyncProfile) {
+        self.count += 1;
+        self.queue_send += profile.queue_send;
+        self.queue_wait += profile.queue_wait;
+        self.segment_sync += profile.segment_sync;
+        self.accounting_delta_sync += profile.accounting_delta_sync;
+        self.durable_lsn_compute += profile.durable_lsn_compute;
+        self.index_batch_commit += profile.index_batch_commit;
+        self.state_update += profile.state_update;
+        self.accounting_nudge += profile.accounting_nudge;
+        self.response_send += profile.response_send;
+        self.writer_total += profile.writer_total;
+    }
+}
+
+#[cfg(feature = "internal-profiling")]
+#[derive(Debug, Default)]
+struct BenchProfileSink {
+    write: Mutex<StoreWriteProfileSummary>,
+    sync: Mutex<StoreSyncProfileSummary>,
+}
+
+#[cfg(feature = "internal-profiling")]
+impl BenchProfileSink {
+    fn write_summary(&self) -> StoreWriteProfileSummary {
+        *self.write.lock().expect("write profile lock poisoned")
+    }
+
+    fn sync_summary(&self) -> StoreSyncProfileSummary {
+        *self.sync.lock().expect("sync profile lock poisoned")
+    }
+}
+
+#[cfg(feature = "internal-profiling")]
+impl StoreProfileSink for BenchProfileSink {
+    fn record_write(&self, profile: StoreWriteProfile) {
+        self.write
+            .lock()
+            .expect("write profile lock poisoned")
+            .add(profile);
+    }
+
+    fn record_sync(&self, profile: StoreSyncProfile) {
+        self.sync
+            .lock()
+            .expect("sync profile lock poisoned")
+            .add(profile);
+    }
+}
+
+#[cfg(feature = "internal-profiling")]
+type ProfileCapture = Arc<BenchProfileSink>;
+
+#[cfg(not(feature = "internal-profiling"))]
+#[derive(Debug, Default)]
+struct ProfileCapture;
+
+#[cfg(feature = "internal-profiling")]
+fn metrics_with_profile_capture() -> (StrataStoreMetrics, ProfileCapture) {
+    let capture = Arc::new(BenchProfileSink::default());
+    (
+        StrataStoreMetrics::default().with_profile_sink(capture.clone()),
+        capture,
+    )
+}
+
+#[cfg(not(feature = "internal-profiling"))]
+fn metrics_with_profile_capture() -> (StrataStoreMetrics, ProfileCapture) {
+    (StrataStoreMetrics::default(), ProfileCapture)
+}
+
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.root_dir.exists() {
         fs::remove_dir_all(&config.root_dir)?;
@@ -404,61 +569,111 @@ fn run_segment_append(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         config.segment_max_bytes,
     )?;
     let mut timings = Vec::with_capacity(config.ops);
+    let mut phases = PhaseTimings::new("append", config.ops);
     let started = Instant::now();
 
     for op in 0..config.ops {
         let key = bench_key(key_prefix, op)?;
         let op_started = Instant::now();
+        let phase_started = Instant::now();
         let record_ref = writer.append(&key, 0, &payload)?.record_ref;
+        phases.primary.push(phase_started.elapsed());
         hint::black_box(record_ref);
-        record_sync(config.sync_every, op + 1, || writer.sync_data())?;
+        if let Some(sync_elapsed) =
+            record_sync_timed(config.sync_every, op + 1, || writer.sync_data())?
+        {
+            phases.sync.push(sync_elapsed);
+        }
         timings.push(op_started.elapsed());
     }
 
     let elapsed = started.elapsed();
-    print_report(config, elapsed, &timings, None);
+    print_report(
+        config,
+        elapsed,
+        &timings,
+        None,
+        Some(&phases),
+        None,
+        None,
+        None,
+    )?;
     Ok(())
 }
 
 fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
     let store_config = config.store_config();
-    let store = StrataStore::open(store_config, StrataStoreMetrics::default())?;
+    let (metrics, profile_capture) = metrics_with_profile_capture();
+    let store = StrataStore::open(store_config, metrics)?;
     let mut timings = Vec::with_capacity(config.ops);
+    let mut phases = PhaseTimings::new("store_put", config.ops);
     let started = Instant::now();
 
     for op in 0..config.ops {
         let key = bench_key(b"store-key-", op)?;
         let op_started = Instant::now();
+        let phase_started = Instant::now();
         let lsn = store.put(0, &key, &payload)?;
+        phases.primary.push(phase_started.elapsed());
         hint::black_box(lsn);
-        record_sync(config.sync_every, op + 1, || store.sync())?;
+        if should_sync(config.sync_every, op + 1) {
+            let phase_started = Instant::now();
+            store.sync()?;
+            phases.sync.push(phase_started.elapsed());
+        }
         timings.push(op_started.elapsed());
     }
 
     let elapsed = started.elapsed();
-    print_report(config, elapsed, &timings, None);
+    print_report(
+        config,
+        elapsed,
+        &timings,
+        None,
+        Some(&phases),
+        Some(&store),
+        None,
+        Some(&profile_capture),
+    )?;
     Ok(())
 }
 
 fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload: Arc<[u8]> = Arc::from(payload(config.payload_size));
     let store_config = config.store_config();
-    let store = StrataStore::open(store_config, StrataStoreMetrics::default())?;
+    let (metrics, profile_capture) = metrics_with_profile_capture();
+    let store = StrataStore::open(store_config, metrics)?;
     let mut timings = Vec::with_capacity(config.ops);
+    let mut phases = PhaseTimings::new("store_put_arc", config.ops);
     let started = Instant::now();
 
     for op in 0..config.ops {
         let key = bench_key(b"store-key-", op)?;
         let op_started = Instant::now();
+        let phase_started = Instant::now();
         let lsn = store.put_arc(0, key, payload.clone())?;
+        phases.primary.push(phase_started.elapsed());
         hint::black_box(lsn);
-        record_sync(config.sync_every, op + 1, || store.sync())?;
+        if should_sync(config.sync_every, op + 1) {
+            let phase_started = Instant::now();
+            store.sync()?;
+            phases.sync.push(phase_started.elapsed());
+        }
         timings.push(op_started.elapsed());
     }
 
     let elapsed = started.elapsed();
-    print_report(config, elapsed, &timings, None);
+    print_report(
+        config,
+        elapsed,
+        &timings,
+        None,
+        Some(&phases),
+        Some(&store),
+        None,
+        Some(&profile_capture),
+    )?;
     Ok(())
 }
 
@@ -477,6 +692,7 @@ fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     store.sync()?;
 
     let mut timings = Vec::with_capacity(config.ops);
+    let mut phases = PhaseTimings::new("store_get", config.ops);
     let mut profile_summary = config
         .store_get_profile
         .then(StoreGetProfileSummary::default);
@@ -489,12 +705,14 @@ fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     for key_index in key_indexes.take(config.ops) {
         let key = &keys[key_index];
         let op_started = Instant::now();
+        let phase_started = Instant::now();
         match config.store_get_mode {
             StoreGetMode::Payload => {
                 if let Some(profile_summary) = &mut profile_summary {
                     let (value, profile) =
                         store.get_blob_profiled_with_options(key, read_options)?;
                     hint::black_box(value.as_deref());
+                    phases.primary.push(phase_started.elapsed());
                     let op_elapsed = op_started.elapsed();
                     profile_summary.add(op_elapsed, profile);
                     timings.push(op_elapsed);
@@ -509,11 +727,21 @@ fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 hint::black_box(exists);
             }
         }
+        phases.primary.push(phase_started.elapsed());
         timings.push(op_started.elapsed());
     }
 
     let elapsed = started.elapsed();
-    print_report(config, elapsed, &timings, profile_summary.as_ref());
+    print_report(
+        config,
+        elapsed,
+        &timings,
+        profile_summary.as_ref(),
+        Some(&phases),
+        Some(&store),
+        None,
+        None,
+    )?;
     Ok(())
 }
 
@@ -521,18 +749,34 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
     let payload = payload(config.payload_size);
     let db = open_rocksdb_blobdb(config)?;
     let mut timings = Vec::with_capacity(config.ops);
+    let mut phases = PhaseTimings::new("rocksdb_put", config.ops);
     let started = Instant::now();
 
     for op in 0..config.ops {
         let key = bench_key(b"rocksdb-key-", op)?;
         let op_started = Instant::now();
+        let phase_started = Instant::now();
         db.put(key.as_bytes(), &payload)?;
-        record_sync(config.sync_every, op + 1, || db.flush_wal(true))?;
+        phases.primary.push(phase_started.elapsed());
+        if let Some(sync_elapsed) =
+            record_sync_timed(config.sync_every, op + 1, || db.flush_wal(true))?
+        {
+            phases.sync.push(sync_elapsed);
+        }
         timings.push(op_started.elapsed());
     }
 
     let elapsed = started.elapsed();
-    print_report(config, elapsed, &timings, None);
+    print_report(
+        config,
+        elapsed,
+        &timings,
+        None,
+        Some(&phases),
+        None,
+        Some(&db),
+        None,
+    )?;
     Ok(())
 }
 
@@ -550,19 +794,31 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
     db.flush_wal(true)?;
 
     let mut timings = Vec::with_capacity(config.ops);
+    let mut phases = PhaseTimings::new("rocksdb_get", config.ops);
     let started = Instant::now();
     let key_indexes = ReadKeySequence::new(config.read_pattern, keys.len(), config.read_seed);
 
     for key_index in key_indexes.take(config.ops) {
         let key = &keys[key_index];
         let op_started = Instant::now();
+        let phase_started = Instant::now();
         let value = db.get(key.as_bytes())?;
+        phases.primary.push(phase_started.elapsed());
         hint::black_box(value.as_deref());
         timings.push(op_started.elapsed());
     }
 
     let elapsed = started.elapsed();
-    print_report(config, elapsed, &timings, None);
+    print_report(
+        config,
+        elapsed,
+        &timings,
+        None,
+        Some(&phases),
+        None,
+        Some(&db),
+        None,
+    )?;
     Ok(())
 }
 
@@ -573,18 +829,25 @@ fn open_rocksdb_blobdb(config: &Config) -> Result<DB, rocksdb::Error> {
     options.set_min_blob_size(config.rocksdb_min_blob_size);
     options.set_blob_file_size(config.rocksdb_blob_file_size);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
+    options.set_disable_auto_compactions(config.rocksdb_disable_auto_compactions);
     DB::open(&options, config.root_dir.join("rocksdb-blobdb"))
 }
 
-fn record_sync<E>(
+fn record_sync_timed<E>(
     sync_every: usize,
     completed_ops: usize,
     sync: impl FnOnce() -> Result<(), E>,
-) -> Result<(), E> {
+) -> Result<Option<Duration>, E> {
     if sync_every != 0 && completed_ops.is_multiple_of(sync_every) {
+        let started = Instant::now();
         sync()?;
+        return Ok(Some(started.elapsed()));
     }
-    Ok(())
+    Ok(None)
+}
+
+fn should_sync(sync_every: usize, completed_ops: usize) -> bool {
+    sync_every != 0 && completed_ops.is_multiple_of(sync_every)
 }
 
 fn print_report(
@@ -592,13 +855,20 @@ fn print_report(
     elapsed: Duration,
     timings: &[Duration],
     profile: Option<&StoreGetProfileSummary>,
-) {
+    phases: Option<&PhaseTimings>,
+    store: Option<&StrataStore>,
+    rocksdb: Option<&DB>,
+    profile_capture: Option<&ProfileCapture>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut sorted = timings.to_vec();
     sorted.sort_unstable();
 
     let ops = timings.len() as f64;
     let elapsed_secs = elapsed.as_secs_f64();
-    let payload_mib = (config.payload_size as f64 * ops) / 1_048_576.0;
+    let measured_payload_bytes = measured_logical_payload_bytes(config, timings.len());
+    let database_payload_bytes = database_logical_payload_bytes(config, timings.len());
+    let payload_mib = measured_payload_bytes as f64 / 1_048_576.0;
+    let root_summary = summarize_path_if_exists(&config.root_dir)?;
 
     println!("case={}", config.case.as_str());
     println!("root={}", config.root_dir.display());
@@ -614,6 +884,8 @@ fn print_report(
         "store_get_verify_checksum={}",
         config.store_get_verify_checksum
     );
+    println!("measured_logical_payload_bytes={measured_payload_bytes}");
+    println!("database_logical_payload_bytes={database_payload_bytes}");
     println!("elapsed_ms={:.3}", elapsed_secs * 1000.0);
     println!("ops_per_sec={:.3}", ops / elapsed_secs);
     println!("payload_mib_per_sec={:.3}", payload_mib / elapsed_secs);
@@ -621,6 +893,7 @@ fn print_report(
     println!("p50_us={:.3}", percentile_us(&sorted, 50.0));
     println!("p95_us={:.3}", percentile_us(&sorted, 95.0));
     println!("p99_us={:.3}", percentile_us(&sorted, 99.0));
+    println!("p999_us={:.3}", percentile_us(&sorted, 99.9));
     println!("max_us={:.3}", sorted.last().map_or(0.0, duration_us));
     println!("sync_every={}", config.sync_every);
     println!("queue_capacity={}", config.queue_capacity);
@@ -629,11 +902,455 @@ fn print_report(
     println!("rocksdb_min_blob_size={}", config.rocksdb_min_blob_size);
     println!("rocksdb_blob_file_size={}", config.rocksdb_blob_file_size);
     println!("rocksdb_blob_gc={}", config.rocksdb_blob_gc);
+    println!(
+        "rocksdb_disable_auto_compactions={}",
+        config.rocksdb_disable_auto_compactions
+    );
+    println!("final_directory_bytes={}", root_summary.bytes);
+    print_ratio(
+        "final_bytes_per_database_payload_byte",
+        root_summary.bytes,
+        database_payload_bytes,
+    );
+    print_path_summary("filesystem_root", &root_summary);
+    print_layout_metrics(config)?;
 
     if let Some(profile) = profile {
         print_store_get_profile(profile);
     }
+    if let Some(phases) = phases {
+        print_timing_summary(&format!("phase_{}", phases.primary_name), &phases.primary);
+        print_timing_summary("phase_sync", &phases.sync);
+    }
+    if let Some(store) = store {
+        print_strata_store_metrics(store);
+    }
+    if let Some(db) = rocksdb {
+        print_rocksdb_metrics(db);
+    }
+    if let Some(profile_capture) = profile_capture {
+        print_profile_capture(profile_capture);
+    }
+
+    Ok(())
 }
+
+fn measured_logical_payload_bytes(config: &Config, measured_ops: usize) -> u128 {
+    let payload_ops = match config.case {
+        BenchCase::SegmentAppend
+        | BenchCase::StorePut
+        | BenchCase::StorePutArc
+        | BenchCase::RocksDbBlobDbPut
+        | BenchCase::RocksDbBlobDbGet => measured_ops,
+        BenchCase::StoreGet => match config.store_get_mode {
+            StoreGetMode::Payload => measured_ops,
+            StoreGetMode::KeyOnly => 0,
+        },
+    };
+    payload_bytes(config, payload_ops)
+}
+
+fn database_logical_payload_bytes(config: &Config, measured_ops: usize) -> u128 {
+    let stored_payload_ops = match config.case {
+        BenchCase::SegmentAppend
+        | BenchCase::StorePut
+        | BenchCase::StorePutArc
+        | BenchCase::RocksDbBlobDbPut => measured_ops,
+        BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet => {
+            config.read_set_size.min(config.ops.max(1))
+        }
+    };
+    payload_bytes(config, stored_payload_ops)
+}
+
+fn payload_bytes(config: &Config, ops: usize) -> u128 {
+    config.payload_size as u128 * ops as u128
+}
+
+fn print_ratio(name: &str, numerator: u64, denominator: u128) {
+    if denominator == 0 {
+        println!("{name}=0.000000");
+        return;
+    }
+    println!("{name}={:.6}", numerator as f64 / denominator as f64);
+}
+
+fn print_layout_metrics(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let store_config = config.store_config();
+    print_path_summary(
+        "strata_namespace",
+        &summarize_path_if_exists(&store_config.namespace_dir())?,
+    );
+    print_path_summary(
+        "strata_ingest",
+        &summarize_path_if_exists(&store_config.ingest_dir())?,
+    );
+    print_path_summary(
+        "strata_index",
+        &summarize_path_if_exists(&store_config.standalone_index_dir())?,
+    );
+    let accounting_summary = summarize_path_if_exists(&store_config.accounting_index_dir())?;
+    print_path_summary("strata_accounting_index", &accounting_summary);
+    println!(
+        "strata_accounting_active_delta_log_bytes={}",
+        file_len_if_exists(&store_config.accounting_index_dir().join("active-delta.log"))?
+    );
+    print_path_summary(
+        "rocksdb_blobdb_dir",
+        &summarize_path_if_exists(&config.root_dir.join("rocksdb-blobdb"))?,
+    );
+    Ok(())
+}
+
+fn print_path_summary(prefix: &str, summary: &PathSummary) {
+    println!("{prefix}_bytes={}", summary.bytes);
+    println!("{prefix}_file_count={}", summary.file_count);
+    println!("{prefix}_directory_count={}", summary.directory_count);
+    println!("{prefix}_data_file_count={}", summary.data_file_count);
+    println!("{prefix}_sst_file_count={}", summary.sst_file_count);
+    println!("{prefix}_blob_file_count={}", summary.blob_file_count);
+    println!("{prefix}_log_file_count={}", summary.log_file_count);
+    println!(
+        "{prefix}_manifest_file_count={}",
+        summary.manifest_file_count
+    );
+}
+
+fn summarize_path_if_exists(path: &Path) -> std::io::Result<PathSummary> {
+    if !path.exists() {
+        return Ok(PathSummary::default());
+    }
+    summarize_path(path)
+}
+
+fn summarize_path(path: &Path) -> std::io::Result<PathSummary> {
+    let metadata = fs::symlink_metadata(path)?;
+    let mut summary = PathSummary::default();
+    if metadata.is_file() {
+        add_file_to_summary(path, metadata.len(), &mut summary);
+        return Ok(summary);
+    }
+    if !metadata.is_dir() {
+        return Ok(summary);
+    }
+
+    summary.directory_count += 1;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child_summary = summarize_path(&entry.path())?;
+        summary.bytes = summary.bytes.saturating_add(child_summary.bytes);
+        summary.file_count = summary.file_count.saturating_add(child_summary.file_count);
+        summary.directory_count = summary
+            .directory_count
+            .saturating_add(child_summary.directory_count);
+        summary.data_file_count = summary
+            .data_file_count
+            .saturating_add(child_summary.data_file_count);
+        summary.sst_file_count = summary
+            .sst_file_count
+            .saturating_add(child_summary.sst_file_count);
+        summary.blob_file_count = summary
+            .blob_file_count
+            .saturating_add(child_summary.blob_file_count);
+        summary.log_file_count = summary
+            .log_file_count
+            .saturating_add(child_summary.log_file_count);
+        summary.manifest_file_count = summary
+            .manifest_file_count
+            .saturating_add(child_summary.manifest_file_count);
+    }
+    Ok(summary)
+}
+
+fn add_file_to_summary(path: &Path, len: u64, summary: &mut PathSummary) {
+    summary.bytes = summary.bytes.saturating_add(len);
+    summary.file_count += 1;
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("data") => summary.data_file_count += 1,
+        Some("sst") => summary.sst_file_count += 1,
+        Some("blob") => summary.blob_file_count += 1,
+        Some("log") => summary.log_file_count += 1,
+        _ => {}
+    }
+    if path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.starts_with("MANIFEST-"))
+    {
+        summary.manifest_file_count += 1;
+    }
+}
+
+fn file_len_if_exists(path: &Path) -> std::io::Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(fs::metadata(path)?.len())
+}
+
+fn print_timing_summary(prefix: &str, timings: &[Duration]) {
+    let mut sorted = timings.to_vec();
+    sorted.sort_unstable();
+    let count = sorted.len();
+    let total_us = timings.iter().map(duration_us).sum::<f64>();
+    let avg_us = if count == 0 {
+        0.0
+    } else {
+        total_us / count as f64
+    };
+    println!("{prefix}_count={count}");
+    println!("{prefix}_total_us={total_us:.3}");
+    println!("{prefix}_avg_us={avg_us:.3}");
+    println!("{prefix}_p50_us={:.3}", percentile_us(&sorted, 50.0));
+    println!("{prefix}_p95_us={:.3}", percentile_us(&sorted, 95.0));
+    println!("{prefix}_p99_us={:.3}", percentile_us(&sorted, 99.0));
+    println!("{prefix}_p999_us={:.3}", percentile_us(&sorted, 99.9));
+    println!(
+        "{prefix}_max_us={:.3}",
+        sorted.last().map_or(0.0, duration_us)
+    );
+}
+
+fn print_strata_store_metrics(store: &StrataStore) {
+    let store_config = store.config();
+    println!("strata_accounting_enabled=true");
+    println!("strata_gc_enabled=true");
+    println!(
+        "strata_accounting_interval_ms={:.3}",
+        store_config.accounting_interval.as_secs_f64() * 1000.0
+    );
+    println!(
+        "strata_gc_interval_ms={:.3}",
+        store_config.gc_interval.as_secs_f64() * 1000.0
+    );
+    println!("strata_gc_worker_count={}", store_config.gc_worker_count);
+    println!(
+        "strata_gc_active_worker_limit={}",
+        store.gc_active_worker_limit()
+    );
+    println!(
+        "strata_gc_configured_io_bytes_per_sec={}",
+        store_config.gc_io_bytes_per_sec
+    );
+    println!(
+        "strata_gc_active_io_bytes_per_sec={}",
+        store.gc_active_io_bytes_per_sec()
+    );
+
+    match (store.durable_lsn(), store.accounted_lsn()) {
+        (Ok(durable_lsn), Ok(accounted_lsn)) => {
+            println!("strata_durable_lsn={durable_lsn}");
+            println!("strata_accounted_lsn={accounted_lsn}");
+            println!(
+                "strata_accounting_lag_lsn={}",
+                durable_lsn.saturating_sub(accounted_lsn)
+            );
+        }
+        (durable, accounted) => {
+            println!(
+                "strata_lsn_metrics_error={}",
+                sanitize_property_value(&format!("{durable:?}/{accounted:?}"))
+            );
+        }
+    }
+
+    match store.index().iter_segment_states() {
+        Ok(segment_states) => print_strata_segment_state_metrics(&segment_states),
+        Err(error) => println!(
+            "strata_segment_state_metrics_error={}",
+            sanitize_property_value(&error.to_string())
+        ),
+    }
+}
+
+fn print_strata_segment_state_metrics(
+    segment_states: &[(strata_core::SegmentId, strata_core::SegmentState)],
+) {
+    let mut open_count = 0_u64;
+    let mut sealing_count = 0_u64;
+    let mut sealed_count = 0_u64;
+    let mut deleted_count = 0_u64;
+    let mut pending_gc_output_count = 0_u64;
+    let mut write_offset_bytes = 0_u64;
+    let mut durable_offset_bytes = 0_u64;
+    let mut sealed_len_bytes = 0_u64;
+    let mut active_segment_write_offset = 0_u64;
+
+    for (_, state) in segment_states {
+        write_offset_bytes = write_offset_bytes.saturating_add(state.write_offset);
+        durable_offset_bytes = durable_offset_bytes.saturating_add(state.durable_offset);
+        sealed_len_bytes = sealed_len_bytes.saturating_add(state.sealed_len.unwrap_or(0));
+        match state.state {
+            SegmentFileState::Open => {
+                open_count += 1;
+                active_segment_write_offset = active_segment_write_offset.max(state.write_offset);
+            }
+            SegmentFileState::Sealing => sealing_count += 1,
+            SegmentFileState::Sealed => sealed_count += 1,
+            SegmentFileState::Deleted => deleted_count += 1,
+            SegmentFileState::PendingGcOutput => pending_gc_output_count += 1,
+        }
+    }
+
+    println!("strata_segment_state_count={}", segment_states.len());
+    println!(
+        "strata_segment_rollover_count_estimate={}",
+        segment_states.len().saturating_sub(1)
+    );
+    println!("strata_segment_open_count={open_count}");
+    println!("strata_segment_sealing_count={sealing_count}");
+    println!("strata_segment_sealed_count={sealed_count}");
+    println!("strata_segment_deleted_count={deleted_count}");
+    println!("strata_segment_pending_gc_output_count={pending_gc_output_count}");
+    println!("strata_segment_write_offset_bytes={write_offset_bytes}");
+    println!("strata_segment_durable_offset_bytes={durable_offset_bytes}");
+    println!("strata_segment_sealed_len_bytes={sealed_len_bytes}");
+    println!("strata_active_segment_write_offset_bytes={active_segment_write_offset}");
+}
+
+fn print_rocksdb_metrics(db: &DB) {
+    match db.live_files() {
+        Ok(live_files) => {
+            let live_sst_file_bytes = live_files.iter().map(|file| file.size as u64).sum::<u64>();
+            let live_sst_l0_file_count = live_files.iter().filter(|file| file.level == 0).count();
+            println!("rocksdb_live_sst_file_count={}", live_files.len());
+            println!("rocksdb_live_sst_file_bytes={live_sst_file_bytes}");
+            println!("rocksdb_live_sst_l0_file_count={live_sst_l0_file_count}");
+        }
+        Err(error) => println!(
+            "rocksdb_live_files_error={}",
+            sanitize_property_value(&error.to_string())
+        ),
+    }
+
+    for (label, property_name) in ROCKSDB_INT_PROPERTIES {
+        print_rocksdb_int_property(db, label, property_name);
+    }
+    for (label, property_name) in ROCKSDB_STRING_PROPERTIES {
+        print_rocksdb_string_property(db, label, property_name);
+    }
+}
+
+fn print_rocksdb_int_property(db: &DB, label: &str, property_name: &str) {
+    match db.property_int_value(property_name) {
+        Ok(Some(value)) => println!("{label}={value}"),
+        Ok(None) => println!("{label}=unavailable"),
+        Err(error) => println!(
+            "{label}=error:{}",
+            sanitize_property_value(&error.to_string())
+        ),
+    }
+}
+
+fn print_rocksdb_string_property(db: &DB, label: &str, property_name: &str) {
+    match db.property_value(property_name) {
+        Ok(Some(value)) => println!("{label}={}", sanitize_property_value(&value)),
+        Ok(None) => println!("{label}=unavailable"),
+        Err(error) => println!(
+            "{label}=error:{}",
+            sanitize_property_value(&error.to_string())
+        ),
+    }
+}
+
+fn sanitize_property_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+const ROCKSDB_INT_PROPERTIES: &[(&str, &str)] = &[
+    (
+        "rocksdb_property_cur_size_active_mem_table",
+        "rocksdb.cur-size-active-mem-table",
+    ),
+    (
+        "rocksdb_property_cur_size_all_mem_tables",
+        "rocksdb.cur-size-all-mem-tables",
+    ),
+    (
+        "rocksdb_property_size_all_mem_tables",
+        "rocksdb.size-all-mem-tables",
+    ),
+    (
+        "rocksdb_property_num_entries_active_mem_table",
+        "rocksdb.num-entries-active-mem-table",
+    ),
+    (
+        "rocksdb_property_num_entries_imm_mem_tables",
+        "rocksdb.num-entries-imm-mem-tables",
+    ),
+    (
+        "rocksdb_property_num_immutable_mem_table",
+        "rocksdb.num-immutable-mem-table",
+    ),
+    (
+        "rocksdb_property_mem_table_flush_pending",
+        "rocksdb.mem-table-flush-pending",
+    ),
+    (
+        "rocksdb_property_num_running_flushes",
+        "rocksdb.num-running-flushes",
+    ),
+    (
+        "rocksdb_property_compaction_pending",
+        "rocksdb.compaction-pending",
+    ),
+    (
+        "rocksdb_property_num_running_compactions",
+        "rocksdb.num-running-compactions",
+    ),
+    (
+        "rocksdb_property_estimate_pending_compaction_bytes",
+        "rocksdb.estimate-pending-compaction-bytes",
+    ),
+    (
+        "rocksdb_property_num_files_at_level0",
+        "rocksdb.num-files-at-level0",
+    ),
+    (
+        "rocksdb_property_num_live_versions",
+        "rocksdb.num-live-versions",
+    ),
+    (
+        "rocksdb_property_estimate_num_keys",
+        "rocksdb.estimate-num-keys",
+    ),
+    (
+        "rocksdb_property_estimate_live_data_size",
+        "rocksdb.estimate-live-data-size",
+    ),
+    (
+        "rocksdb_property_estimate_table_readers_mem",
+        "rocksdb.estimate-table-readers-mem",
+    ),
+    (
+        "rocksdb_property_total_sst_files_size",
+        "rocksdb.total-sst-files-size",
+    ),
+    (
+        "rocksdb_property_live_sst_files_size",
+        "rocksdb.live-sst-files-size",
+    ),
+    ("rocksdb_property_num_blob_files", "rocksdb.num-blob-files"),
+    (
+        "rocksdb_property_total_blob_file_size",
+        "rocksdb.total-blob-file-size",
+    ),
+    (
+        "rocksdb_property_live_blob_file_size",
+        "rocksdb.live-blob-file-size",
+    ),
+    (
+        "rocksdb_property_live_blob_file_garbage_size",
+        "rocksdb.live-blob-file-garbage-size",
+    ),
+];
+
+const ROCKSDB_STRING_PROPERTIES: &[(&str, &str)] =
+    &[("rocksdb_property_blob_stats", "rocksdb.blob-stats")];
 
 fn print_store_get_profile(profile: &StoreGetProfileSummary) {
     println!("profile_ops={}", profile.count);
@@ -657,6 +1374,116 @@ fn print_store_get_profile(profile: &StoreGetProfileSummary) {
     print_profile_duration("profile_accounted", accounted, profile.count);
     let unaccounted = profile.op_total.checked_sub(accounted).unwrap_or_default();
     print_profile_duration("profile_unaccounted", unaccounted, profile.count);
+}
+
+#[cfg(feature = "internal-profiling")]
+fn print_profile_capture(capture: &ProfileCapture) {
+    let write = capture.write_summary();
+    let sync = capture.sync_summary();
+    print_store_write_profile(&write);
+    print_store_sync_profile(&sync);
+}
+
+#[cfg(not(feature = "internal-profiling"))]
+fn print_profile_capture(_: &ProfileCapture) {}
+
+#[cfg(feature = "internal-profiling")]
+fn print_store_write_profile(profile: &StoreWriteProfileSummary) {
+    println!("write_profile_ops={}", profile.count);
+    print_profile_duration(
+        "write_profile_queue_send",
+        profile.queue_send,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_queue_wait",
+        profile.queue_wait,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_prepare_batch",
+        profile.prepare_batch,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_segment_capacity",
+        profile.segment_capacity,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_segment_append",
+        profile.segment_append,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_accounting_delta_append",
+        profile.accounting_delta_append,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_index_batch_commit",
+        profile.index_batch_commit,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_rollover_post_commit",
+        profile.rollover_post_commit,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_accounting_nudge",
+        profile.accounting_nudge,
+        profile.count,
+    );
+    print_profile_duration(
+        "write_profile_response_send",
+        profile.response_send,
+        profile.count,
+    );
+    print_profile_duration("write_profile_writer", profile.writer_total, profile.count);
+}
+
+#[cfg(feature = "internal-profiling")]
+fn print_store_sync_profile(profile: &StoreSyncProfileSummary) {
+    println!("sync_profile_ops={}", profile.count);
+    print_profile_duration("sync_profile_queue_send", profile.queue_send, profile.count);
+    print_profile_duration("sync_profile_queue_wait", profile.queue_wait, profile.count);
+    print_profile_duration(
+        "sync_profile_segment_sync",
+        profile.segment_sync,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_accounting_delta_sync",
+        profile.accounting_delta_sync,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_durable_lsn_compute",
+        profile.durable_lsn_compute,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_index_batch_commit",
+        profile.index_batch_commit,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_state_update",
+        profile.state_update,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_accounting_nudge",
+        profile.accounting_nudge,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_response_send",
+        profile.response_send,
+        profile.count,
+    );
+    print_profile_duration("sync_profile_writer", profile.writer_total, profile.count);
 }
 
 fn print_profile_duration(name: &str, duration: Duration, count: usize) {
@@ -840,6 +1667,7 @@ options:
   --rocksdb-min-blob-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-file-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-gc <true|false>
+  --rocksdb-disable-auto-compactions <true|false>
   --sync-every <count>
   --keep-data"
 }
@@ -886,6 +1714,8 @@ mod tests {
                 "--store-get-profile",
                 "--store-get-verify-checksum",
                 "false",
+                "--rocksdb-disable-auto-compactions",
+                "true",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -897,5 +1727,6 @@ mod tests {
         assert_eq!(config.store_get_mode, StoreGetMode::KeyOnly);
         assert!(config.store_get_profile);
         assert!(!config.store_get_verify_checksum);
+        assert!(config.rocksdb_disable_auto_compactions);
     }
 }

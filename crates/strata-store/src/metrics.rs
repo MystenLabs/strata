@@ -3,6 +3,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry};
 use strata_core::{Epoch, SegmentId, StrataLsn};
 
+#[cfg(feature = "internal-profiling")]
+use crate::StoreProfileSink;
+use crate::{StoreSyncProfile, StoreWriteProfile};
+
 const OPERATION_LATENCY_BUCKETS: &[f64] = &[
     0.000_001, 0.000_005, 0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001,
     0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0,
@@ -11,6 +15,8 @@ const OPERATION_LATENCY_BUCKETS: &[f64] = &[
 #[derive(Clone, Debug, Default)]
 pub struct StrataStoreMetrics {
     inner: Option<Arc<PrometheusMetrics>>,
+    #[cfg(feature = "internal-profiling")]
+    profile_sink: Option<Arc<dyn StoreProfileSink>>,
 }
 
 #[derive(Debug)]
@@ -501,7 +507,55 @@ impl StrataStoreMetrics {
                     "Current Strata GC tuner health state: 0 healthy, 1 pressured, 2 cooldown.",
                 )?,
             })),
+            #[cfg(feature = "internal-profiling")]
+            profile_sink: None,
         })
+    }
+
+    #[cfg(feature = "internal-profiling")]
+    pub fn with_profile_sink(mut self, sink: Arc<dyn StoreProfileSink>) -> Self {
+        self.profile_sink = Some(sink);
+        self
+    }
+
+    pub(crate) fn internal_profile_enabled(&self) -> bool {
+        #[cfg(feature = "internal-profiling")]
+        {
+            return self.profile_sink.is_some();
+        }
+
+        #[cfg(not(feature = "internal-profiling"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn record_write_profile(&self, profile: StoreWriteProfile) {
+        #[cfg(feature = "internal-profiling")]
+        {
+            if let Some(sink) = &self.profile_sink {
+                sink.record_write(profile);
+            }
+        }
+
+        #[cfg(not(feature = "internal-profiling"))]
+        {
+            let _ = profile;
+        }
+    }
+
+    pub(crate) fn record_sync_profile(&self, profile: StoreSyncProfile) {
+        #[cfg(feature = "internal-profiling")]
+        {
+            if let Some(sink) = &self.profile_sink {
+                sink.record_sync(profile);
+            }
+        }
+
+        #[cfg(not(feature = "internal-profiling"))]
+        {
+            let _ = profile;
+        }
     }
 
     pub(crate) fn enqueue_write_command(&self) {
