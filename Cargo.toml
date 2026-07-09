@@ -11,7 +11,6 @@ internal-profiling = ["strata-store/internal-profiling"]
 
 [dependencies]
 strata-core.workspace = true
-strata-gc.workspace = true
 strata-store.workspace = true
 
 [workspace]

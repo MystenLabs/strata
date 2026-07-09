@@ -7979,7 +7979,6 @@ name = "strata"
 version = "0.1.0"
 dependencies = [
  "strata-core",
- "strata-gc",
  "strata-store",
 ]
 
