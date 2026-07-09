@@ -39,8 +39,8 @@ use strata_store::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    GcPlannerConfig, ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile,
-    StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_SEGMENT_MAX_BYTES, GcPlannerConfig, ReadOptions, SealedSegmentIntegrityPolicy,
+    StoreGetProfile, StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -49,7 +49,6 @@ const DEFAULT_OPS: usize = 1024;
 const DEFAULT_READ_SET_SIZE: usize = 1024;
 const DEFAULT_READ_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
-const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1 << 40;
 const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READER_CACHE_CAPACITY;
 const DEFAULT_STARTING_EPOCH: Epoch = 1;
 const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;

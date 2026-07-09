@@ -1,4 +1,5 @@
 use super::*;
+use strata_core::SegmentGcLifetimeRange;
 
 fn controller_config(max_workers: usize, initial_workers: usize) -> GcConcurrencyConfig {
     GcConcurrencyConfig {
@@ -9,6 +10,85 @@ fn controller_config(max_workers: usize, initial_workers: usize) -> GcConcurrenc
         max_io_bytes_per_sec: 32 * 1024 * 1024,
         min_io_bytes_per_sec: 4 * 1024 * 1024,
     }
+}
+
+fn gc_test_range(offset: u64, len: u64) -> SegmentGcRecordRange {
+    SegmentGcRecordRange { offset, len }
+}
+
+fn gc_test_lifecycle(epoch: u64) -> BlobLifecycle {
+    BlobLifecycle {
+        logical_end_epoch: epoch,
+        extension_count: 0,
+    }
+}
+
+#[test]
+fn overlay_record_classifier_advances_through_sorted_ranges() {
+    let overlay = SegmentGcOverlay {
+        expired: vec![gc_test_range(100, 50)],
+        retired: vec![gc_test_range(300, 50)],
+        lifetimes: vec![
+            SegmentGcLifetimeRange {
+                range: gc_test_range(0, 50),
+                lifecycle: gc_test_lifecycle(10),
+            },
+            SegmentGcLifetimeRange {
+                range: gc_test_range(200, 50),
+                lifecycle: gc_test_lifecycle(20),
+            },
+        ],
+        ..SegmentGcOverlay::default()
+    };
+    let mut classifier = OverlayRecordClassifier::new(7, &overlay);
+
+    assert_eq!(
+        classifier.classify(gc_test_range(0, 50)).unwrap(),
+        OverlayRecordState::CopyEligible {
+            lifecycle: Some(gc_test_lifecycle(10)),
+        }
+    );
+    assert_eq!(
+        classifier.classify(gc_test_range(50, 50)).unwrap(),
+        OverlayRecordState::CopyEligible { lifecycle: None }
+    );
+    assert_eq!(
+        classifier.classify(gc_test_range(100, 50)).unwrap(),
+        OverlayRecordState::Skip
+    );
+    assert_eq!(
+        classifier.classify(gc_test_range(200, 50)).unwrap(),
+        OverlayRecordState::CopyEligible {
+            lifecycle: Some(gc_test_lifecycle(20)),
+        }
+    );
+    assert_eq!(
+        classifier.classify(gc_test_range(300, 50)).unwrap(),
+        OverlayRecordState::Skip
+    );
+    assert_eq!(
+        classifier.classify(gc_test_range(350, 50)).unwrap(),
+        OverlayRecordState::CopyEligible { lifecycle: None }
+    );
+}
+
+#[test]
+fn overlay_record_classifier_rejects_partial_overlap() {
+    let overlay = SegmentGcOverlay {
+        expired: vec![gc_test_range(25, 50)],
+        ..SegmentGcOverlay::default()
+    };
+    let mut classifier = OverlayRecordClassifier::new(7, &overlay);
+
+    let error = classifier.classify(gc_test_range(0, 50)).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::GcOverlayPartialRecordRange {
+            segment_id: 7,
+            offset: 0,
+            len: 50,
+        }
+    ));
 }
 
 #[test]

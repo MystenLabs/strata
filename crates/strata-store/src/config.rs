@@ -25,6 +25,7 @@ pub const DEFAULT_GC_SYNC_IMPACT_THRESHOLD: Duration = Duration::from_millis(250
 pub const DEFAULT_GC_IO_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_GC_MIN_IO_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN: Option<StrataLsn> = None;
+pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Runtime configuration for one Strata store namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]

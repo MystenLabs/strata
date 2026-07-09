@@ -388,6 +388,21 @@ async fn open_cleans_stale_pending_gc_output() {
     );
 }
 
+#[tokio::test]
+async fn open_cleans_stale_gc_staging_dirs() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "default");
+    let staging_attempt = cfg.namespace_dir().join("gc-staging").join("123-456-0");
+    std::fs::create_dir_all(&staging_attempt).unwrap();
+    std::fs::write(staging_attempt.join("000000000001.data"), b"staged").unwrap();
+
+    let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+
+    assert!(!cfg.namespace_dir().join("gc-staging").exists());
+    assert!(store.config().ingest_dir().exists());
+}
+
 fn open_accounting_sidecar(store: &StrataStore) -> AccountingIndex {
     let manifest = store.index().get_accounting_index_manifest().unwrap();
     AccountingIndex::open_with_manifest(
@@ -1451,6 +1466,97 @@ async fn cached_reader_is_evictable_when_segment_is_deleted() {
     assert_eq!(store.get(&key).unwrap(), None);
     assert!(!store.contains(&key).unwrap());
     assert_eq!(store.reader_cache_len(), 0);
+}
+
+#[tokio::test]
+async fn read_retries_once_when_not_found_segment_was_deleted() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let store =
+        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+            .unwrap();
+
+    let payload_lsn = store.put(&key, b"hello strata").unwrap();
+    let old_ref = store
+        .index()
+        .get_blob_version(&version_key(&key, payload_lsn))
+        .unwrap()
+        .unwrap()
+        .record_ref
+        .unwrap();
+    let new_ref = RecordRef {
+        segment_id: FIRST_SEGMENT_ID + 100,
+        offset: 0,
+        len: old_ref.len,
+    };
+    let attempts = std::cell::Cell::new(0);
+
+    let payload = store
+        .read_live_record_ref(STANDALONE_SHARD, &key, |record_ref| {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 0 {
+                assert_eq!(record_ref, old_ref);
+
+                let mut old_state = store
+                    .index()
+                    .get_segment_state(old_ref.segment_id)
+                    .unwrap()
+                    .unwrap();
+                old_state.state = SegmentFileState::Deleted;
+
+                let new_state = SegmentState {
+                    shard: STORE_SCOPE,
+                    segment_id: new_ref.segment_id,
+                    volume_id: 0,
+                    path: format!("gc/{:012}.data", new_ref.segment_id),
+                    placement_class: PlacementClass::Spillover,
+                    state: SegmentFileState::Sealed,
+                    write_offset: new_ref.len,
+                    durable_offset: new_ref.len,
+                    min_lsn: Some(payload_lsn + 1),
+                    max_lsn: Some(payload_lsn + 1),
+                    sealed_len: Some(new_ref.len),
+                    sealed_sha256: None,
+                };
+
+                let mut batch = store.index().batch();
+                store
+                    .index()
+                    .put_segment_state_batch(&mut batch, &old_state)
+                    .unwrap();
+                store
+                    .index()
+                    .put_segment_state_batch(&mut batch, &new_state)
+                    .unwrap();
+                store
+                    .index()
+                    .map_blob_ref_batch(
+                        &mut batch,
+                        &key,
+                        STANDALONE_SHARD,
+                        payload_lsn + 1,
+                        payload_lsn,
+                        old_ref,
+                        new_ref,
+                    )
+                    .unwrap();
+                batch.write().unwrap();
+
+                return Err(Error::Segment(strata_segment::Error::Io {
+                    path: segment_path(store.config(), old_ref.segment_id),
+                    source: std::io::ErrorKind::NotFound.into(),
+                }));
+            }
+
+            assert_eq!(record_ref, new_ref);
+            Ok(b"hello strata".to_vec())
+        })
+        .unwrap();
+
+    assert_eq!(payload, Some(b"hello strata".to_vec()));
+    assert_eq!(attempts.get(), 2);
 }
 
 #[tokio::test]
@@ -2986,6 +3092,9 @@ async fn gc_prepare_plan_defers_when_accounting_lag_exceeds_configured_limit() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3037,6 +3146,9 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3050,17 +3162,6 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
     assert!(prepared.accounting_snapshot.accounted_lsn() >= tombstone_lsn);
     assert_eq!(prepared.plan.scenario, GcScenario::L0Compaction);
     assert_eq!(prepared.plan.copied_bytes, ref_b.len);
-
-    let selection = prepared.copy_selection.as_ref().unwrap();
-    assert_eq!(selection.copied_bytes, ref_b.len);
-    assert_eq!(selection.records.len(), 1);
-    assert_eq!(selection.records[0].key, key_b);
-    assert_eq!(selection.records[0].payload_lsn, lsn_b);
-    assert_eq!(selection.records[0].from, ref_b);
-    assert_eq!(
-        selection.records[0].destination_class,
-        DestinationClass::Spillover
-    );
 
     assert_eq!(
         store
@@ -3083,7 +3184,13 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
     assert!(output.path.exists());
 
     let copied_record = &copied.copied_records[0];
+    assert_eq!(copied_record.source.key, key_b);
+    assert_eq!(copied_record.source.payload_lsn, lsn_b);
     assert_eq!(copied_record.source.from, ref_b);
+    assert_eq!(
+        copied_record.source.destination_class,
+        DestinationClass::Spillover
+    );
     assert_eq!(copied_record.staged.segment_id, output.staged_segment_id);
     assert_eq!(copied_record.staged.offset, 0);
     assert_eq!(copied_record.staged.len, ref_b.len);
@@ -3122,6 +3229,9 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3140,7 +3250,6 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
             segment_ids: vec![FIRST_SEGMENT_ID]
         }
     );
-    assert!(prepared.copy_selection.is_none());
 
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     let published = store.publish_prepared_gc_copy(copied).unwrap();
@@ -3198,6 +3307,9 @@ async fn gc_publish_empty_delete_plan_batches_multiple_segment_files() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3215,7 +3327,6 @@ async fn gc_publish_empty_delete_plan_batches_multiple_segment_files() {
             segment_ids: vec![FIRST_SEGMENT_ID, second_segment_id]
         }
     );
-    assert!(prepared.copy_selection.is_none());
 
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     let published = store.publish_prepared_gc_copy(copied).unwrap();
@@ -3457,6 +3568,9 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: 1,
+        max_l0_copy_bytes_per_plan: 1,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3475,7 +3589,6 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
             placement_class: PlacementClass::Spillover,
         }
     );
-    assert!(prepared.copy_selection.is_none());
 
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     let published = store.publish_prepared_gc_copy(copied).unwrap();
@@ -3534,6 +3647,9 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3623,6 +3739,9 @@ async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3718,6 +3837,9 @@ async fn gc_publish_tombstoned_unaccounted_copy_retires_destination_after_forwar
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3816,6 +3938,9 @@ async fn gc_publish_unaccounted_epoch_change_expires_relocated_destination() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3915,6 +4040,9 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 1,
         min_garbage_ratio_bps: 1,
         min_exact_epoch_bucket_bytes: 1,
@@ -3924,11 +4052,8 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
         max_join_sources: 4,
     });
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
-    assert_eq!(
-        prepared.copy_selection.as_ref().unwrap().records[0].lifecycle,
-        None
-    );
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+    assert_eq!(copied.copied_records[0].source.lifecycle, None);
     stop_accounting_worker(&mut store.store);
 
     let lifetime_b_lsn = store.extend(&key_b, 43).unwrap().unwrap();

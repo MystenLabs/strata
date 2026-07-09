@@ -17,6 +17,23 @@ pub struct GcPlannerConfig {
     /// The planner uses this as a hard cap for rewrite style plans so one scheduling decision does
     /// not monopolize the disk with a very large copy.
     pub max_copy_bytes_per_plan: u64,
+    /// Maximum bytes to write for one selected L0 ingest compaction plan.
+    ///
+    /// L0 compaction must be able to drain healthy sealed ingest segments into retention layout.
+    /// This cap is intentionally separate from the general rewrite cap so large ingest segments can
+    /// be reorganized without allowing every garbage-ratio rewrite to become equally large.
+    pub max_l0_copy_bytes_per_plan: u64,
+    /// Minimum remaining epoch distance for a known-lifetime bucket to count toward L0 usefulness.
+    ///
+    /// Buckets expiring sooner than this should usually die in the ingest segment and be reclaimed
+    /// by `EmptyDelete` rather than being copied shortly before expiry.
+    pub min_l0_rewrite_epoch_distance: Epoch,
+    /// Minimum fraction of live bytes that must have useful retention value before L0 rewrites an
+    /// ingest segment, in basis points.
+    ///
+    /// Useful bytes are unknown-lifetime bytes plus known-lifetime buckets that are far enough from
+    /// expiry. This is a segment-level gate because current L0 execution full-drains the source.
+    pub min_l0_rewrite_useful_ratio_bps: u16,
     /// Minimum garbage bytes before a dead ref rewrite is worth considering.
     ///
     /// This avoids rewriting tiny files or tiny holes where the metadata and fsync overhead can be
@@ -59,6 +76,9 @@ impl Default for GcPlannerConfig {
     fn default() -> Self {
         Self {
             max_copy_bytes_per_plan: 256 * 1024 * 1024,
+            max_l0_copy_bytes_per_plan: 1024 * 1024 * 1024,
+            min_l0_rewrite_epoch_distance: 2,
+            min_l0_rewrite_useful_ratio_bps: 7_500,
             min_reclaim_bytes: 64 * 1024 * 1024,
             min_garbage_ratio_bps: 6000,
             min_exact_epoch_bucket_bytes: 8 * 1024 * 1024,
@@ -349,7 +369,11 @@ impl GcPlanner {
             .filter(|segment| segment.state.placement_class == PlacementClass::Ingest)
             .filter_map(|segment| {
                 let copied_bytes = segment.summary.live_bytes;
-                if copied_bytes > self.config.max_copy_bytes_per_plan {
+                if copied_bytes > self.config.max_l0_copy_bytes_per_plan {
+                    return None;
+                }
+                let useful_bytes = self.l0_rewrite_useful_bytes(snapshot, segment);
+                if !self.l0_rewrite_is_useful(copied_bytes, useful_bytes) {
                     return None;
                 }
                 let routes = self.route_segment_live_bytes(snapshot, segment);
@@ -364,7 +388,7 @@ impl GcPlanner {
                     },
                     copied_bytes,
                     expected_reclaim_bytes: segment.summary.total_bytes,
-                    score: score_rewrite(segment.summary.total_bytes, copied_bytes, 1_500),
+                    score: score_rewrite(useful_bytes, copied_bytes, 1_500),
                 })
             })
             .collect()
@@ -541,6 +565,31 @@ impl GcPlanner {
         routes
     }
 
+    fn l0_rewrite_useful_bytes(&self, snapshot: &GcSnapshot, segment: &SegmentSnapshot) -> u64 {
+        let known_useful_bytes = segment
+            .summary
+            .future_epoch_histogram
+            .iter()
+            .filter(|(epoch, bucket)| {
+                bucket.bytes > 0
+                    && bucket.refs > 0
+                    && self.l0_epoch_bucket_is_useful(snapshot.current_epoch, **epoch)
+            })
+            .map(|(_, bucket)| bucket.bytes)
+            .sum::<u64>();
+        known_useful_bytes.saturating_add(segment.summary.unknown_lifetime_bytes)
+    }
+
+    fn l0_rewrite_is_useful(&self, live_bytes: u64, useful_bytes: u64) -> bool {
+        useful_bytes > 0
+            && ratio_bps(useful_bytes, live_bytes) >= self.config.min_l0_rewrite_useful_ratio_bps
+    }
+
+    fn l0_epoch_bucket_is_useful(&self, current_epoch: Epoch, end_epoch: Epoch) -> bool {
+        end_epoch > current_epoch
+            && end_epoch.saturating_sub(current_epoch) >= self.config.min_l0_rewrite_epoch_distance
+    }
+
     fn exact_epoch_bucket_is_useful(
         &self,
         current_epoch: Epoch,
@@ -561,10 +610,14 @@ impl GcPlanner {
 }
 
 fn garbage_ratio_bps(summary: &SegmentGcSummary) -> u16 {
-    if summary.total_bytes == 0 {
+    ratio_bps(summary.garbage_bytes(), summary.total_bytes)
+}
+
+fn ratio_bps(numerator: u64, denominator: u64) -> u16 {
+    if denominator == 0 {
         return 0;
     }
-    let ratio = summary.garbage_bytes().saturating_mul(10_000) / summary.total_bytes;
+    let ratio = numerator.saturating_mul(10_000) / denominator;
     ratio.min(u64::from(u16::MAX)) as u16
 }
 
@@ -587,6 +640,9 @@ mod tests {
     fn planner() -> GcPlanner {
         GcPlanner::new(GcPlannerConfig {
             max_copy_bytes_per_plan: 1_000,
+            max_l0_copy_bytes_per_plan: 1_000,
+            min_l0_rewrite_epoch_distance: 2,
+            min_l0_rewrite_useful_ratio_bps: 7_500,
             min_reclaim_bytes: 100,
             min_garbage_ratio_bps: 5000,
             min_exact_epoch_bucket_bytes: 50,
@@ -738,6 +794,146 @@ mod tests {
         };
         assert_eq!(routes[0].destination_class, DestinationClass::Spillover);
         assert_eq!(routes[0].end_epoch, None);
+    }
+
+    #[test]
+    fn l0_uses_dedicated_copy_cap() {
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: 1_000,
+            max_l0_copy_bytes_per_plan: 2_000,
+            min_l0_rewrite_epoch_distance: 2,
+            min_l0_rewrite_useful_ratio_bps: 7_500,
+            min_reclaim_bytes: 100,
+            min_garbage_ratio_bps: 5000,
+            min_exact_epoch_bucket_bytes: 50,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 100,
+            max_join_sources: 4,
+        });
+        let mut segment_summary = summary(2_000, 1_500, 0);
+        segment_summary.unknown_lifetime_bytes = 1_500;
+        segment_summary.unknown_lifetime_ref_count = 1;
+        let plan = planner
+            .plan(&snapshot(vec![sealed_segment(
+                1,
+                PlacementClass::Ingest,
+                segment_summary,
+            )]))
+            .unwrap();
+
+        assert_eq!(plan.scenario, GcScenario::L0Compaction);
+        assert_eq!(plan.copied_bytes, 1_500);
+    }
+
+    #[test]
+    fn l0_skips_segment_when_live_bytes_are_too_close_to_expiry() {
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        add_epoch_bucket(&mut segment_summary, 11, 900, 9);
+        add_epoch_bucket(&mut segment_summary, 20, 100, 1);
+
+        assert!(
+            planner()
+                .plan(&snapshot(vec![sealed_segment(
+                    1,
+                    PlacementClass::Ingest,
+                    segment_summary,
+                )]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn l0_accepts_segment_when_all_live_bytes_have_retention_value() {
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        add_epoch_bucket(&mut segment_summary, 20, 1_000, 10);
+        let plan = planner()
+            .plan(&snapshot(vec![sealed_segment(
+                1,
+                PlacementClass::Ingest,
+                segment_summary,
+            )]))
+            .unwrap();
+
+        assert_eq!(plan.scenario, GcScenario::L0Compaction);
+    }
+
+    #[test]
+    fn l0_skips_mixed_segment_to_avoid_moving_near_expiry_bytes() {
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        add_epoch_bucket(&mut segment_summary, 11, 300, 3);
+        add_epoch_bucket(&mut segment_summary, 20, 700, 7);
+
+        assert!(
+            planner()
+                .plan(&snapshot(vec![sealed_segment(
+                    1,
+                    PlacementClass::Ingest,
+                    segment_summary,
+                )]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn l0_allows_tiny_near_expiry_tail() {
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        add_epoch_bucket(&mut segment_summary, 11, 1, 1);
+        add_epoch_bucket(&mut segment_summary, 20, 999, 999);
+        let plan = planner()
+            .plan(&snapshot(vec![sealed_segment(
+                1,
+                PlacementClass::Ingest,
+                segment_summary,
+            )]))
+            .unwrap();
+
+        assert_eq!(plan.scenario, GcScenario::L0Compaction);
+    }
+
+    #[test]
+    fn l0_counts_unknown_lifetime_bytes_as_useful() {
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        segment_summary.unknown_lifetime_bytes = 1_000;
+        segment_summary.unknown_lifetime_ref_count = 10;
+        let plan = planner()
+            .plan(&snapshot(vec![sealed_segment(
+                1,
+                PlacementClass::Ingest,
+                segment_summary,
+            )]))
+            .unwrap();
+
+        assert_eq!(plan.scenario, GcScenario::L0Compaction);
+    }
+
+    #[test]
+    fn dead_ref_still_uses_general_copy_cap() {
+        let planner = GcPlanner::new(GcPlannerConfig {
+            max_copy_bytes_per_plan: 1_000,
+            max_l0_copy_bytes_per_plan: 2_000,
+            min_l0_rewrite_epoch_distance: 2,
+            min_l0_rewrite_useful_ratio_bps: 7_500,
+            min_reclaim_bytes: 100,
+            min_garbage_ratio_bps: 5000,
+            min_exact_epoch_bucket_bytes: 50,
+            min_exact_epoch_distance: 1,
+            max_exact_epoch_extension_count: 1,
+            min_join_output_bytes: 100,
+            max_join_sources: 4,
+        });
+        let mut segment_summary = summary(3_000, 1_500, 1_500);
+        add_epoch_bucket(&mut segment_summary, 50, 1_500, 1);
+
+        assert!(
+            planner
+                .plan(&snapshot(vec![sealed_segment(
+                    1,
+                    PlacementClass::Spillover,
+                    segment_summary,
+                )]))
+                .is_none()
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@
 //! ```text
 //! open
 //!   -> validate config and create ingest directory
+//!   -> discard stale GC staging directories
 //!   -> discard or reject orphan segment files with no index state
 //!   -> recover unsealed segments
 //!   -> verify sealed segment files according to SealedSegmentIntegrityPolicy
@@ -167,8 +168,8 @@ pub use config::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
-    StrataStoreConfig,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy,
+    StrataRecoveryPolicy, StrataStoreConfig,
 };
 pub use error::{Error, Result};
 pub use gc::{
@@ -343,6 +344,7 @@ impl StrataStore {
     ) -> Result<Self> {
         validate_config(&config)?;
         ensure_ingest_dir(&config)?;
+        cleanup_stale_gc_staging_dirs(&config)?;
         ensure_shard_active(&index, STANDALONE_SHARD)?;
         ensure_epoch_initialized(&index, config.starting_epoch)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
@@ -2634,6 +2636,22 @@ fn sync_dir(path: &Path) -> Result<()> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Removes GC staging attempts left behind by a crash before publish/prepublish.
+///
+/// Staging files are never referenced by segment state; after restart there is no in-memory
+/// `PreparedGcCopy` that could publish them, so the only correct recovery action is deletion.
+fn cleanup_stale_gc_staging_dirs(config: &StrataStoreConfig) -> Result<()> {
+    let staging_root = config.namespace_dir().join("gc-staging");
+    match fs::remove_dir_all(&staging_root) {
+        Ok(()) => sync_parent_dir(&staging_root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: staging_root,
+            source,
+        }),
+    }
 }
 
 /// Resolves a key to its readable payload, or None for missing/tombstoned blobs.

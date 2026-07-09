@@ -389,6 +389,9 @@ async fn gc_snapshot_reads_segment_metadata_from_one_index_view() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: 1_000,
+        max_l0_copy_bytes_per_plan: 1_000,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 100,
         min_garbage_ratio_bps: 5000,
         min_exact_epoch_bucket_bytes: 50,
@@ -468,6 +471,9 @@ async fn gc_snapshot_uses_pinned_accounting_frontier() {
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: 1_000,
+        max_l0_copy_bytes_per_plan: 1_000,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
         min_reclaim_bytes: 100,
         min_garbage_ratio_bps: 5000,
         min_exact_epoch_bucket_bytes: 50,

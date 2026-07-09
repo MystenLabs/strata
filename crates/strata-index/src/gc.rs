@@ -8,7 +8,7 @@ use crate::{Error, Result};
 use super::{AccountingSnapshotGuard, StrataIndex};
 
 impl StrataIndex {
-    /// Builds a point-in-time GC planning view for an active accounting snapshot.
+    /// Builds a point in time GC planning view for an active accounting snapshot.
     ///
     /// The planner consumes a plain `GcSnapshot`, not live database handles. This method is the
     /// boundary where the index pins a RocksDB snapshot, reads every GC-facing row from the same

@@ -18,5 +18,6 @@ pub use planner::{
     RouteEstimate, SegmentSnapshot,
 };
 pub use selector::{
-    GcCopyRecord, GcCopySelection, GcSelectionError, GcSourceRecord, select_copy_records,
+    GcCopyRecord, GcCopySelection, GcCopySelector, GcSelectionError, GcSourceRecord,
+    select_copy_records,
 };

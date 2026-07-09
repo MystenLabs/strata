@@ -1,10 +1,10 @@
 use std::{
-    io::Read,
+    io::{ErrorKind, Read},
     ops::Range,
     time::{Duration, Instant},
 };
 
-use strata_core::{BlobKey, RecordRef, SegmentFileState, SegmentId, ShardId, ShardKey};
+use strata_core::{BlobKey, RecordRef, SegmentFileState, ShardId, ShardKey};
 use strata_segment::{SegmentPayloadStream, SegmentReadOptions};
 
 use crate::{Error, Result, STANDALONE_SHARD, StrataStore, resolve_blob_version};
@@ -88,11 +88,7 @@ impl StrataStore {
         options: ReadOptions,
     ) -> Result<Option<Vec<u8>>> {
         let started = Instant::now();
-        let result = (|| {
-            let Some(record_ref) = self.live_record_ref(shard, key)? else {
-                return Ok(None);
-            };
-
+        let result = self.read_live_record_ref(shard, key, |record_ref| {
             let record = self.reader_cache.read_record_with_options(
                 &self.config,
                 record_ref,
@@ -105,8 +101,8 @@ impl StrataStore {
                 });
             }
 
-            Ok(Some(record.payload))
-        })();
+            Ok(record.payload)
+        });
         self.metrics.record_get(
             result
                 .as_ref()
@@ -128,43 +124,79 @@ impl StrataStore {
     ) -> Result<(Option<Vec<u8>>, StoreGetProfile)> {
         let operation_started = Instant::now();
         let mut profile = StoreGetProfile::default();
+        let mut retry_used = false;
 
-        let started = Instant::now();
-        let Some(record_ref) = self.live_record_ref(STANDALONE_SHARD, key)? else {
+        loop {
+            let started = Instant::now();
+            let record_ref = match self.live_record_ref_once(STANDALONE_SHARD, key)? {
+                LiveRecordRef::Readable(record_ref) => record_ref,
+                LiveRecordRef::Missing => {
+                    profile.record_lookup = started.elapsed();
+                    self.metrics
+                        .record_get(Ok(None), operation_started.elapsed());
+                    return Ok((None, profile));
+                }
+                LiveRecordRef::Deleted(_) if !retry_used => {
+                    // The blob row and segment state are separate reads. Example: this read saw
+                    // `K -> S10`, then GC published `MapRef(K, S10 -> S22)` and EmptyDelete marked
+                    // S10 Deleted before this state check. Re-resolve once before reporting a miss.
+                    profile.record_lookup = started.elapsed();
+                    retry_used = true;
+                    continue;
+                }
+                LiveRecordRef::Deleted(_) => {
+                    profile.record_lookup = started.elapsed();
+                    self.metrics
+                        .record_get(Ok(None), operation_started.elapsed());
+                    return Ok((None, profile));
+                }
+            };
             profile.record_lookup = started.elapsed();
-            self.metrics
-                .record_get(Ok(None), operation_started.elapsed());
-            return Ok((None, profile));
-        };
-        profile.record_lookup = started.elapsed();
 
-        let (record, reader_profile) = self.reader_cache.read_record_profiled(
-            &self.config,
-            record_ref,
-            options.into(),
-            &mut profile.reader_acquire,
-        )?;
-        profile.fixed_header = reader_profile.fixed_header;
-        profile.buffer_alloc = reader_profile.buffer_alloc;
-        profile.record_body = reader_profile.record_body;
-        profile.decode = reader_profile.decode;
+            let (record, reader_profile) = match self.reader_cache.read_record_profiled(
+                &self.config,
+                record_ref,
+                options.into(),
+                &mut profile.reader_acquire,
+            ) {
+                Ok(record) => record,
+                Err(error) if !retry_used => {
+                    if self.stale_ref_not_found(record_ref, &error)? {
+                        retry_used = true;
+                        continue;
+                    }
+                    self.metrics
+                        .record_get(Err(()), operation_started.elapsed());
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.metrics
+                        .record_get(Err(()), operation_started.elapsed());
+                    return Err(error);
+                }
+            };
+            profile.fixed_header = reader_profile.fixed_header;
+            profile.buffer_alloc = reader_profile.buffer_alloc;
+            profile.record_body = reader_profile.record_body;
+            profile.decode = reader_profile.decode;
 
-        let started = Instant::now();
-        if &record.key != key {
-            self.metrics
-                .record_get(Err(()), operation_started.elapsed());
-            return Err(Error::KeyMismatch {
-                requested: key.clone(),
-                found: record.key,
-            });
+            let started = Instant::now();
+            if &record.key != key {
+                self.metrics
+                    .record_get(Err(()), operation_started.elapsed());
+                return Err(Error::KeyMismatch {
+                    requested: key.clone(),
+                    found: record.key,
+                });
+            }
+            profile.key_validate = started.elapsed();
+
+            self.metrics.record_get(
+                Ok(Some(record.payload.len() as u64)),
+                operation_started.elapsed(),
+            );
+            return Ok((Some(record.payload), profile));
         }
-        profile.key_validate = started.elapsed();
-
-        self.metrics.record_get(
-            Ok(Some(record.payload.len() as u64)),
-            operation_started.elapsed(),
-        );
-        Ok((Some(record.payload), profile))
     }
 
     pub fn get_blob_range(
@@ -212,11 +244,7 @@ impl StrataStore {
         payload_range: Range<u64>,
     ) -> Result<Option<SegmentPayloadStream>> {
         let started = Instant::now();
-        let result = (|| {
-            let Some(record_ref) = self.live_record_ref(shard, key)? else {
-                return Ok(None);
-            };
-
+        let result = self.read_live_record_ref(shard, key, |record_ref| {
             let metadata = self
                 .reader_cache
                 .read_record_metadata(&self.config, record_ref)?;
@@ -227,12 +255,9 @@ impl StrataStore {
                 });
             }
 
-            Ok(Some(self.reader_cache.open_payload_stream(
-                &self.config,
-                record_ref,
-                payload_range,
-            )?))
-        })();
+            self.reader_cache
+                .open_payload_stream(&self.config, record_ref, payload_range.clone())
+        });
         self.metrics.record_stream(
             result
                 .as_ref()
@@ -252,22 +277,88 @@ impl StrataStore {
         shard: ShardKey,
         key: &BlobKey,
     ) -> Result<Option<RecordRef>> {
-        let Some(resolved) = resolve_blob_version(&self.index, shard, key)? else {
-            return Ok(None);
-        };
-        let record_ref = resolved.record_ref;
-        if !self.segment_is_readable(record_ref.segment_id)? {
-            self.evict_segment_reader(record_ref.segment_id);
-            return Ok(None);
+        let mut retry_used = false;
+        loop {
+            match self.live_record_ref_once(shard, key)? {
+                LiveRecordRef::Readable(record_ref) => return Ok(Some(record_ref)),
+                LiveRecordRef::Missing => return Ok(None),
+                LiveRecordRef::Deleted(_) if !retry_used => {
+                    // The blob row and segment state are separate reads. Example: this read saw
+                    // `K -> S10`, then GC published `MapRef(K, S10 -> S22)` and EmptyDelete marked
+                    // S10 Deleted before this state check. Re-resolve once before reporting a miss.
+                    retry_used = true;
+                }
+                LiveRecordRef::Deleted(_) => return Ok(None),
+            }
         }
-        Ok(Some(record_ref))
     }
 
-    fn segment_is_readable(&self, segment_id: SegmentId) -> Result<bool> {
+    pub(crate) fn read_live_record_ref<T>(
+        &self,
+        shard: ShardKey,
+        key: &BlobKey,
+        mut read: impl FnMut(RecordRef) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let mut retry_used = false;
+        loop {
+            let record_ref = match self.live_record_ref_once(shard, key)? {
+                LiveRecordRef::Readable(record_ref) => record_ref,
+                LiveRecordRef::Missing => return Ok(None),
+                LiveRecordRef::Deleted(_) if !retry_used => {
+                    // The blob row and segment state are separate reads. Example: this read saw
+                    // `K -> S10`, then GC published `MapRef(K, S10 -> S22)` and EmptyDelete marked
+                    // S10 Deleted before this state check. Re resolve once before reporting a miss.
+                    retry_used = true;
+                    continue;
+                }
+                LiveRecordRef::Deleted(_) => return Ok(None),
+            };
+
+            match read(record_ref) {
+                Ok(value) => return Ok(Some(value)),
+                Err(error) if !retry_used => {
+                    if self.stale_ref_not_found(record_ref, &error)? {
+                        retry_used = true;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn live_record_ref_once(&self, shard: ShardKey, key: &BlobKey) -> Result<LiveRecordRef> {
+        let Some(resolved) = resolve_blob_version(&self.index, shard, key)? else {
+            return Ok(LiveRecordRef::Missing);
+        };
+        let record_ref = resolved.record_ref;
+        match self.index.get_segment_state(record_ref.segment_id)? {
+            Some(state) if segment_state_is_readable(state.state) => {
+                Ok(LiveRecordRef::Readable(record_ref))
+            }
+            Some(state) if state.state == SegmentFileState::Deleted => {
+                self.evict_segment_reader(record_ref.segment_id);
+                Ok(LiveRecordRef::Deleted(record_ref))
+            }
+            Some(_) | None => {
+                self.evict_segment_reader(record_ref.segment_id);
+                Ok(LiveRecordRef::Missing)
+            }
+        }
+    }
+
+    fn stale_ref_not_found(&self, record_ref: RecordRef, error: &Error) -> Result<bool> {
+        if !segment_read_not_found(error) {
+            return Ok(false);
+        }
+        // Example: this read resolved `K -> S10`, then GC published `MapRef(K, S10 -> S22)` and
+        // EmptyDelete unlinked S10 before the physical read. Only retry that NotFound when metadata
+        // also says S10 is Deleted; if metadata says S10 is readable, surface the storage error.
         Ok(self
             .index
-            .get_segment_state(segment_id)?
-            .is_some_and(|state| segment_state_is_readable(state.state)))
+            .get_segment_state(record_ref.segment_id)?
+            .is_some_and(|state| state.state == SegmentFileState::Deleted))
     }
 
     fn readable_shard_key(&self, shard_id: ShardId) -> Result<ShardKey> {
@@ -287,6 +378,21 @@ impl StrataStore {
     pub(crate) fn reader_cache_len(&self) -> usize {
         self.reader_cache.len()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveRecordRef {
+    Missing,
+    Readable(RecordRef),
+    Deleted(RecordRef),
+}
+
+fn segment_read_not_found(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Segment(strata_segment::Error::Io { source, .. })
+            if source.kind() == ErrorKind::NotFound
+    )
 }
 
 pub(crate) fn segment_state_is_readable(state: SegmentFileState) -> bool {

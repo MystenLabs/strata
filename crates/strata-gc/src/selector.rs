@@ -64,6 +64,62 @@ pub struct GcCopySelection {
     pub copied_bytes: u64,
 }
 
+/// Route matcher for a planner-produced copy action.
+///
+/// Executors can use this when scanning source records directly into copy output. The selector
+/// keeps route validation centralized while allowing callers to avoid first materializing a full
+/// `Vec<GcSourceRecord>`.
+#[derive(Debug, Clone)]
+pub struct GcCopySelector {
+    routes: RouteTable,
+}
+
+impl GcCopySelector {
+    pub fn new(plan: &GcPlan) -> Result<Self, GcSelectionError> {
+        Ok(Self {
+            routes: route_table(plan)?,
+        })
+    }
+
+    pub fn select_record(&self, record: &GcSourceRecord) -> Option<GcCopyRecord> {
+        self.destination_for(record.record_ref.segment_id, record.lifecycle)
+            .map(|destination_class| GcCopyRecord {
+                key: record.key.clone(),
+                shard: record.shard,
+                payload_lsn: record.payload_lsn,
+                from: record.record_ref,
+                lifecycle: record.lifecycle,
+                destination_class,
+            })
+    }
+
+    pub fn destination_for(
+        &self,
+        source_segment_id: u64,
+        lifecycle: Option<BlobLifecycle>,
+    ) -> Option<DestinationClass> {
+        let key = RouteKey::from_record(source_segment_id, lifecycle);
+        self.routes
+            .by_key
+            .get(&key)
+            .map(|route| route.destination_class)
+    }
+
+    pub fn expected_bytes(&self) -> u64 {
+        self.routes.expected_bytes
+    }
+
+    pub fn validate_copied_bytes(&self, actual: u64) -> Result<(), GcSelectionError> {
+        if actual != self.routes.expected_bytes {
+            return Err(GcSelectionError::CopyBytesMismatch {
+                expected: self.routes.expected_bytes,
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Validation failure while turning aggregate routes into exact record copies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GcSelectionError {
@@ -112,26 +168,11 @@ pub fn select_copy_records(
     plan: &GcPlan,
     records: &[GcSourceRecord],
 ) -> Result<GcCopySelection, GcSelectionError> {
-    let routes = route_table(plan)?;
-    let mut selected = Vec::new();
-
-    for record in records {
-        if !routes.source_is_planned(record.record_ref.segment_id) {
-            continue;
-        }
-        let key = RouteKey::from_record(record.record_ref.segment_id, record.lifecycle);
-        let Some(route) = routes.by_key.get(&key) else {
-            continue;
-        };
-        selected.push(GcCopyRecord {
-            key: record.key.clone(),
-            shard: record.shard,
-            payload_lsn: record.payload_lsn,
-            from: record.record_ref,
-            lifecycle: record.lifecycle,
-            destination_class: route.destination_class,
-        });
-    }
+    let selector = GcCopySelector::new(plan)?;
+    let mut selected = records
+        .iter()
+        .filter_map(|record| selector.select_record(record))
+        .collect::<Vec<_>>();
 
     selected.sort_by_key(|record| (record.from.segment_id, record.from.offset));
     let copied_bytes = selected
@@ -139,15 +180,10 @@ pub fn select_copy_records(
         .map(|record| record.from.len)
         .try_fold(0_u64, u64::checked_add)
         .ok_or(GcSelectionError::CopyBytesMismatch {
-            expected: routes.expected_bytes,
+            expected: selector.expected_bytes(),
             actual: u64::MAX,
         })?;
-    if copied_bytes != routes.expected_bytes {
-        return Err(GcSelectionError::CopyBytesMismatch {
-            expected: routes.expected_bytes,
-            actual: copied_bytes,
-        });
-    }
+    selector.validate_copied_bytes(copied_bytes)?;
 
     Ok(GcCopySelection {
         scenario: plan.scenario,
@@ -178,18 +214,10 @@ impl RouteKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RouteTable {
     by_key: BTreeMap<RouteKey, RouteEstimate>,
     expected_bytes: u64,
-}
-
-impl RouteTable {
-    fn source_is_planned(&self, source_segment_id: u64) -> bool {
-        self.by_key
-            .keys()
-            .any(|key| key.source_segment_id == source_segment_id)
-    }
 }
 
 fn route_table(plan: &GcPlan) -> Result<RouteTable, GcSelectionError> {

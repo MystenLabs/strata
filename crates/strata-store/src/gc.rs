@@ -1,21 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    path::PathBuf,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use strata_core::{
-    BlobLifecycle, PlacementClass, RecordRef, SegmentFileState, SegmentGcOverlay,
-    SegmentGcRecordRange, SegmentId, SegmentState, StrataLsn,
+    BlobLifecycle, DecodedRecord, FIXED_RECORD_HEADER_LEN, PlacementClass, RecordRef,
+    SegmentFileState, SegmentGcOverlay, SegmentGcRecordRange, SegmentId, SegmentState, StrataLsn,
 };
 use strata_gc::{
-    DestinationClass, GcAction, GcCopyRecord, GcCopySelection, GcPlan, GcPlanner, GcSnapshot,
-    GcSourceRecord, select_copy_records,
+    DestinationClass, GcAction, GcCopyRecord, GcCopySelector, GcPlan, GcPlanner, GcSnapshot,
 };
 use strata_index::{AccountingSnapshotGuard, StrataIndex};
-use strata_segment::{SegmentReader, SegmentScanner, SegmentWriter};
+use strata_segment::SegmentWriter;
 
 use crate::{
     Error, GcIoLimiter, GcPublishRequest, Result, SegmentIdAllocator, StoreHalt, StrataStore,
@@ -36,11 +36,6 @@ pub struct PreparedGcPlan {
     pub accounting_snapshot: AccountingSnapshotGuard,
     /// Aggregate pure-planner recommendation.
     pub plan: GcPlan,
-    /// Exact copy records selected from source segment scans.
-    ///
-    /// `None` means the plan is metadata-only, such as deleting an empty segment or reclassifying a
-    /// segment whose pinned bytes are too expensive to copy in this run.
-    pub copy_selection: Option<GcCopySelection>,
     /// In-memory source segment claim held until this plan is copied or dropped.
     #[doc(hidden)]
     pub claim: Option<GcSourceClaimGuard>,
@@ -966,13 +961,12 @@ impl StrataStore {
         self.gc_executor()?.gc_deferred_by_accounting_lag()
     }
 
-    /// Prepares one GC plan using real segment files and the segment GC overlay.
+    /// Prepares one GC plan from the segment GC overlay.
     ///
     /// This is the bridge from pure planning to execution. It creates an accounting snapshot guard,
-    /// builds the GC planning view from that guard, asks the planner for one plan, scans every
-    /// source segment named by copy actions, applies dead/lifetime overlay ranges, and validates
-    /// exact copy records against the aggregate route estimates. It does not copy bytes or publish
-    /// metadata.
+    /// builds the GC planning view from that guard, asks the planner for one plan, and claims the
+    /// source segments named by that plan. It does not read source segment files, copy bytes, or
+    /// publish metadata.
     pub fn prepare_gc_plan(&self, planner: &GcPlanner) -> Result<Option<PreparedGcPlan>> {
         self.gc_executor()?.prepare_gc_plan(planner)
     }
@@ -1031,13 +1025,12 @@ impl GcExecutor {
         Ok(lag.exceeds_configured_limit().then_some(lag))
     }
 
-    /// Prepares one GC plan using real segment files and the segment GC overlay.
+    /// Prepares one GC plan from the segment GC overlay.
     ///
     /// This is the bridge from pure planning to execution. It creates an accounting snapshot guard,
-    /// builds the GC planning view from that guard, asks the planner for one plan, scans every
-    /// source segment named by copy actions, applies dead/lifetime overlay ranges, and validates
-    /// exact copy records against the aggregate route estimates. It does not copy bytes or publish
-    /// metadata.
+    /// builds the GC planning view from that guard, asks the planner for one plan, and claims the
+    /// source segments named by that plan. It does not read source segment files, copy bytes, or
+    /// publish metadata.
     pub(crate) fn prepare_gc_plan(&self, planner: &GcPlanner) -> Result<Option<PreparedGcPlan>> {
         if self.gc_deferred_by_accounting_lag()?.is_some() {
             return Ok(None);
@@ -1053,91 +1046,14 @@ impl GcExecutor {
             let Some(claim) = self.claims.try_claim(source_segments) else {
                 continue;
             };
-            let copy_selection = if plan_has_copy_action(&plan) {
-                Some(self.select_gc_copy_records(&plan)?)
-            } else {
-                None
-            };
 
             return Ok(Some(PreparedGcPlan {
                 accounting_snapshot,
                 plan,
-                copy_selection,
                 claim: Some(claim),
             }));
         }
         Ok(None)
-    }
-
-    /// Scans all copy sources named by a plan and selects the exact records to rewrite.
-    fn select_gc_copy_records(&self, plan: &GcPlan) -> Result<GcCopySelection> {
-        let mut records = Vec::new();
-        for segment_id in copy_source_segment_ids(plan) {
-            records.extend(self.scan_gc_source_segment(segment_id)?);
-        }
-        select_copy_records(plan, &records).map_err(Error::from)
-    }
-
-    /// Reads one source segment and returns copy-eligible records with overlay-derived lifecycle.
-    ///
-    /// Expired and retired record ranges are skipped. Partial overlay ranges are rejected because
-    /// GC copies whole records; a range covering only part of a record means the overlay is corrupt
-    /// or was built with inconsistent record boundaries.
-    fn scan_gc_source_segment(&self, segment_id: SegmentId) -> Result<Vec<GcSourceRecord>> {
-        let state = self
-            .index
-            .get_segment_state(segment_id)?
-            .ok_or(Error::GcMissingSourceSegment { segment_id })?;
-        let overlay = self
-            .index
-            .get_segment_gc_overlay(segment_id)?
-            .unwrap_or_default();
-        let path = gc_source_segment_path(&self.config, &state);
-        let scan_bytes = fs::metadata(&path)
-            .map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?
-            .len();
-        self.gc_io_limiter.acquire(scan_bytes);
-        let mut scanner = SegmentScanner::open(&path, segment_id)?;
-        let prefix = scanner.scan_valid_prefix()?;
-
-        if state.state == SegmentFileState::Sealed {
-            let sealed_len = state
-                .sealed_len
-                .ok_or(Error::SealedSegmentMissingLength { segment_id })?;
-            if prefix.valid_len != sealed_len {
-                return Err(Error::GcSourceSegmentInvalidPrefix {
-                    segment_id,
-                    path,
-                    expected_len: sealed_len,
-                    valid_len: prefix.valid_len,
-                });
-            }
-        }
-
-        prefix
-            .records
-            .into_iter()
-            .filter_map(|record| {
-                let record_ref = record.record_ref;
-                let range = SegmentGcRecordRange::from(record_ref);
-                match overlay_lifecycle_for_record(segment_id, &overlay, range) {
-                    Ok(OverlayRecordState::Skip) => None,
-                    Ok(OverlayRecordState::CopyEligible { lifecycle }) => {
-                        Some(Ok(GcSourceRecord {
-                            key: record.key,
-                            shard: record.header.shard,
-                            payload_lsn: record.header.generation,
-                            record_ref,
-                            lifecycle,
-                        }))
-                    }
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .collect()
     }
 
     /// Copies selected GC records into sealed staging files.
@@ -1150,14 +1066,9 @@ impl GcExecutor {
         let PreparedGcPlan {
             accounting_snapshot,
             plan,
-            copy_selection,
             claim,
         } = prepared;
-        let records = copy_selection
-            .as_ref()
-            .map(|selection| selection.records.clone())
-            .unwrap_or_default();
-        if records.is_empty() {
+        if !plan_has_copy_action(&plan) {
             return Ok(PreparedGcCopy {
                 accounting_snapshot,
                 plan,
@@ -1168,7 +1079,7 @@ impl GcExecutor {
         }
 
         let staging_dir = create_gc_staging_dir(&self.config)?;
-        let copy_result = self.copy_gc_records_to_staging(&staging_dir, &records);
+        let copy_result = self.copy_gc_plan_to_staging(&staging_dir, &plan);
         let (outputs, copied_records) = match copy_result {
             Ok(copy) => copy,
             Err(error) => {
@@ -1341,88 +1252,250 @@ impl GcExecutor {
     ///
     /// Staging output uses local segment ids starting at one. Publish later assigns durable segment
     /// ids and translates staged refs into final refs while holding the writer ordering domain.
-    fn copy_gc_records_to_staging(
+    fn copy_gc_plan_to_staging(
         &self,
-        staging_dir: &std::path::Path,
-        records: &[GcCopyRecord],
+        staging_dir: &Path,
+        plan: &GcPlan,
     ) -> Result<(Vec<GcStagedOutputSegment>, Vec<GcStagedCopiedRecord>)> {
-        let mut readers = BTreeMap::new();
-        let mut outputs = Vec::new();
-        let mut open_outputs = BTreeMap::new();
-        let mut copied_records = Vec::with_capacity(records.len());
-        let mut next_staged_segment_id = 1;
+        let selector = GcCopySelector::new(plan)?;
+        let mut copier = GcStagingCopier::new(
+            &self.gc_io_limiter,
+            staging_dir,
+            self.config.segment_max_bytes,
+        );
 
-        for record in records {
-            let payload = self.read_gc_source_payload(&mut readers, record.from)?;
-            if !open_outputs.contains_key(&record.destination_class) {
-                let output = create_staged_output(
-                    staging_dir,
-                    next_staged_segment_id,
-                    record.destination_class,
-                    self.config.segment_max_bytes,
-                )?;
-                next_staged_segment_id = output.next_staged_segment_id;
-                open_outputs.insert(record.destination_class, output);
-            }
-            let output = open_outputs
-                .get_mut(&record.destination_class)
-                .expect("staged output inserted above");
-            let staged = append_gc_record_to_staged_output(
-                &self.gc_io_limiter,
-                output,
-                &mut outputs,
-                staging_dir,
-                &mut next_staged_segment_id,
-                record,
-                &payload,
-                self.config.segment_max_bytes,
-            )?;
-            copied_records.push(GcStagedCopiedRecord {
-                source: record.clone(),
-                staged,
+        for segment_id in copy_source_segment_ids(plan) {
+            self.copy_gc_source_segment_to_staging(segment_id, &selector, &mut copier)?;
+        }
+
+        selector.validate_copied_bytes(copier.copied_bytes())?;
+        copier.finish()
+    }
+
+    /// Scans one source segment and copies records selected by the aggregate plan routes.
+    ///
+    /// The scan is offset ordered, so overlay classification advances monotonically through the
+    /// segment-local overlay. Expired and retired ranges are skipped. Copy-eligible records are
+    /// decoded only when their lifecycle bucket is named by the plan.
+    fn copy_gc_source_segment_to_staging(
+        &self,
+        segment_id: SegmentId,
+        selector: &GcCopySelector,
+        copier: &mut GcStagingCopier<'_>,
+    ) -> Result<()> {
+        let state = self
+            .index
+            .get_segment_state(segment_id)?
+            .ok_or(Error::GcMissingSourceSegment { segment_id })?;
+        if state.state != SegmentFileState::Sealed {
+            return Err(Error::GcSourceSegmentNotSealed {
+                segment_id,
+                state: state.state,
+            });
+        }
+        let sealed_len = state
+            .sealed_len
+            .ok_or(Error::SealedSegmentMissingLength { segment_id })?;
+        let overlay = self
+            .index
+            .get_segment_gc_overlay(segment_id)?
+            .unwrap_or_default();
+        let path = gc_source_segment_path(&self.config, &state);
+        let file_len = fs::metadata(&path)
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        if file_len != sealed_len {
+            return Err(Error::GcSourceSegmentInvalidPrefix {
+                segment_id,
+                path,
+                expected_len: sealed_len,
+                valid_len: file_len,
             });
         }
 
-        for (_, output) in open_outputs {
-            outputs.push(output.finish(&self.gc_io_limiter)?);
-        }
-        outputs.sort_by_key(|output| output.staged_segment_id);
-        copied_records
-            .sort_by_key(|record| (record.source.from.segment_id, record.source.from.offset));
-        Ok((outputs, copied_records))
-    }
+        let mut file = File::open(&path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let mut classifier = OverlayRecordClassifier::new(segment_id, &overlay);
+        let mut offset = 0_u64;
 
-    /// Reads the payload for one source record, reusing open readers per source segment.
-    fn read_gc_source_payload(
-        &self,
-        readers: &mut BTreeMap<SegmentId, SegmentReader>,
-        record_ref: RecordRef,
-    ) -> Result<Vec<u8>> {
-        let reader = if let Some(reader) = readers.get_mut(&record_ref.segment_id) {
-            reader
-        } else {
-            let state = self.index.get_segment_state(record_ref.segment_id)?.ok_or(
-                Error::GcMissingSourceSegment {
-                    segment_id: record_ref.segment_id,
-                },
-            )?;
-            if state.state != SegmentFileState::Sealed {
-                return Err(Error::GcSourceSegmentNotSealed {
-                    segment_id: record_ref.segment_id,
-                    state: state.state,
+        while offset < sealed_len {
+            let remaining = sealed_len - offset;
+            if remaining < FIXED_RECORD_HEADER_LEN as u64 {
+                return Err(Error::GcSourceSegmentInvalidPrefix {
+                    segment_id,
+                    path,
+                    expected_len: sealed_len,
+                    valid_len: offset,
                 });
             }
-            let path = gc_source_segment_path(&self.config, &state);
-            readers.insert(
-                record_ref.segment_id,
-                SegmentReader::open(&path, record_ref.segment_id)?,
-            );
-            readers
-                .get_mut(&record_ref.segment_id)
-                .expect("reader inserted above")
-        };
-        self.gc_io_limiter.acquire(record_ref.len);
-        Ok(reader.read_payload(record_ref)?)
+
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|source| Error::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            let mut fixed = [0; FIXED_RECORD_HEADER_LEN];
+            self.gc_io_limiter.acquire(FIXED_RECORD_HEADER_LEN as u64);
+            file.read_exact(&mut fixed).map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+            let header =
+                DecodedRecord::peek_fixed_header(&fixed).map_err(strata_segment::Error::from)?;
+            let record_len = header
+                .encoded_record_len()
+                .map_err(strata_segment::Error::from)?;
+            if remaining < record_len {
+                return Err(Error::GcSourceSegmentInvalidPrefix {
+                    segment_id,
+                    path,
+                    expected_len: sealed_len,
+                    valid_len: offset,
+                });
+            }
+
+            let record_ref = RecordRef {
+                segment_id,
+                offset,
+                len: record_len,
+            };
+            let range = SegmentGcRecordRange::from(record_ref);
+            let lifecycle = match classifier.classify(range)? {
+                OverlayRecordState::Skip => {
+                    offset = offset
+                        .checked_add(record_len)
+                        .ok_or(strata_segment::Error::RangeOverflow)?;
+                    continue;
+                }
+                OverlayRecordState::CopyEligible { lifecycle } => lifecycle,
+            };
+
+            let Some(destination_class) = selector.destination_for(segment_id, lifecycle) else {
+                offset = offset
+                    .checked_add(record_len)
+                    .ok_or(strata_segment::Error::RangeOverflow)?;
+                continue;
+            };
+
+            let payload_len = usize::try_from(header.payload_len)
+                .map_err(|_| strata_segment::Error::RangeOverflow)?;
+            let key_len = header.key_len as usize;
+            let body_len = payload_len
+                .checked_add(key_len)
+                .ok_or(strata_segment::Error::RangeOverflow)?;
+            let mut body = vec![0; body_len];
+            self.gc_io_limiter.acquire(body_len as u64);
+            if !body.is_empty() {
+                file.read_exact(&mut body).map_err(|source| Error::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+            let key = body.split_off(payload_len);
+            let payload = body;
+            let decoded = DecodedRecord::from_parts(header, &fixed, payload, key)
+                .map_err(strata_segment::Error::from)?;
+            let payload = decoded.payload;
+            let record = GcCopyRecord {
+                key: decoded.key,
+                shard: decoded.header.shard,
+                payload_lsn: decoded.header.generation,
+                from: record_ref,
+                lifecycle,
+                destination_class,
+            };
+            copier.append(record, &payload)?;
+
+            offset = offset
+                .checked_add(record_len)
+                .ok_or(strata_segment::Error::RangeOverflow)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Open GC staging state shared across source segment scans.
+struct GcStagingCopier<'a> {
+    io_limiter: &'a GcIoLimiter,
+    staging_dir: &'a Path,
+    segment_max_bytes: u64,
+    outputs: Vec<GcStagedOutputSegment>,
+    open_outputs: BTreeMap<DestinationClass, OpenStagedOutput>,
+    copied_records: Vec<GcStagedCopiedRecord>,
+    copied_bytes: u64,
+    next_staged_segment_id: SegmentId,
+}
+
+impl<'a> GcStagingCopier<'a> {
+    fn new(io_limiter: &'a GcIoLimiter, staging_dir: &'a Path, segment_max_bytes: u64) -> Self {
+        Self {
+            io_limiter,
+            staging_dir,
+            segment_max_bytes,
+            outputs: Vec::new(),
+            open_outputs: BTreeMap::new(),
+            copied_records: Vec::new(),
+            copied_bytes: 0,
+            next_staged_segment_id: 1,
+        }
+    }
+
+    fn copied_bytes(&self) -> u64 {
+        self.copied_bytes
+    }
+
+    fn append(&mut self, record: GcCopyRecord, payload: &[u8]) -> Result<()> {
+        if !self.open_outputs.contains_key(&record.destination_class) {
+            let output = create_staged_output(
+                self.staging_dir,
+                self.next_staged_segment_id,
+                record.destination_class,
+                self.segment_max_bytes,
+            )?;
+            self.next_staged_segment_id = output.next_staged_segment_id;
+            self.open_outputs.insert(record.destination_class, output);
+        }
+
+        let output = self
+            .open_outputs
+            .get_mut(&record.destination_class)
+            .expect("staged output inserted above");
+        let staged = append_gc_record_to_staged_output(
+            self.io_limiter,
+            output,
+            &mut self.outputs,
+            self.staging_dir,
+            &mut self.next_staged_segment_id,
+            &record,
+            payload,
+            self.segment_max_bytes,
+        )?;
+        self.copied_bytes = self
+            .copied_bytes
+            .checked_add(record.from.len)
+            .ok_or(strata_segment::Error::RangeOverflow)?;
+        self.copied_records.push(GcStagedCopiedRecord {
+            source: record,
+            staged,
+        });
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(Vec<GcStagedOutputSegment>, Vec<GcStagedCopiedRecord>)> {
+        for (_, output) in self.open_outputs {
+            self.outputs.push(output.finish(self.io_limiter)?);
+        }
+        self.outputs.sort_by_key(|output| output.staged_segment_id);
+        self.copied_records
+            .sort_by_key(|record| (record.source.from.segment_id, record.source.from.offset));
+        Ok((self.outputs, self.copied_records))
     }
 }
 
@@ -1626,36 +1699,109 @@ enum OverlayRecordState {
     CopyEligible { lifecycle: Option<BlobLifecycle> },
 }
 
-/// Classifies one record according to the segment GC overlay.
+/// Offset ordered classifier for records in one segment GC overlay.
 ///
 /// Overlay ranges must either fully contain a record or not overlap it. Partial overlap is rejected
 /// because GC only rewrites whole encoded records and cannot split payload liveness.
-fn overlay_lifecycle_for_record(
+struct OverlayRecordClassifier<'a> {
     segment_id: SegmentId,
-    overlay: &SegmentGcOverlay,
-    record: SegmentGcRecordRange,
-) -> Result<OverlayRecordState> {
-    for skipped in overlay.expired.iter().chain(overlay.retired.iter()) {
-        if range_contains(*skipped, record) {
+    overlay: &'a SegmentGcOverlay,
+    expired_index: usize,
+    retired_index: usize,
+    lifetime_index: usize,
+}
+
+impl<'a> OverlayRecordClassifier<'a> {
+    fn new(segment_id: SegmentId, overlay: &'a SegmentGcOverlay) -> Self {
+        Self {
+            segment_id,
+            overlay,
+            expired_index: 0,
+            retired_index: 0,
+            lifetime_index: 0,
+        }
+    }
+
+    fn classify(&mut self, record: SegmentGcRecordRange) -> Result<OverlayRecordState> {
+        if self.skipped_range_contains_or_overlaps(record)? {
             return Ok(OverlayRecordState::Skip);
         }
-        if ranges_overlap(*skipped, record) {
-            return Err(partial_overlay_error(segment_id, record));
-        }
+
+        let lifecycle = self.lifecycle_for_record(record)?;
+        Ok(OverlayRecordState::CopyEligible { lifecycle })
     }
 
-    let mut lifecycle = None;
-    for lifetime in &overlay.lifetimes {
+    fn skipped_range_contains_or_overlaps(&mut self, record: SegmentGcRecordRange) -> Result<bool> {
+        if classify_skipped_range(
+            self.segment_id,
+            &self.overlay.expired,
+            &mut self.expired_index,
+            record,
+        )? {
+            return Ok(true);
+        }
+        classify_skipped_range(
+            self.segment_id,
+            &self.overlay.retired,
+            &mut self.retired_index,
+            record,
+        )
+    }
+
+    fn lifecycle_for_record(
+        &mut self,
+        record: SegmentGcRecordRange,
+    ) -> Result<Option<BlobLifecycle>> {
+        advance_range_cursor(
+            &self.overlay.lifetimes,
+            &mut self.lifetime_index,
+            record.offset,
+            |entry| entry.range,
+        );
+        let Some(lifetime) = self.overlay.lifetimes.get(self.lifetime_index) else {
+            return Ok(None);
+        };
         if range_contains(lifetime.range, record) {
-            lifecycle = Some(lifetime.lifecycle);
-            continue;
+            return Ok(Some(lifetime.lifecycle));
         }
         if ranges_overlap(lifetime.range, record) {
-            return Err(partial_overlay_error(segment_id, record));
+            return Err(partial_overlay_error(self.segment_id, record));
         }
+        Ok(None)
     }
+}
 
-    Ok(OverlayRecordState::CopyEligible { lifecycle })
+fn classify_skipped_range(
+    segment_id: SegmentId,
+    ranges: &[SegmentGcRecordRange],
+    index: &mut usize,
+    record: SegmentGcRecordRange,
+) -> Result<bool> {
+    advance_range_cursor(ranges, index, record.offset, |range| *range);
+    let Some(range) = ranges.get(*index).copied() else {
+        return Ok(false);
+    };
+    if range_contains(range, record) {
+        return Ok(true);
+    }
+    if ranges_overlap(range, record) {
+        return Err(partial_overlay_error(segment_id, record));
+    }
+    Ok(false)
+}
+
+fn advance_range_cursor<T>(
+    ranges: &[T],
+    index: &mut usize,
+    record_offset: u64,
+    range_for: impl Fn(&T) -> SegmentGcRecordRange,
+) {
+    while let Some(range) = ranges.get(*index).map(&range_for) {
+        if range_end(range) > record_offset {
+            break;
+        }
+        *index += 1;
+    }
 }
 
 /// Builds the error returned when an overlay range cuts through a record boundary.
