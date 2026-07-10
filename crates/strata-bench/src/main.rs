@@ -21,13 +21,17 @@
 #[cfg(feature = "internal-profiling")]
 use std::sync::Mutex;
 use std::{
-    env, fs, hint,
+    env, fs, hint, io,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process,
     sync::Arc,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use prometheus::{Encoder, Registry, TextEncoder};
 use rocksdb::{DB, Options};
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
 use strata_segment::SegmentWriter;
@@ -189,6 +193,7 @@ struct Config {
     rocksdb_blob_gc: bool,
     rocksdb_disable_auto_compactions: bool,
     sync_every: usize,
+    metrics_listen: Option<String>,
     keep_data: bool,
     root_was_defaulted: bool,
 }
@@ -218,6 +223,7 @@ impl Config {
             rocksdb_blob_gc: true,
             rocksdb_disable_auto_compactions: false,
             sync_every: 0,
+            metrics_listen: None,
             keep_data: false,
             root_was_defaulted: true,
         };
@@ -298,6 +304,9 @@ impl Config {
                 }
                 "--sync-every" => {
                     config.sync_every = parse_usize(&next_value(&mut args, "--sync-every")?)?
+                }
+                "--metrics-listen" => {
+                    config.metrics_listen = Some(next_value(&mut args, "--metrics-listen")?)
                 }
                 "--keep-data" => config.keep_data = true,
                 unknown => return Err(format!("unknown argument '{unknown}'")),
@@ -541,20 +550,23 @@ type ProfileCapture = Arc<BenchProfileSink>;
 struct ProfileCapture;
 
 #[cfg(feature = "internal-profiling")]
-fn metrics_with_profile_capture() -> (StrataStoreMetrics, ProfileCapture) {
+fn metrics_with_profile_capture(
+    metrics: StrataStoreMetrics,
+) -> (StrataStoreMetrics, ProfileCapture) {
     let capture = Arc::new(BenchProfileSink::default());
-    (
-        StrataStoreMetrics::default().with_profile_sink(capture.clone()),
-        capture,
-    )
+    (metrics.with_profile_sink(capture.clone()), capture)
 }
 
 #[cfg(not(feature = "internal-profiling"))]
-fn metrics_with_profile_capture() -> (StrataStoreMetrics, ProfileCapture) {
-    (StrataStoreMetrics::default(), ProfileCapture)
+fn metrics_with_profile_capture(
+    metrics: StrataStoreMetrics,
+) -> (StrataStoreMetrics, ProfileCapture) {
+    (metrics, ProfileCapture)
 }
 
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let bench_metrics = BenchMetrics::start(&config)?;
+
     if config.root_dir.exists() {
         fs::remove_dir_all(&config.root_dir)?;
     }
@@ -562,9 +574,9 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let result = match config.case {
         BenchCase::SegmentAppend => run_segment_append(&config),
-        BenchCase::StorePut => run_store_put(&config),
-        BenchCase::StorePutArc => run_store_put_arc(&config),
-        BenchCase::StoreGet => run_store_get(&config),
+        BenchCase::StorePut => run_store_put(&config, &bench_metrics),
+        BenchCase::StorePutArc => run_store_put_arc(&config, &bench_metrics),
+        BenchCase::StoreGet => run_store_get(&config, &bench_metrics),
         BenchCase::RocksDbBlobDbPut => run_rocksdb_blobdb_put(&config),
         BenchCase::RocksDbBlobDbGet => run_rocksdb_blobdb_get(&config),
     };
@@ -619,10 +631,14 @@ fn run_segment_append(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_store_put(
+    config: &Config,
+    bench_metrics: &BenchMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
     let store_config = config.store_config();
-    let (metrics, profile_capture) = metrics_with_profile_capture();
+    let (metrics, profile_capture) =
+        metrics_with_profile_capture(bench_metrics.store_metrics(&config.namespace)?);
     let store = StrataStore::open(store_config, metrics)?;
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("store_put", config.ops);
@@ -657,10 +673,14 @@ fn run_store_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_store_put_arc(
+    config: &Config,
+    bench_metrics: &BenchMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload: Arc<[u8]> = Arc::from(payload(config.payload_size));
     let store_config = config.store_config();
-    let (metrics, profile_capture) = metrics_with_profile_capture();
+    let (metrics, profile_capture) =
+        metrics_with_profile_capture(bench_metrics.store_metrics(&config.namespace)?);
     let store = StrataStore::open(store_config, metrics)?;
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("store_put_arc", config.ops);
@@ -695,10 +715,16 @@ fn run_store_put_arc(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn run_store_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_store_get(
+    config: &Config,
+    bench_metrics: &BenchMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
     let store_config = config.store_config();
-    let store = StrataStore::open(store_config, StrataStoreMetrics::default())?;
+    let store = StrataStore::open(
+        store_config,
+        bench_metrics.store_metrics(&config.namespace)?,
+    )?;
     let read_set_size = config.read_set_size.min(config.ops.max(1));
     let keys = (0..read_set_size)
         .map(|op| bench_key(b"read-key-", op))
@@ -866,6 +892,127 @@ fn record_sync_timed<E>(
 
 fn should_sync(sync_every: usize, completed_ops: usize) -> bool {
     sync_every != 0 && completed_ops.is_multiple_of(sync_every)
+}
+
+struct BenchMetrics {
+    registry: Option<Arc<Registry>>,
+    _server: Option<MetricsServer>,
+}
+
+impl BenchMetrics {
+    fn start(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let Some(listen_addr) = config.metrics_listen.as_deref() else {
+            return Ok(Self {
+                registry: None,
+                _server: None,
+            });
+        };
+
+        let registry = Arc::new(Registry::new());
+        let server = start_metrics_server(listen_addr, Arc::clone(&registry))?;
+        Ok(Self {
+            registry: Some(registry),
+            _server: Some(server),
+        })
+    }
+
+    fn store_metrics(&self, store_label: &str) -> Result<StrataStoreMetrics, prometheus::Error> {
+        match &self.registry {
+            Some(registry) => StrataStoreMetrics::new(registry, store_label),
+            None => Ok(StrataStoreMetrics::default()),
+        }
+    }
+}
+
+struct MetricsServer {
+    _thread: thread::JoinHandle<()>,
+}
+
+fn start_metrics_server(listen_addr: &str, registry: Arc<Registry>) -> io::Result<MetricsServer> {
+    let listener = TcpListener::bind(listen_addr)?;
+    let local_addr = listener.local_addr()?;
+    let thread = thread::Builder::new()
+        .name("strata-bench-metrics".to_owned())
+        .spawn(move || serve_metrics(listener, registry))
+        .map_err(io::Error::other)?;
+    eprintln!("metrics_listen={local_addr}");
+    Ok(MetricsServer { _thread: thread })
+}
+
+fn serve_metrics(listener: TcpListener, registry: Arc<Registry>) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(error) = handle_metrics_connection(stream, &registry) {
+                    eprintln!(
+                        "metrics_connection_error={}",
+                        sanitize_property_value(&error.to_string())
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "metrics_accept_error={}",
+                    sanitize_property_value(&error.to_string())
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn handle_metrics_connection(mut stream: TcpStream, registry: &Registry) -> io::Result<()> {
+    let mut request = [0_u8; 1024];
+    let read = stream.read(&mut request)?;
+    let path = request_path(&request[..read]).unwrap_or("");
+
+    match path.split_once('?').map_or(path, |(path, _)| path) {
+        "/metrics" => {
+            let encoder = TextEncoder::new();
+            let metric_families = registry.gather();
+            let mut body = Vec::new();
+            encoder
+                .encode(&metric_families, &mut body)
+                .map_err(io::Error::other)?;
+            write_http_response(&mut stream, "200 OK", encoder.format_type(), &body)
+        }
+        "/" => write_http_response(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            b"strata-bench metrics: GET /metrics\n",
+        ),
+        _ => write_http_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+        ),
+    }
+}
+
+fn request_path(request: &[u8]) -> Option<&str> {
+    let request = std::str::from_utf8(request).ok()?;
+    let line = request.lines().next()?;
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "GET" {
+        return None;
+    }
+    parts.next()
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)
 }
 
 struct ReportInputs<'a> {
@@ -1711,6 +1858,7 @@ options:
   --rocksdb-blob-gc <true|false>
   --rocksdb-disable-auto-compactions <true|false>
   --sync-every <count>
+  --metrics-listen <addr>              serve Prometheus metrics on /metrics
   --keep-data"
 }
 
@@ -1762,6 +1910,8 @@ mod tests {
                 "false",
                 "--rocksdb-disable-auto-compactions",
                 "true",
+                "--metrics-listen",
+                "127.0.0.1:0",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1776,6 +1926,7 @@ mod tests {
         assert!(!config.strata_accounting);
         assert!(!config.strata_gc);
         assert!(config.rocksdb_disable_auto_compactions);
+        assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
     }
 
     #[test]
