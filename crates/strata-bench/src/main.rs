@@ -62,6 +62,7 @@ const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READE
 const DEFAULT_STARTING_EPOCH: Epoch = 1;
 const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
+const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
 const BENCH_SEGMENT_ID: u64 = 1;
 
 fn main() {
@@ -194,6 +195,7 @@ struct Config {
     rocksdb_disable_auto_compactions: bool,
     sync_every: usize,
     metrics_listen: Option<String>,
+    metrics_drain_seconds: u64,
     keep_data: bool,
     root_was_defaulted: bool,
 }
@@ -224,6 +226,7 @@ impl Config {
             rocksdb_disable_auto_compactions: false,
             sync_every: 0,
             metrics_listen: None,
+            metrics_drain_seconds: DEFAULT_METRICS_DRAIN_SECONDS,
             keep_data: false,
             root_was_defaulted: true,
         };
@@ -307,6 +310,10 @@ impl Config {
                 }
                 "--metrics-listen" => {
                     config.metrics_listen = Some(next_value(&mut args, "--metrics-listen")?)
+                }
+                "--metrics-drain-seconds" => {
+                    config.metrics_drain_seconds =
+                        parse_u64(&next_value(&mut args, "--metrics-drain-seconds")?)?
                 }
                 "--keep-data" => config.keep_data = true,
                 unknown => return Err(format!("unknown argument '{unknown}'")),
@@ -580,6 +587,11 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         BenchCase::RocksDbBlobDbPut => run_rocksdb_blobdb_put(&config),
         BenchCase::RocksDbBlobDbGet => run_rocksdb_blobdb_get(&config),
     };
+
+    if bench_metrics.is_enabled() && config.metrics_drain_seconds != 0 {
+        eprintln!("metrics_drain_seconds={}", config.metrics_drain_seconds);
+        thread::sleep(Duration::from_secs(config.metrics_drain_seconds));
+    }
 
     if config.root_was_defaulted && !config.keep_data {
         let _ = fs::remove_dir_all(&config.root_dir);
@@ -921,6 +933,10 @@ impl BenchMetrics {
             Some(registry) => StrataStoreMetrics::new(registry, store_label),
             None => Ok(StrataStoreMetrics::default()),
         }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.registry.is_some()
     }
 }
 
@@ -1859,6 +1875,7 @@ options:
   --rocksdb-disable-auto-compactions <true|false>
   --sync-every <count>
   --metrics-listen <addr>              serve Prometheus metrics on /metrics
+  --metrics-drain-seconds <seconds>    wait after benchmark when metrics are enabled; default 30
   --keep-data"
 }
 
@@ -1912,6 +1929,8 @@ mod tests {
                 "true",
                 "--metrics-listen",
                 "127.0.0.1:0",
+                "--metrics-drain-seconds",
+                "7",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1927,6 +1946,7 @@ mod tests {
         assert!(!config.strata_gc);
         assert!(config.rocksdb_disable_auto_compactions);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(config.metrics_drain_seconds, 7);
     }
 
     #[test]
