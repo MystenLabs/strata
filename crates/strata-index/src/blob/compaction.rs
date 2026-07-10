@@ -76,7 +76,7 @@ struct BlobVersionsCompactionFilter {
 }
 
 impl CompactionFilter for BlobVersionsCompactionFilter {
-    fn filter<'a>(&'a mut self, _level: u32, _key: &[u8], value: &[u8]) -> Decision<'a> {
+    fn filter(&mut self, _level: u32, _key: &[u8], value: &[u8]) -> Decision {
         let Ok(mut state) = bcs::from_bytes::<BlobVersionState>(value) else {
             return Decision::Keep;
         };
@@ -102,16 +102,26 @@ impl CompactionFilter for BlobVersionsCompactionFilter {
             return Decision::Remove;
         }
         match bcs::to_bytes(&state) {
-            Ok(bytes) => {
-                self.scratch = bytes;
-                Decision::Change(self.scratch.as_slice())
-            }
+            Ok(bytes) => self.change_value(bytes),
             Err(_) => Decision::Keep,
         }
     }
 
     fn name(&self) -> &CStr {
         self.name.as_c_str()
+    }
+}
+
+impl BlobVersionsCompactionFilter {
+    fn change_value(&mut self, bytes: Vec<u8>) -> Decision {
+        self.scratch = bytes;
+        let scratch = self.scratch.as_slice();
+        // SAFETY: rocksdb 0.22 incorrectly requires a 'static replacement slice. Its callback
+        // forwards this pointer directly to RocksDB, which copies it before another call can
+        // mutate this factory-created, single-threaded filter. The scratch buffer is owned by the
+        // filter and therefore remains allocated for that entire interval.
+        let scratch = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(scratch) };
+        Decision::Change(scratch)
     }
 }
 

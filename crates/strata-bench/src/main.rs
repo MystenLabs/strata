@@ -182,6 +182,8 @@ struct Config {
     segment_max_bytes: u64,
     reader_cache_capacity: usize,
     starting_epoch: Epoch,
+    strata_accounting: bool,
+    strata_gc: bool,
     rocksdb_min_blob_size: u64,
     rocksdb_blob_file_size: u64,
     rocksdb_blob_gc: bool,
@@ -209,6 +211,8 @@ impl Config {
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             starting_epoch: DEFAULT_STARTING_EPOCH,
+            strata_accounting: true,
+            strata_gc: true,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
             rocksdb_blob_gc: true,
@@ -267,6 +271,13 @@ impl Config {
                 "--starting-epoch" => {
                     config.starting_epoch = parse_u64(&next_value(&mut args, "--starting-epoch")?)?
                 }
+                "--strata-accounting" => {
+                    config.strata_accounting =
+                        parse_bool(&next_value(&mut args, "--strata-accounting")?)?
+                }
+                "--strata-gc" => {
+                    config.strata_gc = parse_bool(&next_value(&mut args, "--strata-gc")?)?
+                }
                 "--rocksdb-min-blob-size" => {
                     config.rocksdb_min_blob_size =
                         parse_size(&next_value(&mut args, "--rocksdb-min-blob-size")?)? as u64
@@ -305,6 +316,9 @@ impl Config {
         if config.rocksdb_blob_file_size == 0 {
             return Err("rocksdb_blob_file_size must be non-zero".to_owned());
         }
+        if config.strata_gc && !config.strata_accounting {
+            return Err("--strata-gc true requires --strata-accounting true".to_owned());
+        }
 
         Ok(config)
     }
@@ -319,6 +333,7 @@ impl Config {
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            accounting_worker_enabled: self.strata_accounting,
             accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
             accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
             accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
@@ -333,6 +348,7 @@ impl Config {
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
             accounting_sidecar_major_patch_bytes_threshold:
                 DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+            gc_workers_enabled: self.strata_gc,
             gc_interval: DEFAULT_GC_INTERVAL,
             gc_worker_count: DEFAULT_GC_WORKER_COUNT,
             gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
@@ -1128,8 +1144,12 @@ fn print_timing_summary(prefix: &str, timings: &[Duration]) {
 
 fn print_strata_store_metrics(store: &StrataStore) {
     let store_config = store.config();
-    println!("strata_accounting_enabled=true");
-    println!("strata_gc_enabled=true");
+    println!(
+        "strata_accounting_enabled={}",
+        store_config.accounting_worker_enabled
+    );
+    println!("strata_accounting_delta_log_enabled=true");
+    println!("strata_gc_enabled={}", store_config.gc_workers_enabled);
     println!(
         "strata_accounting_interval_ms={:.3}",
         store_config.accounting_interval.as_secs_f64() * 1000.0
@@ -1138,7 +1158,18 @@ fn print_strata_store_metrics(store: &StrataStore) {
         "strata_gc_interval_ms={:.3}",
         store_config.gc_interval.as_secs_f64() * 1000.0
     );
-    println!("strata_gc_worker_count={}", store_config.gc_worker_count);
+    println!(
+        "strata_gc_worker_count={}",
+        if store_config.gc_workers_enabled {
+            store_config.gc_worker_count
+        } else {
+            0
+        }
+    );
+    println!(
+        "strata_gc_configured_worker_count={}",
+        store_config.gc_worker_count
+    );
     println!(
         "strata_gc_active_worker_limit={}",
         store.gc_active_worker_limit()
@@ -1673,6 +1704,8 @@ options:
   --segment-max-bytes <bytes|KiB|MiB|GiB>
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --starting-epoch <epoch>
+  --strata-accounting <true|false>      background accounting worker
+  --strata-gc <true|false>              background GC workers
   --rocksdb-min-blob-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-file-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-gc <true|false>
@@ -1723,6 +1756,10 @@ mod tests {
                 "--store-get-profile",
                 "--store-get-verify-checksum",
                 "false",
+                "--strata-accounting",
+                "false",
+                "--strata-gc",
+                "false",
                 "--rocksdb-disable-auto-compactions",
                 "true",
             ]
@@ -1736,6 +1773,20 @@ mod tests {
         assert_eq!(config.store_get_mode, StoreGetMode::KeyOnly);
         assert!(config.store_get_profile);
         assert!(!config.store_get_verify_checksum);
+        assert!(!config.strata_accounting);
+        assert!(!config.strata_gc);
         assert!(config.rocksdb_disable_auto_compactions);
+    }
+
+    #[test]
+    fn config_rejects_gc_without_accounting() {
+        let error = Config::parse(
+            ["--strata-accounting", "false"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("GC without accounting should be rejected");
+
+        assert_eq!(error, "--strata-gc true requires --strata-accounting true");
     }
 }

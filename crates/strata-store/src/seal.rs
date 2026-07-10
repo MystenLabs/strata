@@ -33,7 +33,7 @@ pub(crate) struct SealWorker {
     pub(crate) index: StrataIndex,
     pub(crate) ingest_owner: SegmentOwner,
     pub(crate) seal_rx: mpsc::Receiver<SealCommand>,
-    pub(crate) accounting_tx: mpsc::SyncSender<AccountingCommand>,
+    pub(crate) accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
     pub(crate) metrics: StrataStoreMetrics,
     pub(crate) store_halt: StoreHalt,
 }
@@ -112,7 +112,9 @@ impl SealWorker {
         self.metrics.set_durable_lsn(durable_lsn);
         self.metrics
             .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
-        let _ = self.accounting_tx.try_send(AccountingCommand::Run);
+        if let Some(accounting_tx) = &self.accounting_tx {
+            let _ = accounting_tx.try_send(AccountingCommand::Run);
+        }
         Ok(())
     }
 }

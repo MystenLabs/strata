@@ -39,6 +39,11 @@ pub struct StrataStoreConfig {
     pub segment_reader_cache_capacity: usize,
     pub recovery_policy: StrataRecoveryPolicy,
     pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
+    /// Whether the background accounting materialization worker is started.
+    ///
+    /// The foreground active delta log remains enabled because it is part of the store's
+    /// durability and recovery contract.
+    pub accounting_worker_enabled: bool,
     pub accounting_interval: Duration,
     pub accounting_unaccounted_threshold: usize,
     pub accounting_sidecar_partition_count: u32,
@@ -48,6 +53,8 @@ pub struct StrataStoreConfig {
     pub accounting_sidecar_delta_run_bytes_threshold: u64,
     pub accounting_sidecar_major_patch_count_threshold: usize,
     pub accounting_sidecar_major_patch_bytes_threshold: u64,
+    /// Whether background GC workers are started.
+    pub gc_workers_enabled: bool,
     /// Background GC cadence for one planning/copy/publish attempt.
     pub gc_interval: Duration,
     /// Maximum number of background GC workers that may plan/copy disjoint source segments

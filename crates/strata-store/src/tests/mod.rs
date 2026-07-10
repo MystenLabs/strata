@@ -516,6 +516,7 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         segment_reader_cache_capacity: 16,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+        accounting_worker_enabled: true,
         accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
         accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
         accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
@@ -530,6 +531,7 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
             DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
         accounting_sidecar_major_patch_bytes_threshold:
             DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+        gc_workers_enabled: true,
         gc_interval: Duration::from_secs(3600),
         gc_worker_count: DEFAULT_GC_WORKER_COUNT,
         gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
@@ -715,6 +717,46 @@ async fn standalone_put_get_round_trip() {
     assert_eq!(store.get(&key).unwrap(), Some(b"hello strata".to_vec()));
     assert!(dir.path().join("default").join("ingest").exists());
     assert!(dir.path().join("default").join("index").exists());
+}
+
+#[tokio::test]
+async fn background_accounting_and_gc_workers_can_be_disabled() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "no-background-maintenance");
+    cfg.accounting_worker_enabled = false;
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    assert!(store.store.accounting_tx.is_none());
+    assert!(store.store.accounting_handle.is_none());
+    assert!(store.store.gc_txs.is_empty());
+    assert!(store.store.gc_handles.is_empty());
+    assert_eq!(store.gc_active_worker_limit(), 0);
+    assert_eq!(store.gc_active_io_bytes_per_sec(), 0);
+
+    let lsn = store.put(&key, b"hello strata").unwrap();
+    store.sync().unwrap();
+
+    assert_eq!(store.durable_lsn().unwrap(), lsn);
+    assert_eq!(store.accounted_lsn().unwrap(), 0);
+    assert_eq!(store.get(&key).unwrap(), Some(b"hello strata".to_vec()));
+}
+
+#[tokio::test]
+async fn gc_workers_require_background_accounting() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "invalid-background-maintenance");
+    cfg.accounting_worker_enabled = false;
+
+    let error = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::InvalidConfig("gc workers require the accounting worker")
+    ));
 }
 
 #[tokio::test]
@@ -2290,7 +2332,7 @@ async fn metrics_track_seal_backpressure_waits() {
         pending_rollovers: Vec::new(),
         segment_ids: SegmentIdAllocator::new(3),
         seal_tx,
-        accounting_tx,
+        accounting_tx: Some(accounting_tx),
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
@@ -5438,7 +5480,7 @@ async fn seal_segment_reports_error_without_marking_failed() {
         index: index.clone(),
         ingest_owner: INGEST_SEGMENT_OWNER,
         seal_rx,
-        accounting_tx,
+        accounting_tx: Some(accounting_tx),
         metrics: StrataStoreMetrics::default(),
         store_halt: StoreHalt::default(),
     };

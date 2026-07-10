@@ -397,24 +397,32 @@ impl StrataStore {
             GcConcurrencyConfig::from_store_config(&config),
             metrics.clone(),
         ));
-        let accounting_worker = AccountingWorker {
-            config: config.clone(),
-            index: index.clone(),
-            interval: config.accounting_interval,
-            command_rx: accounting_rx,
-            run_lock: Arc::clone(&accounting_lock),
-            gc_txs: Arc::clone(&accounting_gc_txs),
+        let accounting_handle = if config.accounting_worker_enabled {
+            let accounting_worker = AccountingWorker {
+                config: config.clone(),
+                index: index.clone(),
+                interval: config.accounting_interval,
+                command_rx: accounting_rx,
+                run_lock: Arc::clone(&accounting_lock),
+                gc_txs: Arc::clone(&accounting_gc_txs),
+            };
+            Some(
+                thread::Builder::new()
+                    .name(format!("strata-accounting-{}", config.namespace))
+                    .spawn(move || accounting_worker.run())
+                    .map_err(|source| Error::ThreadSpawn { source })?,
+            )
+        } else {
+            drop(accounting_rx);
+            None
         };
-        let accounting_handle = thread::Builder::new()
-            .name(format!("strata-accounting-{}", config.namespace))
-            .spawn(move || accounting_worker.run())
-            .map_err(|source| Error::ThreadSpawn { source })?;
+        let store_accounting_tx = accounting_handle.as_ref().map(|_| accounting_tx.clone());
         let seal_worker = SealWorker {
             config: config.clone(),
             index: index.clone(),
             ingest_owner: INGEST_SEGMENT_OWNER,
             seal_rx,
-            accounting_tx: accounting_tx.clone(),
+            accounting_tx: store_accounting_tx.clone(),
             metrics: metrics.clone(),
             store_halt: store_halt.clone(),
         };
@@ -438,7 +446,7 @@ impl StrataStore {
             pending_rollovers: Vec::new(),
             segment_ids: segment_ids.clone(),
             seal_tx: seal_tx.clone(),
-            accounting_tx: accounting_tx.clone(),
+            accounting_tx: store_accounting_tx.clone(),
             write_rx,
             ingest_owner: INGEST_SEGMENT_OWNER,
             reader_cache: Arc::clone(&reader_cache),
@@ -450,9 +458,14 @@ impl StrataStore {
             .name(format!("strata-writer-{}", config.namespace))
             .spawn(move || coordinator.run())
             .map_err(|source| Error::ThreadSpawn { source })?;
-        let mut gc_txs = Vec::with_capacity(config.gc_worker_count);
-        let mut gc_handles = Vec::with_capacity(config.gc_worker_count);
-        for worker_index in 0..config.gc_worker_count {
+        let configured_gc_workers = if config.gc_workers_enabled {
+            config.gc_worker_count
+        } else {
+            0
+        };
+        let mut gc_txs = Vec::with_capacity(configured_gc_workers);
+        let mut gc_handles = Vec::with_capacity(configured_gc_workers);
+        for worker_index in 0..configured_gc_workers {
             let (gc_tx, gc_rx) = mpsc::channel();
             let gc_worker = GcWorker {
                 executor: GcExecutor {
@@ -498,7 +511,9 @@ impl StrataStore {
         }
 
         if !index.iter_shard_cleanup_jobs()?.is_empty() {
-            let _ = accounting_tx.try_send(AccountingCommand::Run);
+            if let Some(accounting_tx) = &store_accounting_tx {
+                let _ = accounting_tx.try_send(AccountingCommand::Run);
+            }
             for gc_tx in &gc_txs {
                 let _ = gc_tx.send(GcCommand::Run);
             }
@@ -512,8 +527,8 @@ impl StrataStore {
             writer_handle: Some(writer_handle),
             seal_tx: Some(seal_tx),
             seal_handle: Some(seal_handle),
-            accounting_tx: Some(accounting_tx),
-            accounting_handle: Some(accounting_handle),
+            accounting_tx: store_accounting_tx,
+            accounting_handle,
             gc_txs,
             gc_handles,
             accounting_lock,
@@ -541,12 +556,20 @@ impl StrataStore {
 
     /// Current number of background GC workers the runtime tuner may admit concurrently.
     pub fn gc_active_worker_limit(&self) -> usize {
-        self.gc_concurrency.active_limit()
+        if self.config.gc_workers_enabled {
+            self.gc_concurrency.active_limit()
+        } else {
+            0
+        }
     }
 
     /// Current store-wide background GC I/O budget selected by the runtime tuner.
     pub fn gc_active_io_bytes_per_sec(&self) -> u64 {
-        self.gc_concurrency.active_io_bytes_per_sec()
+        if self.config.gc_workers_enabled {
+            self.gc_concurrency.active_io_bytes_per_sec()
+        } else {
+            0
+        }
     }
 
     #[cfg(test)]
@@ -1376,7 +1399,7 @@ struct WriteCoordinator {
     pending_rollovers: Vec<PendingRollover>,
     segment_ids: SegmentIdAllocator,
     seal_tx: mpsc::Sender<SealCommand>,
-    accounting_tx: mpsc::SyncSender<AccountingCommand>,
+    accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
     write_rx: mpsc::Receiver<WriteCommand>,
     ingest_owner: SegmentOwner,
     reader_cache: Arc<SegmentReaderCache>,
@@ -1577,7 +1600,9 @@ impl WriteCoordinator {
         self.index.set_blob_compact_safe_lsn(drop_lsn);
         self.metrics.set_next_lsn(next_lsn);
         self.metrics.set_durable_lsn(drop_lsn);
-        let _ = self.accounting_tx.try_send(AccountingCommand::Run);
+        if let Some(accounting_tx) = &self.accounting_tx {
+            let _ = accounting_tx.try_send(AccountingCommand::Run);
+        }
         Ok(())
     }
 
@@ -1848,7 +1873,9 @@ impl WriteCoordinator {
             || self.run_rollover_post_commit(pending_rollovers),
         );
         let force_accounting_nudge = prepared.result.last_epoch().is_some();
-        if let Some(last_lsn) = prepared.result.last_lsn() {
+        if let (Some(last_lsn), Some(accounting_tx)) =
+            (prepared.result.last_lsn(), self.accounting_tx.clone())
+        {
             profile_phase(
                 profile.as_deref_mut(),
                 |profile, elapsed| profile.accounting_nudge += elapsed,
@@ -1857,7 +1884,7 @@ impl WriteCoordinator {
                         last_lsn,
                         self.config.accounting_unaccounted_threshold,
                         force_accounting_nudge,
-                        self.accounting_tx.clone(),
+                        accounting_tx,
                     )
                     .run()
                 },
@@ -2071,7 +2098,9 @@ impl WriteCoordinator {
                     .and_then(|record| record.publish_lsn.checked_add(1))
                     .expect("published records are non-empty and checked above");
                 self.metrics.set_next_lsn(next_lsn);
-                let _ = self.accounting_tx.try_send(AccountingCommand::Run);
+                if let Some(accounting_tx) = &self.accounting_tx {
+                    let _ = accounting_tx.try_send(AccountingCommand::Run);
+                }
                 Ok(GcPublishResult {
                     reconciled_accounted_lsn,
                     output_segments: output_plan.published_outputs,
@@ -2737,18 +2766,22 @@ impl WriteCoordinator {
             started.elapsed(),
             durable_offset.saturating_sub(previous_durable_offset),
         );
-        profile_phase(
-            profile,
-            |profile, elapsed| profile.accounting_nudge += elapsed,
-            || self.nudge_accounting(),
-        );
+        if self.accounting_tx.is_some() {
+            profile_phase(
+                profile,
+                |profile, elapsed| profile.accounting_nudge += elapsed,
+                || self.nudge_accounting(),
+            );
+        }
         Ok(())
     }
 
     /// `try_send` into a bounded(1) channel: if a run is already queued, the nudge coalesces into
     /// it and the drop is intentional. Accounting must never apply backpressure to the writer.
     fn nudge_accounting(&self) {
-        let _ = self.accounting_tx.try_send(AccountingCommand::Run);
+        if let Some(accounting_tx) = &self.accounting_tx {
+            let _ = accounting_tx.try_send(AccountingCommand::Run);
+        }
     }
 }
 
@@ -4030,6 +4063,11 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
     if config.max_unsealed_segments < 2 {
         return Err(Error::InvalidConfig(
             "max_unsealed_segments must be at least 2",
+        ));
+    }
+    if config.gc_workers_enabled && !config.accounting_worker_enabled {
+        return Err(Error::InvalidConfig(
+            "gc workers require the accounting worker",
         ));
     }
     if config.accounting_interval.is_zero() {

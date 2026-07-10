@@ -48,6 +48,3 @@ thiserror = "2"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }
 typed-store = { path = "/Users/sadhansood/dev/walrus/crates/typed-store" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-
-[patch.crates-io]
-rocksdb = { path = "/Users/sadhansood/dev/walrus/crates/rocksdb" }

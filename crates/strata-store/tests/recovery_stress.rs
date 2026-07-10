@@ -500,6 +500,7 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         segment_reader_cache_capacity: 8,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+        accounting_worker_enabled: true,
         accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
         accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
         accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
@@ -514,6 +515,7 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
             DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
         accounting_sidecar_major_patch_bytes_threshold:
             DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+        gc_workers_enabled: true,
         gc_interval: Duration::from_secs(3600),
         gc_worker_count: DEFAULT_GC_WORKER_COUNT,
         gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
