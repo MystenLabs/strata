@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, num::NonZeroU32};
 
 use serde::{Deserialize, Serialize};
-use strata_core::{Epoch, StrataLsn};
+use strata_core::{Epoch, ShardKey, StrataLsn};
 
 use crate::{Error, FORMAT_VERSION, PartitionId, Result, RunId};
 
@@ -120,6 +120,8 @@ pub struct Manifest {
     /// Keeping them in the same durable root as run metadata gives blob updates and epoch transitions
     /// one publication order when both are ingested from the active log.
     pub epoch_changes: Vec<EpochChange>,
+    /// Shard-generation drops ingested from the active log.
+    pub shard_drops: Vec<ShardDrop>,
 }
 
 impl Manifest {
@@ -136,6 +138,7 @@ impl Manifest {
             next_run_id: 1,
             partitions,
             epoch_changes: Vec::new(),
+            shard_drops: Vec::new(),
         }
     }
 }
@@ -145,6 +148,13 @@ impl Manifest {
 pub struct EpochChange {
     pub lsn: StrataLsn,
     pub epoch: Epoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardDrop {
+    pub lsn: StrataLsn,
+    pub shard: ShardKey,
+    pub materialized: bool,
 }
 
 pub fn manifest_to_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
@@ -192,6 +202,23 @@ pub(crate) fn advance_manifest_generation(manifest: &mut Manifest) -> Result<()>
                 generation: manifest.generation,
             })?;
     Ok(())
+}
+
+pub(crate) fn push_shard_drop(manifest: &mut Manifest, lsn: StrataLsn, shard: ShardKey) {
+    if let Some(existing) = manifest
+        .shard_drops
+        .iter_mut()
+        .find(|drop| drop.shard == shard)
+    {
+        existing.lsn = existing.lsn.max(lsn);
+        return;
+    }
+    manifest.shard_drops.push(ShardDrop {
+        lsn,
+        shard,
+        materialized: false,
+    });
+    manifest.shard_drops.sort_by_key(|drop| drop.lsn);
 }
 
 pub(crate) fn allocate_run_id(manifest: &mut Manifest) -> RunId {

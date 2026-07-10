@@ -69,3 +69,17 @@ pub struct ShardKey {
     pub id: ShardId,
     pub generation: ShardGeneration,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardCleanupState {
+    PendingAccounting,
+    ReadyForGc,
+}
+
+/// Durable progress for asynchronously reclaiming one dropped shard generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardCleanupJob {
+    pub shard: ShardKey,
+    pub drop_lsn: StrataLsn,
+    pub state: ShardCleanupState,
+}

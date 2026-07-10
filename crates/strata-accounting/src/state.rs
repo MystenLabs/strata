@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
-use strata_core::{BlobKey, BlobLifecycle, Epoch, RecordRef, ShardKey, StrataLsn};
+use strata_core::{BlobKey, BlobLifecycle, Epoch, RecordRef, SegmentOwner, ShardKey, StrataLsn};
 
 use crate::events::{CompactionEventBatch, RefEvent, RetireReason};
 
@@ -65,6 +67,9 @@ pub struct LivePayload {
     /// Shard identity travels with the live physical ref so a future `Live` event can be reconstructed
     /// from folded state without consulting the original delta log.
     pub shard: ShardKey,
+    /// Physical ownership determines whether shard drop needs a range retirement or can rely on
+    /// whole-directory deletion.
+    pub owner: SegmentOwner,
     /// This is the byte range that segment accounting and the GC overlay protect. The reducer treats
     /// changes to this field as physical storage transitions, not merely logical metadata updates.
     pub record_ref: RecordRef,
@@ -129,10 +134,11 @@ pub struct MaterializedBlobState {
     /// payload. This is what lets base-run metadata advertise how far compaction has materialized a
     /// key whose last operation may have been a tombstone, lifecycle change, or pending map.
     pub head_lsn: StrataLsn,
-    /// Presence here means a physical segment range is currently live for this key and must be
-    /// reflected in ref events and GC overlay operations. Absence does not make the row
-    /// disposable, because tombstones and pending maps can still have future physical effects.
-    pub payload: Option<LivePayload>,
+    /// One live physical range per shard generation. The foreground index permits the same blob key
+    /// to be live in multiple shards, so accounting must protect those ranges independently.
+    /// An empty map does not make the row disposable because tombstones and pending maps can still
+    /// have future physical effects.
+    pub payloads: BTreeMap<ShardKey, LivePayload>,
     /// Lifecycle is key-level intent carried until there is a physical range to annotate. Keeping it
     /// beside, rather than inside, the payload lets a later put inherit the lifetime and lets a map
     /// transfer that lifetime to the replacement segment range.
@@ -149,7 +155,7 @@ pub struct MaterializedBlobState {
 
 impl MaterializedBlobState {
     pub fn is_live(&self) -> bool {
-        self.payload.is_some()
+        !self.payloads.is_empty()
     }
 
     pub fn lifecycle_value(&self) -> Option<BlobLifecycle> {
@@ -307,6 +313,20 @@ pub(crate) fn compact_delta_updates(
         return raw_patch_updates(updates);
     }
 
+    let put_shards = updates
+        .iter()
+        .filter_map(|update| match update {
+            BlobUpdate::Put { shard, .. } => Some(*shard),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if put_shards.len() > 1 {
+        // A Put supersedes only the same shard's payload. Without the older folded state, shallow
+        // compaction cannot determine which shard lifetimes are locally closed, so preserve the
+        // complete group for major compaction.
+        return raw_patch_updates(updates);
+    }
+
     let Some(first_put_index) = updates
         .iter()
         .position(|update| matches!(update, BlobUpdate::Put { .. }))
@@ -380,10 +400,11 @@ fn emit_closed_delta_events(
 
     if let Some(current) = state.as_mut() {
         let lifecycle = current.lifecycle_value();
-        if let Some(payload) = current.payload.take() {
+        for payload in std::mem::take(&mut current.payloads).into_values() {
             batch.record_event(RefEvent::Retired {
                 lsn: close_lsn,
                 key: key.clone(),
+                shard: payload.shard,
                 record_ref: payload.record_ref,
                 lifecycle,
                 reason: close_reason,
@@ -478,29 +499,32 @@ pub(crate) fn fold_update(
         } => {
             let current = state.get_or_insert_with(MaterializedBlobState::default);
             let requested_lifecycle = *lifecycle;
+            let previous_lifecycle = current.lifecycle_value();
             let inherited_lifecycle = requested_lifecycle.or_else(|| {
-                current
-                    .lifecycle_value()
-                    .filter(|lifecycle| lifecycle.logical_end_epoch > *current_epoch)
+                previous_lifecycle.filter(|lifecycle| lifecycle.logical_end_epoch > *current_epoch)
             });
-            // A Put replaces the live physical record for the key. The previous payload is retired
-            // at the new LSN before the new payload is announced live, which preserves the byte
-            // transition order expected by the GC summary and overlay.
-            if let Some(payload) = current.payload.take() {
+            // A Put replaces the live physical record for this shard. Other shards may carry the
+            // same logical key and remain independently live.
+            if let Some(payload) = current.payloads.remove(shard) {
                 emit(RefEvent::Retired {
                     lsn: *lsn,
                     key: key.clone(),
+                    shard: payload.shard,
                     record_ref: payload.record_ref,
                     lifecycle: current.lifecycle_value(),
                     reason: RetireReason::Overwritten,
                 });
             }
             current.head_lsn = *lsn;
-            current.payload = Some(LivePayload {
-                payload_lsn: *lsn,
-                shard: *shard,
-                record_ref: *record_ref,
-            });
+            current.payloads.insert(
+                *shard,
+                LivePayload {
+                    payload_lsn: *lsn,
+                    shard: *shard,
+                    owner: SegmentOwner::Store,
+                    record_ref: *record_ref,
+                },
+            );
             // A Put without explicit lifecycle inherits any prior key-level lifecycle. If there was
             // no prior active lifecycle, record the absence so the base row still reflects that this
             // payload was observed and does not need a later inferred default.
@@ -508,6 +532,22 @@ pub(crate) fn fold_update(
                 || current.lifecycle.is_none()
                 || current.lifecycle_value() != inherited_lifecycle
             {
+                if previous_lifecycle != inherited_lifecycle {
+                    for payload in current
+                        .payloads
+                        .values()
+                        .filter(|payload| payload.shard != *shard)
+                    {
+                        emit(RefEvent::LifecycleChanged {
+                            lsn: *lsn,
+                            key: key.clone(),
+                            shard: payload.shard,
+                            record_ref: payload.record_ref,
+                            old: previous_lifecycle,
+                            new: inherited_lifecycle,
+                        });
+                    }
+                }
                 current.lifecycle = Some(LifecycleChange {
                     lsn: *lsn,
                     new_lifecycle: inherited_lifecycle,
@@ -528,10 +568,11 @@ pub(crate) fn fold_update(
             // Tombstones shadow older base/patch payloads. Even when no payload is currently loaded,
             // the marker must survive as residual state so a later major compaction can retire an
             // older physical ref at this LSN.
-            if let Some(payload) = current.payload.take() {
+            for payload in std::mem::take(&mut current.payloads).into_values() {
                 emit(RefEvent::Retired {
                     lsn: *lsn,
-                    key,
+                    key: key.clone(),
+                    shard: payload.shard,
                     record_ref: payload.record_ref,
                     lifecycle: current.lifecycle_value(),
                     reason: RetireReason::Tombstoned,
@@ -565,33 +606,38 @@ pub(crate) fn fold_update(
                 lsn: *lsn,
                 new_lifecycle: Some(new),
             });
-            if !old_expired
-                && old != Some(new)
-                && let Some(payload) = &current.payload
-            {
-                emit(RefEvent::LifecycleChanged {
-                    lsn: *lsn,
-                    key,
-                    record_ref: payload.record_ref,
-                    old,
-                    new: Some(new),
-                });
+            if !old_expired && old != Some(new) {
+                for payload in current.payloads.values() {
+                    emit(RefEvent::LifecycleChanged {
+                        lsn: *lsn,
+                        key: key.clone(),
+                        shard: payload.shard,
+                        record_ref: payload.record_ref,
+                        old,
+                        new: Some(new),
+                    });
+                }
             }
         }
         BlobUpdate::MapRef { lsn, from, to, .. } => {
             let current = state.get_or_insert_with(MaterializedBlobState::default);
             current.head_lsn = current.head_lsn.max(*lsn);
             let lifecycle = current.lifecycle_value();
-            if let Some(payload) = &mut current.payload
-                && payload.record_ref == *from
+            if let Some(payload) = current
+                .payloads
+                .values_mut()
+                .find(|payload| payload.record_ref == *from)
             {
                 // When the source ref is present, MapRef is an in-place physical rewrite of the live
                 // payload: retire the old range, install the new range, and carry lifecycle metadata
                 // onto the new segment range.
+                let shard = payload.shard;
                 payload.record_ref = *to;
+                payload.owner = SegmentOwner::Shard(shard);
                 emit(RefEvent::Mapped {
                     lsn: *lsn,
                     key,
+                    shard,
                     from: *from,
                     to: *to,
                     lifecycle,
@@ -616,23 +662,29 @@ fn apply_pending_maps(
     emit: &mut impl FnMut(RefEvent),
 ) {
     let lifecycle = state.lifecycle_value();
-    let Some(payload) = &mut state.payload else {
-        return;
-    };
-
     let mut index = 0;
     while index < state.pending_maps.len() {
         let map = state.pending_maps[index];
-        if map.from == payload.record_ref {
+        let matching_shard = state
+            .payloads
+            .iter()
+            .find_map(|(shard, payload)| (map.from == payload.record_ref).then_some(*shard));
+        if let Some(shard) = matching_shard {
             // Pending maps are replayed at the moment the source physical ref appears. This is why
             // delta compaction keeps MapRef groups raw: only the full folded state can prove which
             // segment range should be retired and which replacement range inherits lifecycle state.
             state.pending_maps.remove(index);
+            let payload = state
+                .payloads
+                .get_mut(&shard)
+                .expect("matching shard payload must remain present");
             payload.record_ref = map.to;
+            payload.owner = SegmentOwner::Shard(shard);
             state.head_lsn = state.head_lsn.max(map.lsn);
             emit(RefEvent::Mapped {
                 lsn: map.lsn,
                 key: key.clone(),
+                shard,
                 from: map.from,
                 to: map.to,
                 lifecycle,

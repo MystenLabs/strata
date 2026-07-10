@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -10,7 +11,7 @@ use strata_segment::{
     RecordMetadata, SegmentPayloadStream, SegmentReadOptions, SegmentReadProfile, SegmentReader,
 };
 
-use crate::{Result, StrataStoreConfig, layout::segment_path};
+use crate::Result;
 
 #[derive(Debug)]
 pub(crate) struct SegmentReaderCache {
@@ -34,26 +35,25 @@ impl SegmentReaderCache {
 
     pub(crate) fn read_record_with_options(
         &self,
-        config: &StrataStoreConfig,
+        path: &Path,
         record_ref: RecordRef,
         options: SegmentReadOptions,
     ) -> Result<DecodedRecord> {
-        self.with_reader(config, record_ref.segment_id, |reader| {
+        self.with_reader(path, record_ref.segment_id, |reader| {
             reader.read_record_with_options(record_ref, options)
         })
     }
 
     pub(crate) fn read_record_profiled(
         &self,
-        config: &StrataStoreConfig,
+        path: &Path,
         record_ref: RecordRef,
         options: SegmentReadOptions,
         reader_acquire: &mut Duration,
     ) -> Result<(DecodedRecord, SegmentReadProfile)> {
         if self.capacity == 0 {
-            let path = segment_path(config, record_ref.segment_id);
             let started = Instant::now();
-            let mut reader = SegmentReader::open(&path, record_ref.segment_id)?;
+            let mut reader = SegmentReader::open(path, record_ref.segment_id)?;
             *reader_acquire = started.elapsed();
             return Ok(reader.read_record_profiled_with_options(record_ref, options)?);
         }
@@ -67,9 +67,8 @@ impl SegmentReaderCache {
             let reader = if let Some(reader) = inner.readers.get(&record_ref.segment_id) {
                 Arc::clone(reader)
             } else {
-                let path = segment_path(config, record_ref.segment_id);
                 let reader = Arc::new(Mutex::new(SegmentReader::open(
-                    &path,
+                    path,
                     record_ref.segment_id,
                 )?));
                 inner
@@ -96,21 +95,21 @@ impl SegmentReaderCache {
 
     pub(crate) fn read_record_metadata(
         &self,
-        config: &StrataStoreConfig,
+        path: &Path,
         record_ref: RecordRef,
     ) -> Result<RecordMetadata> {
-        self.with_reader(config, record_ref.segment_id, |reader| {
+        self.with_reader(path, record_ref.segment_id, |reader| {
             reader.read_record_metadata(record_ref)
         })
     }
 
     pub(crate) fn open_payload_stream(
         &self,
-        config: &StrataStoreConfig,
+        path: &Path,
         record_ref: RecordRef,
         payload_range: Range<u64>,
     ) -> Result<SegmentPayloadStream> {
-        self.with_reader(config, record_ref.segment_id, |reader| {
+        self.with_reader(path, record_ref.segment_id, |reader| {
             reader.open_payload_stream(record_ref, payload_range)
         })
     }
@@ -134,13 +133,12 @@ impl SegmentReaderCache {
 
     fn with_reader<T>(
         &self,
-        config: &StrataStoreConfig,
+        path: &Path,
         segment_id: SegmentId,
         read: impl FnOnce(&mut SegmentReader) -> strata_segment::Result<T>,
     ) -> Result<T> {
         if self.capacity == 0 {
-            let path = segment_path(config, segment_id);
-            let mut reader = SegmentReader::open(&path, segment_id)?;
+            let mut reader = SegmentReader::open(path, segment_id)?;
             return Ok(read(&mut reader)?);
         }
 
@@ -152,8 +150,7 @@ impl SegmentReaderCache {
             let reader = if let Some(reader) = inner.readers.get(&segment_id) {
                 Arc::clone(reader)
             } else {
-                let path = segment_path(config, segment_id);
-                let reader = Arc::new(Mutex::new(SegmentReader::open(&path, segment_id)?));
+                let reader = Arc::new(Mutex::new(SegmentReader::open(path, segment_id)?));
                 inner.readers.insert(segment_id, Arc::clone(&reader));
                 reader
             };

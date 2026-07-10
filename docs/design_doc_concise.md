@@ -41,14 +41,14 @@ Main RocksDB column families:
 
 ```text
 blob_versions          BlobKey -> BlobVersionState
-segment_states         SegmentKey -> SegmentState
+segment_states         SegmentId -> SegmentState
 segment_gc_overlay     SegmentId -> SegmentGcOverlay + SegmentGcSummary
 segment_ref_events     SegmentRefEventKey -> SegmentRefEvent
 shards                 ShardId -> ShardInfo
 store_state            StoreStateKey -> u64
 epoch_changes          StrataLsn -> Epoch
 unaccounted_lsn_ops    StrataLsn -> BlobKey
-accounting_index       AccountingIndexKey -> AccountingIndexValue
+accounting_index       AccountingIndexKey -> manifest/cursors/shard cleanup jobs
 ```
 
 The logical commit domain is a store-global LSN stream. RocksDB metadata is the commit log; segment files are payload logs. Recovery never treats payload records found only in `.data` files as committed operations.
@@ -93,6 +93,7 @@ The expected extension point is `SegmentState`:
 
 ```text
 SegmentState {
+  owner, // Store for mixed ingest, Shard(ShardKey) for retention
   segment_id,
   path,
   placement_class,
@@ -318,9 +319,24 @@ Run files are written, synced, and renamed before they become reachable. The Roc
 
 `blob_versions` compaction follows `durable_lsn`, not `accounted_lsn`. The active accounting delta log is the accounting input, so packed per-key tail entries may fold into heads once the corresponding logical operations are durable.
 
-### GC Metadata
+### Asynchronous Shard Drop
 
-The repo contains GC planning and accounting structures, but not a full physical segment-copy/reclaim worker.
+`drop_shard` completes after the writer durably commits a generation fence, a `ShardDropped` accounting delta, and a cleanup job keyed by the full `ShardKey`. It does not wait for accounting, GC claims, or filesystem deletion.
+
+```text
+PendingAccounting
+  -> accounting folds through drop_lsn
+  -> remove the generation from every MaterializedBlobState
+  -> emit Retired only for SegmentOwner::Store payloads
+ReadyForGc
+  -> drain claims for SegmentOwner::Shard(generation) segments
+  -> evict readers and delete generation metadata/directory
+  -> remove cleanup job
+```
+
+Shard-owned payloads do not need individual retirement ranges because the complete generation directory is deleted. A persisted cleanup job is the recovery source of truth; in-memory accounting and GC commands are wakeups only.
+
+### GC Metadata
 
 Implemented metadata:
 

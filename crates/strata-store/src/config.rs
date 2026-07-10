@@ -25,6 +25,7 @@ pub const DEFAULT_GC_SYNC_IMPACT_THRESHOLD: Duration = Duration::from_millis(250
 pub const DEFAULT_GC_IO_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_GC_MIN_IO_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN: Option<StrataLsn> = None;
+pub const DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Runtime configuration for one Strata store namespace.
@@ -77,6 +78,11 @@ pub struct StrataStoreConfig {
     /// stale. GC publish still uses relocation forwarding and does not require accounting to catch
     /// all the way up to the durable LSN.
     pub gc_max_accounting_lag_lsn: Option<StrataLsn>,
+    /// Maximum time one background shard-cleanup attempt waits for retention-segment GC readers.
+    ///
+    /// New overlapping claims are fenced immediately. A timeout leaves the persisted cleanup job
+    /// in place so a later GC wakeup can retry without delaying the `drop_shard` caller.
+    pub shard_drop_gc_drain_timeout: Duration,
     /// Initial epoch used only when creating a namespace without persisted epoch metadata.
     pub starting_epoch: Epoch,
 }

@@ -3,14 +3,16 @@ use std::{fs, io::Read, path::Path, sync::mpsc};
 use sha2::{Digest, Sha256};
 use strata_accounting::ActiveDeltaLogState;
 use strata_core::{
-    BlobKey, MapRefOp, SegmentFileState, SegmentId, SegmentKey, SegmentState, ShardKey, StrataLsn,
+    BlobKey, MapRefOp, SegmentFileState, SegmentId, SegmentOwner, SegmentState, StrataLsn,
 };
 use strata_index::StrataIndex;
 
 use crate::{
-    Error, Result, STORE_SCOPE, SealedSegmentIntegrityPolicy, StoreHalt, StrataStoreConfig,
-    StrataStoreMetrics, accounting::AccountingCommand, active_segment_state_from_path,
-    layout::segment_path, unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
+    Error, Result, SealedSegmentIntegrityPolicy, StoreHalt, StrataStoreConfig, StrataStoreMetrics,
+    accounting::AccountingCommand,
+    active_segment_state_from_path,
+    layout::{segment_path, segment_state_path},
+    unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
 
 #[derive(Debug)]
@@ -29,7 +31,7 @@ pub(crate) struct SegmentSealTask {
 pub(crate) struct SealWorker {
     pub(crate) config: StrataStoreConfig,
     pub(crate) index: StrataIndex,
-    pub(crate) store_scope: ShardKey,
+    pub(crate) ingest_owner: SegmentOwner,
     pub(crate) seal_rx: mpsc::Receiver<SealCommand>,
     pub(crate) accounting_tx: mpsc::SyncSender<AccountingCommand>,
     pub(crate) metrics: StrataStoreMetrics,
@@ -79,7 +81,7 @@ impl SealWorker {
 
         let mut state = active_segment_state_from_path(
             &self.config,
-            self.store_scope,
+            self.ingest_owner,
             task.segment_id,
             task.sealed_len,
             task.sealed_len,
@@ -151,7 +153,7 @@ pub(crate) fn verify_sealed_segments(
 
 fn verify_sealed_segment(config: &StrataStoreConfig, state: &SegmentState) -> Result<()> {
     let segment_id = state.segment_id;
-    let path = segment_path(config, segment_id);
+    let path = segment_state_path(config, state);
     let expected_len = state
         .sealed_len
         .ok_or(Error::SealedSegmentMissingLength { segment_id })?;
@@ -323,23 +325,19 @@ fn compute_durable_lsn(
 fn segment_states_with_override(
     index: &StrataIndex,
     override_state: Option<&SegmentState>,
-) -> Result<Vec<(SegmentKey, SegmentState)>> {
-    let mut states = index.iter_segment_states_by_key()?;
+) -> Result<Vec<(SegmentId, SegmentState)>> {
+    let mut states = index.iter_segment_states()?;
     if let Some(override_state) = override_state {
-        let override_key = SegmentKey {
-            shard: STORE_SCOPE,
-            segment_id: override_state.segment_id,
-        };
         let mut replaced = false;
-        for (key, state) in &mut states {
-            if *key == override_key {
+        for (segment_id, state) in &mut states {
+            if *segment_id == override_state.segment_id {
                 *state = override_state.clone();
                 replaced = true;
                 break;
             }
         }
         if !replaced {
-            states.push((override_key, override_state.clone()));
+            states.push((override_state.segment_id, override_state.clone()));
         }
     }
     Ok(states)
@@ -349,7 +347,7 @@ fn unaccounted_lsn_is_durable(
     index: &StrataIndex,
     lsn: StrataLsn,
     key: &BlobKey,
-    states: &[(SegmentKey, SegmentState)],
+    states: &[(SegmentId, SegmentState)],
 ) -> Result<bool> {
     let (op, lifecycle_op) = index.blob_ops_at_lsn(key, lsn)?;
     let map_ref = index.blob_map_ref_at_lsn(key, lsn)?;
@@ -366,13 +364,9 @@ fn unaccounted_lsn_is_durable(
     let Some(record_end_offset) = record_ref.end_offset() else {
         return Err(strata_segment::Error::RangeOverflow.into());
     };
-    let segment_key = SegmentKey {
-        shard: STORE_SCOPE,
-        segment_id: record_ref.segment_id,
-    };
     let is_durable = states
         .iter()
-        .find(|(candidate, _)| *candidate == segment_key)
+        .find(|(candidate, _)| *candidate == record_ref.segment_id)
         .is_some_and(|(_, state)| {
             state.state != SegmentFileState::Deleted && state.durable_offset >= record_end_offset
         });
@@ -384,7 +378,7 @@ fn unaccounted_lsn_is_durable(
 
 fn map_ref_is_durable(
     map_ref: Option<&MapRefOp>,
-    states: &[(SegmentKey, SegmentState)],
+    states: &[(SegmentId, SegmentState)],
 ) -> Result<bool> {
     let Some(map_ref) = map_ref else {
         return Ok(true);
@@ -392,13 +386,9 @@ fn map_ref_is_durable(
     let Some(record_end_offset) = map_ref.to.end_offset() else {
         return Err(strata_segment::Error::RangeOverflow.into());
     };
-    let segment_key = SegmentKey {
-        shard: STORE_SCOPE,
-        segment_id: map_ref.to.segment_id,
-    };
     Ok(states
         .iter()
-        .find(|(candidate, _)| *candidate == segment_key)
+        .find(|(candidate, _)| *candidate == map_ref.to.segment_id)
         .is_some_and(|(_, state)| {
             state.state != SegmentFileState::Deleted && state.durable_offset >= record_end_offset
         }))

@@ -13,6 +13,7 @@ pub enum RetireReason {
     Overwritten,
     Tombstoned,
     Mapped,
+    ShardDropped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub enum RefEvent {
     Retired {
         lsn: StrataLsn,
         key: BlobKey,
+        shard: ShardKey,
         record_ref: RecordRef,
         lifecycle: Option<BlobLifecycle>,
         reason: RetireReason,
@@ -34,6 +36,7 @@ pub enum RefEvent {
     LifecycleChanged {
         lsn: StrataLsn,
         key: BlobKey,
+        shard: ShardKey,
         record_ref: RecordRef,
         old: Option<BlobLifecycle>,
         new: Option<BlobLifecycle>,
@@ -41,6 +44,7 @@ pub enum RefEvent {
     Mapped {
         lsn: StrataLsn,
         key: BlobKey,
+        shard: ShardKey,
         from: RecordRef,
         to: RecordRef,
         lifecycle: Option<BlobLifecycle>,

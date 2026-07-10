@@ -4,7 +4,8 @@ use strata_accounting::{AccountingIndex, AccountingIndexConfig};
 use strata_core::{
     BlobLifecycle, BlobLifecycleAction, BlobLifecycleMergeOp, BlobLifecycleOp, BlobState,
     GcRelocation, MapRefOp, PlacementClass, PutMergeOp, RecordRef, SegmentFileState,
-    SegmentGcLiveRecord, SegmentGcSummary, ShardInfo, ShardKey, ShardState,
+    SegmentGcLiveRecord, SegmentGcSummary, SegmentOwner, ShardCleanupJob, ShardCleanupState,
+    ShardInfo, ShardKey, ShardState,
 };
 use strata_gc::{GcPlanner, GcPlannerConfig, GcScenario};
 use tempfile::tempdir;
@@ -18,6 +19,10 @@ fn init_typed_store_metrics() {
     INIT_TYPED_STORE_METRICS.call_once(|| {
         DBMetrics::get();
     });
+}
+
+fn open_test_index(dir: &tempfile::TempDir) -> StrataIndex {
+    StrataIndex::open_path(dir.path(), "strata", dir.path().display().to_string()).unwrap()
 }
 
 fn blob_entry(segment_id: SegmentId, offset: u64) -> PutEntry {
@@ -41,12 +46,25 @@ fn version_key(key: &BlobKey, lsn: strata_core::StrataLsn) -> BlobVersionKey {
 }
 
 fn segment_state(segment_id: SegmentId) -> SegmentState {
-    segment_state_for_shard(STANDALONE_SHARD, segment_id)
+    SegmentState {
+        owner: SegmentOwner::Store,
+        segment_id,
+        volume_id: 0,
+        path: format!("{segment_id:06}.data"),
+        placement_class: PlacementClass::Ingest,
+        state: SegmentFileState::Open,
+        write_offset: 128,
+        durable_offset: 64,
+        min_lsn: Some(1),
+        max_lsn: Some(3),
+        sealed_len: None,
+        sealed_sha256: None,
+    }
 }
 
 fn segment_state_for_shard(shard: ShardKey, segment_id: SegmentId) -> SegmentState {
     SegmentState {
-        shard,
+        owner: SegmentOwner::Shard(shard),
         segment_id,
         volume_id: 0,
         path: format!("{segment_id:06}.data"),
@@ -70,9 +88,13 @@ fn put_version_state(index: &StrataIndex, key: &BlobKey, state: &PutState) {
         versions: state.clone(),
         lifecycle: BlobLifecycleState::default(),
     };
+    put_blob_state(index, key, &blob_state);
+}
+
+fn put_blob_state(index: &StrataIndex, key: &BlobKey, state: &BlobVersionState) {
     let mut batch = index.batch();
     batch
-        .insert_batch(index.blob_versions(), [(key, &blob_state)])
+        .insert_batch(index.blob_versions(), [(key, state)])
         .unwrap();
     batch.write().unwrap();
 }
@@ -110,11 +132,11 @@ async fn open_path_persists_blob_entry_across_reopen() {
     let entry = blob_entry(7, 128);
 
     {
-        let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+        let index = open_test_index(&dir);
         index.put_blob_entry(&key, &entry).unwrap();
     }
 
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     assert_eq!(index.get_blob_entry(&key).unwrap(), Some(entry.clone()));
 }
 
@@ -125,7 +147,7 @@ async fn from_db_creates_missing_cfs() {
     let db = open_cf(
         dir.path(),
         None,
-        unique_metric_conf("strata_index_test"),
+        metric_conf_with_suffix("strata_index_test", dir.path().display().to_string()),
         &["existing"],
     )
     .unwrap();
@@ -149,20 +171,48 @@ async fn shard_info_persists_across_reopen() {
     };
 
     {
-        let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+        let index = open_test_index(&dir);
         index.put_shard_info(shard_id, info).unwrap();
     }
 
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     assert_eq!(index.get_shard_info(shard_id).unwrap(), Some(info));
     assert_eq!(index.iter_shards().unwrap(), vec![(shard_id, info)]);
+}
+
+#[tokio::test]
+async fn shard_cleanup_job_persists_and_is_removed_by_generation() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = open_test_index(&dir);
+    let job = ShardCleanupJob {
+        shard: ShardKey {
+            id: 17,
+            generation: 4,
+        },
+        drop_lsn: 42,
+        state: ShardCleanupState::PendingAccounting,
+    };
+
+    let mut batch = index.batch();
+    index.put_shard_cleanup_job_batch(&mut batch, job).unwrap();
+    batch.write_with_sync(true).unwrap();
+    assert_eq!(index.get_shard_cleanup_job(job.shard).unwrap(), Some(job));
+    assert_eq!(index.iter_shard_cleanup_jobs().unwrap(), vec![job]);
+
+    let mut batch = index.batch();
+    index
+        .delete_shard_cleanup_job_batch(&mut batch, job.shard)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+    assert!(index.get_shard_cleanup_job(job.shard).unwrap().is_none());
 }
 
 #[tokio::test]
 async fn batch_writes_across_index_cfs_atomically() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let entry = blob_entry(9, 256);
     let state = segment_state(9);
@@ -232,7 +282,7 @@ async fn batch_writes_across_index_cfs_atomically() {
 async fn accounting_snapshot_guard_pins_frontier_and_returns_later_ref_events() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let before_key = SegmentRefEventKey {
         segment_id: 1,
         lsn: 5,
@@ -316,7 +366,7 @@ async fn accounting_snapshot_guard_pins_frontier_and_returns_later_ref_events() 
 async fn gc_snapshot_requires_initialized_epoch() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let accounting_snapshot = index.create_accounting_snapshot().unwrap();
 
     assert!(
@@ -331,7 +381,7 @@ async fn gc_snapshot_requires_initialized_epoch() {
 async fn gc_snapshot_reads_segment_metadata_from_one_index_view() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let mut state = segment_state(9);
     state.state = SegmentFileState::Sealed;
     state.placement_class = PlacementClass::Spillover;
@@ -409,10 +459,51 @@ async fn gc_snapshot_reads_segment_metadata_from_one_index_view() {
 }
 
 #[tokio::test]
+async fn gc_snapshot_excludes_obsolete_shard_owned_segments() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = open_test_index(&dir);
+    let shard = ShardKey {
+        id: 44,
+        generation: 0,
+    };
+    let store_state = segment_state(1);
+    let shard_state = segment_state_for_shard(shard, 2);
+    let mut batch = index.batch();
+    index.put_current_epoch_batch(&mut batch, 10).unwrap();
+    index
+        .put_shard_info_batch(
+            &mut batch,
+            shard.id,
+            ShardInfo {
+                current_generation: shard.generation,
+                state: ShardState::Dropped,
+            },
+        )
+        .unwrap();
+    index
+        .put_segment_state_batch(&mut batch, &store_state)
+        .unwrap();
+    index
+        .put_segment_state_batch(&mut batch, &shard_state)
+        .unwrap();
+    batch.write().unwrap();
+
+    let accounting_snapshot = index.create_accounting_snapshot().unwrap();
+    let snapshot = index
+        .build_gc_snapshot(&accounting_snapshot)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(snapshot.segments.len(), 1);
+    assert_eq!(snapshot.segments[0].state, store_state);
+}
+
+#[tokio::test]
 async fn gc_snapshot_uses_pinned_accounting_frontier() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
 
     let mut batch = index.batch();
     index.put_current_epoch_batch(&mut batch, 10).unwrap();
@@ -493,7 +584,7 @@ async fn gc_snapshot_uses_pinned_accounting_frontier() {
 async fn latest_blob_version_returns_highest_lsn_for_key() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let mut first = blob_entry(7, 128);
     first.lsn = 1;
@@ -509,7 +600,7 @@ async fn latest_blob_version_returns_highest_lsn_for_key() {
 async fn blob_versions_are_stored_as_packed_state() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let mut first = blob_entry(7, 128);
     first.lsn = 1;
@@ -525,7 +616,7 @@ async fn blob_versions_are_stored_as_packed_state() {
         .unwrap();
     batch.write().unwrap();
 
-    let state = index.get_blob_version_state(&key).unwrap().unwrap();
+    let state = index.get_put_state(&key).unwrap().unwrap();
     assert_eq!(state.heads.len(), 0);
     assert_eq!(state.tail.len(), 2);
     assert_eq!(
@@ -545,7 +636,7 @@ async fn blob_versions_are_stored_as_packed_state() {
 async fn map_blob_ref_merge_rewrites_exact_payload_ref() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let shard = ShardKey {
         id: 7,
@@ -598,7 +689,7 @@ async fn map_blob_ref_merge_rewrites_exact_payload_ref() {
 async fn rollback_removes_map_blob_ref_by_publish_lsn() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let shard = ShardKey {
         id: 7,
@@ -661,7 +752,7 @@ async fn rollback_removes_map_blob_ref_by_publish_lsn() {
 async fn rollback_prunes_gc_relocations_by_publish_lsn() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let from_a = RecordRef {
         segment_id: 1,
         offset: 0,
@@ -727,7 +818,7 @@ async fn rollback_prunes_gc_relocations_by_publish_lsn() {
 async fn segment_gc_overlay_merge_coalesces_retired_ranges() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
 
     let mut batch = index.batch();
     index
@@ -751,7 +842,7 @@ async fn segment_gc_overlay_merge_coalesces_retired_ranges() {
 async fn segment_gc_overlay_retire_removes_lifetime_hint() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let range = gc_range(20, 8);
     let lifecycle = gc_lifetime(50);
 
@@ -782,7 +873,7 @@ async fn segment_gc_overlay_retire_removes_lifetime_hint() {
 async fn segment_gc_overlay_add_expired_record_accounts_garbage() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let range = gc_range(20, 8);
 
     let mut batch = index.batch();
@@ -809,7 +900,7 @@ async fn segment_gc_overlay_add_expired_record_accounts_garbage() {
 async fn segment_gc_overlay_add_retired_record_accounts_garbage() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let range = gc_range(20, 8);
 
     let mut batch = index.batch();
@@ -837,7 +928,7 @@ async fn segment_gc_overlay_add_retired_record_accounts_garbage() {
 async fn segment_gc_overlay_lifetime_update_does_not_revive_expired_subrange() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let lifecycle = gc_lifetime(60);
 
     let mut batch = index.batch();
@@ -876,7 +967,7 @@ async fn segment_gc_overlay_lifetime_update_does_not_revive_expired_subrange() {
 async fn blob_versions_pack_payload_and_lifecycle_state_together() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let entry = blob_entry(7, 128);
 
@@ -931,7 +1022,7 @@ async fn blob_versions_pack_payload_and_lifecycle_state_together() {
 async fn durable_lsn_advances_global_blob_version_compaction_frontier() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let shard = ShardKey {
         id: 42,
@@ -967,7 +1058,7 @@ async fn durable_lsn_advances_global_blob_version_compaction_frontier() {
         index.iter_unaccounted_lsn_ops().unwrap(),
         vec![(1, key.clone()), (2, key.clone())]
     );
-    let state = index.get_blob_version_state(&key).unwrap().unwrap();
+    let state = index.get_put_state(&key).unwrap().unwrap();
     assert_eq!(state.tail, Vec::new());
     let head = state.heads.get(&shard).unwrap();
     assert_eq!(head.head_lsn, 2);
@@ -981,10 +1072,75 @@ async fn durable_lsn_advances_global_blob_version_compaction_frontier() {
 }
 
 #[tokio::test]
+async fn blob_versions_compaction_filter_compacts_through_durable_lsn() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = open_test_index(&dir);
+    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let shard = ShardKey {
+        id: 42,
+        generation: 7,
+    };
+    let mut first = blob_entry(7, 128);
+    first.lsn = 1;
+    let mut second = blob_entry(7, 256);
+    second.lsn = 2;
+    let mut third = blob_entry(7, 512);
+    third.lsn = 3;
+
+    let mut versions = PutState::default();
+    append_put(&mut versions, shard, first);
+    append_put(&mut versions, shard, second.clone());
+    append_put(&mut versions, shard, third.clone());
+    let mut lifecycle = BlobLifecycleState::default();
+    lifecycle.append_op(BlobLifecycleOp {
+        lsn: 2,
+        action: BlobLifecycleAction::SetLifetime {
+            logical_end_epoch: 50,
+            current_epoch: 42,
+        },
+    });
+    lifecycle.append_op(BlobLifecycleOp {
+        lsn: 3,
+        action: BlobLifecycleAction::Tombstone,
+    });
+    put_blob_state(
+        &index,
+        &key,
+        &BlobVersionState {
+            versions,
+            lifecycle,
+        },
+    );
+
+    let mut batch = index.batch();
+    index.put_durable_lsn_batch(&mut batch, 2).unwrap();
+    batch.write().unwrap();
+    index.flush_wal(true).unwrap();
+    index.set_blob_compact_safe_lsn(2);
+    compact_blob_versions(&index);
+
+    let state = index.get_blob_state(&key).unwrap().unwrap();
+    let head = state.versions.heads.get(&shard).unwrap();
+    assert_eq!(head.head_lsn, 2);
+    assert_eq!(head.payload_lsn, Some(2));
+    assert_eq!(head.entry.record_ref, second.record_ref);
+    assert_eq!(state.versions.tail.len(), 1);
+    assert_eq!(state.versions.tail[0].entry, third);
+    assert_eq!(state.lifecycle.head.lifetime.as_ref().unwrap().lsn, 2);
+    assert_eq!(state.lifecycle.tail.len(), 1);
+    assert_eq!(state.lifecycle.tail[0].lsn, 3);
+    assert_eq!(
+        index.resolve_blob_head(&key, shard).unwrap().unwrap().entry,
+        third
+    );
+}
+
+#[tokio::test]
 async fn blob_versions_compaction_filter_removes_dropped_shard_generation() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let dropped_shard = ShardKey {
         id: 5,
         generation: 0,
@@ -1039,19 +1195,14 @@ async fn blob_versions_compaction_filter_removes_dropped_shard_generation() {
             .entry,
         kept_entry
     );
-    assert!(
-        index
-            .get_blob_version_state(&dropped_only_key)
-            .unwrap()
-            .is_none()
-    );
+    assert!(index.get_put_state(&dropped_only_key).unwrap().is_none());
 }
 
 #[tokio::test]
 async fn blob_versions_compaction_filter_removes_stale_shard_generation() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let stale_shard = ShardKey {
         id: 5,
         generation: 0,
@@ -1101,7 +1252,7 @@ async fn blob_versions_compaction_filter_removes_stale_shard_generation() {
 async fn removing_blob_versions_deletes_exact_rows_and_exposes_previous_version() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let mut first = blob_entry(7, 128);
     first.lsn = 1;
@@ -1136,7 +1287,7 @@ async fn removing_blob_versions_deletes_exact_rows_and_exposes_previous_version(
 async fn removing_blob_versions_is_scoped_to_shard() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let shard = ShardKey {
         id: 9,
@@ -1179,7 +1330,7 @@ async fn removing_blob_versions_is_scoped_to_shard() {
 async fn iterates_segment_states() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let state_1 = segment_state(1);
     let state_2 = segment_state(2);
 
@@ -1191,29 +1342,22 @@ async fn iterates_segment_states() {
 }
 
 #[tokio::test]
-async fn segment_state_is_keyed_by_shard() {
+async fn segment_owner_is_stored_in_segment_state() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
-    let shard = ShardKey {
-        id: 5,
-        generation: 2,
-    };
-    let standalone_state = segment_state(1);
-    let shard_state = segment_state_for_shard(shard, 1);
+    let index = open_test_index(&dir);
+    let shard_state = segment_state_for_shard(STANDALONE_SHARD, 1);
 
-    let mut batch = index.batch();
-    index
-        .put_segment_state_batch(&mut batch, &standalone_state)
-        .unwrap();
-    index
-        .put_segment_state_batch(&mut batch, &shard_state)
-        .unwrap();
-    batch.write().unwrap();
+    index.put_segment_state(&shard_state).unwrap();
 
-    assert_eq!(index.get_segment_state(1).unwrap(), Some(standalone_state));
     assert_eq!(
-        index.get_segment_state_for_shard(shard, 1).unwrap(),
+        index.get_segment_state(1).unwrap(),
+        Some(shard_state.clone())
+    );
+    assert_eq!(
+        index
+            .get_segment_state_for_shard(STANDALONE_SHARD, 1)
+            .unwrap(),
         Some(shard_state)
     );
 }
@@ -1222,7 +1366,7 @@ async fn segment_state_is_keyed_by_shard() {
 async fn store_state_fields_update_independently() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
 
     assert_eq!(
         index.get_store_state().unwrap(),
@@ -1257,7 +1401,7 @@ async fn store_state_fields_update_independently() {
 async fn lsn_keyed_tables_are_store_global() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
 
@@ -1287,7 +1431,7 @@ async fn lsn_keyed_tables_are_store_global() {
 async fn removing_shard_keyed_metadata_skips_blob_versions() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let shard = ShardKey {
         id: 5,
         generation: 2,
@@ -1301,7 +1445,7 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
     let mut entry = blob_entry(1, 128);
     entry.lsn = 1;
     let shard_state = segment_state_for_shard(shard, 1);
-    let other_state = segment_state_for_shard(other_shard, 1);
+    let other_state = segment_state_for_shard(other_shard, 2);
     let mut batch = index.batch();
     index
         .merge_blob_version_batch(&mut batch, &key, shard, &entry)
@@ -1351,7 +1495,7 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
     );
     assert!(index.resolve_blob_head(&key, shard).unwrap().is_some());
     assert_eq!(
-        index.get_segment_state_for_shard(other_shard, 1).unwrap(),
+        index.get_segment_state_for_shard(other_shard, 2).unwrap(),
         Some(other_state)
     );
 }
@@ -1360,7 +1504,7 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
 async fn epoch_changes_track_genesis_and_lsn_ordered_updates() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
 
     assert_eq!(index.latest_epoch_at_lsn(StrataLsn::MAX).unwrap(), None);
 
@@ -1387,7 +1531,7 @@ async fn epoch_changes_track_genesis_and_lsn_ordered_updates() {
 async fn iterates_unaccounted_lsn_ops_in_order() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_3 = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -1432,7 +1576,7 @@ async fn iterates_unaccounted_lsn_ops_in_order() {
 async fn unaccounted_lsn_ops_are_retained_until_explicitly_removed() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let index = StrataIndex::open_path(dir.path(), "strata").unwrap();
+    let index = open_test_index(&dir);
     let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let entry_1 = blob_entry(1, 0);

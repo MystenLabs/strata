@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use strata_core::{
     BlobKey, BlobVersionState, Epoch, GcRelocation, RecordRef, SegmentGcOverlay, SegmentId,
-    SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo,
-    StoreStateKey, StrataLsn,
+    SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo, StoreStateKey,
+    StrataLsn,
 };
 use typed_store::rocks::{DBBatch, DBMap, RocksDB};
 
@@ -28,7 +28,7 @@ impl StrataIndex {
         &self.blob_versions
     }
 
-    pub fn segment_states(&self) -> &DBMap<SegmentKey, SegmentState> {
+    pub fn segment_states(&self) -> &DBMap<SegmentId, SegmentState> {
         &self.segment_states
     }
 

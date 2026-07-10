@@ -3,10 +3,12 @@ pub(crate) mod merge;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(any(test, feature = "test-utils"))]
+use strata_core::BlobLifecycleHead;
 use strata_core::{
-    BlobKey, BlobLifecycleHead, BlobLifecycleMergeOp, BlobLifecycleOp, BlobLifecycleState,
-    BlobVersionKey, BlobVersionState, MapRefOp, PutEntry, PutHead, PutMergeOp, PutOp, PutState,
-    ShardKey, StrataLsn,
+    BlobKey, BlobLifecycleMergeOp, BlobLifecycleOp, BlobLifecycleState, BlobVersionKey,
+    BlobVersionState, MapRefOp, PutEntry, PutHead, PutMergeOp, PutOp, PutState, ShardKey,
+    StrataLsn,
 };
 use typed_store::{Map, rocks::DBBatch};
 
@@ -36,7 +38,7 @@ impl StrataIndex {
         Ok(self.blob_versions.get(key)?)
     }
 
-    pub fn get_blob_version_state(&self, key: &BlobKey) -> Result<Option<PutState>> {
+    pub fn get_put_state(&self, key: &BlobKey) -> Result<Option<PutState>> {
         Ok(self
             .get_blob_state(key)?
             .and_then(|state| (!state.versions.is_empty()).then_some(state.versions)))
@@ -48,6 +50,8 @@ impl StrataIndex {
             .and_then(|state| (!state.lifecycle.is_empty()).then_some(state.lifecycle)))
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn resolve_blob_lifecycle_at(
         &self,
         key: &BlobKey,
@@ -74,10 +78,6 @@ impl StrataIndex {
 
     pub fn get_blob_entry(&self, key: &BlobKey) -> Result<Option<PutEntry>> {
         Ok(self.latest_blob_version(key)?.map(|(_, entry)| entry))
-    }
-
-    pub fn contains_blob(&self, key: &BlobKey) -> Result<bool> {
-        Ok(self.latest_blob_version(key)?.is_some())
     }
 
     pub fn put_blob_entry(&self, key: &BlobKey, entry: &PutEntry) -> Result<()> {
@@ -229,7 +229,7 @@ impl StrataIndex {
     }
 
     pub fn latest_blob_version(&self, key: &BlobKey) -> Result<Option<(BlobVersionKey, PutEntry)>> {
-        let Some(state) = self.get_blob_version_state(key)? else {
+        let Some(state) = self.get_put_state(key)? else {
             return Ok(None);
         };
 
@@ -261,7 +261,7 @@ impl StrataIndex {
         key: &BlobVersionKey,
         shard: ShardKey,
     ) -> Result<Option<PutEntry>> {
-        let Some(state) = self.get_blob_version_state(&key.key)? else {
+        let Some(state) = self.get_put_state(&key.key)? else {
             return Ok(None);
         };
 

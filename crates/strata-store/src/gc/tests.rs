@@ -106,6 +106,53 @@ fn gc_concurrency_controller_limits_admitted_workers() {
 }
 
 #[test]
+fn shard_drop_reservation_blocks_new_claims_while_existing_claim_drains() {
+    let claims = Arc::new(GcSourceClaims::default());
+    let held = claims.try_claim(BTreeSet::from([5])).unwrap();
+    let waiter_claims = Arc::clone(&claims);
+    let (result_tx, result_rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let claim = waiter_claims
+            .claim_when_available(BTreeSet::from([1, 2, 3, 4, 5]), Duration::from_secs(2));
+        result_tx.send(claim.is_some()).unwrap();
+        drop(claim);
+    });
+
+    let reservation_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match claims.try_claim(BTreeSet::from([1])) {
+            Some(claim) if Instant::now() < reservation_deadline => {
+                drop(claim);
+                std::thread::yield_now();
+            }
+            Some(_) => panic!("drop reservation was not installed"),
+            None => break,
+        }
+    }
+    for segment_id in 1..=4 {
+        assert!(claims.try_claim(BTreeSet::from([segment_id])).is_none());
+    }
+
+    drop(held);
+    assert!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    waiter.join().unwrap();
+}
+
+#[test]
+fn shard_drop_claim_timeout_releases_draining_reservation() {
+    let claims = Arc::new(GcSourceClaims::default());
+    let held = claims.try_claim(BTreeSet::from([1])).unwrap();
+
+    assert!(
+        claims
+            .claim_when_available(BTreeSet::from([1, 2]), Duration::from_millis(10))
+            .is_none()
+    );
+    assert!(claims.try_claim(BTreeSet::from([2])).is_some());
+    drop(held);
+}
+
+#[test]
 fn gc_concurrency_controller_increases_after_healthy_window() {
     let controller = Arc::new(GcConcurrencyController::new(
         controller_config(2, 1),

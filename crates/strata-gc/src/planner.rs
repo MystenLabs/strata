@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use strata_core::SegmentOwner;
 use strata_core::{
     Epoch, PlacementClass, SegmentFileState, SegmentGcSummary, SegmentId, SegmentState, StrataLsn,
 };
@@ -529,8 +531,8 @@ impl GcPlanner {
         segment: &SegmentSnapshot,
     ) -> Vec<RouteEstimate> {
         let mut routes = Vec::new();
-        let stable_lifetimes = self.segment_lifetimes_stable(&segment.summary);
 
+        let stable_lifetimes = self.segment_lifetimes_stable(&segment.summary);
         for (epoch, bucket) in &segment.summary.future_epoch_histogram {
             if bucket.bytes == 0 || bucket.refs == 0 {
                 continue;
@@ -660,7 +662,7 @@ mod tests {
         max_lsn: Option<StrataLsn>,
     ) -> SegmentState {
         SegmentState {
-            shard: SHARD,
+            owner: SegmentOwner::Shard(SHARD),
             segment_id,
             volume_id: VOLUME,
             path: format!("{segment_id}.data"),

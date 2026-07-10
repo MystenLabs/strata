@@ -1,17 +1,17 @@
 pub(crate) mod gc_overlay;
 
 use strata_core::{
-    SegmentId, SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardKey,
+    SegmentId, SegmentOwner, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardKey,
 };
 use typed_store::{Map, rocks::DBBatch};
 
 use crate::{Error, Result};
 
-use super::{STANDALONE_SHARD, StrataIndex};
+use super::StrataIndex;
 
 impl StrataIndex {
     pub fn get_segment_state(&self, segment_id: SegmentId) -> Result<Option<SegmentState>> {
-        self.get_segment_state_for_shard(STANDALONE_SHARD, segment_id)
+        Ok(self.segment_states.get(&segment_id)?)
     }
 
     pub fn get_segment_state_for_shard(
@@ -19,7 +19,9 @@ impl StrataIndex {
         shard: ShardKey,
         segment_id: SegmentId,
     ) -> Result<Option<SegmentState>> {
-        Ok(self.segment_states.get(&SegmentKey { shard, segment_id })?)
+        Ok(self
+            .get_segment_state(segment_id)?
+            .filter(|state| state.owner == SegmentOwner::Shard(shard)))
     }
 
     pub fn put_segment_state(&self, state: &SegmentState) -> Result<()> {
@@ -31,16 +33,7 @@ impl StrataIndex {
 
     pub fn put_segment_state_batch(&self, batch: &mut DBBatch, state: &SegmentState) -> Result<()> {
         batch
-            .insert_batch(
-                self.segment_states(),
-                [(
-                    &SegmentKey {
-                        shard: state.shard,
-                        segment_id: state.segment_id,
-                    },
-                    state,
-                )],
-            )
+            .insert_batch(self.segment_states(), [(&state.segment_id, state)])
             .map_err(Error::from)?;
         Ok(())
     }
@@ -82,14 +75,13 @@ impl StrataIndex {
     }
 
     pub fn iter_segment_states(&self) -> Result<Vec<(SegmentId, SegmentState)>> {
-        self.iter_segment_states_for_shard(STANDALONE_SHARD)
-    }
-
-    pub fn iter_segment_states_by_key(&self) -> Result<Vec<(SegmentKey, SegmentState)>> {
-        self.segment_states
+        let mut states = self
+            .segment_states
             .safe_iter()?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
+            .map_err(Error::from)?;
+        states.sort_by_key(|(segment_id, state)| (*segment_id, state.owner));
+        Ok(states)
     }
 
     pub fn iter_segment_states_for_shard(
@@ -99,7 +91,9 @@ impl StrataIndex {
         self.segment_states
             .safe_iter()?
             .filter_map(|result| match result {
-                Ok((key, state)) if key.shard == shard => Some(Ok((key.segment_id, state))),
+                Ok((segment_id, state)) if state.owner == SegmentOwner::Shard(shard) => {
+                    Some(Ok((segment_id, state)))
+                }
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })

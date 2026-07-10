@@ -1,10 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, RwLock},
 };
 
 use strata_core::{ShardId, ShardInfo, StrataLsn};
@@ -23,11 +20,16 @@ use super::cf::{
 use super::options::cf_options;
 use super::{StrataIndex, StrataIndexCfNames};
 
-static NEXT_METRIC_ID: AtomicU64 = AtomicU64::new(0);
-
 impl StrataIndex {
     /// Opens a dedicated typed-store RocksDB instance at `path`.
-    pub fn open_path(path: impl AsRef<Path>, cf_prefix: impl AsRef<str>) -> Result<Self> {
+    ///
+    /// `metric_suffix` is appended to the `strata_index` RocksDB metric label. Use a stable,
+    /// low-cardinality index identifier such as a namespace or configured instance name.
+    pub fn open_path(
+        path: impl AsRef<Path>,
+        cf_prefix: impl AsRef<str>,
+        metric_suffix: impl AsRef<str>,
+    ) -> Result<Self> {
         let cf_names = StrataIndexCfNames::new(cf_prefix);
         let compact_safe_lsn = Arc::new(RwLock::new(0));
         let shard_infos = Arc::new(RwLock::new(BTreeMap::new()));
@@ -43,7 +45,7 @@ impl StrataIndex {
         let db = open_cf_opts(
             path,
             Some(default_db_options().options),
-            unique_metric_conf("strata_index"),
+            metric_conf_with_suffix("strata_index", metric_suffix),
             &cf_options,
         )?;
         Self::from_db_with_cf_names(db, cf_names, compact_safe_lsn, shard_infos)
@@ -182,7 +184,11 @@ impl StrataIndex {
     }
 }
 
-pub(crate) fn unique_metric_conf(base: &str) -> MetricConf {
-    let metric_id = NEXT_METRIC_ID.fetch_add(1, Ordering::Relaxed);
-    MetricConf::new(&format!("{base}_{metric_id}"))
+pub(crate) fn metric_conf_with_suffix(base: &str, suffix: impl AsRef<str>) -> MetricConf {
+    let suffix = suffix.as_ref();
+    if suffix.is_empty() {
+        MetricConf::new(base)
+    } else {
+        MetricConf::new(&format!("{base}_{suffix}"))
+    }
 }

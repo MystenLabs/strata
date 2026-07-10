@@ -6,7 +6,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use strata_accounting::{ActiveDeltaLogReadCursor, ActiveDeltaLogState, Manifest};
 use strata_core::{
-    SegmentRefEvent, SegmentRefEventKey, StoreStateKey, StrataLsn, StrataStoreState,
+    SegmentRefEvent, SegmentRefEventKey, ShardCleanupJob, ShardKey, StoreStateKey, StrataLsn,
+    StrataStoreState,
 };
 use typed_store::{Map, rocks::DBBatch};
 
@@ -25,6 +26,7 @@ pub enum AccountingIndexKey {
     Manifest,
     ActiveDeltaLogState,
     ActiveDeltaLogConsumedCursor,
+    ShardCleanup(ShardKey),
 }
 
 /// In-memory accounting frontier retained by a long-running GC job.
@@ -115,6 +117,7 @@ pub enum AccountingIndexValue {
     Manifest(Manifest),
     ActiveDeltaLogState(ActiveDeltaLogState),
     ActiveDeltaLogConsumedCursor(ActiveDeltaLogReadCursor),
+    ShardCleanupJob(ShardCleanupJob),
 }
 
 impl AccountingIndexValue {
@@ -125,6 +128,7 @@ impl AccountingIndexValue {
             Self::ActiveDeltaLogConsumedCursor(_) => {
                 AccountingIndexKey::ActiveDeltaLogConsumedCursor
             }
+            Self::ShardCleanupJob(job) => AccountingIndexKey::ShardCleanup(job.shard),
         }
     }
 }
@@ -245,9 +249,57 @@ impl StrataIndex {
         )
     }
 
-    /// Creates an in-memory accounting snapshot pin for GC.
+    pub fn get_shard_cleanup_job(&self, shard: ShardKey) -> Result<Option<ShardCleanupJob>> {
+        let key = AccountingIndexKey::ShardCleanup(shard);
+        match self.get_accounting_index_value(key)? {
+            Some(AccountingIndexValue::ShardCleanupJob(job)) => Ok(Some(job)),
+            Some(value) => Err(unexpected_accounting_index_value(key, value)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_shard_cleanup_job_batch(
+        &self,
+        batch: &mut DBBatch,
+        job: ShardCleanupJob,
+    ) -> Result<()> {
+        self.put_accounting_index_value_batch(
+            batch,
+            AccountingIndexKey::ShardCleanup(job.shard),
+            &AccountingIndexValue::ShardCleanupJob(job),
+        )
+    }
+
+    pub fn delete_shard_cleanup_job_batch(
+        &self,
+        batch: &mut DBBatch,
+        shard: ShardKey,
+    ) -> Result<()> {
+        batch.delete_batch(
+            self.accounting_index(),
+            [AccountingIndexKey::ShardCleanup(shard)],
+        )?;
+        Ok(())
+    }
+
+    pub fn iter_shard_cleanup_jobs(&self) -> Result<Vec<ShardCleanupJob>> {
+        self.accounting_index
+            .safe_iter()?
+            .filter_map(|result| match result {
+                Ok((
+                    AccountingIndexKey::ShardCleanup(_),
+                    AccountingIndexValue::ShardCleanupJob(job),
+                )) => Some(Ok(job)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    /// Creates an in memory accounting snapshot pin for GC.
     ///
-    /// This takes a short-lived RocksDB snapshot only to read a consistent `accounted_lsn`; the
+    /// This takes a short lived RocksDB snapshot only to read a consistent `accounted_lsn`, the
     /// returned guard does not retain that RocksDB snapshot. The pin is installed while holding the
     /// same mutex used by ref-event cleanup, which prevents cleanup from deleting events needed by
     /// a newly-created GC guard.

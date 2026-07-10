@@ -164,8 +164,9 @@ impl StrataIndex {
         key: &BlobKey,
     ) -> Result<()> {
         // This reverse index is the bridge from the global LSN stream back to packed per-blob
-        // history. Accounting uses it to find exactly which blob key must be unfolded for an LSN
-        // before the blob_versions value is allowed to compact that LSN away.
+        // history. Accounting uses it to advance the contiguous cleanup frontier; per-LSN
+        // accounting facts come from the active delta log, so blob_versions may fold durable tail
+        // entries before accounted_lsn catches up.
         batch
             .insert_batch(self.unaccounted_lsn_ops(), [(&lsn, key)])
             .map_err(Error::from)?;

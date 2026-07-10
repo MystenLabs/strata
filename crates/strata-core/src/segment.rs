@@ -7,11 +7,23 @@ use crate::{BlobLifecycle, Epoch, ShardKey, StrataLsn};
 pub type SegmentId = u64;
 pub type VolumeId = u32;
 
-/// Index key for a segment local to a shard generation.
+/// Physical owner of a segment file.
+///
+/// Mixed ingest segments are store-owned because they may contain records from many shards.
+/// Retention segments are owned by one concrete shard generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SegmentKey {
-    pub shard: ShardKey,
-    pub segment_id: SegmentId,
+pub enum SegmentOwner {
+    Store,
+    Shard(ShardKey),
+}
+
+impl SegmentOwner {
+    pub fn shard(self) -> Option<ShardKey> {
+        match self {
+            Self::Store => None,
+            Self::Shard(shard) => Some(shard),
+        }
+    }
 }
 
 /// LSN-ordered accounting event for one physical record in an ingest segment.
@@ -595,7 +607,7 @@ pub enum SegmentFileState {
 /// Durable metadata for one segment file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentState {
-    pub shard: ShardKey,
+    pub owner: SegmentOwner,
     pub segment_id: SegmentId,
     pub volume_id: VolumeId,
     pub path: String,

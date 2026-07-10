@@ -112,8 +112,9 @@
 //!   -> advance accounted_lsn while sidecar materialization covers the next durable LSN
 //! ```
 //!
-//! The accounting worker is the *only* writer of GC overlay summary/ranges. The foreground write
-//! path never reads or writes GC accounting state; it only appends cheap accounting deltas.
+//! The accounting worker is the writer of GC overlay summary/ranges, including mixed-ingest
+//! retirements caused by shard drop. The foreground blob write path only appends cheap accounting
+//! deltas and persists resumable cleanup jobs.
 //! Accounting lag is expected: `accounted_lsn` says how far sidecar compaction events have been
 //! reflected in the GC-facing rows. The sidecar manifest/cursor and derived rows commit atomically,
 //! so crash retry reopens from one published sidecar state instead of replaying blob keys from the
@@ -129,6 +130,7 @@ mod metrics;
 mod read;
 mod reader_cache;
 mod seal;
+mod shard_gc;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -149,8 +151,8 @@ use strata_core::{
     BlobKey, BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp,
     BlobLifecycleOp, BlobState, BlobVersionKey, Epoch, GcRelocation, MapRefOp, PlacementClass,
     PutEntry, PutMergeOp, PutOp, RecordRef, SegmentFileState, SegmentGcOverlayMergeOp,
-    SegmentGcRecordRange, SegmentId, SegmentRefEvent, SegmentState, ShardId, ShardInfo, ShardKey,
-    ShardState, StrataLsn, encoded_record_len,
+    SegmentGcRecordRange, SegmentId, SegmentOwner, SegmentRefEvent, SegmentState, ShardCleanupJob,
+    ShardCleanupState, ShardId, ShardInfo, ShardKey, ShardState, StrataLsn, encoded_record_len,
 };
 use strata_gc::GcAction;
 use strata_index::StrataIndex;
@@ -168,8 +170,9 @@ pub use config::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY, SealedSegmentIntegrityPolicy,
-    StrataRecoveryPolicy, StrataStoreConfig,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+    DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
+    StrataStoreConfig,
 };
 pub use error::{Error, Result};
 pub use gc::{
@@ -181,7 +184,9 @@ use gc::{
     GcPrepublishedOutputSegment, GcSourceClaims, GcWorker,
 };
 use gc_rate_limiter::GcIoLimiter;
-use layout::{parse_segment_file_name, relative_segment_path, segment_path, segment_state_path};
+use layout::{
+    parse_segment_file_name, relative_segment_path, retention_dir, segment_path, segment_state_path,
+};
 use metrics::PutMetric;
 pub use metrics::StrataStoreMetrics;
 pub use read::{ReadOptions, StoreGetProfile};
@@ -191,21 +196,20 @@ use seal::{
     durable_lsn_with_accounting_frontier, enqueue_unsealed_segments_for_sealing,
     verify_sealed_segments,
 };
+use shard_gc::shard_generation_is_obsolete;
 pub use strata_gc::{GcPlanner, GcPlannerConfig};
 
 const FIRST_SEGMENT_ID: SegmentId = 1;
 /// How long the writer naps while waiting for the sealer to drain its backlog. Short, because
 /// this sleep sits on the foreground put path during rollover backpressure.
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
-/// Store-global metadata namespace used for segment state, epoch state, and the global LSN
-/// frontier. Logical shards still live in blob version ops and the shard registry.
+/// Default logical shard used by the standalone convenience APIs.
 pub(crate) const STANDALONE_SHARD: ShardKey = ShardKey {
     id: 0,
     generation: 0,
 };
-/// Persisted scope for store-global metadata while the index schema still keys those rows by
-/// `ShardKey`.
-pub(crate) const STORE_SCOPE: ShardKey = STANDALONE_SHARD;
+/// Explicit owner used by mixed ingest segment metadata.
+pub(crate) const INGEST_SEGMENT_OWNER: SegmentOwner = SegmentOwner::Store;
 
 /// Single-namespace Strata store.
 #[derive(Debug)]
@@ -221,6 +225,7 @@ pub struct StrataStore {
     pub(crate) gc_txs: Vec<mpsc::Sender<GcCommand>>,
     gc_handles: Vec<JoinHandle<()>>,
     pub(crate) accounting_lock: Arc<Mutex<()>>,
+    pub(crate) gc_publish_cleanup_lock: Arc<Mutex<()>>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
     pub(crate) gc_io_limiter: Arc<GcIoLimiter>,
@@ -301,8 +306,11 @@ impl StrataStore {
     /// workers out of order. For example, starting a writer before orphan file reconciliation can
     /// make a segment file left by a crashed rollover look like usable active data.
     pub fn open(config: StrataStoreConfig, metrics: StrataStoreMetrics) -> Result<Self> {
-        let index =
-            StrataIndex::open_path(config.standalone_index_dir(), config.index_cf_prefix())?;
+        let index = StrataIndex::open_path(
+            config.standalone_index_dir(),
+            config.index_cf_prefix(),
+            config.namespace.as_str(),
+        )?;
         Self::from_index(config, index, metrics)
     }
 
@@ -345,7 +353,7 @@ impl StrataStore {
         validate_config(&config)?;
         ensure_ingest_dir(&config)?;
         cleanup_stale_gc_staging_dirs(&config)?;
-        ensure_shard_active(&index, STANDALONE_SHARD)?;
+        ensure_default_shard_registered(&index)?;
         ensure_epoch_initialized(&index, config.starting_epoch)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
         recover_unsealed_segments(&config, &index, &metrics)?;
@@ -365,7 +373,7 @@ impl StrataStore {
         let active_segment_state = publish_active_segment_state(
             &config,
             &index,
-            STORE_SCOPE,
+            INGEST_SEGMENT_OWNER,
             &active_writer,
             durable_offset,
         )?;
@@ -380,6 +388,7 @@ impl StrataStore {
         let (seal_tx, seal_rx) = mpsc::channel();
         let (accounting_tx, accounting_rx) = mpsc::sync_channel(1);
         let accounting_lock = Arc::new(Mutex::new(()));
+        let gc_publish_cleanup_lock = Arc::new(Mutex::new(()));
         let accounting_gc_txs = Arc::new(Mutex::new(Vec::new()));
         let gc_claims = Arc::new(GcSourceClaims::default());
         let gc_io_limiter = Arc::new(GcIoLimiter::new(config.gc_io_bytes_per_sec));
@@ -403,7 +412,7 @@ impl StrataStore {
         let seal_worker = SealWorker {
             config: config.clone(),
             index: index.clone(),
-            store_scope: STORE_SCOPE,
+            ingest_owner: INGEST_SEGMENT_OWNER,
             seal_rx,
             accounting_tx: accounting_tx.clone(),
             metrics: metrics.clone(),
@@ -431,7 +440,7 @@ impl StrataStore {
             seal_tx: seal_tx.clone(),
             accounting_tx: accounting_tx.clone(),
             write_rx,
-            store_scope: STORE_SCOPE,
+            ingest_owner: INGEST_SEGMENT_OWNER,
             reader_cache: Arc::clone(&reader_cache),
             gc_concurrency: Arc::clone(&gc_concurrency),
             store_halt: store_halt.clone(),
@@ -451,10 +460,12 @@ impl StrataStore {
                     index: index.clone(),
                     write_tx: write_tx.clone(),
                     accounting_lock: Arc::clone(&accounting_lock),
+                    publish_cleanup_lock: Arc::clone(&gc_publish_cleanup_lock),
                     claims: Arc::clone(&gc_claims),
                     gc_concurrency: Arc::clone(&gc_concurrency),
                     gc_io_limiter: Arc::clone(&gc_io_limiter),
                     segment_ids: segment_ids.clone(),
+                    reader_cache: Arc::clone(&reader_cache),
                     store_halt: store_halt.clone(),
                     metrics: metrics.clone(),
                 },
@@ -486,6 +497,13 @@ impl StrataStore {
             }
         }
 
+        if !index.iter_shard_cleanup_jobs()?.is_empty() {
+            let _ = accounting_tx.try_send(AccountingCommand::Run);
+            for gc_tx in &gc_txs {
+                let _ = gc_tx.send(GcCommand::Run);
+            }
+        }
+
         Ok(Self {
             reader_cache,
             config,
@@ -499,6 +517,7 @@ impl StrataStore {
             gc_txs,
             gc_handles,
             accounting_lock,
+            gc_publish_cleanup_lock,
             gc_claims,
             gc_concurrency,
             gc_io_limiter,
@@ -572,16 +591,20 @@ impl StrataStore {
             .map_err(|_| Error::WriteResponseDropped)?
     }
 
-    /// Marks a logical shard as dropped.
+    /// Durably fences a logical shard generation and schedules asynchronous reclamation.
     pub fn drop_shard(&self, shard_id: ShardId) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
         self.send_write_command(WriteCommand::DropShard(DropShardRequest {
             shard_id,
             response_tx,
         }))?;
-        response_rx
+        let _shard = response_rx
             .recv()
-            .map_err(|_| Error::WriteResponseDropped)?
+            .map_err(|_| Error::WriteResponseDropped)??;
+        if let Some(accounting_tx) = &self.accounting_tx {
+            let _ = accounting_tx.try_send(AccountingCommand::Run);
+        }
+        Ok(())
     }
 
     /// Writes a blob and returns its LSN. Returning means *visible*, not durable: the bytes are
@@ -908,7 +931,7 @@ struct BatchWriteRequest {
 #[derive(Debug)]
 struct DropShardRequest {
     shard_id: ShardId,
-    response_tx: mpsc::Sender<Result<()>>,
+    response_tx: mpsc::Sender<Result<ShardKey>>,
 }
 
 #[derive(Debug)]
@@ -1355,7 +1378,7 @@ struct WriteCoordinator {
     seal_tx: mpsc::Sender<SealCommand>,
     accounting_tx: mpsc::SyncSender<AccountingCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
-    store_scope: ShardKey,
+    ingest_owner: SegmentOwner,
     reader_cache: Arc<SegmentReaderCache>,
     gc_concurrency: Arc<GcConcurrencyController>,
     store_halt: StoreHalt,
@@ -1482,32 +1505,79 @@ impl WriteCoordinator {
     /// Treating "already dropped" as success makes retries idempotent after
     /// caller timeouts. Treating missing shards as success would hide bugs where a caller thinks it
     /// deleted tenant 42 but that tenant was never registered.
-    fn submit_drop_shard(&mut self, shard_id: ShardId) -> Result<()> {
+    fn submit_drop_shard(&mut self, shard_id: ShardId) -> Result<ShardKey> {
         let Some(info) = self.index.get_shard_info(shard_id)? else {
             return Err(Error::ShardNotFound { shard_id });
         };
         if info.state == ShardState::Dropped {
-            return Ok(());
+            return Ok(info.key(shard_id));
         }
 
+        // The drop LSN orders the accounting sweep after every preceding payload transition.
+        self.sync_data(None)?;
         let shard = info.key(shard_id);
-        self.mark_shard_dropped(shard_id, shard)
+        self.mark_shard_dropped(shard_id, shard)?;
+        Ok(shard)
     }
 
-    /// Persists the dropped shard state.
+    /// Persists the dropped shard state, accounting fence, and resumable cleanup job.
     fn mark_shard_dropped(&mut self, shard_id: ShardId, shard: ShardKey) -> Result<()> {
         let dropped_info = ShardInfo {
             current_generation: shard.generation,
             state: ShardState::Dropped,
         };
+        let drop_lsn = self.index.get_next_lsn()?;
+        let next_lsn = drop_lsn
+            .checked_add(1)
+            .ok_or(strata_segment::Error::RangeOverflow)?;
+        let delta_position = self.active_accounting_delta_log.position();
 
-        let mut batch = self.index.batch();
-        self.index
-            .put_shard_info_batch(&mut batch, shard_id, dropped_info)?;
-        batch
-            .write_with_sync(true)
-            .map_err(strata_index::Error::from)?;
+        let commit_result = (|| {
+            self.active_accounting_delta_log
+                .append(&AccountingDelta::ShardDropped {
+                    lsn: drop_lsn,
+                    shard,
+                })?;
+            self.active_accounting_delta_log.sync_data()?;
+            let active_delta_state = self.active_accounting_delta_log.state();
+
+            let mut batch = self.index.batch();
+            self.index
+                .put_shard_info_batch(&mut batch, shard_id, dropped_info)?;
+            self.index.put_shard_cleanup_job_batch(
+                &mut batch,
+                ShardCleanupJob {
+                    shard,
+                    drop_lsn,
+                    state: ShardCleanupState::PendingAccounting,
+                },
+            )?;
+            self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
+            self.index.put_durable_lsn_batch(&mut batch, drop_lsn)?;
+            self.index
+                .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+            batch
+                .write_with_sync(true)
+                .map_err(strata_index::Error::from)?;
+            Ok::<(), Error>(())
+        })();
+
+        if let Err(error) = commit_result {
+            if let Err(rollback_error) =
+                self.active_accounting_delta_log.rollback_to(delta_position)
+            {
+                let rollback_error = Error::from(rollback_error);
+                self.halt_writer_error("shard drop accounting delta rollback", &rollback_error);
+                return Err(rollback_error);
+            }
+            return Err(error);
+        }
+
         self.index.set_cached_shard_info(shard_id, dropped_info);
+        self.index.set_blob_compact_safe_lsn(drop_lsn);
+        self.metrics.set_next_lsn(next_lsn);
+        self.metrics.set_durable_lsn(drop_lsn);
+        let _ = self.accounting_tx.try_send(AccountingCommand::Run);
         Ok(())
     }
 
@@ -1876,8 +1946,14 @@ impl WriteCoordinator {
         let accounting_changes = self
             .index
             .accounting_changes_since(&copy.accounting_snapshot)?;
+        let mut obsolete_shards = BTreeSet::new();
+        for record in &copy.copied_records {
+            if shard_generation_is_obsolete(&self.index, record.source.shard)? {
+                obsolete_shards.insert(record.source.shard);
+            }
+        }
         let (survivors, skipped_records) =
-            split_gc_copied_records(copy.copied_records, &accounting_changes);
+            split_gc_copied_records(copy.copied_records, &accounting_changes, &obsolete_shards);
 
         if survivors.is_empty() {
             let mut batch = self.index.batch();
@@ -2465,7 +2541,7 @@ impl WriteCoordinator {
             PlacementClass::Ingest,
             self.config.segment_max_bytes,
         )?;
-        let new_state = active_segment_state(&self.config, self.store_scope, &new_writer, 0);
+        let new_state = active_segment_state(&self.config, self.ingest_owner, &new_writer, 0);
         let mut old_state = self.active_segment_state.clone();
         old_state.write_offset = old_write_offset;
         old_state.durable_offset = self.durable_offset;
@@ -2745,6 +2821,7 @@ struct GcSkippedCopiedRecord {
 fn split_gc_copied_records(
     records: Vec<GcStagedCopiedRecord>,
     accounting_changes: &[AccountingRefEvent],
+    obsolete_shards: &BTreeSet<ShardKey>,
 ) -> (Vec<GcStagedCopiedRecord>, Vec<GcSkippedCopiedRecord>) {
     let mut terminal_sources = BTreeMap::<(SegmentId, u64), GcSkippedCopiedRecordKind>::new();
     let mut latest_lifecycles = BTreeMap::<(SegmentId, u64), Option<BlobLifecycle>>::new();
@@ -2766,6 +2843,13 @@ fn split_gc_copied_records(
     let mut survivors = Vec::new();
     let mut skipped = Vec::new();
     for mut record in records {
+        if obsolete_shards.contains(&record.source.shard) {
+            skipped.push(GcSkippedCopiedRecord {
+                record,
+                kind: GcSkippedCopiedRecordKind::Retired,
+            });
+            continue;
+        }
         let source_key = (record.source.from.segment_id, record.source.from.offset);
         if let Some(kind) = terminal_sources.get(&source_key).copied() {
             skipped.push(GcSkippedCopiedRecord { record, kind });
@@ -2916,6 +3000,41 @@ fn unlink_gc_segment_files(config: &StrataStoreConfig, states: &[SegmentState]) 
 
     for parent in parents {
         sync_dir(&parent)?;
+        prune_empty_retention_dirs(config, parent)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn prune_empty_retention_dirs(
+    config: &StrataStoreConfig,
+    mut directory: std::path::PathBuf,
+) -> Result<()> {
+    let root = retention_dir(config);
+    while directory != root && directory.starts_with(&root) {
+        match fs::remove_dir(&directory) {
+            Ok(()) => {
+                sync_parent_dir(&directory)?;
+                let Some(parent) = directory.parent() else {
+                    break;
+                };
+                directory = parent.to_path_buf();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = directory.parent() else {
+                    break;
+                };
+                directory = parent.to_path_buf();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                break;
+            }
+            Err(source) => {
+                return Err(Error::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -3062,23 +3181,18 @@ fn ensure_ingest_dir(config: &StrataStoreConfig) -> Result<()> {
 }
 
 /// First open of a shard automatically registers it, afterwards the (id, generation) pair must match the
-/// registry exactly. The generation check is what makes shard drop and re-add safe: a stale handle
-/// from before a drop carries the old generation and gets rejected here, instead of silently
-/// writing into a namespace whose metadata was already torn down.
-fn ensure_shard_active(index: &StrataIndex, shard: ShardKey) -> Result<()> {
-    match index.get_shard_info(shard.id)? {
-        Some(info) if info.current_generation == shard.generation && info.is_active() => Ok(()),
-        Some(info) => Err(Error::ShardUnavailable {
-            shard_id: shard.id,
-            generation: shard.generation,
-            current_generation: info.current_generation,
-            state: info.state,
-        }),
-        None => {
-            index.put_shard_info(shard.id, ShardInfo::active(shard.generation))?;
-            Ok(())
-        }
+/// Creates the standalone convenience shard on a new namespace.
+///
+/// An existing row is intentionally left unchanged. In particular, reopening a store after shard
+/// zero was dropped must preserve that fence so `add_shard(0)` can create the next generation.
+fn ensure_default_shard_registered(index: &StrataIndex) -> Result<()> {
+    if index.get_shard_info(STANDALONE_SHARD.id)?.is_none() {
+        index.put_shard_info(
+            STANDALONE_SHARD.id,
+            ShardInfo::active(STANDALONE_SHARD.generation),
+        )?;
     }
+    Ok(())
 }
 
 /// Deletes (or, under AbsoluteConsistency, reports) segment files that have no index state.
@@ -3443,7 +3557,7 @@ fn apply_recovered_segment_prefix(
 ) -> Result<()> {
     let mut state = active_segment_state_from_path(
         config,
-        STORE_SCOPE,
+        INGEST_SEGMENT_OWNER,
         segment_id,
         prefix.recovered_write_offset,
         prefix.durable_offset,
@@ -3510,7 +3624,7 @@ fn discard_unsealed_segment(
     segment_id: SegmentId,
     metrics: &StrataStoreMetrics,
 ) -> Result<()> {
-    let mut state = active_segment_state_from_path(config, STORE_SCOPE, segment_id, 0, 0);
+    let mut state = active_segment_state_from_path(config, INGEST_SEGMENT_OWNER, segment_id, 0, 0);
     if let Some(existing) = index.get_segment_state(segment_id)? {
         state.volume_id = existing.volume_id;
         state.placement_class = existing.placement_class;
@@ -3797,14 +3911,14 @@ fn map_ref_survived(
 fn publish_active_segment_state(
     config: &StrataStoreConfig,
     index: &StrataIndex,
-    store_scope: ShardKey,
+    owner: SegmentOwner,
     active_writer: &SegmentWriter,
     durable_offset: u64,
 ) -> Result<SegmentState> {
     let existing = index.get_segment_state(active_writer.segment_id())?;
     let state = active_segment_state_with_lsn(
         config,
-        store_scope,
+        owner,
         active_writer,
         durable_offset,
         existing.as_ref(),
@@ -3816,23 +3930,16 @@ fn publish_active_segment_state(
 
 /// Builds the normal open segment state row for the current writer.
 ///
-/// All open segment rows should use the same relative path and store scope.
+/// All open ingest rows should use the same relative path and explicit store owner.
 /// Hand building this in multiple places risks one path being absolute, so a later move of the
 /// store root would make that segment unreadable while others still resolve correctly.
 fn active_segment_state(
     config: &StrataStoreConfig,
-    store_scope: ShardKey,
+    owner: SegmentOwner,
     active_writer: &SegmentWriter,
     durable_offset: u64,
 ) -> SegmentState {
-    active_segment_state_with_lsn(
-        config,
-        store_scope,
-        active_writer,
-        durable_offset,
-        None,
-        None,
-    )
+    active_segment_state_with_lsn(config, owner, active_writer, durable_offset, None, None)
 }
 
 /// Builds the segment state row for the active writer. Fields the writer doesn't own
@@ -3842,7 +3949,7 @@ fn active_segment_state(
 /// segment covers without scanning it.
 fn active_segment_state_with_lsn(
     config: &StrataStoreConfig,
-    store_scope: ShardKey,
+    owner: SegmentOwner,
     active_writer: &SegmentWriter,
     durable_offset: u64,
     existing: Option<&SegmentState>,
@@ -3850,7 +3957,7 @@ fn active_segment_state_with_lsn(
 ) -> SegmentState {
     let mut state = active_segment_state_from_path(
         config,
-        store_scope,
+        owner,
         active_writer.segment_id(),
         active_writer.write_offset(),
         durable_offset,
@@ -3875,14 +3982,14 @@ fn active_segment_state_with_lsn(
 /// sealed or make GC believe it contains LSNs it never wrote.
 fn active_segment_state_from_path(
     config: &StrataStoreConfig,
-    store_scope: ShardKey,
+    owner: SegmentOwner,
     segment_id: SegmentId,
     write_offset: u64,
     durable_offset: u64,
 ) -> SegmentState {
     let path = segment_path(config, segment_id);
     SegmentState {
-        shard: store_scope,
+        owner,
         segment_id,
         volume_id: 0,
         path: relative_segment_path(config, path),

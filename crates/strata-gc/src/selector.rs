@@ -4,12 +4,12 @@ use strata_core::{BlobKey, BlobLifecycle, RecordRef, ShardKey, StrataLsn};
 
 use crate::{DestinationClass, GcAction, GcPlan, GcScenario, RouteEstimate};
 
-/// One scanned source record that remains copy-eligible after applying the segment GC overlay.
+/// One scanned source record that remains copy eligible after applying the segment GC overlay.
 ///
 /// The scanner supplies immutable physical facts from the segment file: key, shard, payload LSN,
 /// and `RecordRef`. The index supplies the segment-local overlay before this value is built:
 /// expired and retired ranges are skipped, and lifetime ranges become `lifecycle` routing hints.
-/// Absence of a lifetime means the record is copy-eligible but should be treated as
+/// Absence of a lifetime means the record is copy eligible but should be treated as
 /// unknown/spillover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcSourceRecord {

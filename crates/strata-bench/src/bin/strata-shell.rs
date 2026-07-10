@@ -18,8 +18,9 @@ use strata_store::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, GcPlannerConfig, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
-    StrataStore, StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig,
+    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -172,6 +173,7 @@ impl Config {
             gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
             gc_planner_config: GcPlannerConfig::default(),
             gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
+            shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: self.starting_epoch,
         }
     }

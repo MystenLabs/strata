@@ -5,10 +5,10 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use strata_core::{BlobKey, RecordRef, StrataLsn};
+use strata_core::{BlobKey, RecordRef, ShardKey, StrataLsn};
 
 use crate::run_io::{read_record_frame, write_record_frame};
-use crate::{BlobUpdate, EpochChange, Error, FORMAT_VERSION, Result};
+use crate::{ACTIVE_DELTA_LOG_FORMAT_VERSION, BlobUpdate, EpochChange, Error, Result};
 
 const ACTIVE_DELTA_LOG_MAGIC: &[u8; 8] = b"STRADL01";
 const ACTIVE_DELTA_LOG_FILE_NAME: &str = "active-delta.log";
@@ -31,6 +31,8 @@ pub enum AccountingDelta {
         /// Ordered map refs whose logical LSN is derived from position in this vector.
         maps: Vec<GcMapRefDelta>,
     },
+    /// Durable logical fence for one dropped shard generation.
+    ShardDropped { lsn: StrataLsn, shard: ShardKey },
 }
 
 /// One logical `MapRef` inside a bulk GC active-log frame.
@@ -54,6 +56,7 @@ impl AccountingDelta {
                 .checked_sub(1)
                 .and_then(|last| base_lsn.checked_add(last as u64))
                 .unwrap_or(*base_lsn),
+            Self::ShardDropped { lsn, .. } => *lsn,
         }
     }
 }
@@ -444,7 +447,7 @@ fn ensure_log_file(path: &Path) -> Result<bool> {
     write_record_frame(
         &mut file,
         &ActiveDeltaLogHeader {
-            format_version: FORMAT_VERSION,
+            format_version: ACTIVE_DELTA_LOG_FORMAT_VERSION,
         },
         path,
     )?;
@@ -534,10 +537,10 @@ fn read_log_header(reader: &mut impl Read, path: &Path) -> Result<()> {
             reason: "missing active delta log header".to_owned(),
         });
     };
-    if header.format_version != FORMAT_VERSION {
+    if header.format_version != ACTIVE_DELTA_LOG_FORMAT_VERSION {
         return Err(Error::IncompatibleManifestVersion {
             actual: header.format_version,
-            expected: FORMAT_VERSION,
+            expected: ACTIVE_DELTA_LOG_FORMAT_VERSION,
         });
     }
     Ok(())

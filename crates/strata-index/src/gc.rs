@@ -1,11 +1,15 @@
-use strata_core::{GcRelocation, RecordRef, SegmentId, StoreStateKey, StrataLsn};
+use std::collections::BTreeMap;
+
+use strata_core::{
+    GcRelocation, RecordRef, SegmentId, SegmentOwner, ShardId, ShardInfo, StoreStateKey, StrataLsn,
+};
 use strata_gc::{GcSnapshot, SegmentSnapshot};
 use typed_store::Map;
 use typed_store::rocks::DBBatch;
 
 use crate::{Error, Result};
 
-use super::{AccountingSnapshotGuard, StrataIndex};
+use super::{AccountingSnapshotGuard, StrataIndex, shard::shard_generation_is_obsolete};
 
 impl StrataIndex {
     /// Builds a point in time GC planning view for an active accounting snapshot.
@@ -35,10 +39,20 @@ impl StrataIndex {
         else {
             return Ok(None);
         };
+        let shard_infos = self
+            .shards
+            .safe_iter_with_snapshot(&snapshot)?
+            .collect::<std::result::Result<BTreeMap<ShardId, ShardInfo>, _>>()
+            .map_err(Error::from)?;
 
         let mut segments = Vec::new();
         for result in self.segment_states.safe_iter_with_snapshot(&snapshot)? {
             let (_, state) = result?;
+            if let SegmentOwner::Shard(shard) = state.owner
+                && shard_generation_is_obsolete(shard, &shard_infos)
+            {
+                continue;
+            }
             let summary = self.segment_gc_summary_with_snapshot(&snapshot, state.segment_id)?;
             segments.push(SegmentSnapshot {
                 state,
@@ -46,7 +60,7 @@ impl StrataIndex {
                 claimed: false,
             });
         }
-        segments.sort_by_key(|segment| (segment.state.shard, segment.state.segment_id));
+        segments.sort_by_key(|segment| (segment.state.owner, segment.state.segment_id));
 
         Ok(Some(GcSnapshot {
             current_epoch,

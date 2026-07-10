@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use strata_core::{ShardId, ShardInfo, ShardKey, ShardState};
+use strata_core::{SegmentOwner, ShardId, ShardInfo, ShardKey, ShardState};
 use typed_store::{Map, rocks::DBBatch};
 
 use crate::{Error, Result};
@@ -95,17 +95,52 @@ impl StrataIndex {
         // Dropping a shard generation removes metadata keyed by the full physical generation, not
         // just the logical shard id. That keeps a later reincarnation of the same shard id from
         // inheriting segment manifests that belonged to the old writer.
-        let segment_state_keys = self
+        let segment_ids = self
             .segment_states
             .safe_iter()?
             .filter_map(|result| match result {
-                Ok((key, _)) if key.shard == shard => Some(Ok(key)),
+                Ok((segment_id, state)) if state.owner == SegmentOwner::Shard(shard) => {
+                    Some(Ok(segment_id))
+                }
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
             .map_err(Error::from)?;
-        batch.delete_batch(&self.segment_states, segment_state_keys)?;
+        batch.delete_batch(&self.segment_states, segment_ids.iter().copied())?;
+
+        if !segment_ids.is_empty() {
+            batch.delete_batch(&self.segment_gc_overlay, segment_ids.iter().copied())?;
+
+            let ref_event_keys = self
+                .segment_ref_events
+                .safe_iter()?
+                .filter_map(|result| match result {
+                    Ok((key, _)) if segment_ids.contains(&key.segment_id) => Some(Ok(key)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)?;
+            batch.delete_batch(&self.segment_ref_events, ref_event_keys)?;
+
+            let relocation_keys = self
+                .gc_relocations
+                .safe_iter()?
+                .filter_map(|result| match result {
+                    Ok((from, relocation))
+                        if segment_ids.contains(&from.segment_id)
+                            || segment_ids.contains(&relocation.to.segment_id) =>
+                    {
+                        Some(Ok(from))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)?;
+            batch.delete_batch(&self.gc_relocations, relocation_keys)?;
+        }
 
         Ok(())
     }

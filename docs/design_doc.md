@@ -241,6 +241,7 @@ Each segment has durable metadata:
 
 ```rust
 struct SegmentState {
+    owner: SegmentOwner,
     segment_id,
     volume_id,
     path,
@@ -250,6 +251,11 @@ struct SegmentState {
     write_offset,
     durable_offset,
     sealed_len,
+}
+
+enum SegmentOwner {
+    Store,           // mixed ingest segment
+    Shard(ShardKey), // one shard generation's retention segment
 }
 
 enum SegmentFileState {
@@ -262,8 +268,12 @@ enum SegmentFileState {
 `write_offset` is how far this process has appended. `durable_offset` is how far the segment is known to be crash safe. For sealed segments, `sealed_len` should match the final durable length.
 
 ```rust
-segment/state/{segment_id} -> SegmentState
+segment/state/{owner}/{segment_id} -> SegmentState
 ```
+
+`SegmentOwner::Store` is not a logical shard. In particular, it is distinct from the default
+logical `ShardKey { id: 0, generation: 0 }`, which may own retention segments and may be dropped
+like any other shard generation.
 
 ## 4.4 Segment GC Accounting Overlay
 
@@ -1633,6 +1643,9 @@ overwrite during L0 copy
 tombstone during L0 copy
 lifecycle extension during L0 copy
 shard drop during L0 copy
+crash with shard cleanup PendingAccounting
+crash with shard cleanup ReadyForGc
+shard re-add before an older generation cleanup completes
 crash before destination fsync
 crash after destination fsync before metadata publish
 crash after metadata publish before source deletion

@@ -8,7 +8,7 @@
 //! StrataIndex
 //! +-----------------+-----------------------------------------------+
 //! | blob_versions   | BlobKey -> packed BlobVersionState            |
-//! | segment_states  | SegmentKey -> SegmentState                    |
+//! | segment_states  | SegmentId -> SegmentState                     |
 //! | segment_ref_events | SegmentRefEventKey -> SegmentRefEvent       |
 //! | segment_gc_overlay | SegmentId -> SegmentGcOverlay + summary     |
 //! | gc_relocations | RecordRef -> GcRelocation                      |
@@ -63,12 +63,12 @@ pub use cf::StrataIndexCfNames;
 pub use error::{Error, Result};
 
 #[cfg(test)]
-pub(crate) use open::unique_metric_conf;
+pub(crate) use open::metric_conf_with_suffix;
 
 use strata_core::{
     BlobKey, BlobVersionState, Epoch, GcRelocation, RecordRef, SegmentGcOverlay, SegmentId,
-    SegmentKey, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo, ShardKey,
-    StoreStateKey, StrataLsn,
+    SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo, ShardKey, StoreStateKey,
+    StrataLsn,
 };
 #[cfg(test)]
 use strata_core::{
@@ -99,7 +99,7 @@ pub struct StrataIndex {
     /// Packed payload version and lifecycle state keyed by blob key.
     blob_versions: DBMap<BlobKey, BlobVersionState>,
     /// Durable manifest for each segment: path, state, offsets, placement, LSN bounds, and digest.
-    segment_states: DBMap<SegmentKey, SegmentState>,
+    segment_states: DBMap<SegmentId, SegmentState>,
     /// Precise ref changes used to reconcile records copied while accounting was running.
     segment_ref_events: DBMap<SegmentRefEventKey, SegmentRefEvent>,
     /// Stale-tolerant segment-local GC view: summary counters, expired/retired ranges, and hints.

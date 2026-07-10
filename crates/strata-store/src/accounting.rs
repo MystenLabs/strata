@@ -28,7 +28,7 @@ use strata_accounting::{
 use strata_core::{
     BlobLifecycle, Epoch, GcRelocation, RecordRef, SegmentFileState, SegmentGcLifetimeUpdate,
     SegmentGcLiveRecord, SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, SegmentRefEvent,
-    SegmentRefEventKey, StrataLsn,
+    SegmentRefEventKey, ShardCleanupState, StrataLsn,
 };
 use strata_index::StrataIndex;
 use typed_store::rocks::DBBatch;
@@ -175,6 +175,15 @@ pub(crate) fn run_accounting_sidecar_once(
     sidecar.run_once(force)
 }
 
+#[cfg(test)]
+pub(crate) fn run_accounting_sidecar_materializing_once(
+    index: &StrataIndex,
+    config: &StrataStoreConfig,
+) -> Result<()> {
+    let mut sidecar = AccountingSidecar::open(config.clone(), index.clone())?;
+    sidecar.run_once_materializing(true).map(|_| ())
+}
+
 /// Incremental sidecar builder for the active accounting delta log.
 ///
 /// Ramp-up: the foreground writer appends `AccountingDelta`s to `active-delta.log`; this object
@@ -217,7 +226,13 @@ impl AccountingSidecar {
     /// `force` becomes true on a wall-clock cadence so low-write stores still eventually compact
     /// small runs. Without that, a quiet store could accumulate many tiny delta files forever.
     fn run(&mut self) -> Result<bool> {
-        let force = self.last_forced_run.elapsed() >= self.config.accounting_sidecar_interval;
+        let pending_shard_drop = self
+            .index
+            .iter_shard_cleanup_jobs()?
+            .into_iter()
+            .any(|job| job.state == ShardCleanupState::PendingAccounting);
+        let force = pending_shard_drop
+            || self.last_forced_run.elapsed() >= self.config.accounting_sidecar_interval;
         let should_nudge_gc = self.run_once_materializing(force)?;
         if force {
             self.last_forced_run = Instant::now();
@@ -243,6 +258,9 @@ impl AccountingSidecar {
     fn run_once(&mut self, force: bool) -> Result<()> {
         let _ = self.ingest_active_delta_log(force)?;
         let _ = self.compact_sidecar(force, false)?;
+        if force {
+            let _ = self.materialize_shard_drops()?;
+        }
         Ok(())
     }
 
@@ -253,7 +271,25 @@ impl AccountingSidecar {
     fn run_once_materializing(&mut self, force: bool) -> Result<bool> {
         let mut should_nudge_gc = self.ingest_active_delta_log(force)?;
         should_nudge_gc |= self.compact_sidecar(force, force)?;
+        should_nudge_gc |= self.materialize_shard_drops()?;
         Ok(should_nudge_gc)
+    }
+
+    fn materialize_shard_drops(&mut self) -> Result<bool> {
+        let drops = self.accounting_index.pending_shard_drops();
+        let mut materialized = false;
+        for drop in drops {
+            let prepared = match self.accounting_index.prepare_materialize_shard_drop(drop) {
+                Ok(prepared) => prepared,
+                Err(strata_accounting::Error::ShardDropRequiresCompaction { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let manifest = prepared.manifest().clone();
+            self.commit_sidecar_state(Some(&manifest), None, Some(&prepared.event_batch))?;
+            self.accounting_index.apply_prepared_shard_drop(prepared)?;
+            materialized = true;
+        }
+        Ok(materialized)
     }
 
     /// Copies durable active-log deltas into immutable sidecar runs and advances the read cursor.
@@ -481,7 +517,8 @@ impl AccountingSidecar {
         let should_nudge_gc = if let Some(frontier) = frontier.as_ref()
             && frontier.accounted_lsn > current_accounted_lsn
         {
-            frontier.materialized_epoch_change
+            !frontier.completed_shard_drops.is_empty()
+                || frontier.materialized_epoch_change
                 || accounting_frontier_unblocks_empty_delete(
                     &self.index,
                     &context,
@@ -499,6 +536,12 @@ impl AccountingSidecar {
                 .remove_unaccounted_lsn_ops_batch(&mut batch, &frontier.consumed_lsns)?;
             self.index
                 .put_accounted_lsn_batch(&mut batch, frontier.accounted_lsn)?;
+            for shard in &frontier.completed_shard_drops {
+                if let Some(mut job) = self.index.get_shard_cleanup_job(*shard)? {
+                    job.state = ShardCleanupState::ReadyForGc;
+                    self.index.put_shard_cleanup_job_batch(&mut batch, job)?;
+                }
+            }
         }
         batch
             .write_with_sync(true)
@@ -555,6 +598,7 @@ struct FrontierUpdate {
     accounted_lsn: StrataLsn,
     consumed_lsns: Vec<StrataLsn>,
     materialized_epoch_change: bool,
+    completed_shard_drops: Vec<strata_core::ShardKey>,
 }
 
 /// Scratchpad for one sidecar commit.
@@ -642,6 +686,7 @@ impl<'a> SidecarAccountingContext<'a> {
         let mut accounted_lsn = self.index.get_accounted_lsn()?;
         let mut consumed_lsns = Vec::new();
         let mut materialized_epoch_change = false;
+        let mut completed_shard_drops = Vec::new();
 
         loop {
             let Some(next_lsn) = accounted_lsn.checked_add(1) else {
@@ -671,6 +716,16 @@ impl<'a> SidecarAccountingContext<'a> {
                 continue;
             }
 
+            if let Some(drop) = manifest
+                .shard_drops
+                .iter()
+                .find(|drop| drop.lsn == next_lsn && drop.materialized)
+            {
+                completed_shard_drops.push(drop.shard);
+                accounted_lsn = next_lsn;
+                continue;
+            }
+
             break;
         }
 
@@ -678,6 +733,7 @@ impl<'a> SidecarAccountingContext<'a> {
             accounted_lsn,
             consumed_lsns,
             materialized_epoch_change,
+            completed_shard_drops,
         })
     }
 

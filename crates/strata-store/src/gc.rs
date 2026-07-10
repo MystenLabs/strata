@@ -3,13 +3,14 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use strata_core::{
     BlobLifecycle, DecodedRecord, FIXED_RECORD_HEADER_LEN, PlacementClass, RecordRef,
-    SegmentFileState, SegmentGcOverlay, SegmentGcRecordRange, SegmentId, SegmentState, StrataLsn,
+    SegmentFileState, SegmentGcOverlay, SegmentGcRecordRange, SegmentId, SegmentOwner,
+    SegmentState, ShardCleanupState, ShardKey, StrataLsn,
 };
 use strata_gc::{
     DestinationClass, GcAction, GcCopyRecord, GcCopySelector, GcPlan, GcPlanner, GcSnapshot,
@@ -20,9 +21,12 @@ use strata_segment::SegmentWriter;
 use crate::{
     Error, GcIoLimiter, GcPublishRequest, Result, SegmentIdAllocator, StoreHalt, StrataStore,
     WriteCommand,
-    layout::{relative_segment_path, segment_path, segment_state_path},
+    layout::{relative_segment_path, retention_segment_path, segment_path, segment_state_path},
     metrics::StrataStoreMetrics,
+    prune_empty_retention_dirs,
+    reader_cache::SegmentReaderCache,
     seal::sha256_file_prefix,
+    shard_gc::{remove_shard_retention_generation, shard_generation_is_obsolete},
     sync_parent_dir,
 };
 
@@ -96,6 +100,8 @@ pub struct GcPublishedOutputSegment {
     pub staged_segment_id: SegmentId,
     /// Durable segment id assigned during publish.
     pub segment_id: SegmentId,
+    /// Shard generation that owns this retention segment.
+    pub shard: ShardKey,
     /// Final on-disk path.
     pub path: PathBuf,
     /// Placement class installed in segment state.
@@ -120,6 +126,8 @@ pub struct GcPublishedRecord {
 pub struct GcStagedOutputSegment {
     /// Local id used only while reading this staging file back before publish.
     pub staged_segment_id: SegmentId,
+    /// Shard generation that owns every record in this staged output.
+    pub shard: ShardKey,
     /// Routing class this file was created for.
     pub destination_class: DestinationClass,
     /// Final placement class to use when this staged file becomes a real segment.
@@ -139,6 +147,8 @@ pub(crate) struct GcPrepublishedOutputSegment {
     pub(crate) staged_segment_id: SegmentId,
     /// Durable segment id assigned before entering the writer queue.
     pub(crate) segment_id: SegmentId,
+    /// Shard generation that owns this retention segment.
+    pub(crate) shard: ShardKey,
     /// Final on-disk path.
     pub(crate) path: PathBuf,
     /// Placement class to install when the output becomes sealed.
@@ -166,6 +176,7 @@ impl GcPrepublishedOutputSegment {
         GcPublishedOutputSegment {
             staged_segment_id: self.staged_segment_id,
             segment_id: self.segment_id,
+            shard: self.shard,
             path: self.path.clone(),
             placement_class: self.placement_class,
             sealed_len: self.sealed_len,
@@ -178,7 +189,7 @@ impl GcPrepublishedOutputSegment {
         state: SegmentFileState,
     ) -> SegmentState {
         SegmentState {
-            shard: crate::STORE_SCOPE,
+            owner: SegmentOwner::Shard(self.shard),
             segment_id: self.segment_id,
             volume_id: 0,
             path: relative_segment_path(config, self.path.clone()),
@@ -734,7 +745,15 @@ mod tests;
 /// This is needed to prevent multiple GC jobs from accessing the same source segment concurrently.
 #[derive(Debug, Default)]
 pub(crate) struct GcSourceClaims {
-    claimed: Mutex<BTreeSet<SegmentId>>,
+    state: Mutex<GcSourceClaimState>,
+    available: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GcSourceClaimState {
+    claimed: BTreeSet<SegmentId>,
+    /// Number of shard-cleanup waiters blocking new GC claims for each segment.
+    draining: BTreeMap<SegmentId, usize>,
 }
 
 impl GcSourceClaims {
@@ -746,25 +765,78 @@ impl GcSourceClaims {
         self: &Arc<Self>,
         segments: BTreeSet<SegmentId>,
     ) -> Option<GcSourceClaimGuard> {
-        let mut claimed = self.claimed.lock().expect("gc source claims lock poisoned");
-        if segments
-            .iter()
-            .any(|segment_id| claimed.contains(segment_id))
-        {
+        let mut state = self.state.lock().expect("gc source claims lock poisoned");
+        if segments.iter().any(|segment_id| {
+            state.claimed.contains(segment_id) || state.draining.contains_key(segment_id)
+        }) {
             return None;
         }
-        claimed.extend(segments.iter().copied());
+        state.claimed.extend(segments.iter().copied());
         Some(GcSourceClaimGuard {
             claims: Arc::clone(self),
             segments,
         })
     }
 
+    /// Waits until every requested source can be claimed.
+    ///
+    /// Shard-drop cleanup uses this after publishing the generation fence. New plans no longer see
+    /// the dropped shard's segments, while jobs that claimed an older snapshot are allowed to
+    /// finish before the generation directory is unlinked beneath them.
+    pub(crate) fn claim_when_available(
+        self: &Arc<Self>,
+        segments: BTreeSet<SegmentId>,
+        timeout: Duration,
+    ) -> Option<GcSourceClaimGuard> {
+        let deadline = Instant::now().checked_add(timeout)?;
+        let mut state = self.state.lock().expect("gc source claims lock poisoned");
+        for segment_id in &segments {
+            *state.draining.entry(*segment_id).or_default() += 1;
+        }
+
+        loop {
+            let unavailable = segments
+                .iter()
+                .any(|segment_id| state.claimed.contains(segment_id));
+            if !unavailable {
+                state.claimed.extend(segments.iter().copied());
+                release_draining_reservation(&mut state, &segments);
+                return Some(GcSourceClaimGuard {
+                    claims: Arc::clone(self),
+                    segments,
+                });
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                release_draining_reservation(&mut state, &segments);
+                self.available.notify_all();
+                return None;
+            }
+            let (next_state, wait) = self
+                .available
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .expect("gc source claims lock poisoned");
+            state = next_state;
+            if wait.timed_out()
+                && segments
+                    .iter()
+                    .any(|segment_id| state.claimed.contains(segment_id))
+            {
+                release_draining_reservation(&mut state, &segments);
+                self.available.notify_all();
+                return None;
+            }
+        }
+    }
+
     /// Marks claimed segments inside a planner snapshot so pure planning can skip them.
     fn mark_snapshot(&self, snapshot: &mut GcSnapshot) {
-        let claimed = self.claimed.lock().expect("gc source claims lock poisoned");
+        let state = self.state.lock().expect("gc source claims lock poisoned");
         for segment in &mut snapshot.segments {
-            if claimed.contains(&segment.state.segment_id) {
+            if state.claimed.contains(&segment.state.segment_id)
+                || state.draining.contains_key(&segment.state.segment_id)
+            {
                 segment.claimed = true;
             }
         }
@@ -785,13 +857,29 @@ pub struct GcSourceClaimGuard {
 
 impl Drop for GcSourceClaimGuard {
     fn drop(&mut self) {
-        let mut claimed = self
+        let mut state = self
             .claims
-            .claimed
+            .state
             .lock()
             .expect("gc source claims lock poisoned");
         for segment_id in &self.segments {
-            claimed.remove(segment_id);
+            state.claimed.remove(segment_id);
+        }
+        self.claims.available.notify_all();
+    }
+}
+
+fn release_draining_reservation(state: &mut GcSourceClaimState, segments: &BTreeSet<SegmentId>) {
+    for segment_id in segments {
+        let remove = match state.draining.get_mut(segment_id) {
+            Some(waiters) => {
+                *waiters = waiters.saturating_sub(1);
+                *waiters == 0
+            }
+            None => false,
+        };
+        if remove {
+            state.draining.remove(segment_id);
         }
     }
 }
@@ -859,6 +947,7 @@ impl GcWorker {
     }
 
     fn run_ready_plans(&self) -> Result<()> {
+        self.executor.cleanup_ready_shard_generations()?;
         for _ in 0..GC_MAX_PLANS_PER_WAKE {
             if self.executor.run_once(&self.planner)?.is_none() {
                 break;
@@ -895,6 +984,8 @@ pub(crate) struct GcExecutor {
     pub(crate) write_tx: mpsc::SyncSender<WriteCommand>,
     /// Accounting run lock used to pause accounting during publish reconciliation.
     pub(crate) accounting_lock: Arc<Mutex<()>>,
+    /// Serializes GC output publication with shard-generation directory cleanup.
+    pub(crate) publish_cleanup_lock: Arc<Mutex<()>>,
     /// In-process source segment ownership table.
     pub(crate) claims: Arc<GcSourceClaims>,
     /// Runtime GC admission controller shared with foreground paths.
@@ -903,6 +994,8 @@ pub(crate) struct GcExecutor {
     pub(crate) gc_io_limiter: Arc<GcIoLimiter>,
     /// Shared monotonic allocator for durable segment ids.
     pub(crate) segment_ids: SegmentIdAllocator,
+    /// Open segment readers that must be evicted before generation-directory deletion.
+    pub(crate) reader_cache: Arc<SegmentReaderCache>,
     /// Terminal store state shared with foreground writer paths.
     pub(crate) store_halt: StoreHalt,
     /// Store metrics sink.
@@ -911,7 +1004,7 @@ pub(crate) struct GcExecutor {
 
 impl StrataStore {
     /// Builds an executor view over this store handle.
-    fn gc_executor(&self) -> Result<GcExecutor> {
+    pub(crate) fn gc_executor(&self) -> Result<GcExecutor> {
         self.store_halt.check()?;
         Ok(GcExecutor {
             config: self.config.clone(),
@@ -922,10 +1015,12 @@ impl StrataStore {
                 .ok_or(Error::WriteQueueClosed)?
                 .clone(),
             accounting_lock: Arc::clone(&self.accounting_lock),
+            publish_cleanup_lock: Arc::clone(&self.gc_publish_cleanup_lock),
             claims: Arc::clone(&self.gc_claims),
             gc_concurrency: Arc::clone(&self.gc_concurrency),
             gc_io_limiter: Arc::clone(&self.gc_io_limiter),
             segment_ids: self.segment_ids.clone(),
+            reader_cache: Arc::clone(&self.reader_cache),
             store_halt: self.store_halt.clone(),
             metrics: self.metrics.clone(),
         })
@@ -1005,6 +1100,51 @@ impl GcExecutor {
         };
         let copy = self.copy_prepared_gc_plan(prepared)?;
         self.publish_prepared_gc_copy(copy).map(Some)
+    }
+
+    pub(crate) fn cleanup_ready_shard_generations(&self) -> Result<usize> {
+        let jobs = self.index.iter_shard_cleanup_jobs()?;
+        let mut cleaned = 0;
+        for job in jobs
+            .into_iter()
+            .filter(|job| job.state == ShardCleanupState::ReadyForGc)
+        {
+            let owned_segments = self
+                .index
+                .iter_segment_states_for_shard(job.shard)?
+                .into_iter()
+                .map(|(segment_id, _)| segment_id)
+                .collect::<BTreeSet<_>>();
+            let Some(_claim) = self.claims.claim_when_available(
+                owned_segments.clone(),
+                self.config.shard_drop_gc_drain_timeout,
+            ) else {
+                continue;
+            };
+            let _publish_cleanup_guard = self
+                .publish_cleanup_lock
+                .lock()
+                .expect("gc publish/cleanup lock poisoned");
+            let Some(current_job) = self.index.get_shard_cleanup_job(job.shard)? else {
+                continue;
+            };
+            if current_job.state != ShardCleanupState::ReadyForGc {
+                continue;
+            }
+            for segment_id in &owned_segments {
+                self.reader_cache.evict(*segment_id);
+                self.metrics.record_reader_cache_eviction();
+            }
+            remove_shard_retention_generation(&self.config, &self.index, job.shard)?;
+            let mut batch = self.index.batch();
+            self.index
+                .delete_shard_cleanup_job_batch(&mut batch, job.shard)?;
+            batch
+                .write_with_sync(true)
+                .map_err(strata_index::Error::from)?;
+            cleaned += 1;
+        }
+        Ok(cleaned)
     }
 
     /// Reports the accounting lag GC would use for admission control.
@@ -1103,6 +1243,13 @@ impl GcExecutor {
     /// rows outside the writer queue. Accounting is paused only while the writer reconciles the
     /// snapshot and publishes MapRefs.
     pub fn publish_prepared_gc_copy(&self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
+        // Keep shard cleanup ordered with every phase that can create or remove a retention path.
+        // The writer may fence a shard while this guard is held; drop cleanup waits until publish
+        // has reconciled that fence and removed any now-unpublished output.
+        let _publish_cleanup_guard = self
+            .publish_cleanup_lock
+            .lock()
+            .expect("gc publish/cleanup lock poisoned");
         let copy = self.prepublish_gc_outputs(copy)?;
         let prepublished_outputs = copy.outputs.clone();
         let result = {
@@ -1116,6 +1263,7 @@ impl GcExecutor {
         match result {
             Ok(result) => {
                 remove_unpublished_prepublished_outputs(
+                    &self.config,
                     &prepublished_outputs,
                     &result.output_segments,
                 )?;
@@ -1173,7 +1321,27 @@ impl GcExecutor {
             copied_records,
             claim,
         } = copy;
-        let outputs = self.prepublish_gc_output_segments(outputs)?;
+        let original_outputs = outputs.clone();
+        let outputs = (|| {
+            let mut publishable = Vec::with_capacity(outputs.len());
+            let mut obsolete = Vec::new();
+            for output in outputs {
+                if shard_generation_is_obsolete(&self.index, output.shard)? {
+                    obsolete.push(output);
+                } else {
+                    publishable.push(output);
+                }
+            }
+            remove_gc_staging_output_files(&obsolete)?;
+            self.prepublish_gc_output_segments(publishable)
+        })();
+        let outputs = match outputs {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let _ = remove_gc_staging_output_files(&original_outputs);
+                return Err(error);
+            }
+        };
         Ok(GcPrepublishedCopy {
             accounting_snapshot,
             plan,
@@ -1195,7 +1363,18 @@ impl GcExecutor {
         let result = (|| {
             for output in &outputs {
                 let segment_id = self.segment_ids.allocate()?;
-                let final_path = segment_path(&self.config, segment_id);
+                let final_path = retention_segment_path(
+                    &self.config,
+                    output.shard,
+                    output.placement_class,
+                    segment_id,
+                );
+                if let Some(parent) = final_path.parent() {
+                    fs::create_dir_all(parent).map_err(|source| Error::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+                }
                 if final_path.exists() {
                     if self.index.get_segment_state(segment_id)?.is_none() {
                         fs::remove_file(&final_path).map_err(|source| Error::Io {
@@ -1220,6 +1399,7 @@ impl GcExecutor {
                 prepublished.push(GcPrepublishedOutputSegment {
                     staged_segment_id: output.staged_segment_id,
                     segment_id,
+                    shard: output.shard,
                     path: final_path,
                     placement_class: output.placement_class,
                     sealed_len: output.sealed_len,
@@ -1241,7 +1421,7 @@ impl GcExecutor {
         match result {
             Ok(()) => Ok(prepublished),
             Err(error) => {
-                let _ = remove_gc_prepublished_output_files(&prepublished);
+                let _ = remove_gc_prepublished_output_files(&self.config, &prepublished);
                 let _ = remove_gc_staging_output_files(&outputs);
                 Err(error)
             }
@@ -1275,7 +1455,7 @@ impl GcExecutor {
     /// Scans one source segment and copies records selected by the aggregate plan routes.
     ///
     /// The scan is offset ordered, so overlay classification advances monotonically through the
-    /// segment-local overlay. Expired and retired ranges are skipped. Copy-eligible records are
+    /// segment-local overlay. Expired and retired ranges are skipped. Copy eligible records are
     /// decoded only when their lifecycle bucket is named by the plan.
     fn copy_gc_source_segment_to_staging(
         &self,
@@ -1422,12 +1602,18 @@ impl GcExecutor {
 }
 
 /// Open GC staging state shared across source segment scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DestinationPlacement {
+    shard: ShardKey,
+    class: DestinationClass,
+}
+
 struct GcStagingCopier<'a> {
     io_limiter: &'a GcIoLimiter,
     staging_dir: &'a Path,
     segment_max_bytes: u64,
     outputs: Vec<GcStagedOutputSegment>,
-    open_outputs: BTreeMap<DestinationClass, OpenStagedOutput>,
+    open_outputs: BTreeMap<DestinationPlacement, OpenStagedOutput>,
     copied_records: Vec<GcStagedCopiedRecord>,
     copied_bytes: u64,
     next_staged_segment_id: SegmentId,
@@ -1452,20 +1638,24 @@ impl<'a> GcStagingCopier<'a> {
     }
 
     fn append(&mut self, record: GcCopyRecord, payload: &[u8]) -> Result<()> {
-        if !self.open_outputs.contains_key(&record.destination_class) {
+        let destination = DestinationPlacement {
+            shard: record.shard,
+            class: record.destination_class,
+        };
+        if !self.open_outputs.contains_key(&destination) {
             let output = create_staged_output(
                 self.staging_dir,
                 self.next_staged_segment_id,
-                record.destination_class,
+                destination,
                 self.segment_max_bytes,
             )?;
             self.next_staged_segment_id = output.next_staged_segment_id;
-            self.open_outputs.insert(record.destination_class, output);
+            self.open_outputs.insert(destination, output);
         }
 
         let output = self
             .open_outputs
-            .get_mut(&record.destination_class)
+            .get_mut(&destination)
             .expect("staged output inserted above");
         let mut append_context = GcStagedOutputAppendContext {
             io_limiter: self.io_limiter,
@@ -1503,8 +1693,8 @@ impl<'a> GcStagingCopier<'a> {
 struct OpenStagedOutput {
     /// Segment writer for the temporary staging file.
     writer: SegmentWriter,
-    /// Logical destination class this output accepts.
-    destination_class: DestinationClass,
+    /// Logical shard and destination class this output accepts.
+    destination: DestinationPlacement,
     /// Final placement class to install if this output is published.
     placement_class: PlacementClass,
     /// Next local staging id to allocate after this output.
@@ -1520,7 +1710,8 @@ impl OpenStagedOutput {
         let sealed_sha256 = sha256_file_prefix(&path, sealed_len)?;
         Ok(GcStagedOutputSegment {
             staged_segment_id: self.writer.segment_id(),
-            destination_class: self.destination_class,
+            shard: self.destination.shard,
+            destination_class: self.destination.class,
             placement_class: self.placement_class,
             path,
             sealed_len,
@@ -1533,16 +1724,16 @@ impl OpenStagedOutput {
 fn create_staged_output(
     staging_dir: &std::path::Path,
     staged_segment_id: SegmentId,
-    destination_class: DestinationClass,
+    destination: DestinationPlacement,
     segment_max_bytes: u64,
 ) -> Result<OpenStagedOutput> {
-    let placement_class = placement_class_for_destination(destination_class);
+    let placement_class = placement_class_for_destination(destination.class);
     let path = staging_dir.join(format!("{staged_segment_id:012}.data"));
     let writer =
         SegmentWriter::create(&path, staged_segment_id, placement_class, segment_max_bytes)?;
     Ok(OpenStagedOutput {
         writer,
-        destination_class,
+        destination,
         placement_class,
         next_staged_segment_id: staged_segment_id.saturating_add(1),
     })
@@ -1576,7 +1767,7 @@ fn append_gc_record_to_staged_output(
             let replacement = create_staged_output(
                 context.staging_dir,
                 *context.next_staged_segment_id,
-                record.destination_class,
+                output.destination,
                 context.segment_max_bytes,
             )?;
             let finished = std::mem::replace(output, replacement).finish(context.io_limiter)?;
@@ -1623,6 +1814,7 @@ fn create_gc_staging_dir(config: &crate::StrataStoreConfig) -> Result<PathBuf> {
 }
 
 fn remove_unpublished_prepublished_outputs(
+    config: &crate::StrataStoreConfig,
     prepublished: &[GcPrepublishedOutputSegment],
     published: &[GcPublishedOutputSegment],
 ) -> Result<()> {
@@ -1638,7 +1830,7 @@ fn remove_unpublished_prepublished_outputs(
     if unpublished.is_empty() {
         return Ok(());
     }
-    remove_gc_prepublished_output_files(&unpublished)
+    remove_gc_prepublished_output_files(config, &unpublished)
 }
 
 fn abandon_prepublished_outputs(
@@ -1657,7 +1849,7 @@ fn abandon_prepublished_outputs(
     batch
         .write_with_sync(true)
         .map_err(strata_index::Error::from)?;
-    remove_gc_prepublished_output_files(outputs)
+    remove_gc_prepublished_output_files(config, outputs)
 }
 
 fn remove_gc_staging_output_files(outputs: &[GcStagedOutputSegment]) -> Result<()> {
@@ -1667,9 +1859,15 @@ fn remove_gc_staging_output_files(outputs: &[GcStagedOutputSegment]) -> Result<(
     Ok(())
 }
 
-fn remove_gc_prepublished_output_files(outputs: &[GcPrepublishedOutputSegment]) -> Result<()> {
+fn remove_gc_prepublished_output_files(
+    config: &crate::StrataStoreConfig,
+    outputs: &[GcPrepublishedOutputSegment],
+) -> Result<()> {
     for output in outputs {
         remove_gc_output_file(&output.path)?;
+        if let Some(parent) = output.path.parent() {
+            prune_empty_retention_dirs(config, parent.to_path_buf())?;
+        }
     }
     Ok(())
 }

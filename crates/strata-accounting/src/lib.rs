@@ -32,7 +32,8 @@ mod state;
 pub type PartitionId = u32;
 pub type RunId = u64;
 
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 2;
+pub(crate) const ACTIVE_DELTA_LOG_FORMAT_VERSION: u32 = 1;
 
 pub use active_log::{
     AccountingDelta, ActiveDeltaLog, ActiveDeltaLogPosition, ActiveDeltaLogReadCursor,
@@ -41,10 +42,10 @@ pub use active_log::{
 pub use events::{CompactionEventBatch, RefEvent, RetireReason, SegmentGcSummaryDelta};
 pub use index::{
     AccountingIndex, AccountingIndexConfig, PreparedAccountingDeltas, PreparedCompaction,
-    PreparedDeltaRuns, PreparedEpochChange, PreparedMajorCompaction,
+    PreparedDeltaRuns, PreparedEpochChange, PreparedMajorCompaction, PreparedShardDrop,
 };
 pub use manifest::{
-    EpochChange, Manifest, PartitionManifest, RunKind, RunMeta, manifest_from_bytes,
+    EpochChange, Manifest, PartitionManifest, RunKind, RunMeta, ShardDrop, manifest_from_bytes,
     manifest_to_bytes,
 };
 pub use state::{
@@ -92,6 +93,14 @@ pub enum Error {
     #[error("delta run does not contain any key-scoped updates")]
     EmptyDeltaRun,
 
+    #[error(
+        "shard drop {shard:?} at LSN {lsn} requires all sidecar partitions to be major compacted"
+    )]
+    ShardDropRequiresCompaction {
+        shard: strata_core::ShardKey,
+        lsn: u64,
+    },
+
     #[error("I/O error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 
@@ -122,6 +131,10 @@ mod tests {
     const SHARD: ShardKey = ShardKey {
         id: 7,
         generation: 2,
+    };
+    const OTHER_SHARD: ShardKey = ShardKey {
+        id: 8,
+        generation: 4,
     };
 
     fn index(partitions: u32) -> (tempfile::TempDir, AccountingIndex) {
@@ -166,10 +179,19 @@ mod tests {
     }
 
     fn put(lsn: StrataLsn, key: &BlobKey, record_ref: RecordRef) -> BlobUpdate {
+        put_for_shard(lsn, key, SHARD, record_ref)
+    }
+
+    fn put_for_shard(
+        lsn: StrataLsn,
+        key: &BlobKey,
+        shard: ShardKey,
+        record_ref: RecordRef,
+    ) -> BlobUpdate {
         BlobUpdate::Put {
             lsn,
             key: key.clone(),
-            shard: SHARD,
+            shard,
             record_ref,
             current_epoch: 42,
             lifecycle: None,
@@ -195,6 +217,35 @@ mod tests {
 
         let reopened = ActiveDeltaLog::open(dir.path(), state).unwrap();
         assert_eq!(reopened.state(), state);
+    }
+
+    #[test]
+    fn active_delta_log_round_trips_shard_drop() {
+        let dir = tempdir().unwrap();
+        let state = {
+            let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+            log.append(&AccountingDelta::ShardDropped {
+                lsn: 7,
+                shard: SHARD,
+            })
+            .unwrap();
+            log.sync_data().unwrap();
+            log.state()
+        };
+
+        let read = ActiveDeltaLog::read_durable_range(
+            dir.path(),
+            ActiveDeltaLogReadCursor::default(),
+            state,
+        )
+        .unwrap();
+        assert_eq!(
+            read.deltas,
+            vec![AccountingDelta::ShardDropped {
+                lsn: 7,
+                shard: SHARD,
+            }]
+        );
     }
 
     #[test]
@@ -461,7 +512,127 @@ mod tests {
         assert!(
             matches!(batch.events[1], RefEvent::Retired { lsn: 20, record_ref, reason: RetireReason::Tombstoned, .. } if record_ref == first_ref)
         );
-        assert_eq!(state.payload.unwrap().record_ref, final_ref);
+        assert_eq!(state.payloads.get(&SHARD).unwrap().record_ref, final_ref);
+    }
+
+    #[test]
+    fn accounting_keeps_same_key_payloads_live_in_independent_shards() {
+        let (_dir, mut index) = index(1);
+        let key = key(b"shared-key");
+        let first_ref = record_ref(10, 0);
+        let other_ref = record_ref(20, 0);
+        let replacement_ref = record_ref(11, 0);
+
+        index
+            .append_delta_run(vec![
+                put_for_shard(1, &key, SHARD, first_ref),
+                put_for_shard(2, &key, OTHER_SHARD, other_ref),
+            ])
+            .unwrap();
+        let shallow = index.compact_partition(0).unwrap();
+        assert!(shallow.events.is_empty());
+        let prepared = index.prepare_major_compact_partition(0).unwrap();
+        let initial = prepared.event_batch.clone();
+        index.apply_prepared_major_compaction(prepared).unwrap();
+        assert_eq!(
+            initial
+                .events
+                .iter()
+                .filter(|event| matches!(event, RefEvent::Live { .. }))
+                .count(),
+            2
+        );
+
+        let state = index.materialized_state(&key).unwrap().unwrap();
+        assert_eq!(state.payloads.len(), 2);
+        assert_eq!(state.payloads.get(&SHARD).unwrap().record_ref, first_ref);
+        assert_eq!(
+            state.payloads.get(&OTHER_SHARD).unwrap().record_ref,
+            other_ref
+        );
+
+        index
+            .append_delta_run(vec![put_for_shard(3, &key, SHARD, replacement_ref)])
+            .unwrap();
+        index.compact_partition(0).unwrap();
+        let prepared = index.prepare_major_compact_partition(0).unwrap();
+        let replacement = prepared.event_batch.clone();
+        index.apply_prepared_major_compaction(prepared).unwrap();
+        assert!(replacement.events.iter().any(
+            |event| matches!(event, RefEvent::Retired { shard, record_ref, .. } if *shard == SHARD && *record_ref == first_ref)
+        ));
+
+        let state = index.materialized_state(&key).unwrap().unwrap();
+        assert_eq!(state.payloads.len(), 2);
+        assert_eq!(
+            state.payloads.get(&SHARD).unwrap().record_ref,
+            replacement_ref
+        );
+        assert_eq!(
+            state.payloads.get(&OTHER_SHARD).unwrap().record_ref,
+            other_ref
+        );
+    }
+
+    #[test]
+    fn shard_drop_retires_ingest_payloads_without_retiring_shard_owned_payloads() {
+        let (_dir, mut index) = index(1);
+        let ingest_key = key(b"drop-ingest");
+        let retention_key = key(b"drop-retention");
+        let ingest_ref = record_ref(10, 0);
+        let retention_source = record_ref(11, 0);
+        let retention_ref = record_ref(20, 0);
+
+        index
+            .append_delta_run(vec![
+                put_for_shard(1, &ingest_key, SHARD, ingest_ref),
+                put_for_shard(2, &retention_key, SHARD, retention_source),
+                BlobUpdate::MapRef {
+                    lsn: 3,
+                    key: retention_key.clone(),
+                    from: retention_source,
+                    to: retention_ref,
+                },
+            ])
+            .unwrap();
+        index.compact_partition(0).unwrap();
+        index.major_compact_partition(0).unwrap();
+
+        let prepared = index
+            .prepare_accounting_deltas(vec![AccountingDelta::ShardDropped {
+                lsn: 4,
+                shard: SHARD,
+            }])
+            .unwrap();
+        index.apply_prepared_accounting_deltas(prepared).unwrap();
+        let drop = index.pending_shard_drops()[0];
+        let prepared = index.prepare_materialize_shard_drop(drop).unwrap();
+
+        assert!(prepared.event_batch.events.iter().any(
+            |event| matches!(event, RefEvent::Retired { record_ref, reason: RetireReason::ShardDropped, .. } if *record_ref == ingest_ref)
+        ));
+        assert!(!prepared.event_batch.events.iter().any(
+            |event| matches!(event, RefEvent::Retired { record_ref, .. } if *record_ref == retention_ref)
+        ));
+        index.apply_prepared_shard_drop(prepared).unwrap();
+
+        assert!(
+            index
+                .materialized_state(&ingest_key)
+                .unwrap()
+                .unwrap()
+                .payloads
+                .is_empty()
+        );
+        assert!(
+            index
+                .materialized_state(&retention_key)
+                .unwrap()
+                .unwrap()
+                .payloads
+                .is_empty()
+        );
+        assert!(index.pending_shard_drops().is_empty());
     }
 
     #[test]
@@ -595,7 +766,7 @@ mod tests {
         let state = index.materialized_state(&key).unwrap().unwrap();
 
         assert!(batch.events.is_empty());
-        assert_eq!(state.payload, None);
+        assert!(state.payloads.is_empty());
         assert_eq!(state.pending_maps, vec![MapRef { lsn: 7, from, to }]);
     }
 
@@ -625,7 +796,7 @@ mod tests {
         index.apply_prepared_major_compaction(prepared).unwrap();
         let state = index.materialized_state(&key).unwrap().unwrap();
 
-        assert_eq!(state.payload.unwrap().record_ref, to);
+        assert_eq!(state.payloads.get(&SHARD).unwrap().record_ref, to);
         assert!(state.pending_maps.is_empty());
         assert!(
             matches!(major_batch.events[0], RefEvent::Live { record_ref, .. } if record_ref == from)
@@ -671,7 +842,8 @@ mod tests {
                 .materialized_state(&key_b)
                 .unwrap()
                 .unwrap()
-                .payload
+                .payloads
+                .get(&SHARD)
                 .unwrap()
                 .record_ref,
             record_ref(10, 100)
@@ -700,7 +872,10 @@ mod tests {
         index.major_compact_partition(0).unwrap();
 
         let state = index.materialized_state(&key).unwrap().unwrap();
-        assert_eq!(state.payload.unwrap().record_ref, record_ref(12, 0));
+        assert_eq!(
+            state.payloads.get(&SHARD).unwrap().record_ref,
+            record_ref(12, 0)
+        );
         let partition = index.manifest().partitions.get(&0).unwrap();
         assert!(partition.patches.is_empty());
         assert_eq!(partition.base.as_ref().unwrap().max_lsn, Some(3));

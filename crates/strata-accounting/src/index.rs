@@ -2,15 +2,15 @@ use std::{collections::BTreeMap, fs, num::NonZeroU32, path::PathBuf};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use strata_core::BlobKey;
+use strata_core::{BlobKey, SegmentOwner};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::active_log::AccountingDelta;
-use crate::events::CompactionEventBatch;
+use crate::events::{CompactionEventBatch, RefEvent, RetireReason};
 use crate::manifest::{
     EpochChange, Manifest, PartitionManifest, RunKind, RunMeta, advance_manifest_generation,
     allocate_run_id, manifest_from_bytes, manifest_to_bytes, partition_mut, push_epoch_change,
-    validate_manifest,
+    push_shard_drop, validate_manifest,
 };
 use crate::run_io::{
     RunFile, RunRecordReader, RunRecords, open_run_record_reader, partition_dir, run_file_name,
@@ -77,6 +77,8 @@ pub struct PreparedAccountingDeltas {
     /// Epoch changes stay in the manifest because they are global timeline facts rather than
     /// partition-local run records.
     pub epoch_changes: Vec<EpochChange>,
+    /// Shard drops remain pending until the materialized payload state is swept.
+    pub shard_drops: Vec<crate::ShardDrop>,
     /// Same local generation guard used by every prepared manifest: it prevents an older active-log
     /// ingest plan from replacing a newer accepted root in this handle.
     base_generation: u64,
@@ -145,6 +147,16 @@ pub struct PreparedMajorCompaction {
     obsolete_runs: Vec<RunMeta>,
 }
 
+/// Replacement sidecar root after removing one dropped generation from every partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedShardDrop {
+    pub drop: crate::ShardDrop,
+    pub event_batch: CompactionEventBatch,
+    base_generation: u64,
+    manifest: Manifest,
+    obsolete_runs: Vec<RunMeta>,
+}
+
 impl PreparedDeltaRuns {
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
@@ -182,6 +194,12 @@ impl PreparedCompaction {
 
     pub fn manifest_bytes(&self) -> Result<Vec<u8>> {
         manifest_to_bytes(&self.manifest)
+    }
+}
+
+impl PreparedShardDrop {
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
     }
 }
 
@@ -306,6 +324,7 @@ impl AccountingIndex {
     ) -> Result<PreparedAccountingDeltas> {
         let mut blob_updates = Vec::new();
         let mut epoch_changes = Vec::new();
+        let mut shard_drops = Vec::new();
         for delta in deltas {
             match delta {
                 AccountingDelta::Blob(update) => blob_updates.push(update),
@@ -324,9 +343,16 @@ impl AccountingIndex {
                         });
                     }
                 }
+                AccountingDelta::ShardDropped { lsn, shard } => {
+                    shard_drops.push(crate::ShardDrop {
+                        lsn,
+                        shard,
+                        materialized: false,
+                    });
+                }
             }
         }
-        if blob_updates.is_empty() && epoch_changes.is_empty() {
+        if blob_updates.is_empty() && epoch_changes.is_empty() && shard_drops.is_empty() {
             return Err(Error::EmptyDeltaRun);
         }
 
@@ -340,10 +366,14 @@ impl AccountingIndex {
         for change in &epoch_changes {
             push_epoch_change(&mut manifest, *change);
         }
+        for drop in &shard_drops {
+            push_shard_drop(&mut manifest, drop.lsn, drop.shard);
+        }
         advance_manifest_generation(&mut manifest)?;
         Ok(PreparedAccountingDeltas {
             delta_metas,
             epoch_changes,
+            shard_drops,
             base_generation,
             manifest,
         })
@@ -597,6 +627,110 @@ impl AccountingIndex {
         self.apply_prepared_manifest(prepared.base_generation, prepared.manifest)?;
         // The replacement base is live only after the manifest swap. Until then, old base/patch
         // files remain the readable state of the partition and must not be deleted.
+        self.remove_runs(&prepared.obsolete_runs);
+        Ok(())
+    }
+
+    pub fn pending_shard_drops(&self) -> Vec<crate::ShardDrop> {
+        self.manifest
+            .shard_drops
+            .iter()
+            .copied()
+            .filter(|drop| !drop.materialized)
+            .collect()
+    }
+
+    pub fn prepare_materialize_shard_drop(
+        &self,
+        drop: crate::ShardDrop,
+    ) -> Result<PreparedShardDrop> {
+        let mut manifest = self.manifest.clone();
+        let mut event_batch = CompactionEventBatch {
+            max_lsn: drop.lsn,
+            ..CompactionEventBatch::default()
+        };
+        let mut obsolete_runs = Vec::new();
+
+        for partition in 0..manifest.partition_count {
+            let partition_manifest = self.partition(partition)?;
+            if !partition_manifest.deltas.is_empty() || !partition_manifest.patches.is_empty() {
+                return Err(Error::ShardDropRequiresCompaction {
+                    shard: drop.shard,
+                    lsn: drop.lsn,
+                });
+            }
+
+            let old_base = partition_manifest.base.clone();
+            let mut changed = false;
+            let mut records = Vec::new();
+            if let Some(base) = old_base.as_ref() {
+                for record in self.state_run_records(base)? {
+                    let mut record = record?;
+                    if let Some(payload) = record.state.payloads.remove(&drop.shard) {
+                        changed = true;
+                        record.state.head_lsn = record.state.head_lsn.max(drop.lsn);
+                        if payload.owner == SegmentOwner::Store {
+                            event_batch.record_event(RefEvent::Retired {
+                                lsn: drop.lsn,
+                                key: record.key.clone(),
+                                shard: drop.shard,
+                                record_ref: payload.record_ref,
+                                lifecycle: record.state.lifecycle_value(),
+                                reason: RetireReason::ShardDropped,
+                            });
+                        }
+                    }
+                    records.push(record);
+                }
+            }
+
+            let replacement = if changed {
+                let run_id = allocate_run_id(&mut manifest);
+                Some(self.write_framed_run(
+                    run_id,
+                    RunKind::Base,
+                    partition,
+                    records.into_iter().map(Ok),
+                )?)
+            } else {
+                old_base.clone()
+            };
+            let partition_manifest = partition_mut(&mut manifest, partition)?;
+            partition_manifest.base = replacement;
+            partition_manifest.materialized_through_lsn =
+                partition_manifest.materialized_through_lsn.max(drop.lsn);
+            if changed && let Some(old_base) = old_base {
+                obsolete_runs.push(old_base);
+            }
+        }
+
+        let Some(manifest_drop) = manifest
+            .shard_drops
+            .iter_mut()
+            .find(|candidate| candidate.shard == drop.shard && candidate.lsn == drop.lsn)
+        else {
+            return Err(Error::CorruptRun {
+                path: self.config.root_dir.clone(),
+                reason: format!(
+                    "pending shard drop {:?} at LSN {} is absent from manifest",
+                    drop.shard, drop.lsn
+                ),
+            });
+        };
+        manifest_drop.materialized = true;
+        advance_manifest_generation(&mut manifest)?;
+
+        Ok(PreparedShardDrop {
+            drop,
+            event_batch,
+            base_generation: self.manifest.generation,
+            manifest,
+            obsolete_runs,
+        })
+    }
+
+    pub fn apply_prepared_shard_drop(&mut self, prepared: PreparedShardDrop) -> Result<()> {
+        self.apply_prepared_manifest(prepared.base_generation, prepared.manifest)?;
         self.remove_runs(&prepared.obsolete_runs);
         Ok(())
     }

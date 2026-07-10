@@ -38,8 +38,8 @@ mod segment;
 pub use checksum::{Checksum, ChecksumAlgorithm};
 pub use error::{Error, Result};
 pub use ids::{
-    BlobState, Epoch, Generation, RecordRef, ShardGeneration, ShardId, ShardInfo, ShardKey,
-    ShardState, StrataLsn,
+    BlobState, Epoch, Generation, RecordRef, ShardCleanupJob, ShardCleanupState, ShardGeneration,
+    ShardId, ShardInfo, ShardKey, ShardState, StrataLsn,
 };
 pub use key::{BlobKey, BlobKeyError};
 pub use lifecycle::{
@@ -56,7 +56,7 @@ pub use record::{
 pub use segment::{
     EpochBucket, GcRelocation, PlacementClass, SegmentFileState, SegmentGcLifetimeRange,
     SegmentGcLifetimeUpdate, SegmentGcLiveRecord, SegmentGcOverlay, SegmentGcOverlayMergeOp,
-    SegmentGcRecordRange, SegmentGcSummary, SegmentId, SegmentKey, SegmentRefEvent,
+    SegmentGcRecordRange, SegmentGcSummary, SegmentId, SegmentOwner, SegmentRefEvent,
     SegmentRefEventKey, SegmentState, VolumeId,
 };
 

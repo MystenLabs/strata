@@ -21,13 +21,14 @@ pub(crate) fn blob_versions_cf_options(
     shard_infos: Arc<RwLock<BTreeMap<ShardId, ShardInfo>>>,
 ) -> rocksdb::Options {
     let mut options = default_db_options().options;
-    let merge_shard_infos = shard_infos.clone();
+    let merge_compact_safe_lsn = Arc::clone(&compact_safe_lsn);
+    let merge_shard_infos = Arc::clone(&shard_infos);
     options.set_merge_operator(
         "strata-blob-versions-merge",
         move |_key: &[u8], existing_value: Option<&[u8]>, operands: &MergeOperands| {
             full_merge_blob_versions(
-                compact_safe_lsn.clone(),
-                merge_shard_infos.clone(),
+                Arc::clone(&merge_compact_safe_lsn),
+                Arc::clone(&merge_shard_infos),
                 existing_value,
                 operands,
             )
@@ -37,6 +38,7 @@ pub(crate) fn blob_versions_cf_options(
         },
     );
     options.set_compaction_filter_factory(BlobVersionsCompactionFilterFactory {
+        compact_safe_lsn,
         shard_infos,
         name: CString::new("strata-blob-versions-compaction-filter").unwrap(),
     });
@@ -44,6 +46,7 @@ pub(crate) fn blob_versions_cf_options(
 }
 
 struct BlobVersionsCompactionFilterFactory {
+    compact_safe_lsn: Arc<RwLock<StrataLsn>>,
     shard_infos: Arc<RwLock<BTreeMap<ShardId, ShardInfo>>>,
     name: CString,
 }
@@ -53,6 +56,7 @@ impl CompactionFilterFactory for BlobVersionsCompactionFilterFactory {
 
     fn create(&mut self, _context: CompactionFilterContext) -> Self::Filter {
         BlobVersionsCompactionFilter {
+            compact_safe_lsn: Arc::clone(&self.compact_safe_lsn),
             shard_infos: Arc::clone(&self.shard_infos),
             scratch: Vec::new(),
             name: CString::new("strata-blob-versions-compaction-filter").unwrap(),
@@ -65,6 +69,7 @@ impl CompactionFilterFactory for BlobVersionsCompactionFilterFactory {
 }
 
 struct BlobVersionsCompactionFilter {
+    compact_safe_lsn: Arc<RwLock<StrataLsn>>,
     shard_infos: Arc<RwLock<BTreeMap<ShardId, ShardInfo>>>,
     scratch: Vec<u8>,
     name: CString,
@@ -75,12 +80,22 @@ impl CompactionFilter for BlobVersionsCompactionFilter {
         let Ok(mut state) = bcs::from_bytes::<BlobVersionState>(value) else {
             return Decision::Keep;
         };
+        let compact_safe_lsn = *self
+            .compact_safe_lsn
+            .read()
+            .expect("blob version compaction frontier lock poisoned");
+        let compacted_lsn = has_lsn_compaction_work(&state, compact_safe_lsn);
+        if compacted_lsn {
+            state.versions.compact_through(compact_safe_lsn);
+            state.lifecycle.compact_through(compact_safe_lsn);
+        }
         let shard_infos = self
             .shard_infos
             .read()
             .expect("shard info cache lock poisoned")
             .clone();
-        if !prune_obsolete_shard_versions(&mut state.versions, &shard_infos) {
+        let pruned_shards = prune_obsolete_shard_versions(&mut state.versions, &shard_infos);
+        if !compacted_lsn && !pruned_shards {
             return Decision::Keep;
         }
         if state.is_empty() {
@@ -98,4 +113,22 @@ impl CompactionFilter for BlobVersionsCompactionFilter {
     fn name(&self) -> &CStr {
         self.name.as_c_str()
     }
+}
+
+fn has_lsn_compaction_work(state: &BlobVersionState, compact_safe_lsn: StrataLsn) -> bool {
+    state
+        .versions
+        .tail
+        .iter()
+        .any(|op| op.lsn() <= compact_safe_lsn)
+        || state
+            .versions
+            .maps
+            .iter()
+            .any(|op| op.publish_lsn <= compact_safe_lsn && op.payload_lsn <= compact_safe_lsn)
+        || state
+            .lifecycle
+            .tail
+            .iter()
+            .any(|op| op.lsn() <= compact_safe_lsn)
 }
