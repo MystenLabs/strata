@@ -513,6 +513,7 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         segment_max_bytes: 1 << 20,
         write_queue_capacity: 128,
         max_unsealed_segments: 8,
+        seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
         segment_reader_cache_capacity: 16,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
@@ -5364,6 +5365,74 @@ async fn unsealed_segment_count_includes_open_and_sealing_segments() {
 }
 
 #[tokio::test]
+async fn seal_publisher_waits_for_lowest_sealing_segment() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "default");
+    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
+    put_test_segment_state(&index, 1, SegmentFileState::Sealing);
+    put_test_segment_state(&index, 2, SegmentFileState::Sealing);
+    let mut completed = BTreeMap::new();
+
+    completed.insert(
+        2,
+        seal::CompletedSeal {
+            task: SegmentSealTask {
+                segment_id: 2,
+                sealed_len: 64,
+            },
+            sealed_sha256: None,
+        },
+    );
+    seal::publish_ready_completed_seals(
+        &cfg,
+        &index,
+        INGEST_SEGMENT_OWNER,
+        None,
+        &StrataStoreMetrics::default(),
+        &mut completed,
+    )
+    .unwrap();
+    assert_eq!(
+        index.get_segment_state(1).unwrap().unwrap().state,
+        SegmentFileState::Sealing
+    );
+    assert_eq!(
+        index.get_segment_state(2).unwrap().unwrap().state,
+        SegmentFileState::Sealing
+    );
+
+    completed.insert(
+        1,
+        seal::CompletedSeal {
+            task: SegmentSealTask {
+                segment_id: 1,
+                sealed_len: 64,
+            },
+            sealed_sha256: None,
+        },
+    );
+    seal::publish_ready_completed_seals(
+        &cfg,
+        &index,
+        INGEST_SEGMENT_OWNER,
+        None,
+        &StrataStoreMetrics::default(),
+        &mut completed,
+    )
+    .unwrap();
+    assert_eq!(
+        index.get_segment_state(1).unwrap().unwrap().state,
+        SegmentFileState::Sealed
+    );
+    assert_eq!(
+        index.get_segment_state(2).unwrap().unwrap().state,
+        SegmentFileState::Sealed
+    );
+    assert!(completed.is_empty());
+}
+
+#[tokio::test]
 async fn reopen_detects_missing_sealed_segment() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
@@ -5505,6 +5574,7 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    cfg.seal_worker_count = 2;
     let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();

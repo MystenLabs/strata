@@ -18,9 +18,9 @@ use strata_store::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig,
-    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
-    StrataStoreMetrics,
+    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
+    GcPlannerConfig, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore,
+    StrataStoreConfig, StrataStoreMetrics,
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -61,6 +61,7 @@ struct Config {
     queue_capacity: usize,
     segment_max_bytes: u64,
     max_unsealed_segments: usize,
+    seal_worker_count: usize,
     reader_cache_capacity: usize,
     recovery_policy: StrataRecoveryPolicy,
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
@@ -77,6 +78,7 @@ impl Config {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             max_unsealed_segments: DEFAULT_MAX_UNSEALED_SEGMENTS,
+            seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
@@ -102,6 +104,10 @@ impl Config {
                 "--max-unsealed-segments" => {
                     config.max_unsealed_segments =
                         parse_nonzero_usize(&next_value(&mut args, "--max-unsealed-segments")?)?
+                }
+                "--seal-workers" => {
+                    config.seal_worker_count =
+                        parse_nonzero_usize(&next_value(&mut args, "--seal-workers")?)?
                 }
                 "--reader-cache-capacity" => {
                     config.reader_cache_capacity =
@@ -147,6 +153,7 @@ impl Config {
             segment_max_bytes: self.segment_max_bytes,
             write_queue_capacity: self.queue_capacity,
             max_unsealed_segments: self.max_unsealed_segments,
+            seal_worker_count: self.seal_worker_count,
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: self.recovery_policy,
             sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
@@ -385,6 +392,7 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
             println!("segment_max_bytes={}", config.segment_max_bytes);
             println!("queue_capacity={}", config.queue_capacity);
             println!("max_unsealed_segments={}", config.max_unsealed_segments);
+            println!("seal_workers={}", config.seal_worker_count);
             println!("reader_cache_capacity={}", config.reader_cache_capacity);
             println!("recovery_policy={:?}", config.recovery_policy);
             println!(
@@ -597,6 +605,7 @@ options:
   --queue-capacity <count>
   --segment-max-bytes <bytes|KiB|MiB|GiB>
   --max-unsealed-segments <count>
+  --seal-workers <count>
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --recovery-policy <point-in-time|absolute-consistency>
   --sealed-integrity <metadata-only|checksum>

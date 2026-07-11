@@ -1,9 +1,18 @@
-use std::{fs, io::Read, path::Path, sync::mpsc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    path::Path,
+    sync::{Arc, Mutex, mpsc},
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use sha2::{Digest, Sha256};
 use strata_accounting::ActiveDeltaLogState;
 use strata_core::{
-    BlobKey, MapRefOp, SegmentFileState, SegmentId, SegmentOwner, SegmentState, StrataLsn,
+    BlobKey, MapRefOp, PlacementClass, SegmentFileState, SegmentId, SegmentOwner, SegmentState,
+    StrataLsn,
 };
 use strata_index::StrataIndex;
 
@@ -14,6 +23,8 @@ use crate::{
     layout::{segment_path, segment_state_path},
     unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
+
+const SEAL_COMMAND_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub(crate) enum SealCommand {
@@ -40,88 +51,336 @@ pub(crate) struct SealWorker {
 
 impl SealWorker {
     pub(crate) fn run(self) {
-        while let Ok(command) = self.seal_rx.recv() {
-            match command {
-                SealCommand::Seal(task) => {
-                    if let Err(error) = self.seal_segment(task) {
-                        self.metrics.record_seal_error();
-                        self.store_halt.halt(format!(
-                            "fatal strata seal worker error sealing segment {}: {}",
-                            task.segment_id, error
-                        ));
+        let SealWorker {
+            config,
+            index,
+            ingest_owner,
+            seal_rx,
+            accounting_tx,
+            metrics,
+            store_halt,
+        } = self;
+
+        let (task_tx, task_rx) = mpsc::channel();
+        let task_rx = Arc::new(Mutex::new(task_rx));
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut worker_handles = Vec::with_capacity(config.seal_worker_count);
+        for worker_id in 0..config.seal_worker_count {
+            let worker = SealTaskWorker {
+                config: config.clone(),
+                index: index.clone(),
+                task_rx: Arc::clone(&task_rx),
+                result_tx: result_tx.clone(),
+            };
+            match thread::Builder::new()
+                .name(format!(
+                    "strata-seal-worker-{}-{worker_id}",
+                    config.namespace
+                ))
+                .spawn(move || worker.run())
+            {
+                Ok(handle) => worker_handles.push(handle),
+                Err(source) => {
+                    store_halt.halt(format!("fatal strata seal worker spawn error: {source}"));
+                    drop(task_tx);
+                    drop(result_tx);
+                    join_seal_threads(worker_handles);
+                    return;
+                }
+            }
+        }
+        drop(result_tx);
+
+        let publisher = SealPublisher {
+            config: config.clone(),
+            index,
+            ingest_owner,
+            result_rx,
+            accounting_tx,
+            metrics,
+            store_halt: store_halt.clone(),
+        };
+        let publisher_handle = match thread::Builder::new()
+            .name(format!("strata-seal-publisher-{}", config.namespace))
+            .spawn(move || publisher.run())
+        {
+            Ok(handle) => handle,
+            Err(source) => {
+                store_halt.halt(format!("fatal strata seal publisher spawn error: {source}"));
+                drop(task_tx);
+                join_seal_threads(worker_handles);
+                return;
+            }
+        };
+
+        dispatch_seal_commands(seal_rx, task_tx, &store_halt);
+        join_seal_threads(worker_handles);
+        let _ = publisher_handle.join();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_segment(&self, task: SegmentSealTask) -> Result<()> {
+        let Some(completed) = prepare_seal_segment(&self.config, &self.index, task)? else {
+            return Ok(());
+        };
+        publish_sealed_segment(
+            &self.config,
+            &self.index,
+            self.ingest_owner,
+            self.accounting_tx.as_ref(),
+            &self.metrics,
+            completed,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedSeal {
+    pub(crate) task: SegmentSealTask,
+    pub(crate) sealed_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Debug)]
+struct SealTaskResult {
+    task: SegmentSealTask,
+    result: Result<Option<CompletedSeal>>,
+}
+
+#[derive(Debug)]
+struct SealTaskWorker {
+    config: StrataStoreConfig,
+    index: StrataIndex,
+    task_rx: Arc<Mutex<mpsc::Receiver<SegmentSealTask>>>,
+    result_tx: mpsc::Sender<SealTaskResult>,
+}
+
+impl SealTaskWorker {
+    fn run(self) {
+        while let Some(task) = self.recv_task() {
+            let result = prepare_seal_segment(&self.config, &self.index, task);
+            let is_error = result.is_err();
+            if self
+                .result_tx
+                .send(SealTaskResult { task, result })
+                .is_err()
+            {
+                break;
+            }
+            if is_error {
+                break;
+            }
+        }
+    }
+
+    fn recv_task(&self) -> Option<SegmentSealTask> {
+        self.task_rx
+            .lock()
+            .expect("seal task receiver lock poisoned")
+            .recv()
+            .ok()
+    }
+}
+
+#[derive(Debug)]
+struct SealPublisher {
+    config: StrataStoreConfig,
+    index: StrataIndex,
+    ingest_owner: SegmentOwner,
+    result_rx: mpsc::Receiver<SealTaskResult>,
+    accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
+    metrics: StrataStoreMetrics,
+    store_halt: StoreHalt,
+}
+
+impl SealPublisher {
+    fn run(self) {
+        let mut completed = BTreeMap::new();
+        while let Ok(task_result) = self.result_rx.recv() {
+            if self.store_halt.error().is_some() {
+                break;
+            }
+
+            match task_result.result {
+                Ok(Some(completed_seal)) => {
+                    completed.insert(completed_seal.task.segment_id, completed_seal);
+                    if let Err(error) = self.publish_ready(&mut completed) {
+                        self.halt_seal_error(task_result.task.segment_id, &error);
                         break;
                     }
                 }
-                SealCommand::Shutdown => break,
+                Ok(None) => {
+                    if let Err(error) = self.publish_ready(&mut completed) {
+                        self.halt_seal_error(task_result.task.segment_id, &error);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    self.halt_seal_error(task_result.task.segment_id, &error);
+                    break;
+                }
             }
         }
     }
 
-    pub(crate) fn seal_segment(&self, task: SegmentSealTask) -> Result<()> {
-        if let Some(existing) = self.index.get_segment_state(task.segment_id)?
-            && existing.state == SegmentFileState::Sealed
-        {
-            return Ok(());
-        }
+    fn publish_ready(&self, completed: &mut BTreeMap<SegmentId, CompletedSeal>) -> Result<()> {
+        publish_ready_completed_seals(
+            &self.config,
+            &self.index,
+            self.ingest_owner,
+            self.accounting_tx.as_ref(),
+            &self.metrics,
+            completed,
+        )
+    }
 
-        let path = segment_path(&self.config, task.segment_id);
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
-        file.sync_data().map_err(|source| Error::Io {
+    fn halt_seal_error(&self, segment_id: SegmentId, error: &Error) {
+        self.metrics.record_seal_error();
+        self.store_halt.halt(format!(
+            "fatal strata seal worker error sealing segment {segment_id}: {error}"
+        ));
+    }
+}
+
+pub(crate) fn publish_ready_completed_seals(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+    ingest_owner: SegmentOwner,
+    accounting_tx: Option<&mpsc::SyncSender<AccountingCommand>>,
+    metrics: &StrataStoreMetrics,
+    completed: &mut BTreeMap<SegmentId, CompletedSeal>,
+) -> Result<()> {
+    loop {
+        let Some(segment_id) = next_sealing_ingest_segment_id(index)? else {
+            return Ok(());
+        };
+        let Some(completed_seal) = completed.remove(&segment_id) else {
+            return Ok(());
+        };
+        publish_sealed_segment(
+            config,
+            index,
+            ingest_owner,
+            accounting_tx,
+            metrics,
+            completed_seal,
+        )?;
+    }
+}
+
+fn dispatch_seal_commands(
+    seal_rx: mpsc::Receiver<SealCommand>,
+    task_tx: mpsc::Sender<SegmentSealTask>,
+    store_halt: &StoreHalt,
+) {
+    loop {
+        if store_halt.error().is_some() {
+            break;
+        }
+        match seal_rx.recv_timeout(SEAL_COMMAND_RECV_TIMEOUT) {
+            Ok(SealCommand::Seal(task)) => {
+                if task_tx.send(task).is_err() {
+                    break;
+                }
+            }
+            Ok(SealCommand::Shutdown) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn join_seal_threads(handles: Vec<JoinHandle<()>>) {
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+fn prepare_seal_segment(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+    task: SegmentSealTask,
+) -> Result<Option<CompletedSeal>> {
+    if let Some(existing) = index.get_segment_state(task.segment_id)?
+        && existing.state == SegmentFileState::Sealed
+    {
+        return Ok(None);
+    }
+
+    let path = segment_path(config, task.segment_id);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| Error::Io {
             path: path.clone(),
             source,
         })?;
-        let sealed_sha256 = match self.config.sealed_segment_integrity_policy {
-            SealedSegmentIntegrityPolicy::Checksum => {
-                Some(sha256_file_prefix(&path, task.sealed_len)?)
-            }
-            SealedSegmentIntegrityPolicy::MetadataOnly => None,
-        };
+    file.sync_data().map_err(|source| Error::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let sealed_sha256 = match config.sealed_segment_integrity_policy {
+        SealedSegmentIntegrityPolicy::Checksum => Some(sha256_file_prefix(&path, task.sealed_len)?),
+        SealedSegmentIntegrityPolicy::MetadataOnly => None,
+    };
 
-        let mut state = active_segment_state_from_path(
-            &self.config,
-            self.ingest_owner,
-            task.segment_id,
-            task.sealed_len,
-            task.sealed_len,
-        );
-        if let Some(existing) = self.index.get_segment_state(task.segment_id)? {
-            state.volume_id = existing.volume_id;
-            state.placement_class = existing.placement_class;
-            state.min_lsn = existing.min_lsn;
-            state.max_lsn = existing.max_lsn;
-        }
-        state.state = SegmentFileState::Sealed;
-        state.sealed_len = Some(task.sealed_len);
-        state.sealed_sha256 = sealed_sha256;
+    Ok(Some(CompletedSeal {
+        task,
+        sealed_sha256,
+    }))
+}
 
-        let durable_lsn = {
-            let mut batch = self.index.batch();
-            self.index.put_segment_state_batch(&mut batch, &state)?;
-            let durable_lsn =
-                durable_lsn_with_accounting_frontier(&self.index, Some(&state), None)?;
-            self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
-            batch
-                .write_with_sync(true)
-                .map_err(strata_index::Error::from)?;
-            durable_lsn
-        };
-        self.index.set_blob_compact_safe_lsn(durable_lsn);
-        self.metrics.record_segment_sealed();
-        self.metrics.set_durable_lsn(durable_lsn);
-        self.metrics
-            .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
-        if let Some(accounting_tx) = &self.accounting_tx {
-            let _ = accounting_tx.try_send(AccountingCommand::Run);
-        }
-        Ok(())
+fn publish_sealed_segment(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+    ingest_owner: SegmentOwner,
+    accounting_tx: Option<&mpsc::SyncSender<AccountingCommand>>,
+    metrics: &StrataStoreMetrics,
+    completed: CompletedSeal,
+) -> Result<()> {
+    let task = completed.task;
+    if let Some(existing) = index.get_segment_state(task.segment_id)?
+        && existing.state == SegmentFileState::Sealed
+    {
+        return Ok(());
     }
+
+    let mut state = active_segment_state_from_path(
+        config,
+        ingest_owner,
+        task.segment_id,
+        task.sealed_len,
+        task.sealed_len,
+    );
+    if let Some(existing) = index.get_segment_state(task.segment_id)? {
+        state.volume_id = existing.volume_id;
+        state.path = existing.path;
+        state.placement_class = existing.placement_class;
+        state.min_lsn = existing.min_lsn;
+        state.max_lsn = existing.max_lsn;
+    }
+    state.state = SegmentFileState::Sealed;
+    state.sealed_len = Some(task.sealed_len);
+    state.sealed_sha256 = completed.sealed_sha256;
+
+    let durable_lsn = {
+        let mut batch = index.batch();
+        index.put_segment_state_batch(&mut batch, &state)?;
+        let durable_lsn = durable_lsn_with_accounting_frontier(index, Some(&state), None)?;
+        index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
+        batch
+            .write_with_sync(true)
+            .map_err(strata_index::Error::from)?;
+        durable_lsn
+    };
+    index.set_blob_compact_safe_lsn(durable_lsn);
+    metrics.record_segment_sealed();
+    metrics.set_durable_lsn(durable_lsn);
+    metrics.set_unsealed_segments(unsealed_ingest_segment_count(index)?);
+    if let Some(accounting_tx) = accounting_tx {
+        let _ = accounting_tx.try_send(AccountingCommand::Run);
+    }
+    Ok(())
 }
 
 pub(crate) fn enqueue_unsealed_segments_for_sealing(
@@ -144,6 +403,18 @@ pub(crate) fn enqueue_unsealed_segments_for_sealing(
         }
     }
     Ok(())
+}
+
+fn next_sealing_ingest_segment_id(index: &StrataIndex) -> Result<Option<SegmentId>> {
+    Ok(index
+        .iter_segment_states()?
+        .into_iter()
+        .filter(|(_, state)| {
+            state.placement_class == PlacementClass::Ingest
+                && state.state == SegmentFileState::Sealing
+        })
+        .map(|(segment_id, _)| segment_id)
+        .min())
 }
 
 pub(crate) fn verify_sealed_segments(

@@ -170,7 +170,7 @@ pub use config::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
     DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
 };
@@ -4064,6 +4064,9 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
         return Err(Error::InvalidConfig(
             "max_unsealed_segments must be at least 2",
         ));
+    }
+    if config.seal_worker_count == 0 {
+        return Err(Error::InvalidConfig("seal_worker_count must be non-zero"));
     }
     if config.gc_workers_enabled && !config.accounting_worker_enabled {
         return Err(Error::InvalidConfig(

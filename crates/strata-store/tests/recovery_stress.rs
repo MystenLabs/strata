@@ -21,8 +21,9 @@ use strata_store::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig, SealedSegmentIntegrityPolicy,
-    StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig,
+    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 use tempfile::tempdir;
 use typed_store::DBMetrics;
@@ -497,6 +498,7 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         segment_max_bytes: 512,
         write_queue_capacity: 4,
         max_unsealed_segments: 3,
+        seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
         segment_reader_cache_capacity: 8,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,

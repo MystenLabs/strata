@@ -45,9 +45,9 @@ use strata_store::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig, ReadOptions,
-    SealedSegmentIntegrityPolicy, StoreGetProfile, StrataRecoveryPolicy, StrataStore,
-    StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
+    GcPlannerConfig, ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile,
+    StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
 #[cfg(feature = "internal-profiling")]
 use strata_store::{StoreProfileSink, StoreSyncProfile, StoreWriteProfile};
@@ -200,6 +200,7 @@ struct Config {
     store_get_verify_checksum: bool,
     queue_capacity: usize,
     segment_max_bytes: u64,
+    seal_worker_count: usize,
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     reader_cache_capacity: usize,
     starting_epoch: Epoch,
@@ -232,6 +233,7 @@ impl Config {
             store_get_verify_checksum: true,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
+            seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             starting_epoch: DEFAULT_STARTING_EPOCH,
@@ -289,6 +291,10 @@ impl Config {
                 "--segment-max-bytes" => {
                     config.segment_max_bytes =
                         parse_size(&next_value(&mut args, "--segment-max-bytes")?)? as u64
+                }
+                "--seal-workers" => {
+                    config.seal_worker_count =
+                        parse_nonzero_usize(&next_value(&mut args, "--seal-workers")?)?
                 }
                 "--sealed-integrity" => {
                     config.sealed_segment_integrity_policy =
@@ -367,6 +373,7 @@ impl Config {
             segment_max_bytes: self.segment_max_bytes,
             write_queue_capacity: self.queue_capacity,
             max_unsealed_segments: 8,
+            seal_worker_count: self.seal_worker_count,
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
@@ -1113,6 +1120,7 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!("sync_every={}", config.sync_every);
     println!("queue_capacity={}", config.queue_capacity);
     println!("segment_max_bytes={}", config.segment_max_bytes);
+    println!("seal_workers={}", config.seal_worker_count);
     println!(
         "sealed_integrity={}",
         sealed_integrity_as_str(config.sealed_segment_integrity_policy)
@@ -1890,6 +1898,7 @@ options:
   --store-get-verify-checksum <true|false>
   --queue-capacity <count>
   --segment-max-bytes <bytes|KiB|MiB|GiB>
+  --seal-workers <count>
   --sealed-integrity <metadata-only|checksum>
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --starting-epoch <epoch>
@@ -1957,6 +1966,8 @@ mod tests {
                 "127.0.0.1:0",
                 "--metrics-drain-seconds",
                 "7",
+                "--seal-workers",
+                "3",
                 "--sealed-integrity",
                 "checksum",
             ]
@@ -1975,6 +1986,7 @@ mod tests {
         assert!(config.rocksdb_disable_auto_compactions);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(config.metrics_drain_seconds, 7);
+        assert_eq!(config.seal_worker_count, 3);
         assert_eq!(
             config.sealed_segment_integrity_policy,
             SealedSegmentIntegrityPolicy::Checksum
