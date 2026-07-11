@@ -199,6 +199,7 @@ impl GcPrepublishedOutputSegment {
             durable_offset: self.sealed_len,
             min_lsn: None,
             max_lsn: None,
+            sealed_before_lsn: None,
             sealed_len: Some(self.sealed_len),
             sealed_sha256: Some(self.sealed_sha256),
         }

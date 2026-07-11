@@ -10,7 +10,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use strata_accounting::ActiveDeltaLogState;
+use strata_accounting::{ActiveDeltaLog, ActiveDeltaLogState};
 use strata_core::{
     BlobKey, MapRefOp, SegmentFileState, SegmentId, SegmentOwner, SegmentState, StrataLsn,
 };
@@ -42,6 +42,7 @@ enum SealPublisherEvent {
 pub(crate) struct SegmentSealTask {
     pub(crate) segment_id: SegmentId,
     pub(crate) sealed_len: u64,
+    pub(crate) sealed_before_lsn: StrataLsn,
 }
 
 #[derive(Debug)]
@@ -50,6 +51,7 @@ pub(crate) struct SealWorker {
     pub(crate) index: StrataIndex,
     pub(crate) ingest_owner: SegmentOwner,
     pub(crate) seal_rx: mpsc::Receiver<SealCommand>,
+    pub(crate) durability_publish_lock: Arc<Mutex<()>>,
     pub(crate) accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
     pub(crate) metrics: StrataStoreMetrics,
     pub(crate) store_halt: StoreHalt,
@@ -62,6 +64,7 @@ impl SealWorker {
             index,
             ingest_owner,
             seal_rx,
+            durability_publish_lock,
             accounting_tx,
             metrics,
             store_halt,
@@ -100,6 +103,7 @@ impl SealWorker {
             index,
             ingest_owner,
             event_rx: publisher_rx,
+            durability_publish_lock,
             accounting_tx,
             metrics,
             store_halt: store_halt.clone(),
@@ -131,6 +135,7 @@ impl SealWorker {
             &self.config,
             &self.index,
             self.ingest_owner,
+            &self.durability_publish_lock,
             self.accounting_tx.as_ref(),
             &self.metrics,
             completed,
@@ -142,6 +147,7 @@ impl SealWorker {
 pub(crate) struct CompletedSeal {
     pub(crate) task: SegmentSealTask,
     pub(crate) sealed_sha256: Option<[u8; 32]>,
+    pub(crate) active_delta_state: ActiveDeltaLogState,
 }
 
 #[derive(Debug)]
@@ -195,6 +201,7 @@ struct SealPublisher {
     ingest_owner: SegmentOwner,
     event_rx: mpsc::Receiver<SealPublisherEvent>,
     accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
+    durability_publish_lock: Arc<Mutex<()>>,
     metrics: StrataStoreMetrics,
     store_halt: StoreHalt,
 }
@@ -255,6 +262,7 @@ impl SealPublisher {
             &self.config,
             &self.index,
             self.ingest_owner,
+            &self.durability_publish_lock,
             self.accounting_tx.as_ref(),
             &self.metrics,
             completed,
@@ -275,6 +283,7 @@ pub(crate) fn publish_ready_completed_seals(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     ingest_owner: SegmentOwner,
+    durability_publish_lock: &Arc<Mutex<()>>,
     accounting_tx: Option<&mpsc::SyncSender<AccountingCommand>>,
     metrics: &StrataStoreMetrics,
     completed: &mut BTreeMap<SegmentId, CompletedSeal>,
@@ -298,6 +307,7 @@ pub(crate) fn publish_ready_completed_seals(
             config,
             index,
             ingest_owner,
+            durability_publish_lock,
             accounting_tx,
             metrics,
             completed_seal,
@@ -370,10 +380,20 @@ fn prepare_seal_segment(
         SealedSegmentIntegrityPolicy::Checksum => Some(sha256_file_prefix(&path, task.sealed_len)?),
         SealedSegmentIntegrityPolicy::MetadataOnly => None,
     };
+    let active_delta_state =
+        ActiveDeltaLog::sync_existing(config.accounting_index_dir(), task.segment_id)?;
+    let checkpoint_lsn = task.sealed_before_lsn.saturating_sub(1);
+    if active_delta_state.durable_lsn < checkpoint_lsn {
+        return Err(Error::DurabilityAccountingGap {
+            required_lsn: checkpoint_lsn,
+            active_delta_log_lsn: active_delta_state.durable_lsn,
+        });
+    }
 
     Ok(Some(CompletedSeal {
         task,
         sealed_sha256,
+        active_delta_state,
     }))
 }
 
@@ -381,6 +401,7 @@ fn publish_sealed_segment(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     ingest_owner: SegmentOwner,
+    durability_publish_lock: &Arc<Mutex<()>>,
     accounting_tx: Option<&mpsc::SyncSender<AccountingCommand>>,
     metrics: &StrataStoreMetrics,
     completed: CompletedSeal,
@@ -405,16 +426,24 @@ fn publish_sealed_segment(
         state.placement_class = existing.placement_class;
         state.min_lsn = existing.min_lsn;
         state.max_lsn = existing.max_lsn;
+        state.sealed_before_lsn = existing.sealed_before_lsn;
     }
     state.state = SegmentFileState::Sealed;
+    state.sealed_before_lsn = Some(task.sealed_before_lsn);
     state.sealed_len = Some(task.sealed_len);
     state.sealed_sha256 = completed.sealed_sha256;
 
     let durable_lsn = {
+        let _publish_guard = durability_publish_lock
+            .lock()
+            .expect("durability publish lock poisoned");
         let mut batch = index.batch();
         index.put_segment_state_batch(&mut batch, &state)?;
-        let durable_lsn = durable_lsn_with_accounting_frontier(index, Some(&state), None)?;
+        let active_delta_state = durable_active_delta_state(index, completed.active_delta_state)?;
+        let durable_lsn =
+            durable_lsn_from_checkpoint(index, task.sealed_before_lsn, active_delta_state)?;
         index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
+        index.put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
         batch
             .write_with_sync(true)
             .map_err(strata_index::Error::from)?;
@@ -430,12 +459,51 @@ fn publish_sealed_segment(
     Ok(())
 }
 
+fn durable_active_delta_state(
+    index: &StrataIndex,
+    candidate: ActiveDeltaLogState,
+) -> Result<ActiveDeltaLogState> {
+    let Some(current) = index.get_accounting_active_delta_log_state()? else {
+        return Ok(candidate);
+    };
+    if current.durable_lsn > candidate.durable_lsn {
+        return Ok(current);
+    }
+    if current.durable_lsn < candidate.durable_lsn {
+        return Ok(candidate);
+    }
+    if current.segment_id > candidate.segment_id {
+        return Ok(current);
+    }
+    if current.segment_id < candidate.segment_id {
+        return Ok(candidate);
+    }
+    Ok(ActiveDeltaLogState {
+        segment_id: current.segment_id,
+        durable_offset: current.durable_offset.max(candidate.durable_offset),
+        durable_lsn: current.durable_lsn,
+    })
+}
+
+fn durable_lsn_from_checkpoint(
+    index: &StrataIndex,
+    sealed_before_lsn: StrataLsn,
+    active_delta_state: ActiveDeltaLogState,
+) -> Result<StrataLsn> {
+    let current_durable_lsn = index.get_durable_lsn()?;
+    let checkpoint_lsn = sealed_before_lsn.saturating_sub(1);
+    Ok(checkpoint_lsn
+        .min(active_delta_state.durable_lsn)
+        .max(current_durable_lsn))
+}
+
 pub(crate) fn enqueue_unsealed_segments_for_sealing(
     index: &StrataIndex,
     active_segment_id: SegmentId,
     seal_tx: &mpsc::Sender<SealCommand>,
     metrics: &StrataStoreMetrics,
 ) -> Result<()> {
+    let committed_before_lsn = index.get_next_lsn()?;
     for segment_id in unsealed_ingest_segment_ids(index)? {
         if segment_id < active_segment_id
             && let Some(state) = index.get_segment_state(segment_id)?
@@ -444,6 +512,15 @@ pub(crate) fn enqueue_unsealed_segments_for_sealing(
                 .send(SealCommand::Seal(SegmentSealTask {
                     segment_id,
                     sealed_len: state.write_offset,
+                    sealed_before_lsn: state
+                        .sealed_before_lsn
+                        .unwrap_or_else(|| {
+                            state
+                                .max_lsn
+                                .and_then(|lsn| lsn.checked_add(1))
+                                .unwrap_or(1)
+                        })
+                        .min(committed_before_lsn),
                 }))
                 .map_err(|_| Error::SealQueueClosed)?;
             metrics.record_seal_enqueued();
@@ -555,7 +632,7 @@ pub(crate) fn active_segment_durable_offset(
 /// Computes the store durable LSN while requiring the active accounting delta log to cover the
 /// same committed prefix.
 ///
-/// Foreground sync fsyncs the segment file and `active-delta.log` first, then publishes
+/// Foreground sync fsyncs the segment file and active accounting log first, then publishes
 /// `store_state[DurableLsn]` and `accounting_index[ActiveDeltaLogState]` in one synced RocksDB
 /// batch. That single batch is what keeps recovery from seeing a new store durable LSN without the
 /// matching accounting-log state row. The batch atomicity does not replace the filesystem ordering:
@@ -571,12 +648,12 @@ pub(crate) fn active_segment_durable_offset(
 /// public durable promise backward if it is called while repairing or observing pre-existing skew.
 ///
 /// Examples:
-/// - current durable LSN is 5, payload is durable through LSN 10, but `active-delta.log` is durable
+/// - current durable LSN is 5, payload is durable through LSN 10, but accounting deltas are durable
 ///   only through LSN 8: return 8.
 /// - current durable LSN is already 9, payload is durable through LSN 10, but the provided
 ///   delta-log frontier is 8: return 9. That is not a healthy steady state; it preserves the
 ///   existing durable promise while the caller repairs or rejects the skew.
-/// - `active-delta.log` is durable through LSN 12, but payload is durable only through LSN 10:
+/// - accounting deltas are durable through LSN 12, but payload is durable only through LSN 10:
 ///   return 10. The accounting log may be ahead, the store cannot publish the extra LSNs yet.
 /// - both are durable through LSN 10: return 10, and the store durable LSN plus
 ///   `ActiveDeltaLogState` become visible together in the metadata batch.

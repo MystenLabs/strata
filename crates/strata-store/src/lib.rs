@@ -40,9 +40,10 @@
 //! ```text
 //! StrataStore::sync
 //!   -> fsync active segment bytes
+//!   -> fsync the active segment's accounting delta log through the committed LSN
 //!   -> advance segment_states[active].durable_offset
 //!   -> advance durable_lsn while unaccounted blob LSNs are covered by durable bytes
-//!   -> store_state[DurableLsn] = durable_lsn
+//!   -> publish store_state[DurableLsn] and ActiveDeltaLogState together
 //!   -> fsync RocksDB WAL
 //! ```
 //!
@@ -104,7 +105,7 @@
 //!
 //! ```text
 //! accounting worker (interval tick or nudge from the writer)
-//!   -> read the durable range of active-delta.log
+//!   -> read the durable range of segment-aligned accounting delta logs
 //!   -> write immutable sidecar delta runs and publish manifest + consumed cursor together
 //!   -> compact delta runs into patch runs
 //!   -> major-compact patches/base state, producing ordered ref events
@@ -118,7 +119,9 @@
 //! Accounting lag is expected: `accounted_lsn` says how far sidecar compaction events have been
 //! reflected in the GC-facing rows. The sidecar manifest/cursor and derived rows commit atomically,
 //! so crash retry reopens from one published sidecar state instead of replaying blob keys from the
-//! packed version rows.
+//! packed version rows. Accounting delta log files are aligned with ingest segments. The writer
+//! appends deltas in LSN order and rolls the active accounting log with the active segment; seal
+//! workers fsync closed accounting logs in parallel with their matching segment files.
 
 mod accounting;
 mod config;
@@ -203,6 +206,7 @@ const FIRST_SEGMENT_ID: SegmentId = 1;
 /// How long the writer naps while waiting for the sealer to drain its backlog. Short, because
 /// this sleep sits on the foreground put path during rollover backpressure.
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
+const DURABILITY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(20 * 60);
 /// Default logical shard used by the standalone convenience APIs.
 pub(crate) const STANDALONE_SHARD: ShardKey = ShardKey {
     id: 0,
@@ -357,14 +361,14 @@ impl StrataStore {
         ensure_epoch_initialized(&index, config.starting_epoch)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
         recover_unsealed_segments(&config, &index, &metrics)?;
-        let active_accounting_delta_log =
-            recover_active_accounting_delta_log(&config, &index, &metrics)?;
         let current_epoch = index
             .get_current_epoch()?
             .ok_or(Error::EpochNotInitialized)?;
         cleanup_pending_gc_outputs(&config, &index)?;
         verify_sealed_segments(&config, &index)?;
         let active_segment_id = choose_active_segment_id(&index)?;
+        let active_accounting_delta_log =
+            recover_active_accounting_delta_log(&config, &index, &metrics, active_segment_id)?;
         let segment_ids =
             SegmentIdAllocator::new(next_segment_id_after(&index, active_segment_id)?);
         let active_writer = open_active_writer(&config, active_segment_id)?;
@@ -393,6 +397,7 @@ impl StrataStore {
         let gc_claims = Arc::new(GcSourceClaims::default());
         let gc_io_limiter = Arc::new(GcIoLimiter::new(config.gc_io_bytes_per_sec));
         let store_halt = StoreHalt::default();
+        let durability_publish_lock = Arc::new(Mutex::new(()));
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
             metrics.clone(),
@@ -422,6 +427,7 @@ impl StrataStore {
             index: index.clone(),
             ingest_owner: INGEST_SEGMENT_OWNER,
             seal_rx,
+            durability_publish_lock: Arc::clone(&durability_publish_lock),
             accounting_tx: store_accounting_tx.clone(),
             metrics: metrics.clone(),
             store_halt: store_halt.clone(),
@@ -441,8 +447,11 @@ impl StrataStore {
             index: index.clone(),
             active_writer,
             active_accounting_delta_log,
+            durability_publish_lock: Arc::clone(&durability_publish_lock),
             active_segment_state,
             durable_offset,
+            last_checkpoint_at: Instant::now(),
+            last_checkpoint_next_lsn: store_state.next_lsn,
             pending_rollovers: Vec::new(),
             segment_ids: segment_ids.clone(),
             seal_tx: seal_tx.clone(),
@@ -1202,75 +1211,66 @@ enum PreparedBatchOp {
     },
 }
 
-/// Converts a committed writer batch into active accounting log deltas.
-///
-/// Accounting replays from this log without reading the foreground
-/// writer's in-memory state. If a put were committed to `blob_versions` but missing here, a crash
-/// before sidecar ingestion would leave the GC overlay summary unaware of those live bytes.
-fn accounting_deltas_for_prepared_batch(prepared: &PreparedBatch) -> Vec<AccountingDelta> {
-    let mut deltas = Vec::with_capacity(prepared.ops.len());
-    for op in &prepared.ops {
-        match op {
-            PreparedBatchOp::Put {
-                shard,
-                key,
-                lsn,
-                current_epoch,
-                record_ref,
-                ..
-            } => deltas.push(AccountingDelta::Blob(BlobUpdate::Put {
+fn accounting_delta_for_prepared_op(op: &PreparedBatchOp) -> Option<AccountingDelta> {
+    match op {
+        PreparedBatchOp::Put {
+            shard,
+            key,
+            lsn,
+            current_epoch,
+            record_ref,
+            ..
+        } => Some(AccountingDelta::Blob(BlobUpdate::Put {
+            lsn: *lsn,
+            key: key.clone(),
+            shard: *shard,
+            record_ref: record_ref.expect("put record ref must be filled before delta append"),
+            current_epoch: *current_epoch,
+            // Foreground put should not read current blob metadata. `None` means "preserve any
+            // materialized lifecycle"; SetLifetime deltas carry actual lifecycle changes.
+            lifecycle: None,
+        })),
+        PreparedBatchOp::Lifecycle {
+            key,
+            lsn: _,
+            lifecycle_op:
+                BlobLifecycleMergeOp::Append(BlobLifecycleOp {
+                    lsn,
+                    action:
+                        BlobLifecycleAction::SetLifetime {
+                            logical_end_epoch,
+                            current_epoch,
+                        },
+                }),
+        } => Some(AccountingDelta::Blob(BlobUpdate::SetLifetime {
+            lsn: *lsn,
+            key: key.clone(),
+            logical_end_epoch: *logical_end_epoch,
+            current_epoch: *current_epoch,
+        })),
+        PreparedBatchOp::Lifecycle {
+            key,
+            lsn: _,
+            lifecycle_op:
+                BlobLifecycleMergeOp::Append(BlobLifecycleOp {
+                    lsn,
+                    action: BlobLifecycleAction::Tombstone,
+                }),
+        } => Some(AccountingDelta::Blob(BlobUpdate::Tombstone {
+            lsn: *lsn,
+            key: key.clone(),
+        })),
+        PreparedBatchOp::Lifecycle {
+            lifecycle_op: BlobLifecycleMergeOp::RollbackFrom { .. },
+            ..
+        } => None,
+        PreparedBatchOp::EpochChange { lsn, epoch } => {
+            Some(AccountingDelta::Epoch(AccountingEpochChange {
                 lsn: *lsn,
-                key: key.clone(),
-                shard: *shard,
-                record_ref: record_ref.expect("put record ref must be filled before delta append"),
-                current_epoch: *current_epoch,
-                // Foreground put should not read current blob metadata. `None` means "preserve any
-                // materialized lifecycle"; SetLifetime deltas carry actual lifecycle changes.
-                lifecycle: None,
-            })),
-            PreparedBatchOp::Lifecycle {
-                key,
-                lsn: _,
-                lifecycle_op:
-                    BlobLifecycleMergeOp::Append(BlobLifecycleOp {
-                        lsn,
-                        action:
-                            BlobLifecycleAction::SetLifetime {
-                                logical_end_epoch,
-                                current_epoch,
-                            },
-                    }),
-            } => deltas.push(AccountingDelta::Blob(BlobUpdate::SetLifetime {
-                lsn: *lsn,
-                key: key.clone(),
-                logical_end_epoch: *logical_end_epoch,
-                current_epoch: *current_epoch,
-            })),
-            PreparedBatchOp::Lifecycle {
-                key,
-                lsn: _,
-                lifecycle_op:
-                    BlobLifecycleMergeOp::Append(BlobLifecycleOp {
-                        lsn,
-                        action: BlobLifecycleAction::Tombstone,
-                    }),
-            } => deltas.push(AccountingDelta::Blob(BlobUpdate::Tombstone {
-                lsn: *lsn,
-                key: key.clone(),
-            })),
-            PreparedBatchOp::Lifecycle {
-                lifecycle_op: BlobLifecycleMergeOp::RollbackFrom { .. },
-                ..
-            } => {}
-            PreparedBatchOp::EpochChange { lsn, epoch } => {
-                deltas.push(AccountingDelta::Epoch(AccountingEpochChange {
-                    lsn: *lsn,
-                    epoch: *epoch,
-                }));
-            }
+                epoch: *epoch,
+            }))
         }
     }
-    deltas
 }
 
 #[derive(Debug)]
@@ -1386,16 +1386,20 @@ fn seal_action(
 /// - "Sync" is just another command in the same queue, so durability snapshots never race an
 ///   in-flight append for this store.
 ///
-/// The price is that a slow fsync stalls the queue. That is an accepted trade: the sync cadence
-/// is the throughput knob, not per-op concurrency.
+/// Explicit sync still waits for the active segment and active accounting-log fsyncs. Ordinary
+/// writes only append buffered accounting deltas; closed accounting epochs are fsynced by seal
+/// workers alongside their matching segment files.
 #[derive(Debug)]
 struct WriteCoordinator {
     config: StrataStoreConfig,
     index: StrataIndex,
     active_writer: SegmentWriter,
     active_accounting_delta_log: ActiveDeltaLog,
+    durability_publish_lock: Arc<Mutex<()>>,
     active_segment_state: SegmentState,
     durable_offset: u64,
+    last_checkpoint_at: Instant,
+    last_checkpoint_next_lsn: StrataLsn,
     pending_rollovers: Vec<PendingRollover>,
     segment_ids: SegmentIdAllocator,
     seal_tx: mpsc::Sender<SealCommand>,
@@ -1415,7 +1419,18 @@ impl WriteCoordinator {
     /// publish durable_lsn 10 while a concurrent append for LSN 10 had reserved an offset but not
     /// finished writing its record bytes.
     fn run(mut self) {
-        while let Ok(command) = self.write_rx.recv() {
+        loop {
+            let timeout = self.next_checkpoint_timeout();
+            let command = match self.write_rx.recv_timeout(timeout) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(error) = self.process_timed_checkpoint() {
+                        self.halt_writer_error("timed durability checkpoint", &error);
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             if matches!(command, WriteCommand::Shutdown) {
                 break;
             }
@@ -1443,6 +1458,10 @@ impl WriteCoordinator {
                 WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
             }
         }
+    }
+
+    fn next_checkpoint_timeout(&self) -> Duration {
+        DURABILITY_CHECKPOINT_INTERVAL.saturating_sub(self.last_checkpoint_at.elapsed())
     }
 
     fn send_command_error(command: WriteCommand, error: Error) {
@@ -1553,17 +1572,20 @@ impl WriteCoordinator {
         let next_lsn = drop_lsn
             .checked_add(1)
             .ok_or(strata_segment::Error::RangeOverflow)?;
-        let delta_position = self.active_accounting_delta_log.position();
 
         let commit_result = (|| {
-            self.active_accounting_delta_log
-                .append(&AccountingDelta::ShardDropped {
+            let active_delta_state = self.append_and_sync_accounting_delta(
+                AccountingDelta::ShardDropped {
                     lsn: drop_lsn,
                     shard,
-                })?;
-            self.active_accounting_delta_log.sync_data()?;
-            let active_delta_state = self.active_accounting_delta_log.state();
+                },
+                drop_lsn,
+            )?;
 
+            let _publish_guard = self
+                .durability_publish_lock
+                .lock()
+                .expect("durability publish lock poisoned");
             let mut batch = self.index.batch();
             self.index
                 .put_shard_info_batch(&mut batch, shard_id, dropped_info)?;
@@ -1586,13 +1608,6 @@ impl WriteCoordinator {
         })();
 
         if let Err(error) = commit_result {
-            if let Err(rollback_error) =
-                self.active_accounting_delta_log.rollback_to(delta_position)
-            {
-                let rollback_error = Error::from(rollback_error);
-                self.halt_writer_error("shard drop accounting delta rollback", &rollback_error);
-                return Err(rollback_error);
-            }
             return Err(error);
         }
 
@@ -1711,7 +1726,7 @@ impl WriteCoordinator {
         let mut appended_bytes = 0_u64;
         let mut put_metrics = Vec::new();
         for op in &mut prepared.ops {
-            let PreparedBatchOp::Put {
+            if let PreparedBatchOp::Put {
                 shard,
                 key,
                 payload,
@@ -1720,32 +1735,59 @@ impl WriteCoordinator {
                 record_bytes,
                 ..
             } = op
-            else {
-                // It is a metadata only operation.
-                continue;
-            };
-
-            let capacity_result = profile_phase(
-                profile.as_deref_mut(),
-                |profile, elapsed| profile.segment_capacity += elapsed,
-                || self.ensure_segment_capacity(*record_bytes),
-            );
-            if let Err(error) = capacity_result {
-                match error {
-                    error @ Error::Segment(
-                        strata_segment::Error::SegmentFull { .. }
-                        | strata_segment::Error::RangeOverflow,
-                    ) => {
-                        let _ = profile_phase(
-                            profile.as_deref_mut(),
-                            |profile, elapsed| profile.response_send += elapsed,
-                            || response_tx.send(Err(error)),
-                        );
-                        return Err(());
+            {
+                let capacity_result = profile_phase(
+                    profile.as_deref_mut(),
+                    |profile, elapsed| profile.segment_capacity += elapsed,
+                    || self.ensure_segment_capacity(*record_bytes, *lsn),
+                );
+                if let Err(error) = capacity_result {
+                    match error {
+                        error @ Error::Segment(
+                            strata_segment::Error::SegmentFull { .. }
+                            | strata_segment::Error::RangeOverflow,
+                        ) => {
+                            let _ = profile_phase(
+                                profile.as_deref_mut(),
+                                |profile, elapsed| profile.response_send += elapsed,
+                                || response_tx.send(Err(error)),
+                            );
+                            return Err(());
+                        }
+                        error => {
+                            self.halt_submit_batch_failure(
+                                "segment rollover",
+                                &error,
+                                appended_records,
+                                appended_bytes,
+                            );
+                            let _ = profile_phase(
+                                profile.as_deref_mut(),
+                                |profile, elapsed| profile.response_send += elapsed,
+                                || response_tx.send(Err(error)),
+                            );
+                            return Err(());
+                        }
                     }
-                    error => {
-                        self.halt_submit_batch_failure(
-                            "segment rollover",
+                }
+
+                let append_result = profile_phase(
+                    profile.as_deref_mut(),
+                    |profile, elapsed| profile.segment_append += elapsed,
+                    || {
+                        self.active_writer
+                            .append_for_shard(&*key, *lsn, *shard, payload.as_ref())
+                    },
+                );
+                let outcome = match append_result {
+                    Ok(outcome) => outcome,
+                    Err(
+                        error @ (strata_segment::Error::SegmentFull { .. }
+                        | strata_segment::Error::RangeOverflow),
+                    ) => {
+                        let invariant = "append_for_shard returned a capacity error after ensure_segment_capacity";
+                        let error = self.halt_submit_batch_invariant(
+                            invariant,
                             &error,
                             appended_records,
                             appended_bytes,
@@ -1757,97 +1799,67 @@ impl WriteCoordinator {
                         );
                         return Err(());
                     }
-                }
+                    Err(error) => {
+                        let terminal =
+                            matches!(error, strata_segment::Error::AppendRollbackFailed { .. });
+                        let error = Error::from(error);
+                        self.metrics
+                            .record_orphaned_segment_bytes(appended_records, appended_bytes);
+                        if terminal {
+                            self.halt_writer_error("segment append", &error);
+                        }
+                        let _ = profile_phase(
+                            profile.as_deref_mut(),
+                            |profile, elapsed| profile.response_send += elapsed,
+                            || response_tx.send(Err(error)),
+                        );
+                        return Err(());
+                    }
+                };
+
+                *record_ref = Some(outcome.record_ref);
+                *record_bytes = outcome.record_len;
+                appended_records = appended_records.saturating_add(1);
+                appended_bytes = appended_bytes.saturating_add(outcome.record_len);
+                put_metrics.push(PutMetric {
+                    payload_bytes: payload.len() as u64,
+                    record_bytes: outcome.record_len,
+                });
+                self.active_segment_state.write_offset = self.active_writer.write_offset();
+                self.active_segment_state.min_lsn = Some(
+                    self.active_segment_state
+                        .min_lsn
+                        .map_or(*lsn, |first| first.min(*lsn)),
+                );
+                self.active_segment_state.max_lsn = Some(
+                    self.active_segment_state
+                        .max_lsn
+                        .map_or(*lsn, |last| last.max(*lsn)),
+                );
             }
 
-            let append_result = profile_phase(
+            let accounting_result = profile_phase(
                 profile.as_deref_mut(),
-                |profile, elapsed| profile.segment_append += elapsed,
-                || {
-                    self.active_writer
-                        .append_for_shard(&*key, *lsn, *shard, payload.as_ref())
-                },
+                |profile, elapsed| profile.accounting_delta_append += elapsed,
+                || self.append_accounting_delta_for_op(op),
             );
-            let outcome = match append_result {
-                Ok(outcome) => outcome,
-                Err(
-                    error @ (strata_segment::Error::SegmentFull { .. }
-                    | strata_segment::Error::RangeOverflow),
-                ) => {
-                    let invariant =
-                        "append_for_shard returned a capacity error after ensure_segment_capacity";
-                    let error = self.halt_submit_batch_invariant(
-                        invariant,
-                        &error,
-                        appended_records,
-                        appended_bytes,
-                    );
-                    let _ = profile_phase(
-                        profile.as_deref_mut(),
-                        |profile, elapsed| profile.response_send += elapsed,
-                        || response_tx.send(Err(error)),
-                    );
-                    return Err(());
-                }
-                Err(error) => {
-                    let terminal =
-                        matches!(error, strata_segment::Error::AppendRollbackFailed { .. });
-                    let error = Error::from(error);
-                    self.metrics
-                        .record_orphaned_segment_bytes(appended_records, appended_bytes);
-                    if terminal {
-                        self.halt_writer_error("segment append", &error);
-                    }
-                    let _ = profile_phase(
-                        profile.as_deref_mut(),
-                        |profile, elapsed| profile.response_send += elapsed,
-                        || response_tx.send(Err(error)),
-                    );
-                    return Err(());
-                }
-            };
-
-            *record_ref = Some(outcome.record_ref);
-            *record_bytes = outcome.record_len;
-            appended_records = appended_records.saturating_add(1);
-            appended_bytes = appended_bytes.saturating_add(outcome.record_len);
-            put_metrics.push(PutMetric {
-                payload_bytes: payload.len() as u64,
-                record_bytes: outcome.record_len,
-            });
-            self.active_segment_state.write_offset = self.active_writer.write_offset();
-            self.active_segment_state.min_lsn = Some(
-                self.active_segment_state
-                    .min_lsn
-                    .map_or(*lsn, |first| first.min(*lsn)),
-            );
-            self.active_segment_state.max_lsn = Some(
-                self.active_segment_state
-                    .max_lsn
-                    .map_or(*lsn, |last| last.max(*lsn)),
-            );
+            if let Err(error) = accounting_result {
+                self.halt_submit_batch_failure(
+                    "accounting delta append",
+                    &error,
+                    appended_records,
+                    appended_bytes,
+                );
+                let _ = profile_phase(
+                    profile.as_deref_mut(),
+                    |profile, elapsed| profile.response_send += elapsed,
+                    || response_tx.send(Err(error)),
+                );
+                return Err(());
+            }
         }
 
         let pending_rollovers = self.take_pending_rollovers();
-        let accounting_result = profile_phase(
-            profile.as_deref_mut(),
-            |profile, elapsed| profile.accounting_delta_append += elapsed,
-            || self.append_accounting_deltas(&prepared),
-        );
-        if let Err(error) = accounting_result {
-            self.halt_submit_batch_failure(
-                "accounting delta append",
-                &error,
-                appended_records,
-                appended_bytes,
-            );
-            let _ = profile_phase(
-                profile.as_deref_mut(),
-                |profile, elapsed| profile.response_send += elapsed,
-                || response_tx.send(Err(error)),
-            );
-            return Err(());
-        }
         let commit_result = profile_phase(
             profile.as_deref_mut(),
             |profile, elapsed| profile.index_batch_commit += elapsed,
@@ -2010,14 +2022,9 @@ impl WriteCoordinator {
         let skipped_output_ranges =
             skipped_gc_output_ranges(&skipped_records, &output_plan.staged_to_final_segment_id);
 
-        let accounting_delta_position = self.active_accounting_delta_log.position();
         let pending_rollovers = self.take_pending_rollovers();
+        let accounting_delta = gc_publish_accounting_delta(&published_records);
         let commit_result = (|| {
-            if let Some(delta) = gc_publish_accounting_delta(&published_records) {
-                self.active_accounting_delta_log.append(&delta)?;
-            }
-            let active_delta_state = self.active_accounting_delta_log.state();
-
             let mut batch = self.index.batch();
             for rollover in &pending_rollovers {
                 rollover.apply_batch(&self.index, &mut batch)?;
@@ -2078,8 +2085,9 @@ impl WriteCoordinator {
                 .and_then(|record| record.publish_lsn.checked_add(1))
                 .ok_or(strata_segment::Error::RangeOverflow)?;
             self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-            self.index
-                .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+            if let Some(delta) = accounting_delta.as_ref() {
+                self.append_accounting_delta(delta)?;
+            }
             if let Err(error) = batch
                 .write()
                 .map_err(strata_index::Error::from)
@@ -2112,20 +2120,6 @@ impl WriteCoordinator {
                 })
             }
             Err(GcPublishCommitError::BeforeIndexBatch(error)) => {
-                let error = match self
-                    .active_accounting_delta_log
-                    .rollback_to(accounting_delta_position)
-                {
-                    Ok(()) => error,
-                    Err(rollback_error) => {
-                        let rollback_error = Error::from(rollback_error);
-                        self.halt_writer_error(
-                            "gc publish accounting delta rollback",
-                            &rollback_error,
-                        );
-                        rollback_error
-                    }
-                };
                 self.restore_pending_rollovers(pending_rollovers);
                 Err(error)
             }
@@ -2505,11 +2499,35 @@ impl WriteCoordinator {
         Ok(())
     }
 
-    /// Appends accounting deltas for the prepared batch before the index batch commits.
-    fn append_accounting_deltas(&mut self, prepared: &PreparedBatch) -> Result<()> {
-        let deltas = accounting_deltas_for_prepared_batch(prepared);
-        self.active_accounting_delta_log.append_all(&deltas)?;
+    /// Appends the ordered accounting delta for one prepared op to the currently active accounting
+    /// epoch.
+    fn append_accounting_delta_for_op(&mut self, op: &PreparedBatchOp) -> Result<()> {
+        let Some(delta) = accounting_delta_for_prepared_op(op) else {
+            return Ok(());
+        };
+        self.append_accounting_delta(&delta)
+    }
+
+    fn append_accounting_delta(&mut self, delta: &AccountingDelta) -> Result<()> {
+        self.active_accounting_delta_log.append(delta)?;
         Ok(())
+    }
+
+    fn append_and_sync_accounting_delta(
+        &mut self,
+        delta: AccountingDelta,
+        durable_lsn: StrataLsn,
+    ) -> Result<ActiveDeltaLogState> {
+        self.active_accounting_delta_log.append(&delta)?;
+        self.active_accounting_delta_log.sync_data()?;
+        let state = self.active_accounting_delta_log.state();
+        if state.durable_lsn < durable_lsn {
+            return Err(Error::DurabilityAccountingGap {
+                required_lsn: durable_lsn,
+                active_delta_log_lsn: state.durable_lsn,
+            });
+        }
+        Ok(state)
     }
 
     /// Returns the active generation key for a shard that can accept writes.
@@ -2541,6 +2559,36 @@ impl WriteCoordinator {
         }
     }
 
+    fn process_timed_checkpoint(&mut self) -> Result<()> {
+        self.last_checkpoint_at = Instant::now();
+        let sealed_before_lsn = self.index.get_next_lsn()?;
+        if sealed_before_lsn <= self.last_checkpoint_next_lsn {
+            return Ok(());
+        }
+
+        self.rollover_active_segment(sealed_before_lsn)?;
+        let pending_rollovers = self.take_pending_rollovers();
+        let commit_result = (|| {
+            let mut batch = self.index.batch();
+            for rollover in &pending_rollovers {
+                rollover.apply_batch(&self.index, &mut batch)?;
+            }
+            batch.write().map_err(strata_index::Error::from)?;
+            Ok::<(), Error>(())
+        })();
+
+        match commit_result {
+            Ok(()) => {
+                self.run_rollover_post_commit(pending_rollovers);
+                Ok(())
+            }
+            Err(error) => {
+                self.restore_pending_rollovers(pending_rollovers);
+                Err(error)
+            }
+        }
+    }
+
     /// Swaps in a fresh segment and hands the full one to the sealer.
     ///
     /// The pre-existing-file check handles a specific crash: a previous run created the new
@@ -2551,15 +2599,33 @@ impl WriteCoordinator {
     /// The old segment flips to `Sealing` in the next LSN-bearing commit that also publishes the
     /// new segment, so rollover metadata stays in the same store-global order as preceding payload
     /// writes. Sealing itself is queued only after that commit succeeds.
-    fn rollover_active_segment(&mut self) -> Result<()> {
+    fn rollover_active_segment(&mut self, sealed_before_lsn: StrataLsn) -> Result<()> {
         self.wait_for_seal_backlog_capacity()?;
         let old_segment_id = self.active_writer.segment_id();
+        if self.active_accounting_delta_log.segment_id() != old_segment_id {
+            return Err(Error::InvariantViolation {
+                reason: format!(
+                    "active accounting log segment {} does not match active data segment {}",
+                    self.active_accounting_delta_log.segment_id(),
+                    old_segment_id
+                ),
+            });
+        }
+        self.active_accounting_delta_log.flush_for_rollover()?;
         let old_write_offset = self.active_writer.write_offset();
         let new_segment_id = self.segment_ids.allocate()?;
         let new_path = segment_path(&self.config, new_segment_id);
         if new_path.exists() && self.index.get_segment_state(new_segment_id)?.is_none() {
             fs::remove_file(&new_path).map_err(|source| Error::Io {
                 path: new_path.clone(),
+                source,
+            })?;
+        }
+        let new_accounting_path =
+            ActiveDeltaLog::path(self.config.accounting_index_dir(), new_segment_id);
+        if new_accounting_path.exists() && self.index.get_segment_state(new_segment_id)?.is_none() {
+            fs::remove_file(&new_accounting_path).map_err(|source| Error::Io {
+                path: new_accounting_path.clone(),
                 source,
             })?;
         }
@@ -2570,11 +2636,17 @@ impl WriteCoordinator {
             PlacementClass::Ingest,
             self.config.segment_max_bytes,
         )?;
+        let new_accounting_log = ActiveDeltaLog::open(
+            self.config.accounting_index_dir(),
+            new_segment_id,
+            self.active_accounting_delta_log.state(),
+        )?;
         let new_state = active_segment_state(&self.config, self.ingest_owner, &new_writer, 0);
         let mut old_state = self.active_segment_state.clone();
         old_state.write_offset = old_write_offset;
         old_state.durable_offset = self.durable_offset;
         old_state.state = SegmentFileState::Sealing;
+        old_state.sealed_before_lsn = Some(sealed_before_lsn);
 
         self.pending_rollovers.push(PendingRollover {
             old_segment_state: old_state,
@@ -2582,11 +2654,15 @@ impl WriteCoordinator {
             seal_task: SegmentSealTask {
                 segment_id: old_segment_id,
                 sealed_len: old_write_offset,
+                sealed_before_lsn,
             },
         });
         self.active_writer = new_writer;
+        self.active_accounting_delta_log = new_accounting_log;
         self.active_segment_state = new_state;
         self.durable_offset = 0;
+        self.last_checkpoint_at = Instant::now();
+        self.last_checkpoint_next_lsn = sealed_before_lsn;
         self.metrics.set_active_segment(
             self.active_writer.segment_id(),
             self.active_writer.write_offset(),
@@ -2600,7 +2676,7 @@ impl WriteCoordinator {
     /// Records are never split across segment files. If a too large record
     /// were partially appended before discovering the limit, recovery would only see a torn record
     /// and would have to roll back unrelated later LSNs.
-    fn ensure_segment_capacity(&mut self, record_len: u64) -> Result<()> {
+    fn ensure_segment_capacity(&mut self, record_len: u64, record_lsn: StrataLsn) -> Result<()> {
         loop {
             let attempted_size = self
                 .active_writer
@@ -2621,7 +2697,7 @@ impl WriteCoordinator {
                 }
                 .into());
             }
-            self.rollover_active_segment()?;
+            self.rollover_active_segment(record_lsn)?;
         }
     }
 
@@ -2683,13 +2759,31 @@ impl WriteCoordinator {
         let accounting_sync_result = profile_phase(
             profile.as_deref_mut(),
             |profile, elapsed| profile.accounting_delta_sync += elapsed,
-            || self.active_accounting_delta_log.sync_data(),
+            || {
+                let committed_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+                self.active_accounting_delta_log.sync_data()?;
+                let state = self.active_accounting_delta_log.state();
+                if state.durable_lsn < committed_lsn {
+                    return Err(Error::DurabilityAccountingGap {
+                        required_lsn: committed_lsn,
+                        active_delta_log_lsn: state.durable_lsn,
+                    });
+                }
+                Ok(state)
+            },
         );
-        if let Err(error) = accounting_sync_result {
-            self.metrics.record_sync(Err(()), started.elapsed());
-            return Err(error.into());
-        }
+        let active_delta_state = match accounting_sync_result {
+            Ok(state) => state,
+            Err(error) => {
+                self.metrics.record_sync(Err(()), started.elapsed());
+                return Err(error);
+            }
+        };
 
+        let _publish_guard = self
+            .durability_publish_lock
+            .lock()
+            .expect("durability publish lock poisoned");
         let (state, batch, durable_lsn) = profile_phase(
             profile.as_deref_mut(),
             |profile, elapsed| profile.durable_lsn_compute += elapsed,
@@ -2705,6 +2799,7 @@ impl WriteCoordinator {
                     state.state = existing.state;
                     state.min_lsn = existing.min_lsn;
                     state.max_lsn = existing.max_lsn;
+                    state.sealed_before_lsn = existing.sealed_before_lsn;
                     state.sealed_len = existing.sealed_len;
                     state.sealed_sha256 = existing.sealed_sha256;
                 }
@@ -2713,7 +2808,7 @@ impl WriteCoordinator {
                 let mut batch = self.index.batch();
                 self.index.put_segment_state_batch(&mut batch, &state)?;
                 let current_durable_lsn = self.index.get_durable_lsn()?;
-                let mut active_delta_state = self.active_accounting_delta_log.state();
+                let mut active_delta_state = active_delta_state;
                 active_delta_state.durable_lsn =
                     active_delta_state.durable_lsn.max(current_durable_lsn);
                 let durable_lsn = durable_lsn_with_accounting_frontier(
@@ -3352,8 +3447,9 @@ fn recover_active_accounting_delta_log(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     metrics: &StrataStoreMetrics,
+    active_segment_id: SegmentId,
 ) -> Result<ActiveDeltaLog> {
-    let mut log = open_active_accounting_delta_log(config, index)?;
+    let mut log = open_active_accounting_delta_log(config, index, active_segment_id)?;
 
     // First trim the easy mismatch: deltas for operations that never committed to RocksDB.
     let committed_lsn = index.get_next_lsn()?.saturating_sub(1);
@@ -3365,7 +3461,9 @@ fn recover_active_accounting_delta_log(
     // `durable_lsn`, the durable promise is already broken and recovery must stop. Otherwise
     // `rollback_operations_from` rewinds only the non-durable committed tail, so recompute
     // `committed_lsn`.
-    let delta_log_lsn = log.max_lsn().unwrap_or_default();
+    let delta_log_lsn =
+        ActiveDeltaLog::max_lsn_through(config.accounting_index_dir(), active_segment_id)?
+            .unwrap_or_default();
     if delta_log_lsn < committed_lsn {
         let durable_lsn = index.get_durable_lsn()?;
         if delta_log_lsn < durable_lsn {
@@ -3396,11 +3494,13 @@ fn recover_active_accounting_delta_log(
 fn open_active_accounting_delta_log(
     config: &StrataStoreConfig,
     index: &StrataIndex,
+    active_segment_id: SegmentId,
 ) -> Result<ActiveDeltaLog> {
     let mut durable_state =
         index
             .get_accounting_active_delta_log_state()?
             .unwrap_or(ActiveDeltaLogState {
+                segment_id: 0,
                 durable_offset: 0,
                 durable_lsn: index.get_durable_lsn()?,
             });
@@ -3408,6 +3508,7 @@ fn open_active_accounting_delta_log(
     durable_state.durable_lsn = durable_state.durable_lsn.max(index.get_durable_lsn()?);
     Ok(ActiveDeltaLog::open(
         config.accounting_index_dir(),
+        active_segment_id,
         durable_state,
     )?)
 }
@@ -3599,6 +3700,7 @@ fn apply_recovered_segment_prefix(
         state.volume_id = existing.volume_id;
         state.placement_class = existing.placement_class;
         state.state = existing.state;
+        state.sealed_before_lsn = existing.sealed_before_lsn;
         state.sealed_len = existing.sealed_len;
     }
     state.min_lsn = None;
@@ -4000,6 +4102,7 @@ fn active_segment_state_with_lsn(
         state.placement_class = existing.placement_class;
         state.min_lsn = existing.min_lsn;
         state.max_lsn = existing.max_lsn;
+        state.sealed_before_lsn = existing.sealed_before_lsn;
     }
     if let Some(lsn) = appended_lsn {
         state.min_lsn = Some(state.min_lsn.map_or(lsn, |first| first.min(lsn)));
@@ -4032,6 +4135,7 @@ fn active_segment_state_from_path(
         durable_offset,
         min_lsn: None,
         max_lsn: None,
+        sealed_before_lsn: None,
         sealed_len: None,
         sealed_sha256: None,
     }

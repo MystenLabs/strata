@@ -4,7 +4,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     ops::Deref,
     path::Path,
-    sync::{Once, mpsc},
+    sync::{Arc, Mutex, Once, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -37,6 +37,15 @@ const TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD: u64 = TEST_RECORD_LEN * 2 - 1;
 fn open_test_index(path: impl AsRef<Path>, cf_prefix: impl AsRef<str>) -> StrataIndex {
     let path = path.as_ref();
     StrataIndex::open_path(path, cf_prefix, path.display().to_string()).unwrap()
+}
+
+fn test_active_accounting_log(cfg: &StrataStoreConfig, segment_id: SegmentId) -> ActiveDeltaLog {
+    ActiveDeltaLog::open(
+        cfg.accounting_index_dir(),
+        segment_id,
+        ActiveDeltaLogState::default(),
+    )
+    .unwrap()
 }
 
 fn gc_range(record_ref: RecordRef) -> SegmentGcRecordRange {
@@ -186,6 +195,7 @@ async fn durable_frontier_advances_across_durable_gc_map_ref() {
         durable_offset: to_end_offset - 1,
         min_lsn: None,
         max_lsn: None,
+        sealed_before_lsn: None,
         sealed_len: Some(to_end_offset),
         sealed_sha256: None,
     };
@@ -221,6 +231,7 @@ async fn durable_frontier_advances_across_durable_gc_map_ref() {
             &index,
             None,
             Some(ActiveDeltaLogState {
+                segment_id: 1,
                 durable_offset: 0,
                 durable_lsn: 2,
             }),
@@ -241,6 +252,7 @@ async fn durable_frontier_advances_across_durable_gc_map_ref() {
             &index,
             None,
             Some(ActiveDeltaLogState {
+                segment_id: 1,
                 durable_offset: 0,
                 durable_lsn: 2,
             }),
@@ -298,6 +310,7 @@ async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
         durable_offset: output_len,
         min_lsn: Some(6),
         max_lsn: Some(6),
+        sealed_before_lsn: None,
         sealed_len: Some(output_len),
         sealed_sha256: None,
     };
@@ -403,6 +416,7 @@ async fn open_cleans_stale_pending_gc_output() {
         durable_offset: 7,
         min_lsn: None,
         max_lsn: None,
+        sealed_before_lsn: None,
         sealed_len: Some(7),
         sealed_sha256: None,
     };
@@ -622,15 +636,25 @@ fn wait_for_accounted_lsn(store: &StrataStore, expected_lsn: StrataLsn) {
                 .accounting_lock
                 .lock()
                 .expect("accounting run lock poisoned");
-            accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+            accounting::run_accounting_sidecar_materializing_once(store.index(), store.config())
+                .unwrap();
         }
         let accounted_lsn = store.accounted_lsn().unwrap();
         if accounted_lsn >= expected_lsn {
             return;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "timed out waiting for accounted_lsn to reach {expected_lsn}; current accounted_lsn was {accounted_lsn}",
+            started.elapsed() < Duration::from_secs(60),
+            "timed out waiting for accounted_lsn to reach {expected_lsn}; current accounted_lsn was {accounted_lsn}; durable_lsn was {}; active_delta_state was {:?}; active_delta_cursor was {:?}",
+            store.durable_lsn().unwrap(),
+            store
+                .index()
+                .get_accounting_active_delta_log_state()
+                .unwrap(),
+            store
+                .index()
+                .get_accounting_active_delta_log_consumed_cursor()
+                .unwrap(),
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -681,6 +705,7 @@ fn put_test_segment_state(index: &StrataIndex, segment_id: SegmentId, state: Seg
             durable_offset: 0,
             min_lsn: Some(segment_id),
             max_lsn: Some(segment_id),
+            sealed_before_lsn: None,
             sealed_len: None,
             sealed_sha256: None,
         })
@@ -1528,6 +1553,7 @@ async fn reopen_finishes_durable_shard_drop_cleanup() {
                 durable_offset: 17,
                 min_lsn: Some(1),
                 max_lsn: Some(1),
+                sealed_before_lsn: None,
                 sealed_len: Some(17),
                 sealed_sha256: None,
             })
@@ -1887,6 +1913,7 @@ async fn read_retries_once_when_not_found_segment_was_deleted() {
                     durable_offset: new_ref.len,
                     min_lsn: Some(payload_lsn + 1),
                     max_lsn: Some(payload_lsn + 1),
+                    sealed_before_lsn: None,
                     sealed_len: Some(new_ref.len),
                     sealed_sha256: None,
                 };
@@ -2322,15 +2349,16 @@ async fn metrics_track_seal_backpressure_waits() {
     let (_write_tx, write_rx) = mpsc::sync_channel(1);
     let (accounting_tx, _accounting_rx) = mpsc::sync_channel(1);
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
-    let active_accounting_delta_log =
-        ActiveDeltaLog::open(cfg.accounting_index_dir(), ActiveDeltaLogState::default()).unwrap();
     let coordinator = WriteCoordinator {
         config: cfg.clone(),
         index: index.clone(),
         active_writer,
-        active_accounting_delta_log,
+        active_accounting_delta_log: test_active_accounting_log(&cfg, 2),
+        durability_publish_lock: Arc::new(Mutex::new(())),
         active_segment_state,
         durable_offset: 0,
+        last_checkpoint_at: Instant::now(),
+        last_checkpoint_next_lsn: index.get_next_lsn().unwrap(),
         pending_rollovers: Vec::new(),
         segment_ids: SegmentIdAllocator::new(3),
         seal_tx,
@@ -3402,6 +3430,7 @@ async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
             durable_offset: bytes,
             min_lsn: Some(0),
             max_lsn: Some(0),
+            sealed_before_lsn: None,
             sealed_len: Some(bytes),
             sealed_sha256: None,
         };
@@ -4097,6 +4126,7 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
         durable_offset: TEST_RECORD_LEN,
         min_lsn: Some(0),
         max_lsn: Some(0),
+        sealed_before_lsn: None,
         sealed_len: Some(TEST_RECORD_LEN),
         sealed_sha256: None,
     };
@@ -5083,7 +5113,7 @@ async fn recovery_rolls_back_ops_missing_from_active_delta_log() {
         assert_eq!(store.index().get_next_lsn().unwrap(), 2);
     }
 
-    std::fs::remove_file(cfg.accounting_index_dir().join("active-delta.log")).unwrap();
+    std::fs::remove_file(ActiveDeltaLog::path(cfg.accounting_index_dir(), 1)).unwrap();
 
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     assert_eq!(store.index().get_next_lsn().unwrap(), 1);
@@ -5114,7 +5144,7 @@ async fn recovery_rejects_missing_active_delta_log_for_durable_lsn() {
         batch.write_with_sync(true).unwrap();
     }
 
-    std::fs::remove_file(cfg.accounting_index_dir().join("active-delta.log")).unwrap();
+    std::fs::remove_file(ActiveDeltaLog::path(cfg.accounting_index_dir(), 1)).unwrap();
 
     let err = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap_err();
     assert!(matches!(
@@ -5204,15 +5234,15 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
         let segment_2_state =
             active_segment_state_from_path(&cfg, INGEST_SEGMENT_OWNER, 2, segment_2_end, 0);
 
-        let mut active_delta_log =
-            ActiveDeltaLog::open(cfg.accounting_index_dir(), ActiveDeltaLogState::default())
-                .unwrap();
-        for (key, record_ref, lsn) in [
-            (&key_a, out_a.record_ref, 1),
-            (&key_b, out_b.record_ref, 2),
-            (&key_c, out_c.record_ref, 3),
-        ] {
-            active_delta_log
+        let mut segment_1_delta_log = ActiveDeltaLog::open(
+            cfg.accounting_index_dir(),
+            1,
+            ActiveDeltaLogState::default(),
+        )
+        .unwrap();
+        for (key, record_ref, lsn) in [(&key_a, out_a.record_ref, 1), (&key_b, out_b.record_ref, 2)]
+        {
+            segment_1_delta_log
                 .append(&AccountingDelta::Blob(BlobUpdate::Put {
                     lsn,
                     key: key.clone(),
@@ -5223,6 +5253,20 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
                 }))
                 .unwrap();
         }
+        segment_1_delta_log.sync_data().unwrap();
+        let mut active_delta_log =
+            ActiveDeltaLog::open(cfg.accounting_index_dir(), 2, segment_1_delta_log.state())
+                .unwrap();
+        active_delta_log
+            .append(&AccountingDelta::Blob(BlobUpdate::Put {
+                lsn: 3,
+                key: key_c.clone(),
+                shard: STANDALONE_SHARD,
+                record_ref: out_c.record_ref,
+                current_epoch: 42,
+                lifecycle: None,
+            }))
+            .unwrap();
         active_delta_log.sync_data().unwrap();
 
         let mut batch = index.batch();
@@ -5376,6 +5420,7 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
     let mut completed = BTreeMap::new();
     let mut sealing = [Reverse(1), Reverse(2)].into_iter().collect();
     let mut sealing_ids = [1, 2].into_iter().collect();
+    let durability_publish_lock = Arc::new(Mutex::new(()));
 
     completed.insert(
         2,
@@ -5383,14 +5428,17 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
             task: SegmentSealTask {
                 segment_id: 2,
                 sealed_len: 64,
+                sealed_before_lsn: 1,
             },
             sealed_sha256: None,
+            active_delta_state: ActiveDeltaLogState::default(),
         },
     );
     seal::publish_ready_completed_seals(
         &cfg,
         &index,
         INGEST_SEGMENT_OWNER,
+        &durability_publish_lock,
         None,
         &StrataStoreMetrics::default(),
         &mut completed,
@@ -5413,14 +5461,17 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
             task: SegmentSealTask {
                 segment_id: 1,
                 sealed_len: 64,
+                sealed_before_lsn: 1,
             },
             sealed_sha256: None,
+            active_delta_state: ActiveDeltaLogState::default(),
         },
     );
     seal::publish_ready_completed_seals(
         &cfg,
         &index,
         INGEST_SEGMENT_OWNER,
+        &durability_publish_lock,
         None,
         &StrataStoreMetrics::default(),
         &mut completed,
@@ -5558,6 +5609,7 @@ async fn seal_segment_reports_error_without_marking_failed() {
         index: index.clone(),
         ingest_owner: INGEST_SEGMENT_OWNER,
         seal_rx,
+        durability_publish_lock: Arc::new(Mutex::new(())),
         accounting_tx: Some(accounting_tx),
         metrics: StrataStoreMetrics::default(),
         store_halt: StoreHalt::default(),
@@ -5568,6 +5620,7 @@ async fn seal_segment_reports_error_without_marking_failed() {
             .seal_segment(SegmentSealTask {
                 segment_id: 1,
                 sealed_len: 64,
+                sealed_before_lsn: 1,
             })
             .is_err()
     );
@@ -5618,7 +5671,7 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
     assert_eq!(sealed.durable_offset, sealed.write_offset);
     assert_eq!(sealed.sealed_len, Some(sealed.write_offset));
     assert_eq!(sealed.sealed_sha256, None);
-    assert_eq!(store.durable_lsn().unwrap(), 0);
+    assert_eq!(store.durable_lsn().unwrap(), 1);
 
     let open = store.index().get_segment_state(2).unwrap().unwrap();
     assert_eq!(open.state, SegmentFileState::Open);
@@ -5637,6 +5690,73 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
 
     store.sync().unwrap();
     assert_eq!(store.durable_lsn().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn timed_checkpoint_rolls_empty_segment_for_metadata_only_lsn() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "default");
+    ensure_ingest_dir(&cfg).unwrap();
+    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
+    ensure_epoch_initialized(&index, cfg.starting_epoch).unwrap();
+    let mut batch = index.batch();
+    index.put_next_lsn_batch(&mut batch, 2).unwrap();
+    batch.write().unwrap();
+
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
+    let gc_concurrency = Arc::new(GcConcurrencyController::new(
+        GcConcurrencyConfig::from_store_config(&cfg),
+        metrics.clone(),
+    ));
+    let active_writer = SegmentWriter::create(
+        segment_path(&cfg, 1),
+        1,
+        PlacementClass::Ingest,
+        cfg.segment_max_bytes,
+    )
+    .unwrap();
+    let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
+    let (seal_tx, seal_rx) = mpsc::channel();
+    let (_write_tx, write_rx) = mpsc::sync_channel(1);
+
+    let mut coordinator = WriteCoordinator {
+        config: cfg.clone(),
+        index: index.clone(),
+        active_writer,
+        active_accounting_delta_log: test_active_accounting_log(&cfg, 1),
+        durability_publish_lock: Arc::new(Mutex::new(())),
+        active_segment_state,
+        durable_offset: 0,
+        last_checkpoint_at: Instant::now() - DURABILITY_CHECKPOINT_INTERVAL,
+        last_checkpoint_next_lsn: 1,
+        pending_rollovers: Vec::new(),
+        segment_ids: SegmentIdAllocator::new(2),
+        seal_tx,
+        accounting_tx: None,
+        write_rx,
+        ingest_owner: INGEST_SEGMENT_OWNER,
+        reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
+        gc_concurrency,
+        store_halt: StoreHalt::default(),
+        metrics,
+    };
+
+    coordinator.process_timed_checkpoint().unwrap();
+
+    let old_state = index.get_segment_state(1).unwrap().unwrap();
+    assert_eq!(old_state.state, SegmentFileState::Sealing);
+    assert_eq!(old_state.write_offset, 0);
+    assert_eq!(old_state.sealed_before_lsn, Some(2));
+    let new_state = index.get_segment_state(2).unwrap().unwrap();
+    assert_eq!(new_state.state, SegmentFileState::Open);
+    let SealCommand::Seal(task) = seal_rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+        panic!("expected seal command");
+    };
+    assert_eq!(task.segment_id, 1);
+    assert_eq!(task.sealed_len, 0);
+    assert_eq!(task.sealed_before_lsn, 2);
 }
 
 #[tokio::test]

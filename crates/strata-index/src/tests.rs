@@ -57,6 +57,7 @@ fn segment_state(segment_id: SegmentId) -> SegmentState {
         durable_offset: 64,
         min_lsn: Some(1),
         max_lsn: Some(3),
+        sealed_before_lsn: None,
         sealed_len: None,
         sealed_sha256: None,
     }
@@ -74,6 +75,7 @@ fn segment_state_for_shard(shard: ShardKey, segment_id: SegmentId) -> SegmentSta
         durable_offset: 64,
         min_lsn: Some(1),
         max_lsn: Some(3),
+        sealed_before_lsn: None,
         sealed_len: None,
         sealed_sha256: None,
     }

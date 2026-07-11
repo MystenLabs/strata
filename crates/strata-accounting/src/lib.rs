@@ -203,7 +203,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let key = key(b"active-log");
         let state = {
-            let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+            let mut log =
+                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
             log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
                 .unwrap();
             log.append(&AccountingDelta::Epoch(EpochChange { lsn: 2, epoch: 43 }))
@@ -215,7 +216,7 @@ mod tests {
         assert_eq!(state.durable_lsn, 2);
         assert!(state.durable_offset > 0);
 
-        let reopened = ActiveDeltaLog::open(dir.path(), state).unwrap();
+        let reopened = ActiveDeltaLog::open(dir.path(), state.segment_id, state).unwrap();
         assert_eq!(reopened.state(), state);
     }
 
@@ -223,7 +224,8 @@ mod tests {
     fn active_delta_log_round_trips_shard_drop() {
         let dir = tempdir().unwrap();
         let state = {
-            let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+            let mut log =
+                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
             log.append(&AccountingDelta::ShardDropped {
                 lsn: 7,
                 shard: SHARD,
@@ -253,7 +255,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let key = key(b"active-log-read");
         let state = {
-            let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+            let mut log =
+                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
             log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
                 .unwrap();
             log.append(&AccountingDelta::Blob(put(2, &key, record_ref(11, 0))))
@@ -268,6 +271,7 @@ mod tests {
         assert_eq!(read.max_lsn, Some(2));
 
         let cursor = read.next_cursor(cursor);
+        assert_eq!(cursor.segment_id, 1);
         assert_eq!(cursor.offset, state.durable_offset);
         assert_eq!(cursor.max_lsn, 2);
         let read = ActiveDeltaLog::read_durable_range(dir.path(), cursor, state).unwrap();
@@ -281,7 +285,8 @@ mod tests {
         let key_a = key(b"gc-map-a");
         let key_b = key(b"gc-map-b");
         let state = {
-            let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+            let mut log =
+                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
             log.append(&AccountingDelta::GcMapRefBatch {
                 base_lsn: 10,
                 maps: vec![
@@ -317,7 +322,7 @@ mod tests {
     fn active_delta_log_rolls_back_failed_commit_append() {
         let dir = tempdir().unwrap();
         let key = key(b"rollback");
-        let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+        let mut log = ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
         let before = log.position();
 
         log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
@@ -334,7 +339,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let key = key(b"truncate");
         let state = {
-            let mut log = ActiveDeltaLog::open(dir.path(), ActiveDeltaLogState::default()).unwrap();
+            let mut log =
+                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
             log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
                 .unwrap();
             log.append(&AccountingDelta::Blob(put(2, &key, record_ref(11, 0))))
@@ -345,7 +351,7 @@ mod tests {
         };
 
         assert_eq!(state.durable_lsn, 1);
-        let reopened = ActiveDeltaLog::open(dir.path(), state).unwrap();
+        let reopened = ActiveDeltaLog::open(dir.path(), state.segment_id, state).unwrap();
         assert_eq!(reopened.state(), state);
     }
 

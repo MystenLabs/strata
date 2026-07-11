@@ -672,6 +672,7 @@ mod tests {
             durable_offset: 1_000,
             min_lsn: Some(1),
             max_lsn,
+            sealed_before_lsn: None,
             sealed_len: Some(1_000),
             sealed_sha256: None,
         }

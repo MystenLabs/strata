@@ -617,6 +617,8 @@ pub struct SegmentState {
     pub durable_offset: u64,
     pub min_lsn: Option<StrataLsn>,
     pub max_lsn: Option<StrataLsn>,
+    /// Exclusive logical checkpoint boundary assigned when an ingest segment is rolled over.
+    pub sealed_before_lsn: Option<StrataLsn>,
     pub sealed_len: Option<u64>,
     /// SHA-256 digest of the sealed bytes, present only after the segment is finalized.
     pub sealed_sha256: Option<[u8; 32]>,

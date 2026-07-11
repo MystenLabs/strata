@@ -1,17 +1,19 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
-use strata_core::{BlobKey, RecordRef, ShardKey, StrataLsn};
+use strata_core::{BlobKey, RecordRef, SegmentId, ShardKey, StrataLsn};
 
 use crate::run_io::{read_record_frame, write_record_frame};
 use crate::{ACTIVE_DELTA_LOG_FORMAT_VERSION, BlobUpdate, EpochChange, Error, Result};
 
 const ACTIVE_DELTA_LOG_MAGIC: &[u8; 8] = b"STRADL01";
-const ACTIVE_DELTA_LOG_FILE_NAME: &str = "active-delta.log";
+const ACTIVE_DELTA_LOG_FILE_PREFIX: &str = "active-delta-";
+const ACTIVE_DELTA_LOG_FILE_SUFFIX: &str = ".log";
 
 /// Raw foreground accounting event appended in store-global LSN order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +66,7 @@ impl AccountingDelta {
 /// Durable cursor for the active accounting delta log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ActiveDeltaLogState {
+    pub segment_id: SegmentId,
     pub durable_offset: u64,
     pub durable_lsn: StrataLsn,
 }
@@ -81,6 +84,7 @@ impl ActiveDeltaLogState {
 /// Durable cursor for sidecar ingestion from the active accounting delta log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ActiveDeltaLogReadCursor {
+    pub segment_id: SegmentId,
     pub offset: u64,
     pub max_lsn: StrataLsn,
 }
@@ -99,6 +103,7 @@ impl ActiveDeltaLogReadCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveDeltaLogRead {
     pub deltas: Vec<AccountingDelta>,
+    pub end_segment_id: SegmentId,
     pub end_offset: u64,
     pub max_lsn: Option<StrataLsn>,
 }
@@ -106,6 +111,7 @@ pub struct ActiveDeltaLogRead {
 impl ActiveDeltaLogRead {
     pub fn next_cursor(&self, previous: ActiveDeltaLogReadCursor) -> ActiveDeltaLogReadCursor {
         ActiveDeltaLogReadCursor {
+            segment_id: self.end_segment_id,
             offset: self.end_offset,
             max_lsn: self
                 .max_lsn
@@ -117,6 +123,7 @@ impl ActiveDeltaLogRead {
 /// Append-only accounting delta log for the active writer.
 #[derive(Debug)]
 pub struct ActiveDeltaLog {
+    segment_id: SegmentId,
     path: PathBuf,
     writer: BufWriter<fs::File>,
     write_offset: u64,
@@ -128,6 +135,7 @@ pub struct ActiveDeltaLog {
 /// Rewind point used when the foreground RocksDB commit fails after delta-log append.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveDeltaLogPosition {
+    segment_id: SegmentId,
     write_offset: u64,
     max_lsn: Option<StrataLsn>,
     durable_offset: u64,
@@ -135,8 +143,16 @@ pub struct ActiveDeltaLogPosition {
 }
 
 impl ActiveDeltaLog {
-    pub fn open(root_dir: impl AsRef<Path>, durable_state: ActiveDeltaLogState) -> Result<Self> {
-        let path = root_dir.as_ref().join(ACTIVE_DELTA_LOG_FILE_NAME);
+    pub fn path(root_dir: impl AsRef<Path>, segment_id: SegmentId) -> PathBuf {
+        root_dir.as_ref().join(log_file_name(segment_id))
+    }
+
+    pub fn open(
+        root_dir: impl AsRef<Path>,
+        segment_id: SegmentId,
+        durable_state: ActiveDeltaLogState,
+    ) -> Result<Self> {
+        let path = Self::path(root_dir, segment_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| Error::Io {
                 path: parent.to_path_buf(),
@@ -166,15 +182,34 @@ impl ActiveDeltaLog {
         // RocksDB claims bytes are durable that the log file does not contain.
         // Continuing would let sidecar readers skip missing deltas, so treat this
         // as corruption instead of silently rewinding.
-        if durable_state.durable_offset > recovered.valid_offset {
+        let header_offset = recovered.header_offset;
+        let (durable_offset, durable_lsn) = if durable_state.segment_id == segment_id {
+            if durable_state.durable_offset > recovered.valid_offset {
+                return Err(Error::CorruptRun {
+                    path,
+                    reason: format!(
+                        "active delta durable offset {} is past recovered offset {}",
+                        durable_state.durable_offset, recovered.valid_offset
+                    ),
+                });
+            }
+            (
+                durable_state.durable_offset,
+                durable_state
+                    .durable_lsn
+                    .min(recovered.max_lsn.unwrap_or(durable_state.durable_lsn)),
+            )
+        } else if durable_state.segment_id < segment_id {
+            (header_offset, durable_state.durable_lsn)
+        } else {
             return Err(Error::CorruptRun {
                 path,
                 reason: format!(
-                    "active delta durable offset {} is past recovered offset {}",
-                    durable_state.durable_offset, recovered.valid_offset
+                    "active delta durable state for segment {} is ahead of active segment {}",
+                    durable_state.segment_id, segment_id
                 ),
             });
-        }
+        };
 
         // Remove any garbage after the valid prefix before accepting appends.
         // Otherwise a crash tail like a half written LSN 42 frame would remain in
@@ -210,24 +245,19 @@ impl ActiveDeltaLog {
             })?;
 
         Ok(Self {
+            segment_id,
             path,
             writer: BufWriter::new(file),
             write_offset: recovered.valid_offset,
             max_lsn: recovered.max_lsn,
-            durable_offset: durable_state.durable_offset,
-            // Keep the durable LSN no higher than what this file actually
-            // contains. For example, if metadata says durable_lsn=100 but the
-            // recovered log is empty after a fresh initialization, advertising
-            // 100 would make recovery believe accounting deltas up to 100 are
-            // present when they are not.
-            durable_lsn: durable_state
-                .durable_lsn
-                .min(recovered.max_lsn.unwrap_or_default()),
+            durable_offset,
+            durable_lsn,
         })
     }
 
     pub fn position(&self) -> ActiveDeltaLogPosition {
         ActiveDeltaLogPosition {
+            segment_id: self.segment_id,
             write_offset: self.write_offset,
             max_lsn: self.max_lsn,
             durable_offset: self.durable_offset,
@@ -237,9 +267,14 @@ impl ActiveDeltaLog {
 
     pub fn state(&self) -> ActiveDeltaLogState {
         ActiveDeltaLogState {
+            segment_id: self.segment_id,
             durable_offset: self.durable_offset,
             durable_lsn: self.durable_lsn,
         }
+    }
+
+    pub fn segment_id(&self) -> SegmentId {
+        self.segment_id
     }
 
     pub fn durable_lsn(&self) -> StrataLsn {
@@ -255,8 +290,52 @@ impl ActiveDeltaLog {
         cursor: ActiveDeltaLogReadCursor,
         durable_state: ActiveDeltaLogState,
     ) -> Result<ActiveDeltaLogRead> {
-        let path = root_dir.as_ref().join(ACTIVE_DELTA_LOG_FILE_NAME);
-        read_durable_range(&path, cursor, durable_state)
+        read_durable_range(root_dir.as_ref(), cursor, durable_state)
+    }
+
+    pub fn sync_existing(
+        root_dir: impl AsRef<Path>,
+        segment_id: SegmentId,
+    ) -> Result<ActiveDeltaLogState> {
+        let path = Self::path(root_dir, segment_id);
+        let recovered = scan_log_prefix(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.sync_data().map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(ActiveDeltaLogState {
+            segment_id,
+            durable_offset: recovered.valid_offset,
+            durable_lsn: recovered.max_lsn.unwrap_or_default(),
+        })
+    }
+
+    pub fn max_lsn_through(
+        root_dir: impl AsRef<Path>,
+        through_segment_id: SegmentId,
+    ) -> Result<Option<StrataLsn>> {
+        let mut max_lsn = None;
+        for segment_id in active_delta_log_segment_ids(root_dir.as_ref())? {
+            if segment_id > through_segment_id {
+                continue;
+            }
+            let path = Self::path(root_dir.as_ref(), segment_id);
+            let recovered = scan_log_prefix(&path)?;
+            if let Some(segment_max_lsn) = recovered.max_lsn {
+                max_lsn = Some(
+                    max_lsn.map_or(segment_max_lsn, |max: StrataLsn| max.max(segment_max_lsn)),
+                );
+            }
+        }
+        Ok(max_lsn)
     }
 
     pub fn append(&mut self, delta: &AccountingDelta) -> Result<()> {
@@ -282,6 +361,15 @@ impl ActiveDeltaLog {
     }
 
     pub fn rollback_to(&mut self, position: ActiveDeltaLogPosition) -> Result<()> {
+        if position.segment_id != self.segment_id {
+            return Err(Error::CorruptRun {
+                path: self.path.clone(),
+                reason: format!(
+                    "cannot roll accounting segment {} back to position from segment {}",
+                    self.segment_id, position.segment_id
+                ),
+            });
+        }
         self.flush()?;
         truncate_open_file(self.writer.get_mut(), &self.path, position.write_offset)?;
         self.write_offset = position.write_offset;
@@ -322,6 +410,10 @@ impl ActiveDeltaLog {
         Ok(())
     }
 
+    pub fn flush_for_rollover(&mut self) -> Result<()> {
+        self.flush()
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.writer.flush().map_err(|source| Error::Io {
             path: self.path.clone(),
@@ -331,23 +423,84 @@ impl ActiveDeltaLog {
 }
 
 fn read_durable_range(
-    path: &Path,
+    root_dir: &Path,
     cursor: ActiveDeltaLogReadCursor,
     durable_state: ActiveDeltaLogState,
 ) -> Result<ActiveDeltaLogRead> {
-    if cursor.offset > durable_state.durable_offset {
+    if cursor.segment_id > durable_state.segment_id {
+        return Err(Error::CorruptRun {
+            path: root_dir.to_path_buf(),
+            reason: format!(
+                "active delta read cursor segment {} is past durable segment {}",
+                cursor.segment_id, durable_state.segment_id
+            ),
+        });
+    }
+
+    let segment_ids = readable_log_segment_ids(root_dir, cursor.segment_id, durable_state)?;
+    let Some(mut last_segment_id) = segment_ids.first().copied() else {
+        return Ok(ActiveDeltaLogRead {
+            deltas: Vec::new(),
+            end_segment_id: durable_state.segment_id,
+            end_offset: durable_state.durable_offset,
+            max_lsn: None,
+        });
+    };
+    let mut last_offset = 0;
+    let mut deltas = Vec::new();
+    let mut max_lsn = None;
+
+    for segment_id in segment_ids {
+        last_segment_id = segment_id;
+        let path = ActiveDeltaLog::path(root_dir, segment_id);
+        let recovered = scan_log_prefix(&path)?;
+        let durable_offset = if segment_id == durable_state.segment_id {
+            durable_state.durable_offset
+        } else {
+            recovered.valid_offset
+        };
+        let start_cursor_offset = if segment_id == cursor.segment_id {
+            cursor.offset
+        } else {
+            0
+        };
+        let read =
+            read_durable_range_from_file(&path, segment_id, start_cursor_offset, durable_offset)?;
+        last_offset = read.end_offset;
+        if let Some(read_max_lsn) = read.max_lsn {
+            max_lsn = Some(max_lsn.map_or(read_max_lsn, |max: StrataLsn| max.max(read_max_lsn)));
+        }
+        deltas.extend(read.deltas);
+    }
+
+    Ok(ActiveDeltaLogRead {
+        deltas,
+        end_segment_id: last_segment_id,
+        end_offset: last_offset,
+        max_lsn,
+    })
+}
+
+fn read_durable_range_from_file(
+    path: &Path,
+    segment_id: SegmentId,
+    cursor_offset: u64,
+    durable_offset: u64,
+) -> Result<ActiveDeltaLogRead> {
+    if cursor_offset > durable_offset {
         return Err(Error::CorruptRun {
             path: path.to_path_buf(),
             reason: format!(
                 "active delta read cursor {} is past durable offset {}",
-                cursor.offset, durable_state.durable_offset
+                cursor_offset, durable_offset
             ),
         });
     }
-    if cursor.offset == durable_state.durable_offset {
+    if cursor_offset == durable_offset {
         return Ok(ActiveDeltaLogRead {
             deltas: Vec::new(),
-            end_offset: cursor.offset,
+            end_segment_id: segment_id,
+            end_offset: cursor_offset,
             max_lsn: None,
         });
     }
@@ -357,7 +510,7 @@ fn read_durable_range(
         source,
     })?;
     let mut reader = BufReader::new(file);
-    let start_offset = if cursor.offset == 0 {
+    let start_offset = if cursor_offset == 0 {
         read_log_header(&mut reader, path)?;
         reader.stream_position().map_err(|source| Error::Io {
             path: path.to_path_buf(),
@@ -365,19 +518,19 @@ fn read_durable_range(
         })?
     } else {
         reader
-            .seek(SeekFrom::Start(cursor.offset))
+            .seek(SeekFrom::Start(cursor_offset))
             .map_err(|source| Error::Io {
                 path: path.to_path_buf(),
                 source,
             })?
     };
 
-    if start_offset > durable_state.durable_offset {
+    if start_offset > durable_offset {
         return Err(Error::CorruptRun {
             path: path.to_path_buf(),
             reason: format!(
                 "active delta read start {} is past durable offset {}",
-                start_offset, durable_state.durable_offset
+                start_offset, durable_offset
             ),
         });
     }
@@ -385,26 +538,23 @@ fn read_durable_range(
     let mut end_offset = start_offset;
     let mut max_lsn = None;
     let mut deltas = Vec::new();
-    while end_offset < durable_state.durable_offset {
+    while end_offset < durable_offset {
         let Some(delta) = read_delta_frame(&mut reader, path)? else {
             return Err(Error::CorruptRun {
                 path: path.to_path_buf(),
-                reason: format!(
-                    "active delta log ended before durable offset {}",
-                    durable_state.durable_offset
-                ),
+                reason: format!("active delta log ended before durable offset {durable_offset}"),
             });
         };
         end_offset = reader.stream_position().map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        if end_offset > durable_state.durable_offset {
+        if end_offset > durable_offset {
             return Err(Error::CorruptRun {
                 path: path.to_path_buf(),
                 reason: format!(
                     "active delta frame ended at {} past durable offset {}",
-                    end_offset, durable_state.durable_offset
+                    end_offset, durable_offset
                 ),
             });
         }
@@ -414,13 +564,31 @@ fn read_durable_range(
 
     Ok(ActiveDeltaLogRead {
         deltas,
+        end_segment_id: segment_id,
         end_offset,
         max_lsn,
     })
 }
 
+fn readable_log_segment_ids(
+    root_dir: &Path,
+    cursor_segment_id: SegmentId,
+    durable_state: ActiveDeltaLogState,
+) -> Result<Vec<SegmentId>> {
+    let mut ids = active_delta_log_segment_ids(root_dir)?;
+    ids.retain(|segment_id| *segment_id <= durable_state.segment_id);
+    if cursor_segment_id != 0 {
+        ids.retain(|segment_id| *segment_id >= cursor_segment_id);
+    }
+    if durable_state.segment_id != 0 && !ids.contains(&durable_state.segment_id) {
+        ids.insert(durable_state.segment_id);
+    }
+    Ok(ids.into_iter().collect())
+}
+
 #[derive(Debug)]
 struct RecoveredLogPrefix {
+    header_offset: u64,
     valid_offset: u64,
     file_len: u64,
     max_lsn: Option<StrataLsn>,
@@ -483,10 +651,11 @@ fn scan_log_prefix_inner(
         .len();
     let mut reader = BufReader::new(file);
     read_log_header(&mut reader, path)?;
-    let mut valid_offset = reader.stream_position().map_err(|source| Error::Io {
+    let header_offset = reader.stream_position().map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    let mut valid_offset = header_offset;
     let mut max_lsn = None;
 
     loop {
@@ -508,10 +677,50 @@ fn scan_log_prefix_inner(
     }
 
     Ok(RecoveredLogPrefix {
+        header_offset,
         valid_offset,
         file_len,
         max_lsn,
     })
+}
+
+fn active_delta_log_segment_ids(root_dir: &Path) -> Result<BTreeSet<SegmentId>> {
+    let mut ids = BTreeSet::new();
+    let entries = match fs::read_dir(root_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ids),
+        Err(source) => {
+            return Err(Error::Io {
+                path: root_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::Io {
+            path: root_dir.to_path_buf(),
+            source,
+        })?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(segment_id) = parse_log_file_name(&file_name) else {
+            continue;
+        };
+        ids.insert(segment_id);
+    }
+    Ok(ids)
+}
+
+fn log_file_name(segment_id: SegmentId) -> String {
+    format!("{ACTIVE_DELTA_LOG_FILE_PREFIX}{segment_id:020}{ACTIVE_DELTA_LOG_FILE_SUFFIX}")
+}
+
+fn parse_log_file_name(file_name: &str) -> Option<SegmentId> {
+    let segment_id = file_name
+        .strip_prefix(ACTIVE_DELTA_LOG_FILE_PREFIX)?
+        .strip_suffix(ACTIVE_DELTA_LOG_FILE_SUFFIX)?;
+    segment_id.parse().ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -59,11 +59,17 @@ pub enum Error {
     #[error("seal queue is closed")]
     SealQueueClosed,
 
+    #[error("durability queue is closed")]
+    DurabilityQueueClosed,
+
     #[error("gc queue is closed")]
     GcQueueClosed,
 
     #[error("store is halted after terminal failure: {reason}")]
     StoreHalted { reason: String },
+
+    #[error("store invariant violation: {reason}")]
+    InvariantViolation { reason: String },
 
     #[error("epoch metadata is not initialized")]
     EpochNotInitialized,
@@ -193,6 +199,14 @@ pub enum Error {
     )]
     RecoveryDurableAccountingGap {
         durable_lsn: StrataLsn,
+        active_delta_log_lsn: StrataLsn,
+    },
+
+    #[error(
+        "active accounting delta log is durable only through LSN {active_delta_log_lsn}, below checkpoint LSN {required_lsn}"
+    )]
+    DurabilityAccountingGap {
+        required_lsn: StrataLsn,
         active_delta_log_lsn: StrataLsn,
     },
 }

@@ -184,11 +184,11 @@ pub(crate) fn run_accounting_sidecar_materializing_once(
     sidecar.run_once_materializing(true).map(|_| ())
 }
 
-/// Incremental sidecar builder for the active accounting delta log.
+/// Incremental sidecar builder for durable accounting delta logs.
 ///
-/// Ramp-up: the foreground writer appends `AccountingDelta`s to `active-delta.log`; this object
-/// reads the durable part of that log, writes immutable sidecar runs, then records a manifest and
-/// consumed cursor in the main index.
+/// Ramp-up: the foreground writer appends `AccountingDelta`s to segment-aligned accounting logs;
+/// this object reads their durable ranges, writes immutable sidecar runs, then records a manifest
+/// and consumed cursor in the main index.
 ///
 /// Failure example: without the sidecar, recovering or querying accounting history would need to
 /// replay an ever-growing active log, making long-running stores slower over time.
@@ -310,7 +310,11 @@ impl AccountingSidecar {
             cursor,
             durable_state,
         )?;
+        let next_cursor = read.next_cursor(cursor);
         if read.deltas.is_empty() {
+            if next_cursor != cursor {
+                let _ = self.commit_sidecar_state(None, Some(next_cursor), None)?;
+            }
             return Ok(false);
         }
         if !force
@@ -324,7 +328,6 @@ impl AccountingSidecar {
             return Ok(false);
         }
 
-        let next_cursor = read.next_cursor(cursor);
         let prepared = self
             .accounting_index
             .prepare_accounting_deltas(read.deltas)?;
