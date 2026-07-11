@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashSet},
     fs,
     io::Read,
     path::Path,
@@ -11,8 +12,7 @@ use std::{
 use sha2::{Digest, Sha256};
 use strata_accounting::ActiveDeltaLogState;
 use strata_core::{
-    BlobKey, MapRefOp, PlacementClass, SegmentFileState, SegmentId, SegmentOwner, SegmentState,
-    StrataLsn,
+    BlobKey, MapRefOp, SegmentFileState, SegmentId, SegmentOwner, SegmentState, StrataLsn,
 };
 use strata_index::StrataIndex;
 
@@ -30,6 +30,12 @@ const SEAL_COMMAND_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) enum SealCommand {
     Seal(SegmentSealTask),
     Shutdown,
+}
+
+#[derive(Debug)]
+enum SealPublisherEvent {
+    Queued(SegmentId),
+    Completed(SealTaskResult),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,14 +69,14 @@ impl SealWorker {
 
         let (task_tx, task_rx) = mpsc::channel();
         let task_rx = Arc::new(Mutex::new(task_rx));
-        let (result_tx, result_rx) = mpsc::channel();
+        let (publisher_tx, publisher_rx) = mpsc::channel();
         let mut worker_handles = Vec::with_capacity(config.seal_worker_count);
         for worker_id in 0..config.seal_worker_count {
             let worker = SealTaskWorker {
                 config: config.clone(),
                 index: index.clone(),
                 task_rx: Arc::clone(&task_rx),
-                result_tx: result_tx.clone(),
+                publisher_tx: publisher_tx.clone(),
             };
             match thread::Builder::new()
                 .name(format!(
@@ -83,19 +89,17 @@ impl SealWorker {
                 Err(source) => {
                     store_halt.halt(format!("fatal strata seal worker spawn error: {source}"));
                     drop(task_tx);
-                    drop(result_tx);
+                    drop(publisher_tx);
                     join_seal_threads(worker_handles);
                     return;
                 }
             }
         }
-        drop(result_tx);
-
         let publisher = SealPublisher {
             config: config.clone(),
             index,
             ingest_owner,
-            result_rx,
+            event_rx: publisher_rx,
             accounting_tx,
             metrics,
             store_halt: store_halt.clone(),
@@ -113,7 +117,7 @@ impl SealWorker {
             }
         };
 
-        dispatch_seal_commands(seal_rx, task_tx, &store_halt);
+        dispatch_seal_commands(seal_rx, task_tx, publisher_tx, &store_halt);
         join_seal_threads(worker_handles);
         let _ = publisher_handle.join();
     }
@@ -151,7 +155,7 @@ struct SealTaskWorker {
     config: StrataStoreConfig,
     index: StrataIndex,
     task_rx: Arc<Mutex<mpsc::Receiver<SegmentSealTask>>>,
-    result_tx: mpsc::Sender<SealTaskResult>,
+    publisher_tx: mpsc::Sender<SealPublisherEvent>,
 }
 
 impl SealTaskWorker {
@@ -160,8 +164,11 @@ impl SealTaskWorker {
             let result = prepare_seal_segment(&self.config, &self.index, task);
             let is_error = result.is_err();
             if self
-                .result_tx
-                .send(SealTaskResult { task, result })
+                .publisher_tx
+                .send(SealPublisherEvent::Completed(SealTaskResult {
+                    task,
+                    result,
+                }))
                 .is_err()
             {
                 break;
@@ -186,7 +193,7 @@ struct SealPublisher {
     config: StrataStoreConfig,
     index: StrataIndex,
     ingest_owner: SegmentOwner,
-    result_rx: mpsc::Receiver<SealTaskResult>,
+    event_rx: mpsc::Receiver<SealPublisherEvent>,
     accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
     metrics: StrataStoreMetrics,
     store_halt: StoreHalt,
@@ -195,21 +202,37 @@ struct SealPublisher {
 impl SealPublisher {
     fn run(self) {
         let mut completed = BTreeMap::new();
-        while let Ok(task_result) = self.result_rx.recv() {
+        let mut sealing = BinaryHeap::new();
+        let mut sealing_ids = HashSet::new();
+        while let Ok(event) = self.event_rx.recv() {
             if self.store_halt.error().is_some() {
                 break;
             }
 
+            let task_result = match event {
+                SealPublisherEvent::Queued(segment_id) => {
+                    if sealing_ids.insert(segment_id) {
+                        sealing.push(Reverse(segment_id));
+                    }
+                    continue;
+                }
+                SealPublisherEvent::Completed(task_result) => task_result,
+            };
             match task_result.result {
                 Ok(Some(completed_seal)) => {
                     completed.insert(completed_seal.task.segment_id, completed_seal);
-                    if let Err(error) = self.publish_ready(&mut completed) {
+                    if let Err(error) =
+                        self.publish_ready(&mut completed, &mut sealing, &mut sealing_ids)
+                    {
                         self.halt_seal_error(task_result.task.segment_id, &error);
                         break;
                     }
                 }
                 Ok(None) => {
-                    if let Err(error) = self.publish_ready(&mut completed) {
+                    sealing_ids.remove(&task_result.task.segment_id);
+                    if let Err(error) =
+                        self.publish_ready(&mut completed, &mut sealing, &mut sealing_ids)
+                    {
                         self.halt_seal_error(task_result.task.segment_id, &error);
                         break;
                     }
@@ -222,7 +245,12 @@ impl SealPublisher {
         }
     }
 
-    fn publish_ready(&self, completed: &mut BTreeMap<SegmentId, CompletedSeal>) -> Result<()> {
+    fn publish_ready(
+        &self,
+        completed: &mut BTreeMap<SegmentId, CompletedSeal>,
+        sealing: &mut BinaryHeap<Reverse<SegmentId>>,
+        sealing_ids: &mut HashSet<SegmentId>,
+    ) -> Result<()> {
         publish_ready_completed_seals(
             &self.config,
             &self.index,
@@ -230,6 +258,8 @@ impl SealPublisher {
             self.accounting_tx.as_ref(),
             &self.metrics,
             completed,
+            sealing,
+            sealing_ids,
         )
     }
 
@@ -248,9 +278,17 @@ pub(crate) fn publish_ready_completed_seals(
     accounting_tx: Option<&mpsc::SyncSender<AccountingCommand>>,
     metrics: &StrataStoreMetrics,
     completed: &mut BTreeMap<SegmentId, CompletedSeal>,
+    sealing: &mut BinaryHeap<Reverse<SegmentId>>,
+    sealing_ids: &mut HashSet<SegmentId>,
 ) -> Result<()> {
     loop {
-        let Some(segment_id) = next_sealing_ingest_segment_id(index)? else {
+        while sealing
+            .peek()
+            .is_some_and(|Reverse(id)| !sealing_ids.contains(id))
+        {
+            sealing.pop();
+        }
+        let Some(&Reverse(segment_id)) = sealing.peek() else {
             return Ok(());
         };
         let Some(completed_seal) = completed.remove(&segment_id) else {
@@ -264,12 +302,15 @@ pub(crate) fn publish_ready_completed_seals(
             metrics,
             completed_seal,
         )?;
+        sealing.pop();
+        sealing_ids.remove(&segment_id);
     }
 }
 
 fn dispatch_seal_commands(
     seal_rx: mpsc::Receiver<SealCommand>,
     task_tx: mpsc::Sender<SegmentSealTask>,
+    publisher_tx: mpsc::Sender<SealPublisherEvent>,
     store_halt: &StoreHalt,
 ) {
     loop {
@@ -278,6 +319,12 @@ fn dispatch_seal_commands(
         }
         match seal_rx.recv_timeout(SEAL_COMMAND_RECV_TIMEOUT) {
             Ok(SealCommand::Seal(task)) => {
+                if publisher_tx
+                    .send(SealPublisherEvent::Queued(task.segment_id))
+                    .is_err()
+                {
+                    break;
+                }
                 if task_tx.send(task).is_err() {
                     break;
                 }
@@ -403,18 +450,6 @@ pub(crate) fn enqueue_unsealed_segments_for_sealing(
         }
     }
     Ok(())
-}
-
-fn next_sealing_ingest_segment_id(index: &StrataIndex) -> Result<Option<SegmentId>> {
-    Ok(index
-        .iter_segment_states()?
-        .into_iter()
-        .filter(|(_, state)| {
-            state.placement_class == PlacementClass::Ingest
-                && state.state == SegmentFileState::Sealing
-        })
-        .map(|(segment_id, _)| segment_id)
-        .min())
 }
 
 pub(crate) fn verify_sealed_segments(

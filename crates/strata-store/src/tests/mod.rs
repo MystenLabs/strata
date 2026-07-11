@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     ops::Deref,
@@ -5373,6 +5374,8 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
     put_test_segment_state(&index, 1, SegmentFileState::Sealing);
     put_test_segment_state(&index, 2, SegmentFileState::Sealing);
     let mut completed = BTreeMap::new();
+    let mut sealing = [Reverse(1), Reverse(2)].into_iter().collect();
+    let mut sealing_ids = [1, 2].into_iter().collect();
 
     completed.insert(
         2,
@@ -5391,6 +5394,8 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
         None,
         &StrataStoreMetrics::default(),
         &mut completed,
+        &mut sealing,
+        &mut sealing_ids,
     )
     .unwrap();
     assert_eq!(
@@ -5419,6 +5424,8 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
         None,
         &StrataStoreMetrics::default(),
         &mut completed,
+        &mut sealing,
+        &mut sealing_ids,
     )
     .unwrap();
     assert_eq!(

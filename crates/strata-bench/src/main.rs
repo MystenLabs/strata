@@ -58,6 +58,7 @@ const DEFAULT_OPS: usize = 1024;
 const DEFAULT_READ_SET_SIZE: usize = 1024;
 const DEFAULT_READ_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+const DEFAULT_MAX_UNSEALED_SEGMENTS: usize = 8;
 const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READER_CACHE_CAPACITY;
 const DEFAULT_STARTING_EPOCH: Epoch = 1;
 const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
@@ -199,6 +200,7 @@ struct Config {
     store_get_profile: bool,
     store_get_verify_checksum: bool,
     queue_capacity: usize,
+    max_unsealed_segments: usize,
     segment_max_bytes: u64,
     seal_worker_count: usize,
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
@@ -232,6 +234,7 @@ impl Config {
             store_get_profile: false,
             store_get_verify_checksum: true,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            max_unsealed_segments: DEFAULT_MAX_UNSEALED_SEGMENTS,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
@@ -287,6 +290,10 @@ impl Config {
                 "--queue-capacity" => {
                     config.queue_capacity =
                         parse_nonzero_usize(&next_value(&mut args, "--queue-capacity")?)?
+                }
+                "--max-unsealed-segments" => {
+                    config.max_unsealed_segments =
+                        parse_nonzero_usize(&next_value(&mut args, "--max-unsealed-segments")?)?
                 }
                 "--segment-max-bytes" => {
                     config.segment_max_bytes =
@@ -359,6 +366,9 @@ impl Config {
         if config.rocksdb_blob_file_size == 0 {
             return Err("rocksdb_blob_file_size must be non-zero".to_owned());
         }
+        if config.max_unsealed_segments < 2 {
+            return Err("--max-unsealed-segments must be at least 2".to_owned());
+        }
         if config.strata_gc && !config.strata_accounting {
             return Err("--strata-gc true requires --strata-accounting true".to_owned());
         }
@@ -372,7 +382,7 @@ impl Config {
             namespace: self.namespace.clone(),
             segment_max_bytes: self.segment_max_bytes,
             write_queue_capacity: self.queue_capacity,
-            max_unsealed_segments: 8,
+            max_unsealed_segments: self.max_unsealed_segments,
             seal_worker_count: self.seal_worker_count,
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
@@ -1119,6 +1129,7 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!("max_us={:.3}", sorted.last().map_or(0.0, duration_us));
     println!("sync_every={}", config.sync_every);
     println!("queue_capacity={}", config.queue_capacity);
+    println!("max_unsealed_segments={}", config.max_unsealed_segments);
     println!("segment_max_bytes={}", config.segment_max_bytes);
     println!("seal_workers={}", config.seal_worker_count);
     println!(
@@ -1897,6 +1908,7 @@ options:
   --store-get-profile
   --store-get-verify-checksum <true|false>
   --queue-capacity <count>
+  --max-unsealed-segments <count>
   --segment-max-bytes <bytes|KiB|MiB|GiB>
   --seal-workers <count>
   --sealed-integrity <metadata-only|checksum>
@@ -1966,6 +1978,8 @@ mod tests {
                 "127.0.0.1:0",
                 "--metrics-drain-seconds",
                 "7",
+                "--max-unsealed-segments",
+                "12",
                 "--seal-workers",
                 "3",
                 "--sealed-integrity",
@@ -1986,6 +2000,7 @@ mod tests {
         assert!(config.rocksdb_disable_auto_compactions);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(config.metrics_drain_seconds, 7);
+        assert_eq!(config.max_unsealed_segments, 12);
         assert_eq!(config.seal_worker_count, 3);
         assert_eq!(
             config.sealed_segment_integrity_policy,
