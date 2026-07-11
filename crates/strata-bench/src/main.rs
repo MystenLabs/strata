@@ -170,6 +170,21 @@ impl StoreGetMode {
     }
 }
 
+fn parse_sealed_integrity(value: &str) -> Result<SealedSegmentIntegrityPolicy, String> {
+    match value {
+        "metadata-only" | "metadata" => Ok(SealedSegmentIntegrityPolicy::MetadataOnly),
+        "checksum" => Ok(SealedSegmentIntegrityPolicy::Checksum),
+        _ => Err(format!("unknown sealed integrity policy '{value}'")),
+    }
+}
+
+fn sealed_integrity_as_str(policy: SealedSegmentIntegrityPolicy) -> &'static str {
+    match policy {
+        SealedSegmentIntegrityPolicy::MetadataOnly => "metadata-only",
+        SealedSegmentIntegrityPolicy::Checksum => "checksum",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Config {
     case: BenchCase,
@@ -185,6 +200,7 @@ struct Config {
     store_get_verify_checksum: bool,
     queue_capacity: usize,
     segment_max_bytes: u64,
+    sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     reader_cache_capacity: usize,
     starting_epoch: Epoch,
     strata_accounting: bool,
@@ -216,6 +232,7 @@ impl Config {
             store_get_verify_checksum: true,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
+            sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             starting_epoch: DEFAULT_STARTING_EPOCH,
             strata_accounting: true,
@@ -272,6 +289,10 @@ impl Config {
                 "--segment-max-bytes" => {
                     config.segment_max_bytes =
                         parse_size(&next_value(&mut args, "--segment-max-bytes")?)? as u64
+                }
+                "--sealed-integrity" => {
+                    config.sealed_segment_integrity_policy =
+                        parse_sealed_integrity(&next_value(&mut args, "--sealed-integrity")?)?
                 }
                 "--reader-cache-capacity" => {
                     config.reader_cache_capacity =
@@ -348,7 +369,7 @@ impl Config {
             max_unsealed_segments: 8,
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
-            sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
             accounting_worker_enabled: self.strata_accounting,
             accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
             accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
@@ -1092,6 +1113,10 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!("sync_every={}", config.sync_every);
     println!("queue_capacity={}", config.queue_capacity);
     println!("segment_max_bytes={}", config.segment_max_bytes);
+    println!(
+        "sealed_integrity={}",
+        sealed_integrity_as_str(config.sealed_segment_integrity_policy)
+    );
     println!("reader_cache_capacity={}", config.reader_cache_capacity);
     println!("rocksdb_min_blob_size={}", config.rocksdb_min_blob_size);
     println!("rocksdb_blob_file_size={}", config.rocksdb_blob_file_size);
@@ -1865,6 +1890,7 @@ options:
   --store-get-verify-checksum <true|false>
   --queue-capacity <count>
   --segment-max-bytes <bytes|KiB|MiB|GiB>
+  --sealed-integrity <metadata-only|checksum>
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --starting-epoch <epoch>
   --strata-accounting <true|false>      background accounting worker
@@ -1931,6 +1957,8 @@ mod tests {
                 "127.0.0.1:0",
                 "--metrics-drain-seconds",
                 "7",
+                "--sealed-integrity",
+                "checksum",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1947,6 +1975,10 @@ mod tests {
         assert!(config.rocksdb_disable_auto_compactions);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(config.metrics_drain_seconds, 7);
+        assert_eq!(
+            config.sealed_segment_integrity_policy,
+            SealedSegmentIntegrityPolicy::Checksum
+        );
     }
 
     #[test]

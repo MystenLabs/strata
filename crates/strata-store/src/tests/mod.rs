@@ -5419,7 +5419,8 @@ async fn metadata_only_reopen_does_not_hash_sealed_segment_bytes() {
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
     cfg.sealed_segment_integrity_policy = SealedSegmentIntegrityPolicy::MetadataOnly;
-    seal_first_segment(&cfg);
+    let sealed = seal_first_segment(&cfg);
+    assert_eq!(sealed.sealed_sha256, None);
 
     OpenOptions::new()
         .write(true)
@@ -5447,7 +5448,8 @@ async fn checksum_reopen_detects_sealed_segment_hash_mismatch() {
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
     cfg.sealed_segment_integrity_policy = SealedSegmentIntegrityPolicy::Checksum;
-    seal_first_segment(&cfg);
+    let sealed = seal_first_segment(&cfg);
+    assert!(sealed.sealed_sha256.is_some());
 
     OpenOptions::new()
         .write(true)
@@ -5538,13 +5540,7 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
     let sealed = wait_for_segment_state(store.index(), 1, SegmentFileState::Sealed);
     assert_eq!(sealed.durable_offset, sealed.write_offset);
     assert_eq!(sealed.sealed_len, Some(sealed.write_offset));
-    assert_eq!(
-        sealed.sealed_sha256,
-        Some(
-            seal::sha256_file_prefix(&segment_path(store.config(), 1), sealed.write_offset)
-                .unwrap()
-        )
-    );
+    assert_eq!(sealed.sealed_sha256, None);
     assert_eq!(store.durable_lsn().unwrap(), 0);
 
     let open = store.index().get_segment_state(2).unwrap().unwrap();

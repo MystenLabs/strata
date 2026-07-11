@@ -77,7 +77,12 @@ impl SealWorker {
             path: path.clone(),
             source,
         })?;
-        let sealed_sha256 = sha256_file_prefix(&path, task.sealed_len)?;
+        let sealed_sha256 = match self.config.sealed_segment_integrity_policy {
+            SealedSegmentIntegrityPolicy::Checksum => {
+                Some(sha256_file_prefix(&path, task.sealed_len)?)
+            }
+            SealedSegmentIntegrityPolicy::MetadataOnly => None,
+        };
 
         let mut state = active_segment_state_from_path(
             &self.config,
@@ -94,7 +99,7 @@ impl SealWorker {
         }
         state.state = SegmentFileState::Sealed;
         state.sealed_len = Some(task.sealed_len);
-        state.sealed_sha256 = Some(sealed_sha256);
+        state.sealed_sha256 = sealed_sha256;
 
         let durable_lsn = {
             let mut batch = self.index.batch();
