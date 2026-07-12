@@ -8006,6 +8006,7 @@ dependencies = [
  "strata-segment",
  "strata-store",
  "tokio",
+ "typed-store",
 ]
 
 [[package]]

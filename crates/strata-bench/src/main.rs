@@ -11,8 +11,8 @@
 //! store-put           StrataStore put path, cloning each payload into Arc storage
 //! store-put-arc       StrataStore put path with caller-provided Arc payload
 //! store-get           StrataStore point reads from indexed segment records
-//! rocksdb-blobdb-put  RocksDB BlobDB put baseline
-//! rocksdb-blobdb-get  RocksDB BlobDB get baseline
+//! rocksdb-blobdb-put  RocksDB BlobDB put baseline through typed-store
+//! rocksdb-blobdb-get  RocksDB BlobDB get baseline through typed-store
 //! ```
 //!
 //! The benchmark is not part of the storage protocol. It should keep using public crate APIs so
@@ -32,7 +32,7 @@ use std::{
 };
 
 use prometheus::{Encoder, Registry, TextEncoder};
-use rocksdb::{DB, Options};
+use rocksdb::DB;
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
 use strata_segment::SegmentWriter;
 use strata_store::{
@@ -51,6 +51,10 @@ use strata_store::{
 };
 #[cfg(feature = "internal-profiling")]
 use strata_store::{StoreProfileSink, StoreSyncProfile, StoreWriteProfile};
+use typed_store::{
+    DBMetrics, Map,
+    rocks::{DBMap, MetricConf, ReadWriteOptions, RocksDB, default_db_options},
+};
 
 const DEFAULT_NAMESPACE: &str = "default";
 const DEFAULT_PAYLOAD_SIZE: usize = 1 << 20;
@@ -65,6 +69,7 @@ const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
 const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
 const BENCH_SEGMENT_ID: u64 = 1;
+type BlobDbMap = DBMap<Vec<u8>, Vec<u8>>;
 
 fn main() {
     match Config::parse(env::args().skip(1)) {
@@ -841,20 +846,21 @@ fn run_store_get(
 
 fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
-    let db = open_rocksdb_blobdb(config)?;
+    let db = open_typed_rocksdb_blobdb(config)?;
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("rocksdb_put", config.ops);
     let started = Instant::now();
 
     for op in 0..config.ops {
         let key = bench_key(b"rocksdb-key-", op)?;
+        let key = key.as_bytes().to_vec();
         let op_started = Instant::now();
         let phase_started = Instant::now();
-        db.put(key.as_bytes(), &payload)?;
+        db.insert(&key, &payload)?;
         phases.primary.push(phase_started.elapsed());
-        if let Some(sync_elapsed) =
-            record_sync_timed(config.sync_every, op + 1, || db.flush_wal(true))?
-        {
+        if let Some(sync_elapsed) = record_sync_timed(config.sync_every, op + 1, || {
+            flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)
+        })? {
             phases.sync.push(sync_elapsed);
         }
         timings.push(op_started.elapsed());
@@ -868,7 +874,7 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
         profile: None,
         phases: Some(&phases),
         store: None,
-        rocksdb: Some(&db),
+        rocksdb: Some(db.rocksdb.as_ref()),
         profile_capture: None,
     })?;
     Ok(())
@@ -876,16 +882,17 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
 
 fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
-    let db = open_rocksdb_blobdb(config)?;
+    let db = open_typed_rocksdb_blobdb(config)?;
     let read_set_size = config.read_set_size.min(config.ops.max(1));
     let keys = (0..read_set_size)
         .map(|op| bench_key(b"rocksdb-read-key-", op))
+        .map(|result| result.map(|key| key.as_bytes().to_vec()))
         .collect::<Result<Vec<_>, _>>()?;
 
     for key in &keys {
-        db.put(key.as_bytes(), &payload)?;
+        db.insert(key, &payload)?;
     }
-    db.flush_wal(true)?;
+    flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
 
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("rocksdb_get", config.ops);
@@ -896,7 +903,7 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
         let key = &keys[key_index];
         let op_started = Instant::now();
         let phase_started = Instant::now();
-        let value = db.get(key.as_bytes())?;
+        let value = db.get(key)?;
         phases.primary.push(phase_started.elapsed());
         hint::black_box(value.as_deref());
         timings.push(op_started.elapsed());
@@ -910,21 +917,36 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
         profile: None,
         phases: Some(&phases),
         store: None,
-        rocksdb: Some(&db),
+        rocksdb: Some(db.rocksdb.as_ref()),
         profile_capture: None,
     })?;
     Ok(())
 }
 
-fn open_rocksdb_blobdb(config: &Config) -> Result<DB, rocksdb::Error> {
-    let mut options = Options::default();
+fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::error::Error>> {
+    let mut options = default_db_options().options;
     options.create_if_missing(true);
     options.set_enable_blob_files(true);
     options.set_min_blob_size(config.rocksdb_min_blob_size);
     options.set_blob_file_size(config.rocksdb_blob_file_size);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
     options.set_disable_auto_compactions(config.rocksdb_disable_auto_compactions);
-    DB::open(&options, config.root_dir.join("rocksdb-blobdb"))
+    Ok(DBMap::open(
+        config.root_dir.join("rocksdb-blobdb"),
+        MetricConf::new("rocksdb_blobdb"),
+        Some(options),
+        None,
+        Some("rocksdb_blobdb"),
+        &ReadWriteOptions::default(),
+    )?)
+}
+
+fn flush_typed_rocksdb_wal(db: &RocksDB, sync: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let db = standard_rocksdb(db).ok_or_else(|| {
+        io::Error::other("typed-store BlobDB benchmark requires standard RocksDB")
+    })?;
+    db.flush_wal(sync)?;
+    Ok(())
 }
 
 fn record_sync_timed<E>(
@@ -959,6 +981,7 @@ impl BenchMetrics {
         };
 
         let registry = Arc::new(Registry::new());
+        DBMetrics::init(&registry);
         let server = start_metrics_server(listen_addr, Arc::clone(&registry))?;
         Ok(Self {
             registry: Some(registry),
@@ -1076,7 +1099,7 @@ struct ReportInputs<'a> {
     profile: Option<&'a StoreGetProfileSummary>,
     phases: Option<&'a PhaseTimings>,
     store: Option<&'a StrataStore>,
-    rocksdb: Option<&'a DB>,
+    rocksdb: Option<&'a RocksDB>,
     profile_capture: Option<&'a ProfileCapture>,
 }
 
@@ -1461,7 +1484,12 @@ fn print_strata_segment_state_metrics(
     println!("strata_active_segment_write_offset_bytes={active_segment_write_offset}");
 }
 
-fn print_rocksdb_metrics(db: &DB) {
+fn print_rocksdb_metrics(db: &RocksDB) {
+    let Some(db) = standard_rocksdb(db) else {
+        println!("rocksdb_metrics_error=unsupported_engine");
+        return;
+    };
+
     match db.live_files() {
         Ok(live_files) => {
             let live_sst_file_bytes = live_files.iter().map(|file| file.size as u64).sum::<u64>();
@@ -1497,6 +1525,13 @@ fn print_rocksdb_string_property(db: &DB, label: &str, property_name: &str) {
         Ok(Some(value)) => println!("{label}={}", sanitize_property_value(&value)),
         Ok(None) => println!("{label}=unavailable"),
         Err(error) => println!("{label}=error:{}", sanitize_property_value(error.as_ref())),
+    }
+}
+
+fn standard_rocksdb(db: &RocksDB) -> Option<&DB> {
+    match db {
+        RocksDB::DB(handle) => Some(&handle.underlying),
+        RocksDB::OptimisticTransactionDB(_) => None,
     }
 }
 

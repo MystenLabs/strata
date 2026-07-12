@@ -17,3 +17,4 @@ strata-core.workspace = true
 strata-segment.workspace = true
 strata-store.workspace = true
 tokio.workspace = true
+typed-store.workspace = true
