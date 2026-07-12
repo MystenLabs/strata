@@ -220,6 +220,7 @@ struct Config {
     rocksdb_write_buffer_size: usize,
     rocksdb_high_pri_background_threads: usize,
     rocksdb_blob_gc: bool,
+    rocksdb_disable_wal: bool,
     rocksdb_disable_auto_compactions: bool,
     sync_every: usize,
     metrics_listen: Option<String>,
@@ -256,6 +257,7 @@ impl Config {
             rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
             rocksdb_high_pri_background_threads: DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS,
             rocksdb_blob_gc: true,
+            rocksdb_disable_wal: false,
             rocksdb_disable_auto_compactions: false,
             sync_every: 0,
             metrics_listen: None,
@@ -353,6 +355,10 @@ impl Config {
                 "--rocksdb-blob-gc" => {
                     config.rocksdb_blob_gc =
                         parse_bool(&next_value(&mut args, "--rocksdb-blob-gc")?)?
+                }
+                "--rocksdb-disable-wal" => {
+                    config.rocksdb_disable_wal =
+                        parse_bool(&next_value(&mut args, "--rocksdb-disable-wal")?)?
                 }
                 "--rocksdb-disable-auto-compactions" => {
                     config.rocksdb_disable_auto_compactions = parse_bool(&next_value(
@@ -957,13 +963,14 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     options.set_write_buffer_size(config.rocksdb_write_buffer_size);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
     options.set_disable_auto_compactions(config.rocksdb_disable_auto_compactions);
+    let rw_options = ReadWriteOptions::default().set_disable_wal(config.rocksdb_disable_wal);
     Ok(DBMap::open(
         config.root_dir.join("rocksdb-blobdb"),
         MetricConf::new("rocksdb_blobdb"),
         Some(options),
         None,
         Some("rocksdb_blobdb"),
-        &ReadWriteOptions::default(),
+        &rw_options,
     )?)
 }
 
@@ -1197,6 +1204,7 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
         config.rocksdb_high_pri_background_threads
     );
     println!("rocksdb_blob_gc={}", config.rocksdb_blob_gc);
+    println!("rocksdb_disable_wal={}", config.rocksdb_disable_wal);
     println!(
         "rocksdb_disable_auto_compactions={}",
         config.rocksdb_disable_auto_compactions
@@ -1990,6 +1998,7 @@ options:
   --rocksdb-write-buffer-size <bytes|KiB|MiB|GiB>
   --rocksdb-high-pri-background-threads <count>
   --rocksdb-blob-gc <true|false>
+  --rocksdb-disable-wal <true|false>
   --rocksdb-disable-auto-compactions <true|false>
   --sync-every <count>
   --metrics-listen <addr>              serve Prometheus metrics on /metrics
@@ -2045,6 +2054,8 @@ mod tests {
                 "false",
                 "--rocksdb-disable-auto-compactions",
                 "true",
+                "--rocksdb-disable-wal",
+                "true",
                 "--rocksdb-write-buffer-size",
                 "512MiB",
                 "--rocksdb-high-pri-background-threads",
@@ -2073,6 +2084,7 @@ mod tests {
         assert!(!config.strata_accounting);
         assert!(!config.strata_gc);
         assert!(config.rocksdb_disable_auto_compactions);
+        assert!(config.rocksdb_disable_wal);
         assert_eq!(config.rocksdb_write_buffer_size, 512 << 20);
         assert_eq!(config.rocksdb_high_pri_background_threads, 8);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
