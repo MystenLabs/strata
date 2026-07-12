@@ -67,6 +67,7 @@ const DEFAULT_READER_CACHE_CAPACITY: usize = strata_store::DEFAULT_SEGMENT_READE
 const DEFAULT_STARTING_EPOCH: Epoch = 1;
 const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
+const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE: usize = 512 << 20;
 const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
 const BENCH_SEGMENT_ID: u64 = 1;
 type BlobDbMap = DBMap<Vec<u8>, Vec<u8>>;
@@ -215,6 +216,7 @@ struct Config {
     strata_gc: bool,
     rocksdb_min_blob_size: u64,
     rocksdb_blob_file_size: u64,
+    rocksdb_write_buffer_size: usize,
     rocksdb_blob_gc: bool,
     rocksdb_disable_auto_compactions: bool,
     sync_every: usize,
@@ -249,6 +251,7 @@ impl Config {
             strata_gc: true,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
+            rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
             rocksdb_blob_gc: true,
             rocksdb_disable_auto_compactions: false,
             sync_every: 0,
@@ -334,6 +337,10 @@ impl Config {
                     config.rocksdb_blob_file_size =
                         parse_size(&next_value(&mut args, "--rocksdb-blob-file-size")?)? as u64
                 }
+                "--rocksdb-write-buffer-size" => {
+                    config.rocksdb_write_buffer_size =
+                        parse_size(&next_value(&mut args, "--rocksdb-write-buffer-size")?)?
+                }
                 "--rocksdb-blob-gc" => {
                     config.rocksdb_blob_gc =
                         parse_bool(&next_value(&mut args, "--rocksdb-blob-gc")?)?
@@ -370,6 +377,9 @@ impl Config {
         }
         if config.rocksdb_blob_file_size == 0 {
             return Err("rocksdb_blob_file_size must be non-zero".to_owned());
+        }
+        if config.rocksdb_write_buffer_size == 0 {
+            return Err("rocksdb_write_buffer_size must be non-zero".to_owned());
         }
         if config.max_unsealed_segments < 2 {
             return Err("--max-unsealed-segments must be at least 2".to_owned());
@@ -929,6 +939,7 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     options.set_enable_blob_files(true);
     options.set_min_blob_size(config.rocksdb_min_blob_size);
     options.set_blob_file_size(config.rocksdb_blob_file_size);
+    options.set_write_buffer_size(config.rocksdb_write_buffer_size);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
     options.set_disable_auto_compactions(config.rocksdb_disable_auto_compactions);
     Ok(DBMap::open(
@@ -1162,6 +1173,10 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!("reader_cache_capacity={}", config.reader_cache_capacity);
     println!("rocksdb_min_blob_size={}", config.rocksdb_min_blob_size);
     println!("rocksdb_blob_file_size={}", config.rocksdb_blob_file_size);
+    println!(
+        "rocksdb_write_buffer_size={}",
+        config.rocksdb_write_buffer_size
+    );
     println!("rocksdb_blob_gc={}", config.rocksdb_blob_gc);
     println!(
         "rocksdb_disable_auto_compactions={}",
@@ -1953,6 +1968,7 @@ options:
   --strata-gc <true|false>              background GC workers
   --rocksdb-min-blob-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-file-size <bytes|KiB|MiB|GiB>
+  --rocksdb-write-buffer-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-gc <true|false>
   --rocksdb-disable-auto-compactions <true|false>
   --sync-every <count>
@@ -2009,6 +2025,8 @@ mod tests {
                 "false",
                 "--rocksdb-disable-auto-compactions",
                 "true",
+                "--rocksdb-write-buffer-size",
+                "512MiB",
                 "--metrics-listen",
                 "127.0.0.1:0",
                 "--metrics-drain-seconds",
@@ -2033,6 +2051,7 @@ mod tests {
         assert!(!config.strata_accounting);
         assert!(!config.strata_gc);
         assert!(config.rocksdb_disable_auto_compactions);
+        assert_eq!(config.rocksdb_write_buffer_size, 512 << 20);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(config.metrics_drain_seconds, 7);
         assert_eq!(config.max_unsealed_segments, 12);
