@@ -32,7 +32,7 @@ use std::{
 };
 
 use prometheus::{Encoder, Registry, TextEncoder};
-use rocksdb::{DB, Env};
+use rocksdb::{DB, Env, WriteOptions};
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
 use strata_segment::SegmentWriter;
 use strata_store::{
@@ -53,7 +53,7 @@ use strata_store::{
 use strata_store::{StoreProfileSink, StoreSyncProfile, StoreWriteProfile};
 use typed_store::{
     DBMetrics, Map,
-    rocks::{DBMap, MetricConf, ReadWriteOptions, RocksDB, default_db_options},
+    rocks::{DBMap, MetricConf, ReadWriteOptions, RocksDB, be_fix_int_ser, default_db_options},
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -69,6 +69,7 @@ const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
 const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE: usize = 512 << 20;
 const DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS: usize = 4;
+const ROCKSDB_BLOBDB_CF_CLASS: &str = "rocksdb_blobdb";
 const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
 const BENCH_SEGMENT_ID: u64 = 1;
 type BlobDbMap = DBMap<Vec<u8>, Vec<u8>>;
@@ -884,7 +885,7 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
         let key = key.as_bytes().to_vec();
         let op_started = Instant::now();
         let phase_started = Instant::now();
-        db.insert(&key, &payload)?;
+        insert_rocksdb_blobdb(&db, &key, &payload, config.rocksdb_disable_wal)?;
         phases.primary.push(phase_started.elapsed());
         if let Some(sync_elapsed) = record_sync_timed(config.sync_every, op + 1, || {
             flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)
@@ -918,7 +919,7 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
         .collect::<Result<Vec<_>, _>>()?;
 
     for key in &keys {
-        db.insert(key, &payload)?;
+        insert_rocksdb_blobdb(&db, key, &payload, config.rocksdb_disable_wal)?;
     }
     flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
 
@@ -951,6 +952,49 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+fn insert_rocksdb_blobdb(
+    db: &BlobDbMap,
+    key: &Vec<u8>,
+    value: &Vec<u8>,
+    disable_wal: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !disable_wal {
+        db.insert(key, value)?;
+        return Ok(());
+    }
+
+    let db_metrics = DBMetrics::get();
+    let timer = db_metrics
+        .op_metrics
+        .rocksdb_put_latency_seconds
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .start_timer();
+    let key_buf = be_fix_int_ser(key)?;
+    let value_buf = bcs::to_bytes(value)?;
+    db_metrics
+        .op_metrics
+        .rocksdb_put_key_bytes
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .observe(key_buf.len() as f64);
+    db_metrics
+        .op_metrics
+        .rocksdb_put_value_bytes
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .observe(value_buf.len() as f64);
+    db_metrics
+        .op_metrics
+        .rocksdb_put_bytes
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .observe(key_buf.len() as f64 + value_buf.len() as f64);
+
+    let mut write_options = WriteOptions::default();
+    write_options.disable_wal(true);
+    db.rocksdb
+        .put_cf(&db.cf()?, key_buf, value_buf, &write_options)?;
+    timer.stop_and_record();
+    Ok(())
+}
+
 fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::error::Error>> {
     let mut options = default_db_options().options;
     let mut env = Env::new()?;
@@ -963,14 +1007,13 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     options.set_write_buffer_size(config.rocksdb_write_buffer_size);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
     options.set_disable_auto_compactions(config.rocksdb_disable_auto_compactions);
-    let rw_options = ReadWriteOptions::default().set_disable_wal(config.rocksdb_disable_wal);
     Ok(DBMap::open(
         config.root_dir.join("rocksdb-blobdb"),
-        MetricConf::new("rocksdb_blobdb"),
+        MetricConf::new(ROCKSDB_BLOBDB_CF_CLASS),
         Some(options),
         None,
-        Some("rocksdb_blobdb"),
-        &rw_options,
+        Some(ROCKSDB_BLOBDB_CF_CLASS),
+        &ReadWriteOptions::default(),
     )?)
 }
 

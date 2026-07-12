@@ -8000,6 +8000,7 @@ dependencies = [
 name = "strata-bench"
 version = "0.1.0"
 dependencies = [
+ "bcs",
  "prometheus",
  "rocksdb",
  "strata-core",

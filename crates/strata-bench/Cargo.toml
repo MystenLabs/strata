@@ -11,6 +11,7 @@ default = ["internal-profiling"]
 internal-profiling = ["strata-store/internal-profiling"]
 
 [dependencies]
+bcs.workspace = true
 prometheus.workspace = true
 rocksdb.workspace = true
 strata-core.workspace = true
