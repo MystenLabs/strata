@@ -75,6 +75,7 @@ const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE: usize = 512 << 20;
 const DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS: usize = 4;
 const ROCKSDB_BLOBDB_CF_CLASS: &str = "rocksdb_blobdb";
 const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
+const ROCKSDB_PERF_METRICS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const BENCH_SEGMENT_ID: u64 = 1;
 
 /// Stores blob payloads using Serde's byte-buffer path instead of treating every byte as one
@@ -998,6 +999,10 @@ impl RocksDbPerfCapture {
         self.active = false;
         self.context.report(false)
     }
+
+    fn report(&self) -> String {
+        self.context.report(false)
+    }
 }
 
 impl Drop for RocksDbPerfCapture {
@@ -1036,6 +1041,7 @@ fn run_rocksdb_blobdb_get(
     let mut phases = PhaseTimings::new("rocksdb_get", config.ops);
     let perf_capture = config.rocksdb_get_profile.then(RocksDbPerfCapture::start);
     let started = Instant::now();
+    let mut last_perf_metrics_publish = started;
     let key_indexes = ReadKeySequence::new(config.read_pattern, keys.len(), config.read_seed);
 
     for key_index in key_indexes.take(config.ops) {
@@ -1047,6 +1053,15 @@ fn run_rocksdb_blobdb_get(
         phases.primary.push(phase_started.elapsed());
         hint::black_box(value.as_ref().map(|value| value.0.as_slice()));
         timings.push(op_started.elapsed());
+
+        if bench_metrics.rocksdb_perf_is_enabled()
+            && last_perf_metrics_publish.elapsed() >= ROCKSDB_PERF_METRICS_PUBLISH_INTERVAL
+        {
+            if let Some(perf_capture) = perf_capture.as_ref() {
+                bench_metrics.publish_rocksdb_get_profile(&perf_capture.report(), timings.len());
+            }
+            last_perf_metrics_publish = Instant::now();
+        }
     }
 
     let elapsed = started.elapsed();
@@ -1225,6 +1240,10 @@ impl BenchMetrics {
             metrics.set(report, ops);
         }
     }
+
+    fn rocksdb_perf_is_enabled(&self) -> bool {
+        self.rocksdb_perf.is_some()
+    }
 }
 
 struct RocksDbPerfPrometheusMetrics {
@@ -1239,33 +1258,33 @@ impl RocksDbPerfPrometheusMetrics {
     fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
         let profile_ops = IntGauge::new(
             "strata_bench_rocksdb_perf_profile_ops",
-            "Number of RocksDB get operations included in the final native perf snapshot.",
+            "Number of RocksDB get operations included in the latest native perf snapshot.",
         )?;
         let counts = IntGaugeVec::new(
             Opts::new(
                 "strata_bench_rocksdb_perf_count",
-                "Final RocksDB native perf count by counter.",
+                "Latest cumulative RocksDB native perf count by counter.",
             ),
             &["counter"],
         )?;
         let bytes = IntGaugeVec::new(
             Opts::new(
                 "strata_bench_rocksdb_perf_bytes",
-                "Final RocksDB native perf byte count by counter.",
+                "Latest cumulative RocksDB native perf byte count by counter.",
             ),
             &["counter"],
         )?;
         let seconds = GaugeVec::new(
             Opts::new(
                 "strata_bench_rocksdb_perf_seconds",
-                "Final cumulative RocksDB native perf time in seconds by counter.",
+                "Latest cumulative RocksDB native perf time in seconds by counter.",
             ),
             &["counter"],
         )?;
         let seconds_per_op = GaugeVec::new(
             Opts::new(
                 "strata_bench_rocksdb_perf_seconds_per_op",
-                "Final average RocksDB native perf time in seconds per profiled operation.",
+                "Latest average RocksDB native perf time in seconds per profiled operation.",
             ),
             &["counter"],
         )?;
@@ -1276,13 +1295,15 @@ impl RocksDbPerfPrometheusMetrics {
         registry.register(Box::new(seconds.clone()))?;
         registry.register(Box::new(seconds_per_op.clone()))?;
 
-        Ok(Self {
+        let metrics = Self {
             profile_ops,
             counts,
             bytes,
             seconds,
             seconds_per_op,
-        })
+        };
+        metrics.set("", 0);
+        Ok(metrics)
     }
 
     fn set(&self, report: &str, ops: usize) {
@@ -2487,6 +2508,18 @@ mod tests {
         let registry = Registry::new();
         let metrics =
             RocksDbPerfPrometheusMetrics::new(&registry).expect("perf metrics should register");
+
+        let mut initial = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut initial)
+            .expect("initial perf metrics should encode");
+        let initial = String::from_utf8(initial).expect("Prometheus output should be UTF-8");
+        assert!(initial.contains("strata_bench_rocksdb_perf_profile_ops 0"));
+        assert!(initial.contains("strata_bench_rocksdb_perf_count{counter=\"blob_read_count\"} 0"));
+        assert!(
+            initial.contains("strata_bench_rocksdb_perf_seconds_per_op{counter=\"blob_read\"} 0")
+        );
+
         metrics.set(
             "blob_read_count = 7, blob_read_byte = 7340032, blob_read_time = 21000",
             3,
