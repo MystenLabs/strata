@@ -1235,6 +1235,55 @@ async fn accounting_sidecar_ingests_active_delta_log_and_compacts_to_patch() {
 }
 
 #[tokio::test]
+async fn accounting_sidecar_nudge_ingests_without_forcing_compaction() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"sidecar-nudge".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.accounting_interval = Duration::from_secs(3600);
+    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    stop_accounting_worker(&mut store.store);
+
+    store.put(&key, b"payload").unwrap();
+    store.sync().unwrap();
+    accounting::run_accounting_sidecar_nudged_once(store.index(), store.config()).unwrap();
+
+    let active_state = active_delta_log_state(store.index());
+    let consumed_cursor = active_delta_log_read_cursor(store.index());
+    assert_eq!(consumed_cursor.offset, active_state.durable_offset);
+    assert_eq!(consumed_cursor.max_lsn, active_state.durable_lsn);
+
+    let sidecar = open_accounting_sidecar(&store);
+    let delta_count = sidecar
+        .manifest()
+        .partitions
+        .values()
+        .map(|partition| partition.deltas.len())
+        .sum::<usize>();
+    let patch_count = sidecar
+        .manifest()
+        .partitions
+        .values()
+        .map(|partition| partition.patches.len())
+        .sum::<usize>();
+    let base_count = sidecar
+        .manifest()
+        .partitions
+        .values()
+        .filter(|partition| partition.base.is_some())
+        .count();
+    assert_eq!(delta_count, 1);
+    assert_eq!(patch_count, 0);
+    assert_eq!(base_count, 0);
+    assert_eq!(store.accounted_lsn().unwrap(), 0);
+}
+
+#[tokio::test]
 async fn accounting_sidecar_major_compacts_when_patch_threshold_reached() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();

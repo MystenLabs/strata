@@ -68,10 +68,10 @@ pub(crate) struct AccountingWorker {
 impl AccountingWorker {
     /// Runs until shutdown or channel disconnect.
     ///
-    /// Explicit `Run` commands are correctness nudges from writes/syncs: they force the sidecar to
-    /// ingest and materialize durable deltas so `accounted_lsn` can advance. Timer ticks are cheaper
-    /// maintenance passes that still respect size/count thresholds unless the wall-clock backstop
-    /// fires.
+    /// Explicit `Run` commands are progress nudges from writes/syncs: they force the sidecar to
+    /// ingest durable deltas, while compaction still respects its size/count thresholds. Timer
+    /// ticks run the same threshold-based maintenance and retain the wall-clock backstop that
+    /// eventually forces materialization so `accounted_lsn` can advance on quiet stores.
     pub(crate) fn run(self) {
         let mut sidecar = AccountingSidecar::open(self.config.clone(), self.index.clone()).ok();
         loop {
@@ -86,7 +86,7 @@ impl AccountingWorker {
                         &self.config,
                         &self.index,
                         &self.gc_txs,
-                        SidecarRunMode::Forced,
+                        SidecarRunMode::Nudged,
                     );
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -120,7 +120,7 @@ impl AccountingWorker {
         }
         let failed = if let Some(current_sidecar) = sidecar.as_mut() {
             let result = match mode {
-                SidecarRunMode::Forced => current_sidecar.run_forced(),
+                SidecarRunMode::Nudged => current_sidecar.run_nudged(),
                 SidecarRunMode::Maintenance => current_sidecar.run(),
             };
             match result {
@@ -153,7 +153,7 @@ fn nudge_gc(gc_txs: &Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>) {
 
 #[derive(Clone, Copy, Debug)]
 enum SidecarRunMode {
-    Forced,
+    Nudged,
     Maintenance,
 }
 
@@ -173,6 +173,15 @@ pub(crate) fn run_accounting_sidecar_once(
 ) -> Result<()> {
     let mut sidecar = AccountingSidecar::open(config.clone(), index.clone())?;
     sidecar.run_once(force)
+}
+
+#[cfg(test)]
+pub(crate) fn run_accounting_sidecar_nudged_once(
+    index: &StrataIndex,
+    config: &StrataStoreConfig,
+) -> Result<()> {
+    let mut sidecar = AccountingSidecar::open(config.clone(), index.clone())?;
+    sidecar.run_nudged().map(|_| ())
 }
 
 #[cfg(test)]
@@ -226,6 +235,7 @@ impl AccountingSidecar {
     /// `force` becomes true on a wall-clock cadence so low-write stores still eventually compact
     /// small runs. Without that, a quiet store could accumulate many tiny delta files forever.
     fn run(&mut self) -> Result<bool> {
+        self.refresh_accounting_index()?;
         let pending_shard_drop = self
             .index
             .iter_shard_cleanup_jobs()?
@@ -240,14 +250,34 @@ impl AccountingSidecar {
         Ok(should_nudge_gc)
     }
 
-    /// Forces one materializing pass for an explicit writer/sync nudge.
+    /// Ingests durable deltas for an explicit writer/sync nudge.
     ///
-    /// This bypasses the sidecar size/count thresholds because callers waiting on durability expect
-    /// any durable accounting deltas to be reflected in GC-facing rows promptly.
-    fn run_forced(&mut self) -> Result<bool> {
-        let should_nudge_gc = self.run_once_materializing(true)?;
-        self.last_forced_run = Instant::now();
+    /// Nudges bypass only the ingest threshold. Delta and major compaction retain their run-count
+    /// and byte thresholds so a segment rollover does not force a synced publication for every
+    /// populated partition. Unlike a wall-clock forced maintenance pass, a nudge does not reset
+    /// `last_forced_run`; low-volume traffic therefore cannot postpone materialization forever.
+    fn run_nudged(&mut self) -> Result<bool> {
+        self.refresh_accounting_index()?;
+        let mut should_nudge_gc = self.ingest_active_delta_log(true)?;
+        should_nudge_gc |= self.compact_sidecar(false, false)?;
+        should_nudge_gc |= self.materialize_shard_drops()?;
         Ok(should_nudge_gc)
+    }
+
+    /// Refreshes this handle after another serialized publisher advances the durable manifest.
+    ///
+    /// The background worker is normally the only production publisher, but tests and maintenance
+    /// tooling can open a second handle under the same run lock. Compaction may delete files from
+    /// the previous manifest after publishing its replacement, so a long-lived stale handle must
+    /// adopt the durable generation before preparing more work.
+    fn refresh_accounting_index(&mut self) -> Result<()> {
+        let Some(manifest) = self.index.get_accounting_index_manifest()? else {
+            return Ok(());
+        };
+        if manifest.generation != self.accounting_index.manifest().generation {
+            self.accounting_index.apply_manifest(manifest)?;
+        }
+        Ok(())
     }
 
     /// Ingests new active-log deltas first, then compacts sidecar files.
