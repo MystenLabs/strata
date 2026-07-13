@@ -1,8 +1,8 @@
 //! Small benchmark harness for comparing Strata paths against RocksDB blob files.
 //!
-//! It creates a fresh root directory,
-//! runs one case, prints machine-readable key/value metrics, and removes default temporary data
-//! unless `--keep-data` is set.
+//! It creates a fresh root directory, runs one case, prints machine-readable key/value metrics,
+//! and removes default temporary data unless `--keep-data` is set. Get cases can instead reopen a
+//! prior put case's root with `--reuse-existing`.
 //!
 //! Cases:
 //!
@@ -226,6 +226,7 @@ struct Config {
     sync_every: usize,
     metrics_listen: Option<String>,
     metrics_drain_seconds: u64,
+    reuse_existing: bool,
     keep_data: bool,
     root_was_defaulted: bool,
 }
@@ -263,6 +264,7 @@ impl Config {
             sync_every: 0,
             metrics_listen: None,
             metrics_drain_seconds: DEFAULT_METRICS_DRAIN_SECONDS,
+            reuse_existing: false,
             keep_data: false,
             root_was_defaulted: true,
         };
@@ -377,6 +379,7 @@ impl Config {
                     config.metrics_drain_seconds =
                         parse_u64(&next_value(&mut args, "--metrics-drain-seconds")?)?
                 }
+                "--reuse-existing" => config.reuse_existing = true,
                 "--keep-data" => config.keep_data = true,
                 unknown => return Err(format!("unknown argument '{unknown}'")),
             }
@@ -406,8 +409,30 @@ impl Config {
         if config.strata_gc && !config.strata_accounting {
             return Err("--strata-gc true requires --strata-accounting true".to_owned());
         }
+        if config.reuse_existing
+            && !matches!(
+                config.case,
+                BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet
+            )
+        {
+            return Err(
+                "--reuse-existing is only supported for store-get and rocksdb-blobdb-get"
+                    .to_owned(),
+            );
+        }
+        if config.reuse_existing && config.root_was_defaulted {
+            return Err("--reuse-existing requires --root <path>".to_owned());
+        }
 
         Ok(config)
+    }
+
+    fn effective_read_set_size(&self) -> usize {
+        if self.reuse_existing {
+            self.read_set_size
+        } else {
+            self.read_set_size.min(self.ops.max(1))
+        }
     }
 
     fn store_config(&self) -> StrataStoreConfig {
@@ -646,10 +671,23 @@ fn metrics_with_profile_capture(
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let bench_metrics = BenchMetrics::start(&config)?;
 
-    if config.root_dir.exists() {
-        fs::remove_dir_all(&config.root_dir)?;
+    if config.reuse_existing {
+        if !config.root_dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "--reuse-existing root does not exist or is not a directory: {}",
+                    config.root_dir.display()
+                ),
+            )
+            .into());
+        }
+    } else {
+        if config.root_dir.exists() {
+            fs::remove_dir_all(&config.root_dir)?;
+        }
+        fs::create_dir_all(&config.root_dir)?;
     }
-    fs::create_dir_all(&config.root_dir)?;
 
     let result = match config.case {
         BenchCase::SegmentAppend => run_segment_append(&config),
@@ -809,15 +847,22 @@ fn run_store_get(
         store_config,
         bench_metrics.store_metrics(&config.namespace)?,
     )?;
-    let read_set_size = config.read_set_size.min(config.ops.max(1));
+    let read_set_size = config.effective_read_set_size();
+    let key_prefix: &[u8] = if config.reuse_existing {
+        b"store-key-"
+    } else {
+        b"read-key-"
+    };
     let keys = (0..read_set_size)
-        .map(|op| bench_key(b"read-key-", op))
+        .map(|op| bench_key(key_prefix, op))
         .collect::<Result<Vec<_>, _>>()?;
 
-    for key in &keys {
-        store.put(0, key, &payload)?;
+    if !config.reuse_existing {
+        for key in &keys {
+            store.put(0, key, &payload)?;
+        }
+        store.sync()?;
     }
-    store.sync()?;
 
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("store_get", config.ops);
@@ -839,6 +884,7 @@ fn run_store_get(
                 if let Some(profile_summary) = &mut profile_summary {
                     let (value, profile) =
                         store.get_blob_profiled_with_options(key, read_options)?;
+                    verify_reused_key_found(config, value.is_some(), key.as_bytes())?;
                     hint::black_box(value.as_deref());
                     phases.primary.push(phase_started.elapsed());
                     let op_elapsed = op_started.elapsed();
@@ -848,10 +894,12 @@ fn run_store_get(
                 }
 
                 let value = store.get_with_options(key, read_options)?;
+                verify_reused_key_found(config, value.is_some(), key.as_bytes())?;
                 hint::black_box(value.as_deref());
             }
             StoreGetMode::KeyOnly => {
                 let exists = store.contains(key)?;
+                verify_reused_key_found(config, exists, key.as_bytes())?;
                 hint::black_box(exists);
             }
         }
@@ -912,16 +960,23 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
 fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = payload(config.payload_size);
     let db = open_typed_rocksdb_blobdb(config)?;
-    let read_set_size = config.read_set_size.min(config.ops.max(1));
+    let read_set_size = config.effective_read_set_size();
+    let key_prefix: &[u8] = if config.reuse_existing {
+        b"rocksdb-key-"
+    } else {
+        b"rocksdb-read-key-"
+    };
     let keys = (0..read_set_size)
-        .map(|op| bench_key(b"rocksdb-read-key-", op))
+        .map(|op| bench_key(key_prefix, op))
         .map(|result| result.map(|key| key.as_bytes().to_vec()))
         .collect::<Result<Vec<_>, _>>()?;
 
-    for key in &keys {
-        insert_rocksdb_blobdb(&db, key, &payload, config.rocksdb_disable_wal)?;
+    if !config.reuse_existing {
+        for key in &keys {
+            insert_rocksdb_blobdb(&db, key, &payload, config.rocksdb_disable_wal)?;
+        }
+        flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
     }
-    flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
 
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("rocksdb_get", config.ops);
@@ -933,6 +988,7 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
         let op_started = Instant::now();
         let phase_started = Instant::now();
         let value = db.get(key)?;
+        verify_reused_key_found(config, value.is_some(), key)?;
         phases.primary.push(phase_started.elapsed());
         hint::black_box(value.as_deref());
         timings.push(op_started.elapsed());
@@ -949,6 +1005,19 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
         rocksdb: Some(db.rocksdb.as_ref()),
         profile_capture: None,
     })?;
+    Ok(())
+}
+
+fn verify_reused_key_found(config: &Config, found: bool, key: &[u8]) -> io::Result<()> {
+    if config.reuse_existing && !found {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "key from reused write set was not found: {}",
+                String::from_utf8_lossy(key)
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1209,6 +1278,7 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!("read_set_size={}", config.read_set_size);
     println!("read_pattern={}", config.read_pattern.as_str());
     println!("read_seed={}", config.read_seed);
+    println!("reuse_existing={}", config.reuse_existing);
     println!("store_get_mode={}", config.store_get_mode.as_str());
     println!("store_get_profile={}", config.store_get_profile);
     println!(
@@ -1302,9 +1372,7 @@ fn database_logical_payload_bytes(config: &Config, measured_ops: usize) -> u128 
         | BenchCase::StorePut
         | BenchCase::StorePutArc
         | BenchCase::RocksDbBlobDbPut => measured_ops,
-        BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet => {
-            config.read_set_size.min(config.ops.max(1))
-        }
+        BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet => config.effective_read_set_size(),
     };
     payload_bytes(config, stored_payload_ops)
 }
@@ -2024,6 +2092,7 @@ options:
   --read-set-size <count>
   --read-pattern <sequential|random>
   --read-seed <u64>
+  --reuse-existing                    get: reopen --root and read keys from prior put case
   --store-get-mode <payload|key-only>
   --store-get-profile
   --store-get-verify-checksum <true|false>
@@ -2137,6 +2206,62 @@ mod tests {
         assert_eq!(
             config.sealed_segment_integrity_policy,
             SealedSegmentIntegrityPolicy::Checksum
+        );
+    }
+
+    #[test]
+    fn config_allows_get_to_reuse_full_existing_write_set() {
+        let config = Config::parse(
+            [
+                "--case",
+                "store-get",
+                "--root",
+                "/tmp/strata-bench-existing",
+                "--ops",
+                "3",
+                "--read-set-size",
+                "10",
+                "--reuse-existing",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("existing get config should parse");
+
+        assert!(config.reuse_existing);
+        assert_eq!(config.effective_read_set_size(), 10);
+    }
+
+    #[test]
+    fn config_requires_explicit_root_when_reusing_existing_data() {
+        let error = Config::parse(
+            ["--case", "store-get", "--reuse-existing"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("reuse without an explicit root should be rejected");
+
+        assert_eq!(error, "--reuse-existing requires --root <path>");
+    }
+
+    #[test]
+    fn config_rejects_reuse_for_put_cases() {
+        let error = Config::parse(
+            [
+                "--case",
+                "store-put",
+                "--root",
+                "/tmp/strata-bench-existing",
+                "--reuse-existing",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect_err("put cases should not reuse an existing root");
+
+        assert_eq!(
+            error,
+            "--reuse-existing is only supported for store-get and rocksdb-blobdb-get"
         );
     }
 
