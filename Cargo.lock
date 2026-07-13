@@ -8003,6 +8003,8 @@ dependencies = [
  "bcs",
  "prometheus",
  "rocksdb",
+ "serde",
+ "serde_with",
  "strata-core",
  "strata-segment",
  "strata-store",

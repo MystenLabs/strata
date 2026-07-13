@@ -33,6 +33,8 @@ use std::{
 
 use prometheus::{Encoder, Registry, TextEncoder};
 use rocksdb::{DB, Env, WriteOptions};
+use serde::{Deserialize, Serialize};
+use serde_with::{Bytes, serde_as};
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
 use strata_segment::SegmentWriter;
 use strata_store::{
@@ -72,7 +74,15 @@ const DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS: usize = 4;
 const ROCKSDB_BLOBDB_CF_CLASS: &str = "rocksdb_blobdb";
 const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
 const BENCH_SEGMENT_ID: u64 = 1;
-type BlobDbMap = DBMap<Vec<u8>, Vec<u8>>;
+
+/// Stores blob payloads using Serde's byte-buffer path instead of treating every byte as one
+/// sequence element. BCS uses the same length-prefixed wire representation for both paths, so this
+/// remains compatible with values previously written as a bare `Vec<u8>`.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BlobDbValue(#[serde_as(as = "Bytes")] Vec<u8>);
+
+type BlobDbMap = DBMap<Vec<u8>, BlobDbValue>;
 
 fn main() {
     match Config::parse(env::args().skip(1)) {
@@ -922,7 +932,7 @@ fn run_store_get(
 }
 
 fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = payload(config.payload_size);
+    let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("rocksdb_put", config.ops);
@@ -958,7 +968,7 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
 }
 
 fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = payload(config.payload_size);
+    let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
     let read_set_size = config.effective_read_set_size();
     let key_prefix: &[u8] = if config.reuse_existing {
@@ -990,7 +1000,7 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
         let value = db.get(key)?;
         verify_reused_key_found(config, value.is_some(), key)?;
         phases.primary.push(phase_started.elapsed());
-        hint::black_box(value.as_deref());
+        hint::black_box(value.as_ref().map(|value| value.0.as_slice()));
         timings.push(op_started.elapsed());
     }
 
@@ -1024,7 +1034,7 @@ fn verify_reused_key_found(config: &Config, found: bool, key: &[u8]) -> io::Resu
 fn insert_rocksdb_blobdb(
     db: &BlobDbMap,
     key: &Vec<u8>,
-    value: &Vec<u8>,
+    value: &BlobDbValue,
     disable_wal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !disable_wal {
@@ -2121,6 +2131,28 @@ options:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimized_blob_db_value_preserves_legacy_bcs_encoding() {
+        let payload = (0..4096)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let legacy_bytes = bcs::to_bytes(&payload).expect("legacy Vec should serialize");
+        let optimized = BlobDbValue(payload.clone());
+        let optimized_bytes = bcs::to_bytes(&optimized).expect("optimized value should serialize");
+
+        assert_eq!(optimized_bytes, legacy_bytes);
+        assert_eq!(
+            bcs::from_bytes::<BlobDbValue>(&legacy_bytes)
+                .expect("optimized value should decode legacy bytes"),
+            optimized
+        );
+        assert_eq!(
+            bcs::from_bytes::<Vec<u8>>(&optimized_bytes)
+                .expect("legacy Vec should decode optimized bytes"),
+            payload
+        );
+    }
 
     #[test]
     fn read_key_sequence_round_robins_for_sequential_pattern() {

@@ -36,6 +36,7 @@ bcs = "0.1.6"
 prometheus = "0.14.0"
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "multi-threaded-cf", "snappy", "zlib", "zstd"] }
 serde = { version = "1", features = ["derive"] }
+serde_with = "3.20"
 sha2 = "0.10"
 strata-accounting = { path = "crates/strata-accounting" }
 strata-core = { path = "crates/strata-core" }
