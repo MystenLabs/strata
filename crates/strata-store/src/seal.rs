@@ -18,7 +18,7 @@ use strata_index::StrataIndex;
 
 use crate::{
     Error, Result, SealedSegmentIntegrityPolicy, StoreHalt, StrataStoreConfig, StrataStoreMetrics,
-    accounting::AccountingCommand,
+    accounting::AccountingRequestSender,
     active_segment_state_from_path,
     layout::{segment_path, segment_state_path},
     unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
@@ -52,7 +52,7 @@ pub(crate) struct SealWorker {
     pub(crate) ingest_owner: SegmentOwner,
     pub(crate) seal_rx: mpsc::Receiver<SealCommand>,
     pub(crate) durability_publish_lock: Arc<Mutex<()>>,
-    pub(crate) accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
+    pub(crate) accounting_tx: Option<AccountingRequestSender>,
     pub(crate) metrics: StrataStoreMetrics,
     pub(crate) store_halt: StoreHalt,
 }
@@ -200,7 +200,7 @@ struct SealPublisher {
     index: StrataIndex,
     ingest_owner: SegmentOwner,
     event_rx: mpsc::Receiver<SealPublisherEvent>,
-    accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
+    accounting_tx: Option<AccountingRequestSender>,
     durability_publish_lock: Arc<Mutex<()>>,
     metrics: StrataStoreMetrics,
     store_halt: StoreHalt,
@@ -284,7 +284,7 @@ pub(crate) fn publish_ready_completed_seals(
     index: &StrataIndex,
     ingest_owner: SegmentOwner,
     durability_publish_lock: &Arc<Mutex<()>>,
-    accounting_tx: Option<&mpsc::SyncSender<AccountingCommand>>,
+    accounting_tx: Option<&AccountingRequestSender>,
     metrics: &StrataStoreMetrics,
     completed: &mut BTreeMap<SegmentId, CompletedSeal>,
     sealing: &mut BinaryHeap<Reverse<SegmentId>>,
@@ -402,7 +402,7 @@ fn publish_sealed_segment(
     index: &StrataIndex,
     ingest_owner: SegmentOwner,
     durability_publish_lock: &Arc<Mutex<()>>,
-    accounting_tx: Option<&mpsc::SyncSender<AccountingCommand>>,
+    accounting_tx: Option<&AccountingRequestSender>,
     metrics: &StrataStoreMetrics,
     completed: CompletedSeal,
 ) -> Result<()> {
@@ -454,7 +454,7 @@ fn publish_sealed_segment(
     metrics.set_durable_lsn(durable_lsn);
     metrics.set_unsealed_segments(unsealed_ingest_segment_count(index)?);
     if let Some(accounting_tx) = accounting_tx {
-        let _ = accounting_tx.try_send(AccountingCommand::Run);
+        accounting_tx.request_ingest();
     }
     Ok(())
 }

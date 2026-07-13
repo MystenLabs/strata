@@ -162,7 +162,7 @@ use strata_index::StrataIndex;
 pub use strata_index::{AccountingRefEvent, AccountingSnapshot, AccountingSnapshotGuard};
 use strata_segment::{SegmentScanner, SegmentWriter};
 
-use accounting::{AccountingCommand, AccountingWorker};
+use accounting::{AccountingRequestSender, AccountingWorker, accounting_request_channel};
 pub use config::{
     DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
     DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
@@ -224,7 +224,7 @@ pub struct StrataStore {
     writer_handle: Option<JoinHandle<()>>,
     seal_tx: Option<mpsc::Sender<SealCommand>>,
     seal_handle: Option<JoinHandle<()>>,
-    accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
+    accounting_tx: Option<AccountingRequestSender>,
     accounting_handle: Option<JoinHandle<()>>,
     pub(crate) gc_txs: Vec<mpsc::Sender<GcCommand>>,
     gc_handles: Vec<JoinHandle<()>>,
@@ -390,7 +390,12 @@ impl StrataStore {
         metrics.set_current_epoch(current_epoch);
         metrics.set_unsealed_segments(unsealed_ingest_segment_count(&index)?);
         let (seal_tx, seal_rx) = mpsc::channel();
-        let (accounting_tx, accounting_rx) = mpsc::sync_channel(1);
+        let (
+            accounting_tx,
+            accounting_rx,
+            pending_accounting_request,
+            pending_materialize_through_lsn,
+        ) = accounting_request_channel();
         let accounting_lock = Arc::new(Mutex::new(()));
         let gc_publish_cleanup_lock = Arc::new(Mutex::new(()));
         let accounting_gc_txs = Arc::new(Mutex::new(Vec::new()));
@@ -408,6 +413,8 @@ impl StrataStore {
                 index: index.clone(),
                 interval: config.accounting_interval,
                 command_rx: accounting_rx,
+                pending_request: pending_accounting_request,
+                pending_materialize_through_lsn,
                 run_lock: Arc::clone(&accounting_lock),
                 gc_txs: Arc::clone(&accounting_gc_txs),
             };
@@ -519,9 +526,14 @@ impl StrataStore {
             }
         }
 
-        if !index.iter_shard_cleanup_jobs()?.is_empty() {
+        let pending_shard_cleanup_lsn = index
+            .iter_shard_cleanup_jobs()?
+            .into_iter()
+            .map(|job| job.drop_lsn)
+            .max();
+        if let Some(drop_lsn) = pending_shard_cleanup_lsn {
             if let Some(accounting_tx) = &store_accounting_tx {
-                let _ = accounting_tx.try_send(AccountingCommand::Run);
+                accounting_tx.request_materialize(drop_lsn);
             }
             for gc_tx in &gc_txs {
                 let _ = gc_tx.send(GcCommand::Run);
@@ -630,11 +642,14 @@ impl StrataStore {
             shard_id,
             response_tx,
         }))?;
-        let _shard = response_rx
+        let shard = response_rx
             .recv()
             .map_err(|_| Error::WriteResponseDropped)??;
-        if let Some(accounting_tx) = &self.accounting_tx {
-            let _ = accounting_tx.try_send(AccountingCommand::Run);
+        if let (Some(accounting_tx), Some(job)) = (
+            self.accounting_tx.as_ref(),
+            self.index.get_shard_cleanup_job(shard)?,
+        ) {
+            accounting_tx.request_materialize(job.drop_lsn);
         }
         Ok(())
     }
@@ -893,7 +908,7 @@ impl Drop for StrataStore {
             let _ = seal_handle.join();
         }
         if let Some(accounting_tx) = self.accounting_tx.take() {
-            let _ = accounting_tx.send(AccountingCommand::Shutdown);
+            accounting_tx.shutdown();
         }
         if let Some(accounting_handle) = self.accounting_handle.take() {
             let _ = accounting_handle.join();
@@ -1310,8 +1325,8 @@ enum PostCommitAction {
     MaybeNudgeAccounting {
         latest_lsn: StrataLsn,
         threshold: usize,
-        force: bool,
-        accounting_tx: mpsc::SyncSender<AccountingCommand>,
+        materialize: bool,
+        accounting_tx: AccountingRequestSender,
     },
     EnqueueSeal {
         seal_tx: mpsc::Sender<SealCommand>,
@@ -1331,11 +1346,13 @@ impl PostCommitAction {
             Self::MaybeNudgeAccounting {
                 latest_lsn,
                 threshold,
-                force,
+                materialize,
                 accounting_tx,
             } => {
-                if force || threshold == 0 || latest_lsn % threshold as u64 == 0 {
-                    let _ = accounting_tx.try_send(AccountingCommand::Run);
+                if materialize {
+                    accounting_tx.request_materialize(latest_lsn);
+                } else if threshold == 0 || latest_lsn % threshold as u64 == 0 {
+                    accounting_tx.request_ingest();
                 }
             }
             Self::EnqueueSeal {
@@ -1354,13 +1371,13 @@ impl PostCommitAction {
 fn accounting_nudge_action(
     latest_lsn: StrataLsn,
     threshold: usize,
-    force: bool,
-    accounting_tx: mpsc::SyncSender<AccountingCommand>,
+    materialize: bool,
+    accounting_tx: AccountingRequestSender,
 ) -> PostCommitAction {
     PostCommitAction::MaybeNudgeAccounting {
         latest_lsn,
         threshold,
-        force,
+        materialize,
         accounting_tx,
     }
 }
@@ -1403,7 +1420,7 @@ struct WriteCoordinator {
     pending_rollovers: Vec<PendingRollover>,
     segment_ids: SegmentIdAllocator,
     seal_tx: mpsc::Sender<SealCommand>,
-    accounting_tx: Option<mpsc::SyncSender<AccountingCommand>>,
+    accounting_tx: Option<AccountingRequestSender>,
     write_rx: mpsc::Receiver<WriteCommand>,
     ingest_owner: SegmentOwner,
     reader_cache: Arc<SegmentReaderCache>,
@@ -1616,7 +1633,7 @@ impl WriteCoordinator {
         self.metrics.set_next_lsn(next_lsn);
         self.metrics.set_durable_lsn(drop_lsn);
         if let Some(accounting_tx) = &self.accounting_tx {
-            let _ = accounting_tx.try_send(AccountingCommand::Run);
+            accounting_tx.request_materialize(drop_lsn);
         }
         Ok(())
     }
@@ -1884,7 +1901,7 @@ impl WriteCoordinator {
             |profile, elapsed| profile.rollover_post_commit += elapsed,
             || self.run_rollover_post_commit(pending_rollovers),
         );
-        let force_accounting_nudge = prepared.result.last_epoch().is_some();
+        let materialize_accounting = prepared.result.last_epoch().is_some();
         if let (Some(last_lsn), Some(accounting_tx)) =
             (prepared.result.last_lsn(), self.accounting_tx.clone())
         {
@@ -1895,7 +1912,7 @@ impl WriteCoordinator {
                     accounting_nudge_action(
                         last_lsn,
                         self.config.accounting_unaccounted_threshold,
-                        force_accounting_nudge,
+                        materialize_accounting,
                         accounting_tx,
                     )
                     .run()
@@ -2107,7 +2124,7 @@ impl WriteCoordinator {
                     .expect("published records are non-empty and checked above");
                 self.metrics.set_next_lsn(next_lsn);
                 if let Some(accounting_tx) = &self.accounting_tx {
-                    let _ = accounting_tx.try_send(AccountingCommand::Run);
+                    accounting_tx.request_ingest();
                 }
                 Ok(GcPublishResult {
                     reconciled_accounted_lsn,
@@ -2871,11 +2888,11 @@ impl WriteCoordinator {
         Ok(())
     }
 
-    /// `try_send` into a bounded(1) channel: if a run is already queued, the nudge coalesces into
-    /// it and the drop is intentional. Accounting must never apply backpressure to the writer.
+    /// Requests share a bounded(1) wake channel but retain their highest pending priority
+    /// separately, so coalescing never applies backpressure or loses a materialization request.
     fn nudge_accounting(&self) {
         if let Some(accounting_tx) = &self.accounting_tx {
-            let _ = accounting_tx.try_send(AccountingCommand::Run);
+            accounting_tx.request_ingest();
         }
     }
 }

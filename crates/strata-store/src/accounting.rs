@@ -17,7 +17,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -37,14 +41,73 @@ use crate::{Error, Result, config::StrataStoreConfig, gc::GcCommand};
 
 #[derive(Debug)]
 pub(crate) enum AccountingCommand {
-    /// Ask the background worker to catch accounting up soon.
-    ///
-    /// Failure example: without a cheap nudge from writes and syncs, accounting would only move on
-    /// the periodic interval, so GC could keep reclaimable sealed segments pinned far longer than
-    /// the writer intended.
-    Run,
+    /// Wake the worker so it can consume the highest-priority coalesced request.
+    Wake,
     /// Stop the background worker after pending channel work has drained.
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+enum AccountingRequest {
+    None = 0,
+    Ingest = 1,
+    Materialize = 2,
+}
+
+/// Non-blocking accounting request handle shared by foreground, seal, and GC paths.
+///
+/// The wake channel remains bounded to one so repeated ingest requests coalesce. Request priority
+/// lives separately: a materialization request promotes an already queued ingest wakeup instead of
+/// being dropped behind it or applying backpressure to the caller.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountingRequestSender {
+    command_tx: mpsc::SyncSender<AccountingCommand>,
+    pending_request: Arc<AtomicU8>,
+    pending_materialize_through_lsn: Arc<AtomicU64>,
+}
+
+impl AccountingRequestSender {
+    pub(crate) fn request_ingest(&self) {
+        self.request(AccountingRequest::Ingest);
+    }
+
+    pub(crate) fn request_materialize(&self, through_lsn: StrataLsn) {
+        self.pending_materialize_through_lsn
+            .fetch_max(through_lsn, Ordering::AcqRel);
+        self.request(AccountingRequest::Materialize);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _ = self.command_tx.send(AccountingCommand::Shutdown);
+    }
+
+    fn request(&self, request: AccountingRequest) {
+        self.pending_request
+            .fetch_max(request as u8, Ordering::AcqRel);
+        let _ = self.command_tx.try_send(AccountingCommand::Wake);
+    }
+}
+
+pub(crate) fn accounting_request_channel() -> (
+    AccountingRequestSender,
+    mpsc::Receiver<AccountingCommand>,
+    Arc<AtomicU8>,
+    Arc<AtomicU64>,
+) {
+    let (command_tx, command_rx) = mpsc::sync_channel(1);
+    let pending_request = Arc::new(AtomicU8::new(AccountingRequest::None as u8));
+    let pending_materialize_through_lsn = Arc::new(AtomicU64::new(0));
+    (
+        AccountingRequestSender {
+            command_tx,
+            pending_request: Arc::clone(&pending_request),
+            pending_materialize_through_lsn: Arc::clone(&pending_materialize_through_lsn),
+        },
+        command_rx,
+        pending_request,
+        pending_materialize_through_lsn,
+    )
 }
 
 /// Background accounting loop for one store.
@@ -61,6 +124,8 @@ pub(crate) struct AccountingWorker {
     pub(crate) index: StrataIndex,
     pub(crate) interval: Duration,
     pub(crate) command_rx: mpsc::Receiver<AccountingCommand>,
+    pub(crate) pending_request: Arc<AtomicU8>,
+    pub(crate) pending_materialize_through_lsn: Arc<AtomicU64>,
     pub(crate) run_lock: Arc<Mutex<()>>,
     pub(crate) gc_txs: Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
 }
@@ -68,30 +133,67 @@ pub(crate) struct AccountingWorker {
 impl AccountingWorker {
     /// Runs until shutdown or channel disconnect.
     ///
-    /// Explicit `Run` commands are progress nudges from writes/syncs: they force the sidecar to
-    /// ingest durable deltas, while compaction still respects its size/count thresholds. Timer
-    /// ticks run the same threshold-based maintenance and retain the wall-clock backstop that
-    /// eventually forces materialization so `accounted_lsn` can advance on quiet stores.
+    /// Ingest requests force the sidecar to consume durable deltas while compaction still respects
+    /// its thresholds. Materialize requests force the complete pipeline for rare semantic work
+    /// such as shard cleanup and epoch changes. Timer ticks retain the wall-clock backstop that
+    /// eventually materializes quiet stores.
     pub(crate) fn run(self) {
         let mut sidecar = AccountingSidecar::open(self.config.clone(), self.index.clone()).ok();
         loop {
             match self.command_rx.recv_timeout(self.interval) {
-                Ok(AccountingCommand::Run) => {
+                Ok(AccountingCommand::Wake) => {
+                    let Some((mut mode, mut materialize_through_lsn)) = take_pending_run_mode(
+                        &self.pending_request,
+                        &self.pending_materialize_through_lsn,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(through_lsn) = materialize_through_lsn
+                        && self
+                            .index
+                            .get_durable_lsn()
+                            .is_ok_and(|durable_lsn| durable_lsn < through_lsn)
+                    {
+                        // The semantic operation is visible but not crash-safe yet. Preserve its
+                        // priority for the sync/seal wakeup that makes the target durable, while
+                        // keeping this early wakeup on the cheap ingest-only path.
+                        rearm_materialization(
+                            &self.pending_request,
+                            &self.pending_materialize_through_lsn,
+                            through_lsn,
+                        );
+                        mode = SidecarRunMode::Nudged;
+                        materialize_through_lsn = None;
+                    }
                     // Systems invariant: one sidecar pass at a time. Live-allocation overlay
                     // operands are not idempotent, so duplicate application would corrupt GC
                     // summary counters.
                     let _guard = self.run_lock.lock().expect("accounting run lock poisoned");
-                    Self::run_sidecar(
+                    let succeeded = Self::run_sidecar(
                         &mut sidecar,
                         &self.config,
                         &self.index,
                         &self.gc_txs,
-                        SidecarRunMode::Nudged,
+                        mode,
                     );
+                    if let Some(through_lsn) = materialize_through_lsn {
+                        let reached_target = succeeded
+                            && matches!(
+                                self.index.get_accounted_lsn(),
+                                Ok(accounted_lsn) if accounted_lsn >= through_lsn
+                            );
+                        if !reached_target {
+                            rearm_materialization(
+                                &self.pending_request,
+                                &self.pending_materialize_through_lsn,
+                                through_lsn,
+                            );
+                        }
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let _guard = self.run_lock.lock().expect("accounting run lock poisoned");
-                    Self::run_sidecar(
+                    let _ = Self::run_sidecar(
                         &mut sidecar,
                         &self.config,
                         &self.index,
@@ -112,7 +214,7 @@ impl AccountingWorker {
         index: &StrataIndex,
         gc_txs: &Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
         mode: SidecarRunMode,
-    ) {
+    ) -> bool {
         if sidecar.is_none() {
             // Future-maintainer note: sidecar setup can fail transiently while the active log or
             // manifest is being initialized. Retry later instead of killing the worker.
@@ -121,6 +223,7 @@ impl AccountingWorker {
         let failed = if let Some(current_sidecar) = sidecar.as_mut() {
             let result = match mode {
                 SidecarRunMode::Nudged => current_sidecar.run_nudged(),
+                SidecarRunMode::Materialize => current_sidecar.run_materializing(),
                 SidecarRunMode::Maintenance => current_sidecar.run(),
             };
             match result {
@@ -141,6 +244,7 @@ impl AccountingWorker {
             // pass so the in-memory manifest never drifts from RocksDB.
             *sidecar = None;
         }
+        !failed
     }
 }
 
@@ -154,7 +258,77 @@ fn nudge_gc(gc_txs: &Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>) {
 #[derive(Clone, Copy, Debug)]
 enum SidecarRunMode {
     Nudged,
+    Materialize,
     Maintenance,
+}
+
+fn take_pending_run_mode(
+    pending_request: &AtomicU8,
+    pending_materialize_through_lsn: &AtomicU64,
+) -> Option<(SidecarRunMode, Option<StrataLsn>)> {
+    match pending_request.swap(AccountingRequest::None as u8, Ordering::AcqRel) {
+        value if value == AccountingRequest::None as u8 => None,
+        value if value == AccountingRequest::Ingest as u8 => Some((SidecarRunMode::Nudged, None)),
+        value if value == AccountingRequest::Materialize as u8 => {
+            let through_lsn = pending_materialize_through_lsn.swap(0, Ordering::AcqRel);
+            (through_lsn != 0).then_some((SidecarRunMode::Materialize, Some(through_lsn)))
+        }
+        value => panic!("unknown accounting request priority {value}"),
+    }
+}
+
+fn rearm_materialization(
+    pending_request: &AtomicU8,
+    pending_materialize_through_lsn: &AtomicU64,
+    through_lsn: StrataLsn,
+) {
+    pending_materialize_through_lsn.fetch_max(through_lsn, Ordering::AcqRel);
+    pending_request.fetch_max(AccountingRequest::Materialize as u8, Ordering::AcqRel);
+}
+
+#[cfg(test)]
+mod request_tests {
+    use std::sync::mpsc::TryRecvError;
+
+    use super::*;
+
+    #[test]
+    fn materialize_promotes_an_already_queued_ingest_wakeup() {
+        let (sender, command_rx, pending_request, pending_materialize_through_lsn) =
+            accounting_request_channel();
+
+        sender.request_ingest();
+        sender.request_materialize(7);
+
+        assert!(matches!(command_rx.try_recv(), Ok(AccountingCommand::Wake)));
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(
+            take_pending_run_mode(&pending_request, &pending_materialize_through_lsn),
+            Some((SidecarRunMode::Materialize, Some(7)))
+        ));
+    }
+
+    #[test]
+    fn unfinished_materialization_promotes_the_next_ingest_wakeup() {
+        let (sender, command_rx, pending_request, pending_materialize_through_lsn) =
+            accounting_request_channel();
+
+        sender.request_materialize(9);
+        assert!(matches!(command_rx.try_recv(), Ok(AccountingCommand::Wake)));
+        assert!(matches!(
+            take_pending_run_mode(&pending_request, &pending_materialize_through_lsn),
+            Some((SidecarRunMode::Materialize, Some(9)))
+        ));
+
+        rearm_materialization(&pending_request, &pending_materialize_through_lsn, 9);
+        sender.request_ingest();
+
+        assert!(matches!(command_rx.try_recv(), Ok(AccountingCommand::Wake)));
+        assert!(matches!(
+            take_pending_run_mode(&pending_request, &pending_materialize_through_lsn),
+            Some((SidecarRunMode::Materialize, Some(9)))
+        ));
+    }
 }
 
 fn lifecycle_is_expired(lifecycle: Option<BlobLifecycle>, current_epoch: Epoch) -> bool {
@@ -190,7 +364,7 @@ pub(crate) fn run_accounting_sidecar_materializing_once(
     config: &StrataStoreConfig,
 ) -> Result<()> {
     let mut sidecar = AccountingSidecar::open(config.clone(), index.clone())?;
-    sidecar.run_once_materializing(true).map(|_| ())
+    sidecar.run_materializing().map(|_| ())
 }
 
 /// Incremental sidecar builder for durable accounting delta logs.
@@ -261,6 +435,15 @@ impl AccountingSidecar {
         let mut should_nudge_gc = self.ingest_active_delta_log(true)?;
         should_nudge_gc |= self.compact_sidecar(false, false)?;
         should_nudge_gc |= self.materialize_shard_drops()?;
+        Ok(should_nudge_gc)
+    }
+
+    /// Forces ingest, delta compaction, and major compaction for semantic operations whose
+    /// asynchronous cleanup should begin immediately.
+    fn run_materializing(&mut self) -> Result<bool> {
+        self.refresh_accounting_index()?;
+        let should_nudge_gc = self.run_once_materializing(true)?;
+        self.last_forced_run = Instant::now();
         Ok(should_nudge_gc)
     }
 

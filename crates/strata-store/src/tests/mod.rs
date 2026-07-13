@@ -508,7 +508,7 @@ fn try_open_standalone_store(
 
 fn stop_accounting_worker(store: &mut StrataStore) {
     if let Some(accounting_tx) = store.accounting_tx.take() {
-        let _ = accounting_tx.send(AccountingCommand::Shutdown);
+        accounting_tx.shutdown();
     }
     if let Some(accounting_handle) = store.accounting_handle.take() {
         let _ = accounting_handle.join();
@@ -1281,6 +1281,70 @@ async fn accounting_sidecar_nudge_ingests_without_forcing_compaction() {
     assert_eq!(patch_count, 0);
     assert_eq!(base_count, 0);
     assert_eq!(store.accounted_lsn().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn semantic_materialization_request_survives_until_target_lsn_is_durable() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"semantic-materialization".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.accounting_interval = Duration::from_secs(3600);
+    cfg.accounting_sidecar_interval = Duration::from_secs(3600);
+    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    store.put(&key, b"payload").unwrap();
+    let (_, epoch_lsn) = store.increment_epoch().unwrap();
+    store.sync().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store.accounted_lsn().unwrap() < epoch_lsn {
+        assert!(
+            Instant::now() < deadline,
+            "semantic materialization request did not reach LSN {epoch_lsn}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[tokio::test]
+async fn shard_drop_materializes_immediately_despite_compaction_thresholds() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"shard-drop-materialization".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.accounting_interval = Duration::from_secs(3600);
+    cfg.accounting_sidecar_interval = Duration::from_secs(3600);
+    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    store.put(&key, b"payload").unwrap();
+    store.drop_shard(STANDALONE_SHARD.id).unwrap();
+    let drop_lsn = store
+        .index()
+        .get_shard_cleanup_job(STANDALONE_SHARD)
+        .unwrap()
+        .unwrap()
+        .drop_lsn;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store.accounted_lsn().unwrap() < drop_lsn {
+        assert!(
+            Instant::now() < deadline,
+            "shard-drop materialization did not reach LSN {drop_lsn}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[tokio::test]
@@ -2396,7 +2460,12 @@ async fn metrics_track_seal_backpressure_waits() {
     .unwrap();
     let (seal_tx, _seal_rx) = mpsc::channel();
     let (_write_tx, write_rx) = mpsc::sync_channel(1);
-    let (accounting_tx, _accounting_rx) = mpsc::sync_channel(1);
+    let (
+        accounting_tx,
+        _accounting_rx,
+        _pending_accounting_request,
+        _pending_materialize_through_lsn,
+    ) = accounting::accounting_request_channel();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
     let coordinator = WriteCoordinator {
         config: cfg.clone(),
@@ -5652,7 +5721,12 @@ async fn seal_segment_reports_error_without_marking_failed() {
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     put_test_segment_state(&index, 1, SegmentFileState::Sealing);
     let (_seal_tx, seal_rx) = mpsc::channel();
-    let (accounting_tx, _accounting_rx) = mpsc::sync_channel(1);
+    let (
+        accounting_tx,
+        _accounting_rx,
+        _pending_accounting_request,
+        _pending_materialize_through_lsn,
+    ) = accounting::accounting_request_channel();
     let worker = SealWorker {
         config: cfg,
         index: index.clone(),
