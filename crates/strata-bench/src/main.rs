@@ -21,6 +21,7 @@
 #[cfg(feature = "internal-profiling")]
 use std::sync::Mutex;
 use std::{
+    collections::HashMap,
     env, fs, hint, io,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -31,8 +32,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use prometheus::{Encoder, Registry, TextEncoder};
-use rocksdb::{DB, Env, WriteOptions};
+use prometheus::{Encoder, GaugeVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use rocksdb::{DB, Env, PerfContext, PerfStatsLevel, WriteOptions, perf::set_perf_stats};
 use serde::{Deserialize, Serialize};
 use serde_with::{Bytes, serde_as};
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
@@ -55,6 +56,7 @@ use strata_store::{
 use strata_store::{StoreProfileSink, StoreSyncProfile, StoreWriteProfile};
 use typed_store::{
     DBMetrics, Map,
+    metrics::SamplingInterval,
     rocks::{DBMap, MetricConf, ReadWriteOptions, RocksDB, be_fix_int_ser, default_db_options},
 };
 
@@ -231,6 +233,7 @@ struct Config {
     rocksdb_write_buffer_size: usize,
     rocksdb_high_pri_background_threads: usize,
     rocksdb_blob_gc: bool,
+    rocksdb_get_profile: bool,
     rocksdb_disable_wal: bool,
     rocksdb_disable_auto_compactions: bool,
     sync_every: usize,
@@ -269,6 +272,7 @@ impl Config {
             rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
             rocksdb_high_pri_background_threads: DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS,
             rocksdb_blob_gc: true,
+            rocksdb_get_profile: false,
             rocksdb_disable_wal: false,
             rocksdb_disable_auto_compactions: false,
             sync_every: 0,
@@ -369,6 +373,7 @@ impl Config {
                     config.rocksdb_blob_gc =
                         parse_bool(&next_value(&mut args, "--rocksdb-blob-gc")?)?
                 }
+                "--rocksdb-get-profile" => config.rocksdb_get_profile = true,
                 "--rocksdb-disable-wal" => {
                     config.rocksdb_disable_wal =
                         parse_bool(&next_value(&mut args, "--rocksdb-disable-wal")?)?
@@ -432,6 +437,11 @@ impl Config {
         }
         if config.reuse_existing && config.root_was_defaulted {
             return Err("--reuse-existing requires --root <path>".to_owned());
+        }
+        if config.rocksdb_get_profile && config.case != BenchCase::RocksDbBlobDbGet {
+            return Err(
+                "--rocksdb-get-profile is only supported for rocksdb-blobdb-get".to_owned(),
+            );
         }
 
         Ok(config)
@@ -705,7 +715,7 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         BenchCase::StorePutArc => run_store_put_arc(&config, &bench_metrics),
         BenchCase::StoreGet => run_store_get(&config, &bench_metrics),
         BenchCase::RocksDbBlobDbPut => run_rocksdb_blobdb_put(&config),
-        BenchCase::RocksDbBlobDbGet => run_rocksdb_blobdb_get(&config),
+        BenchCase::RocksDbBlobDbGet => run_rocksdb_blobdb_get(&config, &bench_metrics),
     };
 
     if bench_metrics.is_enabled() && config.metrics_drain_seconds != 0 {
@@ -967,7 +977,41 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+struct RocksDbPerfCapture {
+    context: PerfContext,
+    active: bool,
+}
+
+impl RocksDbPerfCapture {
+    fn start() -> Self {
+        let mut context = PerfContext::default();
+        context.reset();
+        set_perf_stats(PerfStatsLevel::EnableTime);
+        Self {
+            context,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        set_perf_stats(PerfStatsLevel::Disable);
+        self.active = false;
+        self.context.report(false)
+    }
+}
+
+impl Drop for RocksDbPerfCapture {
+    fn drop(&mut self) {
+        if self.active {
+            set_perf_stats(PerfStatsLevel::Disable);
+        }
+    }
+}
+
+fn run_rocksdb_blobdb_get(
+    config: &Config,
+    bench_metrics: &BenchMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
     let read_set_size = config.effective_read_set_size();
@@ -990,6 +1034,7 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
 
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("rocksdb_get", config.ops);
+    let perf_capture = config.rocksdb_get_profile.then(RocksDbPerfCapture::start);
     let started = Instant::now();
     let key_indexes = ReadKeySequence::new(config.read_pattern, keys.len(), config.read_seed);
 
@@ -1005,6 +1050,10 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
     }
 
     let elapsed = started.elapsed();
+    let perf_report = perf_capture.map(RocksDbPerfCapture::finish);
+    if let Some(perf_report) = perf_report.as_deref() {
+        bench_metrics.publish_rocksdb_get_profile(perf_report, timings.len());
+    }
     print_report(ReportInputs {
         config,
         elapsed,
@@ -1015,6 +1064,9 @@ fn run_rocksdb_blobdb_get(config: &Config) -> Result<(), Box<dyn std::error::Err
         rocksdb: Some(db.rocksdb.as_ref()),
         profile_capture: None,
     })?;
+    if let Some(perf_report) = perf_report.as_deref() {
+        print_rocksdb_get_profile(perf_report, timings.len());
+    }
     Ok(())
 }
 
@@ -1086,9 +1138,15 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     options.set_write_buffer_size(config.rocksdb_write_buffer_size);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
     options.set_disable_auto_compactions(config.rocksdb_disable_auto_compactions);
+    let metric_conf = if config.rocksdb_get_profile {
+        MetricConf::new(ROCKSDB_BLOBDB_CF_CLASS)
+            .with_sampling(SamplingInterval::new(Duration::ZERO, u64::MAX - 1))
+    } else {
+        MetricConf::new(ROCKSDB_BLOBDB_CF_CLASS)
+    };
     Ok(DBMap::open(
         config.root_dir.join("rocksdb-blobdb"),
-        MetricConf::new(ROCKSDB_BLOBDB_CF_CLASS),
+        metric_conf,
         Some(options),
         None,
         Some(ROCKSDB_BLOBDB_CF_CLASS),
@@ -1123,6 +1181,7 @@ fn should_sync(sync_every: usize, completed_ops: usize) -> bool {
 
 struct BenchMetrics {
     registry: Option<Arc<Registry>>,
+    rocksdb_perf: Option<RocksDbPerfPrometheusMetrics>,
     _server: Option<MetricsServer>,
 }
 
@@ -1131,15 +1190,21 @@ impl BenchMetrics {
         let Some(listen_addr) = config.metrics_listen.as_deref() else {
             return Ok(Self {
                 registry: None,
+                rocksdb_perf: None,
                 _server: None,
             });
         };
 
         let registry = Arc::new(Registry::new());
         DBMetrics::init(&registry);
+        let rocksdb_perf = config
+            .rocksdb_get_profile
+            .then(|| RocksDbPerfPrometheusMetrics::new(&registry))
+            .transpose()?;
         let server = start_metrics_server(listen_addr, Arc::clone(&registry))?;
         Ok(Self {
             registry: Some(registry),
+            rocksdb_perf,
             _server: Some(server),
         })
     }
@@ -1154,6 +1219,101 @@ impl BenchMetrics {
     fn is_enabled(&self) -> bool {
         self.registry.is_some()
     }
+
+    fn publish_rocksdb_get_profile(&self, report: &str, ops: usize) {
+        if let Some(metrics) = &self.rocksdb_perf {
+            metrics.set(report, ops);
+        }
+    }
+}
+
+struct RocksDbPerfPrometheusMetrics {
+    profile_ops: IntGauge,
+    counts: IntGaugeVec,
+    bytes: IntGaugeVec,
+    seconds: GaugeVec,
+    seconds_per_op: GaugeVec,
+}
+
+impl RocksDbPerfPrometheusMetrics {
+    fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
+        let profile_ops = IntGauge::new(
+            "strata_bench_rocksdb_perf_profile_ops",
+            "Number of RocksDB get operations included in the final native perf snapshot.",
+        )?;
+        let counts = IntGaugeVec::new(
+            Opts::new(
+                "strata_bench_rocksdb_perf_count",
+                "Final RocksDB native perf count by counter.",
+            ),
+            &["counter"],
+        )?;
+        let bytes = IntGaugeVec::new(
+            Opts::new(
+                "strata_bench_rocksdb_perf_bytes",
+                "Final RocksDB native perf byte count by counter.",
+            ),
+            &["counter"],
+        )?;
+        let seconds = GaugeVec::new(
+            Opts::new(
+                "strata_bench_rocksdb_perf_seconds",
+                "Final cumulative RocksDB native perf time in seconds by counter.",
+            ),
+            &["counter"],
+        )?;
+        let seconds_per_op = GaugeVec::new(
+            Opts::new(
+                "strata_bench_rocksdb_perf_seconds_per_op",
+                "Final average RocksDB native perf time in seconds per profiled operation.",
+            ),
+            &["counter"],
+        )?;
+
+        registry.register(Box::new(profile_ops.clone()))?;
+        registry.register(Box::new(counts.clone()))?;
+        registry.register(Box::new(bytes.clone()))?;
+        registry.register(Box::new(seconds.clone()))?;
+        registry.register(Box::new(seconds_per_op.clone()))?;
+
+        Ok(Self {
+            profile_ops,
+            counts,
+            bytes,
+            seconds,
+            seconds_per_op,
+        })
+    }
+
+    fn set(&self, report: &str, ops: usize) {
+        let counters = parse_rocksdb_perf_report(report);
+        self.profile_ops.set(saturating_i64(ops as u64));
+        for (counter_name, output_name, kind) in ROCKSDB_GET_PERF_METRICS {
+            let value = counters.get(counter_name).copied().unwrap_or_default();
+            match kind {
+                RocksDbPerfMetricKind::Count => self
+                    .counts
+                    .with_label_values(&[output_name])
+                    .set(saturating_i64(value)),
+                RocksDbPerfMetricKind::Bytes => self
+                    .bytes
+                    .with_label_values(&[output_name])
+                    .set(saturating_i64(value)),
+                RocksDbPerfMetricKind::Nanos => {
+                    let seconds = value as f64 / 1_000_000_000.0;
+                    let seconds_per_op = if ops == 0 { 0.0 } else { seconds / ops as f64 };
+                    self.seconds.with_label_values(&[output_name]).set(seconds);
+                    self.seconds_per_op
+                        .with_label_values(&[output_name])
+                        .set(seconds_per_op);
+                }
+            }
+        }
+    }
+}
+
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 struct MetricsServer {
@@ -1327,6 +1487,7 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
         config.rocksdb_high_pri_background_threads
     );
     println!("rocksdb_blob_gc={}", config.rocksdb_blob_gc);
+    println!("rocksdb_get_profile={}", config.rocksdb_get_profile);
     println!("rocksdb_disable_wal={}", config.rocksdb_disable_wal);
     println!(
         "rocksdb_disable_auto_compactions={}",
@@ -1510,6 +1671,161 @@ fn file_len_if_exists(path: &Path) -> std::io::Result<u64> {
         return Ok(0);
     }
     Ok(fs::metadata(path)?.len())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RocksDbPerfMetricKind {
+    Count,
+    Bytes,
+    Nanos,
+}
+
+const ROCKSDB_GET_PERF_METRICS: &[(&str, &str, RocksDbPerfMetricKind)] = &[
+    (
+        "user_key_comparison_count",
+        "user_key_comparison_count",
+        RocksDbPerfMetricKind::Count,
+    ),
+    (
+        "block_cache_hit_count",
+        "block_cache_hit_count",
+        RocksDbPerfMetricKind::Count,
+    ),
+    (
+        "block_read_count",
+        "block_read_count",
+        RocksDbPerfMetricKind::Count,
+    ),
+    (
+        "block_read_byte",
+        "block_read_bytes",
+        RocksDbPerfMetricKind::Bytes,
+    ),
+    (
+        "block_read_time",
+        "block_read",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "block_checksum_time",
+        "block_checksum",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "block_decompress_time",
+        "block_decompress",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "get_read_bytes",
+        "get_read_bytes",
+        RocksDbPerfMetricKind::Bytes,
+    ),
+    (
+        "blob_cache_hit_count",
+        "blob_cache_hit_count",
+        RocksDbPerfMetricKind::Count,
+    ),
+    (
+        "blob_read_count",
+        "blob_read_count",
+        RocksDbPerfMetricKind::Count,
+    ),
+    (
+        "blob_read_byte",
+        "blob_read_bytes",
+        RocksDbPerfMetricKind::Bytes,
+    ),
+    ("blob_read_time", "blob_read", RocksDbPerfMetricKind::Nanos),
+    (
+        "blob_checksum_time",
+        "blob_checksum",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "blob_decompress_time",
+        "blob_decompress",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "get_from_memtable_count",
+        "get_from_memtable_count",
+        RocksDbPerfMetricKind::Count,
+    ),
+    (
+        "get_from_memtable_time",
+        "get_from_memtable",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "get_post_process_time",
+        "get_post_process",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "get_from_output_files_time",
+        "get_from_output_files",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "read_index_block_nanos",
+        "read_index_block",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "read_filter_block_nanos",
+        "read_filter_block",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "block_seek_nanos",
+        "block_seek",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "find_table_nanos",
+        "find_table",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "env_new_random_access_file_nanos",
+        "env_new_random_access_file",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+    (
+        "db_mutex_lock_nanos",
+        "db_mutex_lock",
+        RocksDbPerfMetricKind::Nanos,
+    ),
+];
+
+fn parse_rocksdb_perf_report(report: &str) -> HashMap<&str, u64> {
+    report
+        .split(',')
+        .filter_map(|entry| {
+            let (name, value) = entry.trim().split_once(" = ")?;
+            Some((name, value.parse().ok()?))
+        })
+        .collect()
+}
+
+fn print_rocksdb_get_profile(report: &str, ops: usize) {
+    let counters = parse_rocksdb_perf_report(report);
+    println!("rocksdb_perf_profile_ops={ops}");
+    for (counter_name, output_name, kind) in ROCKSDB_GET_PERF_METRICS {
+        let value = counters.get(counter_name).copied().unwrap_or_default();
+        match kind {
+            RocksDbPerfMetricKind::Count | RocksDbPerfMetricKind::Bytes => {
+                println!("rocksdb_perf_{output_name}={value}");
+            }
+            RocksDbPerfMetricKind::Nanos => {
+                let total_us = value as f64 / 1_000.0;
+                let avg_us = if ops == 0 { 0.0 } else { total_us / ops as f64 };
+                println!("rocksdb_perf_{output_name}_total_us={total_us:.3}");
+                println!("rocksdb_perf_{output_name}_avg_us_per_op={avg_us:.3}");
+            }
+        }
+    }
 }
 
 fn print_timing_summary(prefix: &str, timings: &[Duration]) {
@@ -2120,6 +2436,7 @@ options:
   --rocksdb-write-buffer-size <bytes|KiB|MiB|GiB>
   --rocksdb-high-pri-background-threads <count>
   --rocksdb-blob-gc <true|false>
+  --rocksdb-get-profile               get: report native RocksDB read perf counters
   --rocksdb-disable-wal <true|false>
   --rocksdb-disable-auto-compactions <true|false>
   --sync-every <count>
@@ -2151,6 +2468,49 @@ mod tests {
             bcs::from_bytes::<Vec<u8>>(&optimized_bytes)
                 .expect("legacy Vec should decode optimized bytes"),
             payload
+        );
+    }
+
+    #[test]
+    fn rocksdb_perf_report_parser_reads_native_counter_format() {
+        let counters = parse_rocksdb_perf_report(
+            "blob_read_count = 7, blob_read_byte = 7340032, blob_read_time = 21000",
+        );
+
+        assert_eq!(counters.get("blob_read_count"), Some(&7));
+        assert_eq!(counters.get("blob_read_byte"), Some(&7_340_032));
+        assert_eq!(counters.get("blob_read_time"), Some(&21_000));
+    }
+
+    #[test]
+    fn rocksdb_perf_snapshot_is_published_as_prometheus_metrics() {
+        let registry = Registry::new();
+        let metrics =
+            RocksDbPerfPrometheusMetrics::new(&registry).expect("perf metrics should register");
+        metrics.set(
+            "blob_read_count = 7, blob_read_byte = 7340032, blob_read_time = 21000",
+            3,
+        );
+
+        let mut encoded = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut encoded)
+            .expect("perf metrics should encode");
+        let encoded = String::from_utf8(encoded).expect("Prometheus output should be UTF-8");
+
+        assert!(encoded.contains("strata_bench_rocksdb_perf_profile_ops 3"));
+        assert!(encoded.contains("strata_bench_rocksdb_perf_count{counter=\"blob_read_count\"} 7"));
+        assert!(
+            encoded
+                .contains("strata_bench_rocksdb_perf_bytes{counter=\"blob_read_bytes\"} 7340032")
+        );
+        assert!(
+            encoded.contains("strata_bench_rocksdb_perf_seconds{counter=\"blob_read\"} 0.000021")
+        );
+        assert!(
+            encoded.contains(
+                "strata_bench_rocksdb_perf_seconds_per_op{counter=\"blob_read\"} 0.000007"
+            )
         );
     }
 
@@ -2262,6 +2622,33 @@ mod tests {
 
         assert!(config.reuse_existing);
         assert_eq!(config.effective_read_set_size(), 10);
+    }
+
+    #[test]
+    fn config_allows_native_rocksdb_get_profiling() {
+        let config = Config::parse(
+            ["--case", "rocksdb-blobdb-get", "--rocksdb-get-profile"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect("BlobDB get profiling should parse");
+
+        assert!(config.rocksdb_get_profile);
+    }
+
+    #[test]
+    fn config_rejects_native_rocksdb_profiling_for_other_cases() {
+        let error = Config::parse(
+            ["--case", "store-get", "--rocksdb-get-profile"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("native RocksDB profiling should require BlobDB get");
+
+        assert_eq!(
+            error,
+            "--rocksdb-get-profile is only supported for rocksdb-blobdb-get"
+        );
     }
 
     #[test]
