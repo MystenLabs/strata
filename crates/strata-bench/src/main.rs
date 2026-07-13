@@ -13,6 +13,8 @@
 //! store-get           StrataStore point reads from indexed segment records
 //! rocksdb-blobdb-put  RocksDB BlobDB put baseline through typed-store
 //! rocksdb-blobdb-get  RocksDB BlobDB get baseline through typed-store
+//! rocksdb-blobdb-get-pinned
+//!                      RocksDB BlobDB pinned get without typed-store value decoding
 //! ```
 //!
 //! The benchmark is not part of the storage protocol. It should keep using public crate APIs so
@@ -119,6 +121,7 @@ enum BenchCase {
     StoreGet,
     RocksDbBlobDbPut,
     RocksDbBlobDbGet,
+    RocksDbBlobDbGetPinned,
 }
 
 impl BenchCase {
@@ -130,6 +133,7 @@ impl BenchCase {
             "store-get" => Ok(Self::StoreGet),
             "rocksdb-blobdb-put" => Ok(Self::RocksDbBlobDbPut),
             "rocksdb-blobdb-get" => Ok(Self::RocksDbBlobDbGet),
+            "rocksdb-blobdb-get-pinned" => Ok(Self::RocksDbBlobDbGetPinned),
             _ => Err(format!("unknown case '{value}'")),
         }
     }
@@ -142,6 +146,7 @@ impl BenchCase {
             Self::StoreGet => "store-get",
             Self::RocksDbBlobDbPut => "rocksdb-blobdb-put",
             Self::RocksDbBlobDbGet => "rocksdb-blobdb-get",
+            Self::RocksDbBlobDbGetPinned => "rocksdb-blobdb-get-pinned",
         }
     }
 }
@@ -428,20 +433,28 @@ impl Config {
         if config.reuse_existing
             && !matches!(
                 config.case,
-                BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet
+                BenchCase::StoreGet
+                    | BenchCase::RocksDbBlobDbGet
+                    | BenchCase::RocksDbBlobDbGetPinned
             )
         {
             return Err(
-                "--reuse-existing is only supported for store-get and rocksdb-blobdb-get"
+                "--reuse-existing is only supported for store-get, rocksdb-blobdb-get, and rocksdb-blobdb-get-pinned"
                     .to_owned(),
             );
         }
         if config.reuse_existing && config.root_was_defaulted {
             return Err("--reuse-existing requires --root <path>".to_owned());
         }
-        if config.rocksdb_get_profile && config.case != BenchCase::RocksDbBlobDbGet {
+        if config.rocksdb_get_profile
+            && !matches!(
+                config.case,
+                BenchCase::RocksDbBlobDbGet | BenchCase::RocksDbBlobDbGetPinned
+            )
+        {
             return Err(
-                "--rocksdb-get-profile is only supported for rocksdb-blobdb-get".to_owned(),
+                "--rocksdb-get-profile is only supported for rocksdb-blobdb-get and rocksdb-blobdb-get-pinned"
+                    .to_owned(),
             );
         }
 
@@ -716,7 +729,12 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         BenchCase::StorePutArc => run_store_put_arc(&config, &bench_metrics),
         BenchCase::StoreGet => run_store_get(&config, &bench_metrics),
         BenchCase::RocksDbBlobDbPut => run_rocksdb_blobdb_put(&config),
-        BenchCase::RocksDbBlobDbGet => run_rocksdb_blobdb_get(&config, &bench_metrics),
+        BenchCase::RocksDbBlobDbGet => {
+            run_rocksdb_blobdb_get(&config, &bench_metrics, RocksDbGetMode::Decoded)
+        }
+        BenchCase::RocksDbBlobDbGetPinned => {
+            run_rocksdb_blobdb_get(&config, &bench_metrics, RocksDbGetMode::Pinned)
+        }
     };
 
     if bench_metrics.is_enabled() && config.metrics_drain_seconds != 0 {
@@ -1013,9 +1031,25 @@ impl Drop for RocksDbPerfCapture {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RocksDbGetMode {
+    Decoded,
+    Pinned,
+}
+
+impl RocksDbGetMode {
+    fn phase_name(self) -> &'static str {
+        match self {
+            Self::Decoded => "rocksdb_get",
+            Self::Pinned => "rocksdb_get_pinned",
+        }
+    }
+}
+
 fn run_rocksdb_blobdb_get(
     config: &Config,
     bench_metrics: &BenchMetrics,
+    mode: RocksDbGetMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
@@ -1038,8 +1072,9 @@ fn run_rocksdb_blobdb_get(
     }
 
     let mut timings = Vec::with_capacity(config.ops);
-    let mut phases = PhaseTimings::new("rocksdb_get", config.ops);
+    let mut phases = PhaseTimings::new(mode.phase_name(), config.ops);
     let perf_capture = config.rocksdb_get_profile.then(RocksDbPerfCapture::start);
+    let pinned_read_write_options = ReadWriteOptions::default();
     let started = Instant::now();
     let mut last_perf_metrics_publish = started;
     let key_indexes = ReadKeySequence::new(config.read_pattern, keys.len(), config.read_seed);
@@ -1048,11 +1083,31 @@ fn run_rocksdb_blobdb_get(
         let key = &keys[key_index];
         let op_started = Instant::now();
         let phase_started = Instant::now();
-        let value = db.get(key)?;
-        verify_reused_key_found(config, value.is_some(), key)?;
-        phases.primary.push(phase_started.elapsed());
-        hint::black_box(value.as_ref().map(|value| value.0.as_slice()));
-        timings.push(op_started.elapsed());
+        match mode {
+            RocksDbGetMode::Decoded => {
+                let value = db.get(key)?;
+                verify_reused_key_found(config, value.is_some(), key)?;
+                phases.primary.push(phase_started.elapsed());
+                hint::black_box(value.as_ref().map(|value| value.0.as_slice()));
+                timings.push(op_started.elapsed());
+            }
+            RocksDbGetMode::Pinned => {
+                let get_started = Instant::now();
+                let key_buf = be_fix_int_ser(key)?;
+                let cf_handle = db.cf()?;
+                let read_options = pinned_read_write_options.readopts();
+                let value = db
+                    .rocksdb
+                    .get_pinned_cf_opt(&cf_handle, &key_buf, &read_options)?;
+                let found = value.is_some();
+                let value_len = value.as_deref().map_or(0, <[u8]>::len);
+                record_rocksdb_blobdb_get_metrics(get_started, found, key_buf.len(), value_len);
+                verify_reused_key_found(config, found, key)?;
+                phases.primary.push(phase_started.elapsed());
+                hint::black_box(value.as_deref());
+                timings.push(op_started.elapsed());
+            }
+        }
 
         if bench_metrics.rocksdb_perf_is_enabled()
             && last_perf_metrics_publish.elapsed() >= ROCKSDB_PERF_METRICS_PUBLISH_INTERVAL
@@ -1083,6 +1138,36 @@ fn run_rocksdb_blobdb_get(
         print_rocksdb_get_profile(perf_report, timings.len());
     }
     Ok(())
+}
+
+fn record_rocksdb_blobdb_get_metrics(
+    started: Instant,
+    found: bool,
+    key_len: usize,
+    value_len: usize,
+) {
+    let db_metrics = DBMetrics::get();
+    let found = found.to_string();
+    db_metrics
+        .op_metrics
+        .rocksdb_get_latency_seconds
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS, &found])
+        .observe(started.elapsed().as_secs_f64());
+    db_metrics
+        .op_metrics
+        .rocksdb_get_key_bytes
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .observe(key_len as f64);
+    db_metrics
+        .op_metrics
+        .rocksdb_get_bytes
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .observe((key_len + value_len) as f64);
+    db_metrics
+        .op_metrics
+        .rocksdb_get_value_bytes
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .observe(value_len as f64);
 }
 
 fn verify_reused_key_found(config: &Config, found: bool, key: &[u8]) -> io::Result<()> {
@@ -1549,7 +1634,8 @@ fn measured_logical_payload_bytes(config: &Config, measured_ops: usize) -> u128 
         | BenchCase::StorePut
         | BenchCase::StorePutArc
         | BenchCase::RocksDbBlobDbPut
-        | BenchCase::RocksDbBlobDbGet => measured_ops,
+        | BenchCase::RocksDbBlobDbGet
+        | BenchCase::RocksDbBlobDbGetPinned => measured_ops,
         BenchCase::StoreGet => match config.store_get_mode {
             StoreGetMode::Payload => measured_ops,
             StoreGetMode::KeyOnly => 0,
@@ -1564,7 +1650,9 @@ fn database_logical_payload_bytes(config: &Config, measured_ops: usize) -> u128 
         | BenchCase::StorePut
         | BenchCase::StorePutArc
         | BenchCase::RocksDbBlobDbPut => measured_ops,
-        BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet => config.effective_read_set_size(),
+        BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet | BenchCase::RocksDbBlobDbGetPinned => {
+            config.effective_read_set_size()
+        }
     };
     payload_bytes(config, stored_payload_ops)
 }
@@ -2431,7 +2519,7 @@ fn usage() -> &'static str {
     "usage: cargo run -p strata-bench --release -- [options]
 
 options:
-  --case <segment-append|store-put|store-put-arc|store-get|rocksdb-blobdb-put|rocksdb-blobdb-get>
+  --case <segment-append|store-put|store-put-arc|store-get|rocksdb-blobdb-put|rocksdb-blobdb-get|rocksdb-blobdb-get-pinned>
   --root <path>
   --namespace <name>
   --payload-size <bytes|KiB|MiB|GiB>
@@ -2659,14 +2747,35 @@ mod tests {
 
     #[test]
     fn config_allows_native_rocksdb_get_profiling() {
-        let config = Config::parse(
-            ["--case", "rocksdb-blobdb-get", "--rocksdb-get-profile"]
-                .into_iter()
-                .map(str::to_owned),
-        )
-        .expect("BlobDB get profiling should parse");
+        for case in ["rocksdb-blobdb-get", "rocksdb-blobdb-get-pinned"] {
+            let config = Config::parse(
+                ["--case", case, "--rocksdb-get-profile"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .expect("BlobDB get profiling should parse");
 
-        assert!(config.rocksdb_get_profile);
+            assert!(config.rocksdb_get_profile);
+        }
+    }
+
+    #[test]
+    fn config_allows_pinned_get_to_reuse_existing_write_set() {
+        let config = Config::parse(
+            [
+                "--case",
+                "rocksdb-blobdb-get-pinned",
+                "--root",
+                "/tmp/strata-bench-existing",
+                "--reuse-existing",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("pinned BlobDB get should reuse an existing write set");
+
+        assert_eq!(config.case, BenchCase::RocksDbBlobDbGetPinned);
+        assert!(config.reuse_existing);
     }
 
     #[test]
@@ -2680,7 +2789,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "--rocksdb-get-profile is only supported for rocksdb-blobdb-get"
+            "--rocksdb-get-profile is only supported for rocksdb-blobdb-get and rocksdb-blobdb-get-pinned"
         );
     }
 
@@ -2713,7 +2822,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "--reuse-existing is only supported for store-get and rocksdb-blobdb-get"
+            "--reuse-existing is only supported for store-get, rocksdb-blobdb-get, and rocksdb-blobdb-get-pinned"
         );
     }
 
