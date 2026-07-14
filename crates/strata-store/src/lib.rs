@@ -793,6 +793,22 @@ impl StrataStore {
         Ok(())
     }
 
+    /// Rolls the current ingest segment so all preceding writes can be sealed and considered by
+    /// retention organization or garbage collection.
+    ///
+    /// Production performs this checkpoint periodically. Administrative tools and benchmarks can
+    /// request it explicitly when they need a bounded active tail. Returning means the rollover
+    /// metadata is visible and sealing has been queued; callers that require the sealed file should
+    /// wait for the segment state to leave `Sealing`.
+    pub fn checkpoint_active_segment(&self) -> Result<()> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.send_write_command(WriteCommand::Checkpoint(CheckpointRequest { response_tx }))?;
+        response_rx
+            .recv()
+            .map_err(|_| Error::WriteResponseDropped)??;
+        Ok(())
+    }
+
     /// Every operation with `lsn <= durable_lsn` survives a crash. This is the value callers
     /// (e.g. the Walrus event cursor) gate on before acknowledging work as done.
     pub fn durable_lsn(&self) -> Result<StrataLsn> {
@@ -803,6 +819,21 @@ impl StrataStore {
     /// Always `<= durable_lsn`; the gap is accounting lag, not a correctness problem.
     pub fn accounted_lsn(&self) -> Result<StrataLsn> {
         Ok(self.index.get_accounted_lsn()?)
+    }
+
+    /// Requests an immediate accounting pass through `through_lsn`.
+    ///
+    /// Normal accounting deliberately batches quiet workloads. Administrative operations and
+    /// benchmarks that need a fully materialized GC view can use this method before waiting for
+    /// `accounted_lsn()` to reach the requested frontier. The request is asynchronous and may be
+    /// issued before the target LSN is durable; the worker preserves it until durability catches up.
+    pub fn request_accounting_materialization(&self, through_lsn: StrataLsn) -> Result<()> {
+        let accounting_tx = self
+            .accounting_tx
+            .as_ref()
+            .ok_or(Error::AccountingQueueClosed)?;
+        accounting_tx.request_materialize(through_lsn);
+        Ok(())
     }
 
     /// Pins the current accounted frontier for a long running GC job.
@@ -924,6 +955,7 @@ enum WriteCommand {
     Batch(BatchWriteRequest),
     DropShard(DropShardRequest),
     GcPublish(GcPublishRequest),
+    Checkpoint(CheckpointRequest),
     Sync(SyncRequest),
     Shutdown,
 }
@@ -995,6 +1027,11 @@ pub(crate) struct GcPublishRequest {
 struct SyncRequest {
     response_tx: mpsc::Sender<Result<()>>,
     profile: ProfileRequest<StoreSyncProfile>,
+}
+
+#[derive(Debug)]
+struct CheckpointRequest {
+    response_tx: mpsc::Sender<Result<()>>,
 }
 
 #[derive(Debug)]
@@ -1471,6 +1508,10 @@ impl WriteCoordinator {
                 WriteCommand::GcPublish(request) => {
                     self.process_gc_publish(request);
                 }
+                WriteCommand::Checkpoint(request) => {
+                    let result = self.process_timed_checkpoint();
+                    let _ = request.response_tx.send(result);
+                }
                 WriteCommand::Sync(request) => {
                     self.process_sync(request);
                 }
@@ -1495,6 +1536,9 @@ impl WriteCoordinator {
                 let _ = request.response_tx.send(Err(error));
             }
             WriteCommand::GcPublish(request) => {
+                let _ = request.response_tx.send(Err(error));
+            }
+            WriteCommand::Checkpoint(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
             WriteCommand::Sync(request) => {

@@ -62,6 +62,9 @@ pub enum Error {
     #[error("durability queue is closed")]
     DurabilityQueueClosed,
 
+    #[error("accounting queue is closed")]
+    AccountingQueueClosed,
+
     #[error("gc queue is closed")]
     GcQueueClosed,
 

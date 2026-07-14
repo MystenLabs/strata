@@ -1401,6 +1401,64 @@ async fn semantic_materialization_request_survives_until_target_lsn_is_durable()
 }
 
 #[tokio::test]
+async fn explicit_accounting_materialization_advances_a_quiet_store() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"explicit-materialization".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.accounting_interval = Duration::from_secs(3600);
+    cfg.accounting_sidecar_interval = Duration::from_secs(3600);
+    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    let lsn = store.put(&key, b"payload").unwrap();
+    store.sync().unwrap();
+    assert!(store.accounted_lsn().unwrap() < lsn);
+
+    store.store.request_accounting_materialization(lsn).unwrap();
+    wait_for_accounted_lsn(&store.store, lsn);
+}
+
+#[tokio::test]
+async fn explicit_active_segment_checkpoint_queues_the_current_tail_for_sealing() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"explicit-checkpoint".to_vec()).unwrap();
+    let store =
+        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+            .unwrap();
+
+    store.put(&key, b"payload").unwrap();
+    let old_segment_id = store
+        .index()
+        .iter_segment_states()
+        .unwrap()
+        .into_iter()
+        .find(|(_, state)| state.state == SegmentFileState::Open)
+        .unwrap()
+        .0;
+
+    store.store.checkpoint_active_segment().unwrap();
+    wait_for_segment_state(store.index(), old_segment_id, SegmentFileState::Sealed);
+    let new_segment_id = store
+        .index()
+        .iter_segment_states()
+        .unwrap()
+        .into_iter()
+        .find(|(_, state)| state.state == SegmentFileState::Open)
+        .unwrap()
+        .0;
+
+    assert_ne!(old_segment_id, new_segment_id);
+    assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+}
+
+#[tokio::test]
 async fn shard_drop_materializes_immediately_despite_compaction_thresholds() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();

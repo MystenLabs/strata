@@ -11,19 +11,24 @@
 //! store-put           StrataStore put path, cloning each payload into Arc storage
 //! store-put-arc       StrataStore put path with caller-provided Arc payload
 //! store-get           StrataStore point reads from indexed segment records
+//! store-delete        StrataStore tombstone and optional background reclamation timeline
 //! rocksdb-blobdb-put  RocksDB BlobDB put baseline through typed-store
 //! rocksdb-blobdb-get  RocksDB BlobDB get baseline through typed-store
 //! rocksdb-blobdb-get-pinned
 //!                      RocksDB BlobDB pinned get without typed-store value decoding
+//! rocksdb-blobdb-delete
+//!                      RocksDB BlobDB point delete and optional background reclamation timeline
 //! ```
 //!
 //! The benchmark is not part of the storage protocol. It should keep using public crate APIs so
 //! benchmark results reflect what callers can actually exercise.
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(feature = "internal-profiling")]
 use std::sync::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs, hint, io,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -75,6 +80,18 @@ const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
 const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE: usize = 512 << 20;
 const DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS: usize = 4;
+const DEFAULT_DELETE_PERCENT: f64 = 50.0;
+const DEFAULT_DELETE_SEED: u64 = 0xd1e7_e001_cafe_f00d;
+const DEFAULT_DELETE_VERIFY_SAMPLES: usize = 1024;
+const DEFAULT_DELETE_SETUP_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_RECLAIM_DURATION: Duration = Duration::from_secs(3600);
+const DEFAULT_POST_DELETE_OPS_PER_SECOND: u64 = 10;
+const DEFAULT_POST_DELETE_PUT_PERCENT: f64 = 40.0;
+const DEFAULT_POST_DELETE_GET_PERCENT: f64 = 20.0;
+const DEFAULT_POST_DELETE_DELETE_PERCENT: f64 = 40.0;
+const DEFAULT_POST_DELETE_SEED: u64 = 0x57ea_d1e7_bacc_600d;
+const DEFAULT_ROCKSDB_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
+const DEFAULT_ROCKSDB_BLOB_GC_FORCE_THRESHOLD: f64 = 1.0;
 const ROCKSDB_BLOBDB_CF_CLASS: &str = "rocksdb_blobdb";
 const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
 const ROCKSDB_PERF_METRICS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
@@ -119,9 +136,11 @@ enum BenchCase {
     StorePut,
     StorePutArc,
     StoreGet,
+    StoreDelete,
     RocksDbBlobDbPut,
     RocksDbBlobDbGet,
     RocksDbBlobDbGetPinned,
+    RocksDbBlobDbDelete,
 }
 
 impl BenchCase {
@@ -131,9 +150,11 @@ impl BenchCase {
             "store-put" => Ok(Self::StorePut),
             "store-put-arc" => Ok(Self::StorePutArc),
             "store-get" => Ok(Self::StoreGet),
+            "store-delete" => Ok(Self::StoreDelete),
             "rocksdb-blobdb-put" => Ok(Self::RocksDbBlobDbPut),
             "rocksdb-blobdb-get" => Ok(Self::RocksDbBlobDbGet),
             "rocksdb-blobdb-get-pinned" => Ok(Self::RocksDbBlobDbGetPinned),
+            "rocksdb-blobdb-delete" => Ok(Self::RocksDbBlobDbDelete),
             _ => Err(format!("unknown case '{value}'")),
         }
     }
@@ -144,9 +165,84 @@ impl BenchCase {
             Self::StorePut => "store-put",
             Self::StorePutArc => "store-put-arc",
             Self::StoreGet => "store-get",
+            Self::StoreDelete => "store-delete",
             Self::RocksDbBlobDbPut => "rocksdb-blobdb-put",
             Self::RocksDbBlobDbGet => "rocksdb-blobdb-get",
             Self::RocksDbBlobDbGetPinned => "rocksdb-blobdb-get-pinned",
+            Self::RocksDbBlobDbDelete => "rocksdb-blobdb-delete",
+        }
+    }
+
+    fn is_delete(self) -> bool {
+        matches!(self, Self::StoreDelete | Self::RocksDbBlobDbDelete)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletePattern {
+    Sequential,
+    Random,
+}
+
+impl DeletePattern {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "sequential" => Ok(Self::Sequential),
+            "random" => Ok(Self::Random),
+            _ => Err(format!("unknown delete pattern '{value}'")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::Random => "random",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteReclaimMode {
+    None,
+    Background,
+}
+
+impl DeleteReclaimMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "background" => Ok(Self::Background),
+            _ => Err(format!("unknown delete reclaim mode '{value}'")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Background => "background",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostDeleteWorkload {
+    Idle,
+    Steady,
+}
+
+impl PostDeleteWorkload {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "idle" => Ok(Self::Idle),
+            "steady" => Ok(Self::Steady),
+            _ => Err(format!("unknown post-delete workload '{value}'")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Steady => "steady",
         }
     }
 }
@@ -234,15 +330,35 @@ struct Config {
     starting_epoch: Epoch,
     strata_accounting: bool,
     strata_gc: bool,
+    strata_gc_io_bytes_per_sec: u64,
+    strata_gc_min_io_bytes_per_sec: u64,
+    strata_gc_min_reclaim_bytes: u64,
+    strata_gc_min_garbage_ratio_bps: u16,
     rocksdb_min_blob_size: u64,
     rocksdb_blob_file_size: u64,
     rocksdb_write_buffer_size: usize,
     rocksdb_high_pri_background_threads: usize,
     rocksdb_blob_gc: bool,
+    rocksdb_blob_gc_age_cutoff: f64,
+    rocksdb_blob_gc_force_threshold: f64,
     rocksdb_get_profile: bool,
     rocksdb_disable_wal: bool,
     rocksdb_disable_auto_compactions: bool,
     sync_every: usize,
+    delete_percent: f64,
+    delete_pattern: DeletePattern,
+    delete_seed: u64,
+    delete_verify_samples: usize,
+    delete_reclaim_mode: DeleteReclaimMode,
+    delete_setup_timeout: Duration,
+    reclaim_duration: Duration,
+    reclaim_sample_at: Vec<Duration>,
+    post_delete_workload: PostDeleteWorkload,
+    post_delete_ops_per_second: u64,
+    post_delete_put_percent: f64,
+    post_delete_get_percent: f64,
+    post_delete_delete_percent: f64,
+    post_delete_seed: u64,
     metrics_listen: Option<String>,
     metrics_drain_seconds: u64,
     reuse_existing: bool,
@@ -252,6 +368,7 @@ struct Config {
 
 impl Config {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let default_gc_planner = GcPlannerConfig::default();
         let mut config = Self {
             case: BenchCase::StorePut,
             root_dir: default_root_dir(),
@@ -273,15 +390,35 @@ impl Config {
             starting_epoch: DEFAULT_STARTING_EPOCH,
             strata_accounting: true,
             strata_gc: true,
+            strata_gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
+            strata_gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
+            strata_gc_min_reclaim_bytes: default_gc_planner.min_reclaim_bytes,
+            strata_gc_min_garbage_ratio_bps: default_gc_planner.min_garbage_ratio_bps,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
             rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
             rocksdb_high_pri_background_threads: DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS,
             rocksdb_blob_gc: true,
+            rocksdb_blob_gc_age_cutoff: DEFAULT_ROCKSDB_BLOB_GC_AGE_CUTOFF,
+            rocksdb_blob_gc_force_threshold: DEFAULT_ROCKSDB_BLOB_GC_FORCE_THRESHOLD,
             rocksdb_get_profile: false,
             rocksdb_disable_wal: false,
             rocksdb_disable_auto_compactions: false,
             sync_every: 0,
+            delete_percent: DEFAULT_DELETE_PERCENT,
+            delete_pattern: DeletePattern::Random,
+            delete_seed: DEFAULT_DELETE_SEED,
+            delete_verify_samples: DEFAULT_DELETE_VERIFY_SAMPLES,
+            delete_reclaim_mode: DeleteReclaimMode::None,
+            delete_setup_timeout: DEFAULT_DELETE_SETUP_TIMEOUT,
+            reclaim_duration: DEFAULT_RECLAIM_DURATION,
+            reclaim_sample_at: default_reclaim_sample_at(),
+            post_delete_workload: PostDeleteWorkload::Idle,
+            post_delete_ops_per_second: DEFAULT_POST_DELETE_OPS_PER_SECOND,
+            post_delete_put_percent: DEFAULT_POST_DELETE_PUT_PERCENT,
+            post_delete_get_percent: DEFAULT_POST_DELETE_GET_PERCENT,
+            post_delete_delete_percent: DEFAULT_POST_DELETE_DELETE_PERCENT,
+            post_delete_seed: DEFAULT_POST_DELETE_SEED,
             metrics_listen: None,
             metrics_drain_seconds: DEFAULT_METRICS_DRAIN_SECONDS,
             reuse_existing: false,
@@ -289,6 +426,7 @@ impl Config {
             root_was_defaulted: true,
         };
 
+        let mut reclaim_sample_at_explicit = false;
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -357,6 +495,24 @@ impl Config {
                 "--strata-gc" => {
                     config.strata_gc = parse_bool(&next_value(&mut args, "--strata-gc")?)?
                 }
+                "--strata-gc-io-bytes-per-sec" => {
+                    config.strata_gc_io_bytes_per_sec =
+                        parse_size(&next_value(&mut args, "--strata-gc-io-bytes-per-sec")?)? as u64
+                }
+                "--strata-gc-min-io-bytes-per-sec" => {
+                    config.strata_gc_min_io_bytes_per_sec =
+                        parse_size(&next_value(&mut args, "--strata-gc-min-io-bytes-per-sec")?)?
+                            as u64
+                }
+                "--strata-gc-min-reclaim-bytes" => {
+                    config.strata_gc_min_reclaim_bytes =
+                        parse_size(&next_value(&mut args, "--strata-gc-min-reclaim-bytes")?)? as u64
+                }
+                "--strata-gc-min-garbage-percent" => {
+                    config.strata_gc_min_garbage_ratio_bps = percent_to_basis_points(parse_percent(
+                        &next_value(&mut args, "--strata-gc-min-garbage-percent")?,
+                    )?)
+                }
                 "--rocksdb-min-blob-size" => {
                     config.rocksdb_min_blob_size =
                         parse_size(&next_value(&mut args, "--rocksdb-min-blob-size")?)? as u64
@@ -379,6 +535,16 @@ impl Config {
                     config.rocksdb_blob_gc =
                         parse_bool(&next_value(&mut args, "--rocksdb-blob-gc")?)?
                 }
+                "--rocksdb-blob-gc-age-cutoff" => {
+                    config.rocksdb_blob_gc_age_cutoff =
+                        parse_fraction(&next_value(&mut args, "--rocksdb-blob-gc-age-cutoff")?)?
+                }
+                "--rocksdb-blob-gc-force-threshold" => {
+                    config.rocksdb_blob_gc_force_threshold = parse_fraction(&next_value(
+                        &mut args,
+                        "--rocksdb-blob-gc-force-threshold",
+                    )?)?
+                }
                 "--rocksdb-get-profile" => config.rocksdb_get_profile = true,
                 "--rocksdb-disable-wal" => {
                     config.rocksdb_disable_wal =
@@ -392,6 +558,70 @@ impl Config {
                 }
                 "--sync-every" => {
                     config.sync_every = parse_usize(&next_value(&mut args, "--sync-every")?)?
+                }
+                "--delete-percent" => {
+                    config.delete_percent =
+                        parse_percent(&next_value(&mut args, "--delete-percent")?)?
+                }
+                "--delete-pattern" => {
+                    config.delete_pattern =
+                        DeletePattern::parse(&next_value(&mut args, "--delete-pattern")?)?
+                }
+                "--delete-seed" => {
+                    config.delete_seed = parse_u64(&next_value(&mut args, "--delete-seed")?)?
+                }
+                "--delete-verify-samples" => {
+                    config.delete_verify_samples =
+                        parse_usize(&next_value(&mut args, "--delete-verify-samples")?)?
+                }
+                "--delete-reclaim" => {
+                    config.delete_reclaim_mode =
+                        DeleteReclaimMode::parse(&next_value(&mut args, "--delete-reclaim")?)?
+                }
+                "--delete-setup-timeout" => {
+                    config.delete_setup_timeout =
+                        parse_duration(&next_value(&mut args, "--delete-setup-timeout")?)?
+                }
+                "--reclaim-duration" => {
+                    config.reclaim_duration =
+                        parse_duration(&next_value(&mut args, "--reclaim-duration")?)?
+                }
+                "--reclaim-sample-at" => {
+                    reclaim_sample_at_explicit = true;
+                    config.reclaim_sample_at =
+                        parse_duration_list(&next_value(&mut args, "--reclaim-sample-at")?)?
+                }
+                "--post-delete-workload" => {
+                    config.post_delete_workload = PostDeleteWorkload::parse(&next_value(
+                        &mut args,
+                        "--post-delete-workload",
+                    )?)?
+                }
+                "--post-delete-ops-per-second" => {
+                    config.post_delete_ops_per_second =
+                        parse_u64(&next_value(&mut args, "--post-delete-ops-per-second")?)?
+                }
+                "--post-delete-put-percent" => {
+                    config.post_delete_put_percent = parse_percent_inclusive(&next_value(
+                        &mut args,
+                        "--post-delete-put-percent",
+                    )?)?
+                }
+                "--post-delete-get-percent" => {
+                    config.post_delete_get_percent = parse_percent_inclusive(&next_value(
+                        &mut args,
+                        "--post-delete-get-percent",
+                    )?)?
+                }
+                "--post-delete-delete-percent" => {
+                    config.post_delete_delete_percent = parse_percent_inclusive(&next_value(
+                        &mut args,
+                        "--post-delete-delete-percent",
+                    )?)?
+                }
+                "--post-delete-seed" => {
+                    config.post_delete_seed =
+                        parse_u64(&next_value(&mut args, "--post-delete-seed")?)?
                 }
                 "--metrics-listen" => {
                     config.metrics_listen = Some(next_value(&mut args, "--metrics-listen")?)
@@ -429,6 +659,65 @@ impl Config {
         }
         if config.strata_gc && !config.strata_accounting {
             return Err("--strata-gc true requires --strata-accounting true".to_owned());
+        }
+        if config.strata_gc_io_bytes_per_sec == 0 {
+            return Err("--strata-gc-io-bytes-per-sec must be non-zero".to_owned());
+        }
+        if config.strata_gc_min_io_bytes_per_sec == 0
+            || config.strata_gc_min_io_bytes_per_sec > config.strata_gc_io_bytes_per_sec
+        {
+            return Err(
+                "--strata-gc-min-io-bytes-per-sec must be non-zero and no greater than --strata-gc-io-bytes-per-sec"
+                    .to_owned(),
+            );
+        }
+        if config.case.is_delete() && config.delete_setup_timeout.is_zero() {
+            return Err("--delete-setup-timeout must be non-zero".to_owned());
+        }
+        if config.delete_reclaim_mode == DeleteReclaimMode::Background
+            && config.reclaim_duration.is_zero()
+        {
+            return Err(
+                "--reclaim-duration must be non-zero for background reclamation".to_owned(),
+            );
+        }
+        if config.delete_reclaim_mode != DeleteReclaimMode::Background
+            && config.post_delete_workload == PostDeleteWorkload::Steady
+        {
+            return Err(
+                "--post-delete-workload steady requires --delete-reclaim background".to_owned(),
+            );
+        }
+        if config.post_delete_workload == PostDeleteWorkload::Steady
+            && config.post_delete_ops_per_second == 0
+        {
+            return Err(
+                "--post-delete-ops-per-second must be non-zero for steady traffic".to_owned(),
+            );
+        }
+        if config.post_delete_ops_per_second > 1_000_000_000 {
+            return Err("--post-delete-ops-per-second must be at most 1000000000".to_owned());
+        }
+        let post_delete_mix_bps = percent_to_basis_points_inclusive(config.post_delete_put_percent)
+            + percent_to_basis_points_inclusive(config.post_delete_get_percent)
+            + percent_to_basis_points_inclusive(config.post_delete_delete_percent);
+        if post_delete_mix_bps != 10_000 {
+            return Err(format!(
+                "post-delete put/get/delete percentages must sum to 100, got {:.6}",
+                config.post_delete_put_percent
+                    + config.post_delete_get_percent
+                    + config.post_delete_delete_percent
+            ));
+        }
+        if reclaim_sample_at_explicit
+            && config
+                .reclaim_sample_at
+                .iter()
+                .any(|sample| *sample > config.reclaim_duration)
+        {
+            return Err(
+                "--reclaim-sample-at cannot contain a time after --reclaim-duration".to_owned(),
+            );
         }
         if config.reuse_existing
             && !matches!(
@@ -469,6 +758,20 @@ impl Config {
         }
     }
 
+    fn effective_reclaim_sample_at(&self) -> Vec<Duration> {
+        if self.delete_reclaim_mode == DeleteReclaimMode::None {
+            return vec![Duration::ZERO];
+        }
+
+        let mut samples = self.reclaim_sample_at.clone();
+        samples.retain(|sample| *sample <= self.reclaim_duration);
+        samples.push(Duration::ZERO);
+        samples.push(self.reclaim_duration);
+        samples.sort_unstable();
+        samples.dedup();
+        samples
+    }
+
     fn store_config(&self) -> StrataStoreConfig {
         StrataStoreConfig {
             root_dir: self.root_dir.clone(),
@@ -501,12 +804,20 @@ impl Config {
             gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
             gc_tuning_window_cycles: DEFAULT_GC_TUNING_WINDOW_CYCLES,
             gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
-            gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
-            gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
-            gc_planner_config: GcPlannerConfig::default(),
+            gc_io_bytes_per_sec: self.strata_gc_io_bytes_per_sec,
+            gc_min_io_bytes_per_sec: self.strata_gc_min_io_bytes_per_sec,
+            gc_planner_config: self.gc_planner_config(),
             gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: self.starting_epoch,
+        }
+    }
+
+    fn gc_planner_config(&self) -> GcPlannerConfig {
+        GcPlannerConfig {
+            min_reclaim_bytes: self.strata_gc_min_reclaim_bytes,
+            min_garbage_ratio_bps: self.strata_gc_min_garbage_ratio_bps,
+            ..GcPlannerConfig::default()
         }
     }
 }
@@ -565,16 +876,102 @@ impl PhaseTimings {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct PathSummary {
     bytes: u64,
+    allocated_bytes: u64,
     file_count: u64,
     directory_count: u64,
     data_file_count: u64,
+    data_file_bytes: u64,
     sst_file_count: u64,
+    sst_file_bytes: u64,
     blob_file_count: u64,
+    blob_file_bytes: u64,
     log_file_count: u64,
+    log_file_bytes: u64,
     manifest_file_count: u64,
+}
+
+impl PathSummary {
+    fn payload_file_bytes(self) -> u64 {
+        self.data_file_bytes.saturating_add(self.blob_file_bytes)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SteadyOperationCounts {
+    puts: u64,
+    gets: u64,
+    deletes: u64,
+    syncs: u64,
+}
+
+impl SteadyOperationCounts {
+    fn operations(self) -> u64 {
+        self.puts
+            .saturating_add(self.gets)
+            .saturating_add(self.deletes)
+    }
+
+    fn mutations(self) -> u64 {
+        self.puts.saturating_add(self.deletes)
+    }
+}
+
+#[derive(Debug, Default)]
+struct SteadyWorkloadSummary {
+    counts: SteadyOperationCounts,
+    put_timings: Vec<Duration>,
+    get_timings: Vec<Duration>,
+    delete_timings: Vec<Duration>,
+    sync_timings: Vec<Duration>,
+}
+
+#[derive(Debug)]
+struct ReclaimSample {
+    target: Duration,
+    elapsed: Duration,
+    path: PathSummary,
+    io: Option<ProcessIoSnapshot>,
+    workload_counts: SteadyOperationCounts,
+}
+
+#[derive(Debug, Default)]
+struct ReclaimTimeline {
+    samples: Vec<ReclaimSample>,
+    workload: SteadyWorkloadSummary,
+    final_sync: Duration,
+}
+
+struct DeleteReportInputs<'a> {
+    config: &'a Config,
+    loaded_keys: usize,
+    deleted_keys: usize,
+    loaded: PathSummary,
+    baseline: PathSummary,
+    post_delete: PathSummary,
+    empty_io: Option<ProcessIoSnapshot>,
+    loaded_io: Option<ProcessIoSnapshot>,
+    baseline_io: Option<ProcessIoSnapshot>,
+    post_delete_io: Option<ProcessIoSnapshot>,
+    final_sync: Duration,
+    reclaim_timeline: &'a ReclaimTimeline,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessIoSnapshot {
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+impl ProcessIoSnapshot {
+    fn saturating_delta(self, earlier: Self) -> Self {
+        Self {
+            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
+            write_bytes: self.write_bytes.saturating_sub(earlier.write_bytes),
+        }
+    }
 }
 
 #[cfg(feature = "internal-profiling")]
@@ -728,6 +1125,7 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         BenchCase::StorePut => run_store_put(&config, &bench_metrics),
         BenchCase::StorePutArc => run_store_put_arc(&config, &bench_metrics),
         BenchCase::StoreGet => run_store_get(&config, &bench_metrics),
+        BenchCase::StoreDelete => run_store_delete(&config, &bench_metrics),
         BenchCase::RocksDbBlobDbPut => run_rocksdb_blobdb_put(&config),
         BenchCase::RocksDbBlobDbGet => {
             run_rocksdb_blobdb_get(&config, &bench_metrics, RocksDbGetMode::Decoded)
@@ -735,6 +1133,7 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         BenchCase::RocksDbBlobDbGetPinned => {
             run_rocksdb_blobdb_get(&config, &bench_metrics, RocksDbGetMode::Pinned)
         }
+        BenchCase::RocksDbBlobDbDelete => run_rocksdb_blobdb_delete(&config),
     };
 
     if bench_metrics.is_enabled() && config.metrics_drain_seconds != 0 {
@@ -960,6 +1359,135 @@ fn run_store_get(
     Ok(())
 }
 
+fn run_store_delete(
+    config: &Config,
+    bench_metrics: &BenchMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = payload(config.payload_size);
+    let store_config = config.store_config();
+    let (metrics, profile_capture) =
+        metrics_with_profile_capture(bench_metrics.store_metrics(&config.namespace)?);
+    let store = StrataStore::open(store_config, metrics)?;
+    let keys = (0..config.ops)
+        .map(|op| bench_key(b"store-delete-key-", op))
+        .collect::<Result<Vec<_>, _>>()?;
+    let empty_io = process_io_snapshot()?;
+
+    for key in &keys {
+        store.put(0, key, &payload)?;
+    }
+    store.sync()?;
+    store.checkpoint_active_segment()?;
+    wait_for_strata_sealing(&store, config.delete_setup_timeout)?;
+    wait_for_strata_accounting(&store, config.delete_setup_timeout)?;
+
+    let loaded = summarize_path_if_exists(&config.root_dir)?;
+    let loaded_io = process_io_snapshot()?;
+    let baseline = loaded;
+    let baseline_io = loaded_io;
+
+    let delete_indexes = delete_indexes(
+        config.ops,
+        config.delete_percent,
+        config.delete_pattern,
+        config.delete_seed,
+    );
+    let mut timings = Vec::with_capacity(delete_indexes.len());
+    let mut phases = PhaseTimings::new("store_delete", delete_indexes.len());
+    let started = Instant::now();
+    for (completed, key_index) in delete_indexes.iter().copied().enumerate() {
+        let op_started = Instant::now();
+        let phase_started = Instant::now();
+        let lsn = store.tombstone(&keys[key_index])?;
+        phases.primary.push(phase_started.elapsed());
+        hint::black_box(lsn);
+        if should_sync(config.sync_every, completed + 1) {
+            let sync_started = Instant::now();
+            store.sync()?;
+            phases.sync.push(sync_started.elapsed());
+        }
+        timings.push(op_started.elapsed());
+    }
+    let elapsed = started.elapsed();
+    let final_sync_started = Instant::now();
+    store.sync()?;
+    let final_sync = final_sync_started.elapsed();
+
+    verify_strata_delete_samples(&store, &keys, &delete_indexes, config.delete_verify_samples)?;
+    let post_delete_io = process_io_snapshot()?;
+    let post_delete = summarize_path_if_exists(&config.root_dir)?;
+    let live_indexes = live_indexes(keys.len(), &delete_indexes);
+    let reclaim_timeline = run_reclaim_timeline(
+        config,
+        &live_indexes,
+        |action| {
+            match action {
+                SteadyAction::Put(index) => {
+                    let key = bench_key(b"store-post-delete-key-", index)?;
+                    hint::black_box(store.put(0, &key, &payload)?);
+                }
+                SteadyAction::GetOriginal(index) => {
+                    let value = store.get(&keys[index])?;
+                    if value.is_none() {
+                        return Err(io::Error::other(format!(
+                            "Strata steady get missed original key {index}"
+                        ))
+                        .into());
+                    }
+                    hint::black_box(value);
+                }
+                SteadyAction::GetSteady(index) => {
+                    let key = bench_key(b"store-post-delete-key-", index)?;
+                    let value = store.get(&key)?;
+                    if value.is_none() {
+                        return Err(io::Error::other(format!(
+                            "Strata steady get missed generated key {index}"
+                        ))
+                        .into());
+                    }
+                    hint::black_box(value);
+                }
+                SteadyAction::Delete(index) => {
+                    let key = bench_key(b"store-post-delete-key-", index)?;
+                    hint::black_box(store.tombstone(&key)?);
+                }
+            }
+            Ok(())
+        },
+        || {
+            store.sync()?;
+            Ok(())
+        },
+    )?;
+    verify_strata_delete_samples(&store, &keys, &delete_indexes, config.delete_verify_samples)?;
+
+    print_delete_report(DeleteReportInputs {
+        config,
+        loaded_keys: keys.len(),
+        deleted_keys: delete_indexes.len(),
+        loaded,
+        baseline,
+        post_delete,
+        empty_io,
+        loaded_io,
+        baseline_io,
+        post_delete_io,
+        final_sync,
+        reclaim_timeline: &reclaim_timeline,
+    });
+    print_report(ReportInputs {
+        config,
+        elapsed,
+        timings: &timings,
+        profile: None,
+        phases: Some(&phases),
+        store: Some(&store),
+        rocksdb: None,
+        profile_capture: Some(&profile_capture),
+    })?;
+    Ok(())
+}
+
 fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
@@ -983,6 +1511,129 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
     }
 
     let elapsed = started.elapsed();
+    print_report(ReportInputs {
+        config,
+        elapsed,
+        timings: &timings,
+        profile: None,
+        phases: Some(&phases),
+        store: None,
+        rocksdb: Some(db.rocksdb.as_ref()),
+        profile_capture: None,
+    })?;
+    Ok(())
+}
+
+fn run_rocksdb_blobdb_delete(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = BlobDbValue(payload(config.payload_size));
+    let db = open_typed_rocksdb_blobdb(config)?;
+    let keys = (0..config.ops)
+        .map(|op| bench_key(b"rocksdb-delete-key-", op))
+        .map(|result| result.map(|key| key.as_bytes().to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let empty_io = process_io_snapshot()?;
+
+    for key in &keys {
+        insert_rocksdb_blobdb(&db, key, &payload, config.rocksdb_disable_wal)?;
+    }
+    flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
+    db.flush()?;
+    let baseline = summarize_path_if_exists(&config.root_dir)?;
+    let baseline_io = process_io_snapshot()?;
+    let loaded = baseline;
+    let loaded_io = baseline_io;
+
+    let delete_indexes = delete_indexes(
+        config.ops,
+        config.delete_percent,
+        config.delete_pattern,
+        config.delete_seed,
+    );
+    let mut timings = Vec::with_capacity(delete_indexes.len());
+    let mut phases = PhaseTimings::new("rocksdb_delete", delete_indexes.len());
+    let started = Instant::now();
+    for (completed, key_index) in delete_indexes.iter().copied().enumerate() {
+        let op_started = Instant::now();
+        let phase_started = Instant::now();
+        delete_rocksdb_blobdb(&db, &keys[key_index], config.rocksdb_disable_wal)?;
+        phases.primary.push(phase_started.elapsed());
+        if let Some(sync_elapsed) = record_sync_timed(config.sync_every, completed + 1, || {
+            flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)
+        })? {
+            phases.sync.push(sync_elapsed);
+        }
+        timings.push(op_started.elapsed());
+    }
+    let elapsed = started.elapsed();
+    let final_sync_started = Instant::now();
+    flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
+    let final_sync = final_sync_started.elapsed();
+
+    verify_rocksdb_delete_samples(&db, &keys, &delete_indexes, config.delete_verify_samples)?;
+    let post_delete_io = process_io_snapshot()?;
+    let post_delete = summarize_path_if_exists(&config.root_dir)?;
+    let live_indexes = live_indexes(keys.len(), &delete_indexes);
+    let reclaim_timeline = run_reclaim_timeline(
+        config,
+        &live_indexes,
+        |action| {
+            match action {
+                SteadyAction::Put(index) => {
+                    let key = bench_key(b"rocksdb-post-delete-key-", index)?
+                        .as_bytes()
+                        .to_vec();
+                    insert_rocksdb_blobdb(&db, &key, &payload, config.rocksdb_disable_wal)?;
+                }
+                SteadyAction::GetOriginal(index) => {
+                    let value = db.get(&keys[index])?;
+                    if value.is_none() {
+                        return Err(io::Error::other(format!(
+                            "BlobDB steady get missed original key {index}"
+                        ))
+                        .into());
+                    }
+                    hint::black_box(value);
+                }
+                SteadyAction::GetSteady(index) => {
+                    let key = bench_key(b"rocksdb-post-delete-key-", index)?
+                        .as_bytes()
+                        .to_vec();
+                    let value = db.get(&key)?;
+                    if value.is_none() {
+                        return Err(io::Error::other(format!(
+                            "BlobDB steady get missed generated key {index}"
+                        ))
+                        .into());
+                    }
+                    hint::black_box(value);
+                }
+                SteadyAction::Delete(index) => {
+                    let key = bench_key(b"rocksdb-post-delete-key-", index)?
+                        .as_bytes()
+                        .to_vec();
+                    delete_rocksdb_blobdb(&db, &key, config.rocksdb_disable_wal)?;
+                }
+            }
+            Ok(())
+        },
+        || flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true),
+    )?;
+    verify_rocksdb_delete_samples(&db, &keys, &delete_indexes, config.delete_verify_samples)?;
+
+    print_delete_report(DeleteReportInputs {
+        config,
+        loaded_keys: keys.len(),
+        deleted_keys: delete_indexes.len(),
+        loaded,
+        baseline,
+        post_delete,
+        empty_io,
+        loaded_io,
+        baseline_io,
+        post_delete_io,
+        final_sync,
+        reclaim_timeline: &reclaim_timeline,
+    });
     print_report(ReportInputs {
         config,
         elapsed,
@@ -1183,6 +1834,365 @@ fn verify_reused_key_found(config: &Config, found: bool, key: &[u8]) -> io::Resu
     Ok(())
 }
 
+fn delete_indexes(
+    key_count: usize,
+    delete_percent: f64,
+    pattern: DeletePattern,
+    seed: u64,
+) -> Vec<usize> {
+    let delete_count =
+        (((key_count as f64) * delete_percent / 100.0).round() as usize).clamp(1, key_count);
+    match pattern {
+        DeletePattern::Sequential => (0..delete_count).collect(),
+        DeletePattern::Random => {
+            let mut indexes = (0..key_count).collect::<Vec<_>>();
+            let mut rng = SplitMix64::new(seed);
+            for index in 0..delete_count {
+                let remaining = key_count - index;
+                let selected = index + (rng.next_u64() as usize % remaining);
+                indexes.swap(index, selected);
+            }
+            indexes.truncate(delete_count);
+            indexes
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SteadyAction {
+    Put(usize),
+    GetOriginal(usize),
+    GetSteady(usize),
+    Delete(usize),
+}
+
+fn run_reclaim_timeline(
+    config: &Config,
+    live_original_indexes: &[usize],
+    mut perform: impl FnMut(SteadyAction) -> Result<(), Box<dyn std::error::Error>>,
+    mut sync: impl FnMut() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<ReclaimTimeline, Box<dyn std::error::Error>> {
+    let sample_at = config.effective_reclaim_sample_at();
+    let mut timeline = ReclaimTimeline::default();
+    let started = Instant::now();
+    let mut next_operation_at = started;
+    let operation_interval = Duration::from_nanos(
+        1_000_000_000_u64
+            .checked_div(config.post_delete_ops_per_second.max(1))
+            .unwrap_or(1)
+            .max(1),
+    );
+    let mut rng = SplitMix64::new(config.post_delete_seed);
+    let mut next_steady_key = 0_usize;
+    let mut steady_live_keys = VecDeque::new();
+    let mut last_synced_mutations = 0_u64;
+
+    for target in sample_at {
+        let deadline = started
+            .checked_add(target)
+            .ok_or_else(|| io::Error::other("reclaim sample time exceeds Instant range"))?;
+
+        while Instant::now() < deadline {
+            if config.post_delete_workload == PostDeleteWorkload::Idle
+                || config.delete_reclaim_mode == DeleteReclaimMode::None
+            {
+                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                continue;
+            }
+
+            let now = Instant::now();
+            if now < next_operation_at {
+                thread::sleep(
+                    next_operation_at
+                        .min(deadline)
+                        .saturating_duration_since(now),
+                );
+                continue;
+            }
+
+            let action = next_steady_action(
+                config,
+                live_original_indexes,
+                &mut steady_live_keys,
+                &mut next_steady_key,
+                &mut rng,
+            );
+            let operation_started = Instant::now();
+            perform(action)?;
+            let operation_elapsed = operation_started.elapsed();
+            match action {
+                SteadyAction::Put(key) => {
+                    timeline.workload.counts.puts = timeline.workload.counts.puts.saturating_add(1);
+                    timeline.workload.put_timings.push(operation_elapsed);
+                    steady_live_keys.push_back(key);
+                }
+                SteadyAction::GetOriginal(_) | SteadyAction::GetSteady(_) => {
+                    timeline.workload.counts.gets = timeline.workload.counts.gets.saturating_add(1);
+                    timeline.workload.get_timings.push(operation_elapsed);
+                }
+                SteadyAction::Delete(_) => {
+                    timeline.workload.counts.deletes =
+                        timeline.workload.counts.deletes.saturating_add(1);
+                    timeline.workload.delete_timings.push(operation_elapsed);
+                }
+            }
+
+            let mutations = timeline.workload.counts.mutations();
+            if config.sync_every != 0
+                && mutations != last_synced_mutations
+                && mutations.is_multiple_of(config.sync_every as u64)
+            {
+                let sync_started = Instant::now();
+                sync()?;
+                timeline.workload.sync_timings.push(sync_started.elapsed());
+                timeline.workload.counts.syncs = timeline.workload.counts.syncs.saturating_add(1);
+                last_synced_mutations = mutations;
+            }
+
+            next_operation_at = next_operation_at
+                .checked_add(operation_interval)
+                .unwrap_or_else(Instant::now);
+            if next_operation_at < Instant::now() {
+                next_operation_at = Instant::now();
+            }
+        }
+
+        if target == config.reclaim_duration
+            && config.post_delete_workload == PostDeleteWorkload::Steady
+            && timeline.workload.counts.mutations() != last_synced_mutations
+        {
+            let sync_started = Instant::now();
+            sync()?;
+            timeline.final_sync = sync_started.elapsed();
+            timeline.workload.sync_timings.push(timeline.final_sync);
+            timeline.workload.counts.syncs = timeline.workload.counts.syncs.saturating_add(1);
+        }
+
+        timeline.samples.push(ReclaimSample {
+            target,
+            elapsed: started.elapsed(),
+            path: summarize_path_if_exists(&config.root_dir)?,
+            io: process_io_snapshot()?,
+            workload_counts: timeline.workload.counts,
+        });
+    }
+
+    Ok(timeline)
+}
+
+fn next_steady_action(
+    config: &Config,
+    live_original_indexes: &[usize],
+    steady_live_keys: &mut VecDeque<usize>,
+    next_steady_key: &mut usize,
+    rng: &mut SplitMix64,
+) -> SteadyAction {
+    let put_bps = percent_to_basis_points_inclusive(config.post_delete_put_percent) as u64;
+    let get_bps = percent_to_basis_points_inclusive(config.post_delete_get_percent) as u64;
+    let roll = rng.next_u64() % 10_000;
+
+    if roll < put_bps {
+        return next_steady_put(next_steady_key);
+    }
+
+    if roll < put_bps + get_bps {
+        if !live_original_indexes.is_empty()
+            && (steady_live_keys.is_empty() || rng.next_u64().is_multiple_of(2))
+        {
+            let index = (rng.next_u64() as usize) % live_original_indexes.len();
+            return SteadyAction::GetOriginal(live_original_indexes[index]);
+        }
+        if let Some(&key) = steady_live_keys.front() {
+            return SteadyAction::GetSteady(key);
+        }
+        return next_steady_put(next_steady_key);
+    }
+
+    match steady_live_keys.pop_front() {
+        Some(key) => SteadyAction::Delete(key),
+        None => next_steady_put(next_steady_key),
+    }
+}
+
+fn next_steady_put(next_steady_key: &mut usize) -> SteadyAction {
+    let key = *next_steady_key;
+    *next_steady_key = next_steady_key.wrapping_add(1);
+    SteadyAction::Put(key)
+}
+
+fn live_indexes(key_count: usize, deleted_indexes: &[usize]) -> Vec<usize> {
+    let deleted = deleted_bitmap(key_count, deleted_indexes);
+    (0..key_count).filter(|index| !deleted[*index]).collect()
+}
+
+fn wait_for_strata_sealing(
+    store: &StrataStore,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        let sealing = store
+            .index()
+            .iter_segment_states()?
+            .into_iter()
+            .any(|(_, state)| state.state == SegmentFileState::Sealing);
+        if !sealing {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for Strata segment sealing",
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_strata_accounting(
+    store: &StrataStore,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target_lsn = store.durable_lsn()?;
+    store.request_accounting_materialization(target_lsn)?;
+    let started = Instant::now();
+    loop {
+        if store.accounted_lsn()? >= target_lsn {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for Strata accounting LSN {target_lsn}"),
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn verify_strata_delete_samples(
+    store: &StrataStore,
+    keys: &[BlobKey],
+    deleted_indexes: &[usize],
+    sample_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if sample_count == 0 {
+        return Ok(());
+    }
+    for &index in deleted_indexes.iter().take(sample_count) {
+        if store.contains(&keys[index])? {
+            return Err(
+                io::Error::other(format!("Strata deleted key {index} remained visible")).into(),
+            );
+        }
+    }
+    let deleted = deleted_bitmap(keys.len(), deleted_indexes);
+    for index in (0..keys.len())
+        .filter(|index| !deleted[*index])
+        .take(sample_count)
+    {
+        if !store.contains(&keys[index])? {
+            return Err(
+                io::Error::other(format!("Strata live key {index} was not visible")).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_rocksdb_delete_samples(
+    db: &BlobDbMap,
+    keys: &[Vec<u8>],
+    deleted_indexes: &[usize],
+    sample_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if sample_count == 0 {
+        return Ok(());
+    }
+    for &index in deleted_indexes.iter().take(sample_count) {
+        if db.contains_key(&keys[index])? {
+            return Err(
+                io::Error::other(format!("BlobDB deleted key {index} remained visible")).into(),
+            );
+        }
+    }
+    let deleted = deleted_bitmap(keys.len(), deleted_indexes);
+    for index in (0..keys.len())
+        .filter(|index| !deleted[*index])
+        .take(sample_count)
+    {
+        if !db.contains_key(&keys[index])? {
+            return Err(
+                io::Error::other(format!("BlobDB live key {index} was not visible")).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn deleted_bitmap(key_count: usize, deleted_indexes: &[usize]) -> Vec<bool> {
+    let mut deleted = vec![false; key_count];
+    for &index in deleted_indexes {
+        deleted[index] = true;
+    }
+    deleted
+}
+
+fn process_io_snapshot() -> io::Result<Option<ProcessIoSnapshot>> {
+    let path = Path::new("/proc/self/io");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(path)?;
+    let mut read_bytes = None;
+    let mut write_bytes = None;
+    for line in contents.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().parse::<u64>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid /proc/self/io value '{value}': {error}"),
+            )
+        })?;
+        match name {
+            "read_bytes" => read_bytes = Some(value),
+            "write_bytes" => write_bytes = Some(value),
+            _ => {}
+        }
+    }
+    match (read_bytes, write_bytes) {
+        (Some(read_bytes), Some(write_bytes)) => Ok(Some(ProcessIoSnapshot {
+            read_bytes,
+            write_bytes,
+        })),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "/proc/self/io did not contain read_bytes and write_bytes",
+        )),
+    }
+}
+
+fn delete_rocksdb_blobdb(
+    db: &BlobDbMap,
+    key: &Vec<u8>,
+    disable_wal: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !disable_wal {
+        db.remove(key)?;
+        return Ok(());
+    }
+
+    let key_buf = be_fix_int_ser(key)?;
+    let mut write_options = WriteOptions::default();
+    write_options.disable_wal(true);
+    db.rocksdb.delete_cf(&db.cf()?, key_buf, &write_options)?;
+    Ok(())
+}
+
 fn insert_rocksdb_blobdb(
     db: &BlobDbMap,
     key: &Vec<u8>,
@@ -1237,7 +2247,10 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     options.set_blob_file_size(config.rocksdb_blob_file_size);
     options.set_write_buffer_size(config.rocksdb_write_buffer_size);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
+    options.set_blob_gc_age_cutoff(config.rocksdb_blob_gc_age_cutoff);
+    options.set_blob_gc_force_threshold(config.rocksdb_blob_gc_force_threshold);
     options.set_disable_auto_compactions(config.rocksdb_disable_auto_compactions);
+    options.enable_statistics();
     let metric_conf = if config.rocksdb_get_profile {
         MetricConf::new(ROCKSDB_BLOBDB_CF_CLASS)
             .with_sampling(SamplingInterval::new(Duration::ZERO, u64::MAX - 1))
@@ -1524,6 +2537,267 @@ struct ReportInputs<'a> {
     profile_capture: Option<&'a ProfileCapture>,
 }
 
+fn print_delete_report(inputs: DeleteReportInputs<'_>) {
+    let DeleteReportInputs {
+        config,
+        loaded_keys,
+        deleted_keys,
+        loaded,
+        baseline,
+        post_delete,
+        empty_io,
+        loaded_io,
+        baseline_io,
+        post_delete_io,
+        final_sync,
+        reclaim_timeline,
+    } = inputs;
+    let final_sample = reclaim_timeline
+        .samples
+        .last()
+        .expect("reclaim timeline always contains at least the t=0 sample");
+    let post_reclaim = final_sample.path;
+    let post_reclaim_io = final_sample.io;
+    let logical_deleted_payload_bytes =
+        (deleted_keys as u128).saturating_mul(config.payload_size as u128);
+    let logical_loaded_payload_bytes =
+        (loaded_keys as u128).saturating_mul(config.payload_size as u128);
+    let post_delete_put_payload_bytes =
+        (reclaim_timeline.workload.counts.puts as u128).saturating_mul(config.payload_size as u128);
+    let post_delete_deleted_payload_bytes = (reclaim_timeline.workload.counts.deletes as u128)
+        .saturating_mul(config.payload_size as u128);
+    let reclaimed_bytes = baseline.bytes.saturating_sub(post_reclaim.bytes);
+    let reclaimed_allocated_bytes = baseline
+        .allocated_bytes
+        .saturating_sub(post_reclaim.allocated_bytes);
+    let reclaimed_payload_file_bytes = baseline
+        .payload_file_bytes()
+        .saturating_sub(post_reclaim.payload_file_bytes());
+
+    println!("delete_loaded_keys={loaded_keys}");
+    println!("delete_deleted_keys={deleted_keys}");
+    println!("delete_percent={:.6}", config.delete_percent);
+    println!("delete_pattern={}", config.delete_pattern.as_str());
+    println!("delete_seed={}", config.delete_seed);
+    println!("delete_verify_samples={}", config.delete_verify_samples);
+    println!(
+        "delete_reclaim_mode={}",
+        config.delete_reclaim_mode.as_str()
+    );
+    println!(
+        "delete_setup_timeout_ms={}",
+        config.delete_setup_timeout.as_millis()
+    );
+    println!(
+        "delete_reclaim_duration_ms={}",
+        config.reclaim_duration.as_millis()
+    );
+    println!(
+        "delete_post_delete_workload={}",
+        config.post_delete_workload.as_str()
+    );
+    println!(
+        "delete_post_delete_target_ops_per_second={}",
+        config.post_delete_ops_per_second
+    );
+    println!(
+        "delete_post_delete_put_percent={:.6}",
+        config.post_delete_put_percent
+    );
+    println!(
+        "delete_post_delete_get_percent={:.6}",
+        config.post_delete_get_percent
+    );
+    println!(
+        "delete_post_delete_delete_percent={:.6}",
+        config.post_delete_delete_percent
+    );
+    println!("delete_post_delete_seed={}", config.post_delete_seed);
+    println!("delete_loaded_payload_bytes={logical_loaded_payload_bytes}");
+    println!("delete_logical_payload_bytes={logical_deleted_payload_bytes}");
+    println!("delete_final_sync_us={:.3}", duration_us(&final_sync));
+    println!(
+        "delete_reclaim_final_sync_us={:.3}",
+        duration_us(&reclaim_timeline.final_sync)
+    );
+    println!(
+        "delete_post_delete_operations={}",
+        reclaim_timeline.workload.counts.operations()
+    );
+    let post_delete_elapsed_seconds = final_sample.elapsed.as_secs_f64();
+    let post_delete_actual_ops_per_second = if post_delete_elapsed_seconds == 0.0 {
+        0.0
+    } else {
+        reclaim_timeline.workload.counts.operations() as f64 / post_delete_elapsed_seconds
+    };
+    println!("delete_post_delete_actual_ops_per_second={post_delete_actual_ops_per_second:.3}");
+    println!(
+        "delete_post_delete_puts={}",
+        reclaim_timeline.workload.counts.puts
+    );
+    println!(
+        "delete_post_delete_gets={}",
+        reclaim_timeline.workload.counts.gets
+    );
+    println!(
+        "delete_post_delete_deletes={}",
+        reclaim_timeline.workload.counts.deletes
+    );
+    println!(
+        "delete_post_delete_syncs={}",
+        reclaim_timeline.workload.counts.syncs
+    );
+    println!("delete_post_delete_put_payload_bytes={post_delete_put_payload_bytes}");
+    println!("delete_post_delete_deleted_payload_bytes={post_delete_deleted_payload_bytes}");
+    println!(
+        "delete_post_delete_directory_delta_bytes={}",
+        post_delete.bytes as i128 - baseline.bytes as i128
+    );
+    println!(
+        "delete_final_directory_delta_from_baseline_bytes={}",
+        post_reclaim.bytes as i128 - baseline.bytes as i128
+    );
+    println!(
+        "delete_final_directory_delta_from_post_delete_bytes={}",
+        post_reclaim.bytes as i128 - post_delete.bytes as i128
+    );
+    println!("delete_reclaimed_directory_bytes={reclaimed_bytes}");
+    println!("delete_reclaimed_allocated_bytes={reclaimed_allocated_bytes}");
+    println!("delete_reclaimed_payload_file_bytes={reclaimed_payload_file_bytes}");
+    print_ratio(
+        "delete_directory_reclaim_efficiency",
+        reclaimed_bytes,
+        logical_deleted_payload_bytes,
+    );
+    print_ratio(
+        "delete_allocated_reclaim_efficiency",
+        reclaimed_allocated_bytes,
+        logical_deleted_payload_bytes,
+    );
+    print_ratio(
+        "delete_payload_file_reclaim_efficiency",
+        reclaimed_payload_file_bytes,
+        logical_deleted_payload_bytes,
+    );
+    print_path_summary("delete_loaded", &loaded);
+    print_path_summary("delete_baseline", &baseline);
+    print_path_summary("delete_post_delete", &post_delete);
+    print_path_summary("delete_post_reclaim", &post_reclaim);
+
+    println!(
+        "delete_reclaim_sample_count={}",
+        reclaim_timeline.samples.len()
+    );
+    for (index, sample) in reclaim_timeline.samples.iter().enumerate() {
+        let prefix = format!("delete_reclaim_sample_{index}");
+        println!("{prefix}_target_ms={}", sample.target.as_millis());
+        println!(
+            "{prefix}_elapsed_ms={:.3}",
+            sample.elapsed.as_secs_f64() * 1000.0
+        );
+        println!(
+            "{prefix}_directory_delta_from_post_delete_bytes={}",
+            sample.path.bytes as i128 - post_delete.bytes as i128
+        );
+        println!(
+            "{prefix}_allocated_reclaimed_from_post_delete_bytes={}",
+            post_delete
+                .allocated_bytes
+                .saturating_sub(sample.path.allocated_bytes)
+        );
+        println!(
+            "{prefix}_payload_file_reclaimed_from_post_delete_bytes={}",
+            post_delete
+                .payload_file_bytes()
+                .saturating_sub(sample.path.payload_file_bytes())
+        );
+        println!("{prefix}_post_delete_puts={}", sample.workload_counts.puts);
+        println!("{prefix}_post_delete_gets={}", sample.workload_counts.gets);
+        println!(
+            "{prefix}_post_delete_deletes={}",
+            sample.workload_counts.deletes
+        );
+        println!(
+            "{prefix}_post_delete_syncs={}",
+            sample.workload_counts.syncs
+        );
+        print_path_summary(&prefix, &sample.path);
+        if let (Some(sample_io), Some(t0_io)) = (sample.io, post_delete_io) {
+            print_process_io_delta(
+                &format!("{prefix}_cumulative_io"),
+                sample_io.saturating_delta(t0_io),
+                logical_deleted_payload_bytes,
+            );
+        } else {
+            println!("{prefix}_cumulative_io_bytes=unavailable");
+        }
+    }
+
+    print_timing_summary(
+        "phase_post_delete_put",
+        &reclaim_timeline.workload.put_timings,
+    );
+    print_timing_summary(
+        "phase_post_delete_get",
+        &reclaim_timeline.workload.get_timings,
+    );
+    print_timing_summary(
+        "phase_post_delete_delete",
+        &reclaim_timeline.workload.delete_timings,
+    );
+    print_timing_summary(
+        "phase_post_delete_sync",
+        &reclaim_timeline.workload.sync_timings,
+    );
+
+    if let (Some(empty), Some(loaded), Some(baseline), Some(post_delete), Some(post_reclaim)) = (
+        empty_io,
+        loaded_io,
+        baseline_io,
+        post_delete_io,
+        post_reclaim_io,
+    ) {
+        let load = loaded.saturating_delta(empty);
+        let setup = baseline.saturating_delta(loaded);
+        let foreground = post_delete.saturating_delta(baseline);
+        let reclaim = post_reclaim.saturating_delta(post_delete);
+        let lifetime = post_reclaim.saturating_delta(empty);
+        print_process_io_delta("delete_load_io", load, logical_loaded_payload_bytes);
+        print_process_io_delta("delete_setup_io", setup, logical_loaded_payload_bytes);
+        print_process_io_delta(
+            "delete_foreground_io",
+            foreground,
+            logical_deleted_payload_bytes,
+        );
+        print_process_io_delta("delete_reclaim_io", reclaim, logical_deleted_payload_bytes);
+        print_process_io_delta("delete_lifetime_io", lifetime, logical_loaded_payload_bytes);
+    } else {
+        println!("delete_process_io_bytes=unavailable");
+    }
+}
+
+fn print_process_io_delta(prefix: &str, delta: ProcessIoSnapshot, logical_bytes: u128) {
+    let total_bytes = delta.read_bytes.saturating_add(delta.write_bytes);
+    println!("{prefix}_read_bytes={}", delta.read_bytes);
+    println!("{prefix}_write_bytes={}", delta.write_bytes);
+    println!("{prefix}_total_bytes={total_bytes}");
+    print_ratio(
+        &format!("{prefix}_read_amplification"),
+        delta.read_bytes,
+        logical_bytes,
+    );
+    print_ratio(
+        &format!("{prefix}_write_amplification"),
+        delta.write_bytes,
+        logical_bytes,
+    );
+    print_ratio(
+        &format!("{prefix}_total_amplification"),
+        total_bytes,
+        logical_bytes,
+    );
+}
+
 fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let ReportInputs {
         config,
@@ -1582,6 +2856,22 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
         sealed_integrity_as_str(config.sealed_segment_integrity_policy)
     );
     println!("reader_cache_capacity={}", config.reader_cache_capacity);
+    println!(
+        "strata_gc_io_bytes_per_sec={}",
+        config.strata_gc_io_bytes_per_sec
+    );
+    println!(
+        "strata_gc_min_io_bytes_per_sec={}",
+        config.strata_gc_min_io_bytes_per_sec
+    );
+    println!(
+        "strata_gc_min_reclaim_bytes={}",
+        config.strata_gc_min_reclaim_bytes
+    );
+    println!(
+        "strata_gc_min_garbage_percent={:.2}",
+        config.strata_gc_min_garbage_ratio_bps as f64 / 100.0
+    );
     println!("rocksdb_min_blob_size={}", config.rocksdb_min_blob_size);
     println!("rocksdb_blob_file_size={}", config.rocksdb_blob_file_size);
     println!(
@@ -1593,6 +2883,14 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
         config.rocksdb_high_pri_background_threads
     );
     println!("rocksdb_blob_gc={}", config.rocksdb_blob_gc);
+    println!(
+        "rocksdb_blob_gc_age_cutoff={:.6}",
+        config.rocksdb_blob_gc_age_cutoff
+    );
+    println!(
+        "rocksdb_blob_gc_force_threshold={:.6}",
+        config.rocksdb_blob_gc_force_threshold
+    );
     println!("rocksdb_get_profile={}", config.rocksdb_get_profile);
     println!("rocksdb_disable_wal={}", config.rocksdb_disable_wal);
     println!(
@@ -1633,7 +2931,9 @@ fn measured_logical_payload_bytes(config: &Config, measured_ops: usize) -> u128 
         BenchCase::SegmentAppend
         | BenchCase::StorePut
         | BenchCase::StorePutArc
+        | BenchCase::StoreDelete
         | BenchCase::RocksDbBlobDbPut
+        | BenchCase::RocksDbBlobDbDelete
         | BenchCase::RocksDbBlobDbGet
         | BenchCase::RocksDbBlobDbGetPinned => measured_ops,
         BenchCase::StoreGet => match config.store_get_mode {
@@ -1650,6 +2950,7 @@ fn database_logical_payload_bytes(config: &Config, measured_ops: usize) -> u128 
         | BenchCase::StorePut
         | BenchCase::StorePutArc
         | BenchCase::RocksDbBlobDbPut => measured_ops,
+        BenchCase::StoreDelete | BenchCase::RocksDbBlobDbDelete => config.ops,
         BenchCase::StoreGet | BenchCase::RocksDbBlobDbGet | BenchCase::RocksDbBlobDbGetPinned => {
             config.effective_read_set_size()
         }
@@ -1698,12 +2999,17 @@ fn print_layout_metrics(config: &Config) -> Result<(), Box<dyn std::error::Error
 
 fn print_path_summary(prefix: &str, summary: &PathSummary) {
     println!("{prefix}_bytes={}", summary.bytes);
+    println!("{prefix}_allocated_bytes={}", summary.allocated_bytes);
     println!("{prefix}_file_count={}", summary.file_count);
     println!("{prefix}_directory_count={}", summary.directory_count);
     println!("{prefix}_data_file_count={}", summary.data_file_count);
+    println!("{prefix}_data_file_bytes={}", summary.data_file_bytes);
     println!("{prefix}_sst_file_count={}", summary.sst_file_count);
+    println!("{prefix}_sst_file_bytes={}", summary.sst_file_bytes);
     println!("{prefix}_blob_file_count={}", summary.blob_file_count);
+    println!("{prefix}_blob_file_bytes={}", summary.blob_file_bytes);
     println!("{prefix}_log_file_count={}", summary.log_file_count);
+    println!("{prefix}_log_file_bytes={}", summary.log_file_bytes);
     println!(
         "{prefix}_manifest_file_count={}",
         summary.manifest_file_count
@@ -1721,7 +3027,12 @@ fn summarize_path(path: &Path) -> std::io::Result<PathSummary> {
     let metadata = fs::symlink_metadata(path)?;
     let mut summary = PathSummary::default();
     if metadata.is_file() {
-        add_file_to_summary(path, metadata.len(), &mut summary);
+        add_file_to_summary(
+            path,
+            metadata.len(),
+            allocated_file_bytes(&metadata),
+            &mut summary,
+        );
         return Ok(summary);
     }
     if !metadata.is_dir() {
@@ -1733,6 +3044,9 @@ fn summarize_path(path: &Path) -> std::io::Result<PathSummary> {
         let entry = entry?;
         let child_summary = summarize_path(&entry.path())?;
         summary.bytes = summary.bytes.saturating_add(child_summary.bytes);
+        summary.allocated_bytes = summary
+            .allocated_bytes
+            .saturating_add(child_summary.allocated_bytes);
         summary.file_count = summary.file_count.saturating_add(child_summary.file_count);
         summary.directory_count = summary
             .directory_count
@@ -1740,15 +3054,27 @@ fn summarize_path(path: &Path) -> std::io::Result<PathSummary> {
         summary.data_file_count = summary
             .data_file_count
             .saturating_add(child_summary.data_file_count);
+        summary.data_file_bytes = summary
+            .data_file_bytes
+            .saturating_add(child_summary.data_file_bytes);
         summary.sst_file_count = summary
             .sst_file_count
             .saturating_add(child_summary.sst_file_count);
+        summary.sst_file_bytes = summary
+            .sst_file_bytes
+            .saturating_add(child_summary.sst_file_bytes);
         summary.blob_file_count = summary
             .blob_file_count
             .saturating_add(child_summary.blob_file_count);
+        summary.blob_file_bytes = summary
+            .blob_file_bytes
+            .saturating_add(child_summary.blob_file_bytes);
         summary.log_file_count = summary
             .log_file_count
             .saturating_add(child_summary.log_file_count);
+        summary.log_file_bytes = summary
+            .log_file_bytes
+            .saturating_add(child_summary.log_file_bytes);
         summary.manifest_file_count = summary
             .manifest_file_count
             .saturating_add(child_summary.manifest_file_count);
@@ -1756,14 +3082,27 @@ fn summarize_path(path: &Path) -> std::io::Result<PathSummary> {
     Ok(summary)
 }
 
-fn add_file_to_summary(path: &Path, len: u64, summary: &mut PathSummary) {
+fn add_file_to_summary(path: &Path, len: u64, allocated_bytes: u64, summary: &mut PathSummary) {
     summary.bytes = summary.bytes.saturating_add(len);
+    summary.allocated_bytes = summary.allocated_bytes.saturating_add(allocated_bytes);
     summary.file_count += 1;
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some("data") => summary.data_file_count += 1,
-        Some("sst") => summary.sst_file_count += 1,
-        Some("blob") => summary.blob_file_count += 1,
-        Some("log") => summary.log_file_count += 1,
+        Some("data") => {
+            summary.data_file_count += 1;
+            summary.data_file_bytes = summary.data_file_bytes.saturating_add(len);
+        }
+        Some("sst") => {
+            summary.sst_file_count += 1;
+            summary.sst_file_bytes = summary.sst_file_bytes.saturating_add(len);
+        }
+        Some("blob") => {
+            summary.blob_file_count += 1;
+            summary.blob_file_bytes = summary.blob_file_bytes.saturating_add(len);
+        }
+        Some("log") => {
+            summary.log_file_count += 1;
+            summary.log_file_bytes = summary.log_file_bytes.saturating_add(len);
+        }
         _ => {}
     }
     if path
@@ -1773,6 +3112,16 @@ fn add_file_to_summary(path: &Path, len: u64, summary: &mut PathSummary) {
     {
         summary.manifest_file_count += 1;
     }
+}
+
+#[cfg(unix)]
+fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
 }
 
 fn file_len_if_exists(path: &Path) -> std::io::Result<u64> {
@@ -2219,8 +3568,10 @@ const ROCKSDB_INT_PROPERTIES: &[(&str, &str)] = &[
     ),
 ];
 
-const ROCKSDB_STRING_PROPERTIES: &[(&str, &str)] =
-    &[("rocksdb_property_blob_stats", "rocksdb.blob-stats")];
+const ROCKSDB_STRING_PROPERTIES: &[(&str, &str)] = &[
+    ("rocksdb_property_blob_stats", "rocksdb.blob-stats"),
+    ("rocksdb_property_stats", "rocksdb.stats"),
+];
 
 fn print_store_get_profile(profile: &StoreGetProfileSummary) {
     println!("profile_ops={}", profile.count);
@@ -2486,6 +3837,48 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_percent(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid percentage '{value}': {error}"))?;
+    if !(parsed.is_finite() && 0.0 < parsed && parsed <= 100.0) {
+        return Err(format!(
+            "percentage must be greater than 0 and at most 100, got '{value}'"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn percent_to_basis_points(percent: f64) -> u16 {
+    (percent * 100.0).round() as u16
+}
+
+fn parse_percent_inclusive(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid percentage '{value}': {error}"))?;
+    if !parsed.is_finite() || !(0.0..=100.0).contains(&parsed) {
+        return Err(format!(
+            "percentage must be between 0 and 100, got '{value}'"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn percent_to_basis_points_inclusive(percent: f64) -> u16 {
+    (percent * 100.0).round() as u16
+}
+
+fn parse_fraction(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid fraction '{value}': {error}"))?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err(format!("fraction must be between 0 and 1, got '{value}'"));
+    }
+    Ok(parsed)
+}
+
 fn parse_size(value: &str) -> Result<usize, String> {
     let value = value.trim();
     let split_at = value
@@ -2507,6 +3900,60 @@ fn parse_size(value: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("size '{value}' overflows usize"))
 }
 
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    let split_at = value
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(value.len());
+    let amount = value[..split_at]
+        .parse::<f64>()
+        .map_err(|error| format!("invalid duration '{value}': {error}"))?;
+    if !amount.is_finite() || amount < 0.0 {
+        return Err(format!(
+            "duration must be finite and non-negative, got '{value}'"
+        ));
+    }
+    let multiplier = match value[split_at..].trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" => 1.0,
+        "ms" => 0.001,
+        "m" | "min" | "mins" => 60.0,
+        "h" | "hr" | "hrs" => 3600.0,
+        suffix => {
+            return Err(format!(
+                "unsupported duration suffix '{suffix}' in '{value}'"
+            ));
+        }
+    };
+    Duration::try_from_secs_f64(amount * multiplier)
+        .map_err(|error| format!("invalid duration '{value}': {error}"))
+}
+
+fn parse_duration_list(value: &str) -> Result<Vec<Duration>, String> {
+    let mut durations = value
+        .split(',')
+        .map(str::trim)
+        .map(|entry| {
+            if entry.is_empty() {
+                return Err("duration list contains an empty entry".to_owned());
+            }
+            parse_duration(entry)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if durations.is_empty() {
+        return Err("duration list must not be empty".to_owned());
+    }
+    durations.sort_unstable();
+    durations.dedup();
+    Ok(durations)
+}
+
+fn default_reclaim_sample_at() -> Vec<Duration> {
+    [0, 60, 300, 600, 900, 1800, 3600]
+        .into_iter()
+        .map(Duration::from_secs)
+        .collect()
+}
+
 fn default_root_dir() -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2519,11 +3966,11 @@ fn usage() -> &'static str {
     "usage: cargo run -p strata-bench --release -- [options]
 
 options:
-  --case <segment-append|store-put|store-put-arc|store-get|rocksdb-blobdb-put|rocksdb-blobdb-get|rocksdb-blobdb-get-pinned>
+  --case <segment-append|store-put|store-put-arc|store-get|store-delete|rocksdb-blobdb-put|rocksdb-blobdb-get|rocksdb-blobdb-get-pinned|rocksdb-blobdb-delete>
   --root <path>
   --namespace <name>
   --payload-size <bytes|KiB|MiB|GiB>
-  --ops <count>
+  --ops <count>                         delete cases: number of keys loaded before deletion
   --read-set-size <count>
   --read-pattern <sequential|random>
   --read-seed <u64>
@@ -2540,15 +3987,35 @@ options:
   --starting-epoch <epoch>
   --strata-accounting <true|false>      background accounting worker
   --strata-gc <true|false>              background GC workers
+  --strata-gc-io-bytes-per-sec <size>
+  --strata-gc-min-io-bytes-per-sec <size>
+  --strata-gc-min-reclaim-bytes <size>
+  --strata-gc-min-garbage-percent <0..100>
   --rocksdb-min-blob-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-file-size <bytes|KiB|MiB|GiB>
   --rocksdb-write-buffer-size <bytes|KiB|MiB|GiB>
   --rocksdb-high-pri-background-threads <count>
   --rocksdb-blob-gc <true|false>
+  --rocksdb-blob-gc-age-cutoff <0..1>
+  --rocksdb-blob-gc-force-threshold <0..1>
   --rocksdb-get-profile               get: report native RocksDB read perf counters
   --rocksdb-disable-wal <true|false>
   --rocksdb-disable-auto-compactions <true|false>
   --sync-every <count>
+  --delete-percent <0..100>             default 50
+  --delete-pattern <sequential|random>  default random
+  --delete-seed <u64>
+  --delete-verify-samples <count>        deleted and live samples; 0 disables
+  --delete-reclaim <none|background>     background observes engine-native workers over time
+  --delete-setup-timeout <duration>      Strata seal/accounting wait; default 5m
+  --reclaim-duration <duration>          background observation window; default 60m
+  --reclaim-sample-at <times>            comma-separated checkpoints; default 0,1m,5m,10m,15m,30m,60m
+  --post-delete-workload <idle|steady>   default idle
+  --post-delete-ops-per-second <count>   steady target rate; default 10
+  --post-delete-put-percent <0..100>     steady mix; default 40
+  --post-delete-get-percent <0..100>     steady mix; default 20
+  --post-delete-delete-percent <0..100>  steady mix; default 40; mix must sum to 100
+  --post-delete-seed <u64>
   --metrics-listen <addr>              serve Prometheus metrics on /metrics
   --metrics-drain-seconds <seconds>    wait after benchmark when metrics are enabled; default 30
   --keep-data"
@@ -2837,5 +4304,157 @@ mod tests {
         .expect_err("GC without accounting should be rejected");
 
         assert_eq!(error, "--strata-gc true requires --strata-accounting true");
+    }
+
+    #[test]
+    fn config_parses_delete_workload_controls() {
+        let config = Config::parse(
+            [
+                "--case",
+                "rocksdb-blobdb-delete",
+                "--delete-percent",
+                "62.5",
+                "--delete-pattern",
+                "sequential",
+                "--delete-seed",
+                "99",
+                "--delete-verify-samples",
+                "17",
+                "--delete-reclaim",
+                "background",
+                "--delete-setup-timeout",
+                "45s",
+                "--reclaim-duration",
+                "30m",
+                "--reclaim-sample-at",
+                "0,5m,15m,30m",
+                "--post-delete-workload",
+                "steady",
+                "--post-delete-ops-per-second",
+                "250",
+                "--post-delete-put-percent",
+                "50",
+                "--post-delete-get-percent",
+                "25",
+                "--post-delete-delete-percent",
+                "25",
+                "--post-delete-seed",
+                "1234",
+                "--rocksdb-blob-gc-age-cutoff",
+                "0.75",
+                "--rocksdb-blob-gc-force-threshold",
+                "0.9",
+                "--strata-gc-io-bytes-per-sec",
+                "64MiB",
+                "--strata-gc-min-io-bytes-per-sec",
+                "8MiB",
+                "--strata-gc-min-reclaim-bytes",
+                "16MiB",
+                "--strata-gc-min-garbage-percent",
+                "55.5",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("delete config should parse");
+
+        assert_eq!(config.case, BenchCase::RocksDbBlobDbDelete);
+        assert_eq!(config.delete_percent, 62.5);
+        assert_eq!(config.delete_pattern, DeletePattern::Sequential);
+        assert_eq!(config.delete_seed, 99);
+        assert_eq!(config.delete_verify_samples, 17);
+        assert_eq!(config.delete_reclaim_mode, DeleteReclaimMode::Background);
+        assert_eq!(config.delete_setup_timeout, Duration::from_secs(45));
+        assert_eq!(config.reclaim_duration, Duration::from_secs(30 * 60));
+        assert_eq!(
+            config.reclaim_sample_at,
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(5 * 60),
+                Duration::from_secs(15 * 60),
+                Duration::from_secs(30 * 60),
+            ]
+        );
+        assert_eq!(config.post_delete_workload, PostDeleteWorkload::Steady);
+        assert_eq!(config.post_delete_ops_per_second, 250);
+        assert_eq!(config.post_delete_put_percent, 50.0);
+        assert_eq!(config.post_delete_get_percent, 25.0);
+        assert_eq!(config.post_delete_delete_percent, 25.0);
+        assert_eq!(config.post_delete_seed, 1234);
+        assert_eq!(config.rocksdb_blob_gc_age_cutoff, 0.75);
+        assert_eq!(config.rocksdb_blob_gc_force_threshold, 0.9);
+        assert_eq!(config.strata_gc_io_bytes_per_sec, 64 << 20);
+        assert_eq!(config.strata_gc_min_io_bytes_per_sec, 8 << 20);
+        assert_eq!(config.strata_gc_min_reclaim_bytes, 16 << 20);
+        assert_eq!(config.strata_gc_min_garbage_ratio_bps, 5_550);
+    }
+
+    #[test]
+    fn random_delete_selection_is_deterministic_unique_and_sized() {
+        let first = delete_indexes(100, 12.5, DeletePattern::Random, 7);
+        let second = delete_indexes(100, 12.5, DeletePattern::Random, 7);
+        let unique = first
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 13);
+        assert_eq!(unique.len(), first.len());
+        assert!(first.iter().all(|index| *index < 100));
+    }
+
+    #[test]
+    fn duration_parser_accepts_reclaim_checkpoint_units() {
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("1.5m").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(
+            parse_duration_list("5m,0,1m,5m").unwrap(),
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+            ]
+        );
+    }
+
+    #[test]
+    fn shorter_reclaim_duration_trims_default_checkpoints_and_keeps_endpoint() {
+        let config = Config::parse(
+            [
+                "--case",
+                "store-delete",
+                "--delete-reclaim",
+                "background",
+                "--reclaim-duration",
+                "3m",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("short background duration should parse");
+
+        assert_eq!(
+            config.effective_reclaim_sample_at(),
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(60),
+                Duration::from_secs(180),
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_delete_reclamation_is_no_longer_supported() {
+        let error = Config::parse(
+            ["--case", "store-delete", "--delete-reclaim", "manual"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("manual compaction mode should be removed");
+
+        assert_eq!(error, "unknown delete reclaim mode 'manual'");
     }
 }
