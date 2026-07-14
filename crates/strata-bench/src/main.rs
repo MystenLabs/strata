@@ -2716,6 +2716,7 @@ mod tests {
         assert_eq!(config.metrics_drain_seconds, 7);
         assert_eq!(config.max_unsealed_segments, 12);
         assert_eq!(config.seal_worker_count, 3);
+        assert_eq!(config.reader_cache_capacity, 64_000);
         assert_eq!(
             config.sealed_segment_integrity_policy,
             SealedSegmentIntegrityPolicy::Checksum

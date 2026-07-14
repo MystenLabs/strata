@@ -7,7 +7,7 @@ const INGEST_DIR: &str = "ingest";
 const INDEX_DIR: &str = "index";
 const ACCOUNTING_INDEX_DIR: &str = "accounting-index";
 
-pub const DEFAULT_SEGMENT_READER_CACHE_CAPACITY: usize = 64;
+pub const DEFAULT_SEGMENT_READER_CACHE_CAPACITY: usize = 64_000;
 pub const DEFAULT_ACCOUNTING_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD: usize = 1024;
 pub const DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT: u32 = 64;

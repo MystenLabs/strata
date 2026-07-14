@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -102,6 +104,7 @@ impl SegmentReader {
     pub fn open(path: impl AsRef<Path>, segment_id: SegmentId) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path).at_path(&path)?;
+        advise_random_access(&file, &path)?;
         Ok(Self {
             path,
             file,
@@ -303,6 +306,25 @@ impl SegmentReader {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+#[cfg(target_os = "linux")]
+fn advise_random_access(file: &File, path: &Path) -> Result<()> {
+    // SAFETY: `file` owns a valid descriptor for the duration of this call. An offset and length
+    // of zero apply the advice to the entire file and do not access userspace memory.
+    let error = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+    if error != 0 {
+        return Err(Error::Io {
+            path: path.to_path_buf(),
+            source: io::Error::from_raw_os_error(error),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_random_access(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn validate_record_ref_len(record_ref: RecordRef, header: RecordHeader) -> Result<()> {
