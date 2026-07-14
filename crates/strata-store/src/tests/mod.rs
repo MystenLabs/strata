@@ -1284,6 +1284,94 @@ async fn accounting_sidecar_nudge_ingests_without_forcing_compaction() {
 }
 
 #[tokio::test]
+async fn accounting_sidecar_reclaims_sealed_consumed_logs_and_recovery_uses_cursor() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.accounting_interval = Duration::from_secs(3600);
+    let key = BlobKey::new(b"reclaimed-delta-log".to_vec()).unwrap();
+    let first_log_path = ActiveDeltaLog::path(cfg.accounting_index_dir(), 1);
+    let second_log_path = ActiveDeltaLog::path(cfg.accounting_index_dir(), 2);
+
+    {
+        let mut store =
+            try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+        stop_accounting_worker(&mut store.store);
+        assert_eq!(store.put(&key, b"payload").unwrap(), 1);
+        store.sync().unwrap();
+        accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+        assert_eq!(active_delta_log_read_cursor(store.index()).segment_id, 1);
+    }
+
+    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
+    let mut first_state = index.get_segment_state(1).unwrap().unwrap();
+    first_state.state = SegmentFileState::Sealing;
+    first_state.sealed_before_lsn = Some(2);
+
+    let second_path = segment_path(&cfg, 2);
+    let second_writer = SegmentWriter::create(
+        &second_path,
+        2,
+        PlacementClass::Ingest,
+        cfg.segment_max_bytes,
+    )
+    .unwrap();
+    second_writer.sync_data().unwrap();
+    let second_state = active_segment_state_from_path(
+        &cfg,
+        INGEST_SEGMENT_OWNER,
+        2,
+        second_writer.write_offset(),
+        second_writer.write_offset(),
+    );
+    drop(second_writer);
+
+    let prior_delta_state = active_delta_log_state(&index);
+    let second_delta_state = {
+        let mut log =
+            ActiveDeltaLog::open(cfg.accounting_index_dir(), 2, prior_delta_state).unwrap();
+        log.sync_data().unwrap();
+        log.state()
+    };
+    let mut batch = index.batch();
+    index
+        .put_segment_state_batch(&mut batch, &first_state)
+        .unwrap();
+    index
+        .put_segment_state_batch(&mut batch, &second_state)
+        .unwrap();
+    index
+        .put_accounting_active_delta_log_state_batch(&mut batch, second_delta_state)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
+    // Advancing the cursor into an empty next log is not enough to reclaim the previous file: its
+    // seal worker may still need to fsync it.
+    accounting::run_accounting_sidecar_once(&index, &cfg, true).unwrap();
+    let cursor = active_delta_log_read_cursor(&index);
+    assert_eq!(cursor.segment_id, 2);
+    assert_eq!(cursor.max_lsn, 1);
+    assert!(first_log_path.exists());
+
+    first_state.state = SegmentFileState::Sealed;
+    first_state.durable_offset = first_state.write_offset;
+    first_state.sealed_len = Some(first_state.write_offset);
+    index.put_segment_state(&first_state).unwrap();
+    index.flush_wal(true).unwrap();
+
+    accounting::run_accounting_sidecar_once(&index, &cfg, true).unwrap();
+    assert!(!first_log_path.exists());
+    assert!(second_log_path.exists());
+    drop(index);
+
+    // The retained active log is intentionally empty. Recovery must accept the consumed cursor as
+    // the durable accounting prefix instead of requiring the reclaimed raw file.
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    assert_eq!(store.durable_lsn().unwrap(), 1);
+    assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+}
+
+#[tokio::test]
 async fn semantic_materialization_request_survives_until_target_lsn_is_durable() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
@@ -5258,6 +5346,13 @@ async fn recovery_rejects_missing_active_delta_log_for_durable_lsn() {
         store
             .index()
             .put_accounting_active_delta_log_state_batch(&mut batch, ActiveDeltaLogState::default())
+            .unwrap();
+        store
+            .index()
+            .put_accounting_active_delta_log_consumed_cursor_batch(
+                &mut batch,
+                ActiveDeltaLogReadCursor::default(),
+            )
             .unwrap();
         batch.write_with_sync(true).unwrap();
     }

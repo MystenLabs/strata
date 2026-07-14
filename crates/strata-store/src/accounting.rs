@@ -518,6 +518,9 @@ impl AccountingSidecar {
             return Ok(false);
         };
         let cursor = self.active_delta_log_read_cursor()?;
+        // Retry cleanup from an already durable cursor before doing more sidecar work. This makes a
+        // prior unlink failure recoverable without needing another cursor transition.
+        self.reclaim_consumed_delta_logs(cursor)?;
         let read = ActiveDeltaLog::read_durable_range(
             self.config.accounting_index_dir(),
             cursor,
@@ -527,6 +530,7 @@ impl AccountingSidecar {
         if read.deltas.is_empty() {
             if next_cursor != cursor {
                 let _ = self.commit_sidecar_state(None, Some(next_cursor), None)?;
+                self.reclaim_consumed_delta_logs(next_cursor)?;
             }
             return Ok(false);
         }
@@ -552,7 +556,34 @@ impl AccountingSidecar {
             self.commit_sidecar_state(Some(&manifest), Some(next_cursor), None)?;
         self.accounting_index
             .apply_prepared_accounting_deltas(prepared)?;
+        self.reclaim_consumed_delta_logs(next_cursor)?;
         Ok(should_nudge_gc)
+    }
+
+    /// Reclaims only logs whose durable sidecar handoff and data-segment seal are both complete.
+    ///
+    /// Cursor ordering alone is insufficient: foreground sync can publish a later active-log
+    /// segment while a seal worker still needs an older log for its final fsync. `Sealed` (or
+    /// `Deleted`) is the durable proof that no seal worker can need that file again.
+    fn reclaim_consumed_delta_logs(&self, cursor: ActiveDeltaLogReadCursor) -> Result<()> {
+        if cursor.segment_id == 0 {
+            return Ok(());
+        }
+        let reclaimable = self
+            .index
+            .iter_segment_states()?
+            .into_iter()
+            .filter_map(|(segment_id, state)| {
+                (segment_id < cursor.segment_id
+                    && matches!(
+                        state.state,
+                        SegmentFileState::Sealed | SegmentFileState::Deleted
+                    ))
+                .then_some(segment_id)
+            })
+            .collect::<BTreeSet<_>>();
+        ActiveDeltaLog::remove_segments(self.config.accounting_index_dir(), &reclaimable)?;
+        Ok(())
     }
 
     /// Compacts sidecar delta and patch runs partition by partition.

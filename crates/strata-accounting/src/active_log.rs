@@ -338,6 +338,54 @@ impl ActiveDeltaLog {
         Ok(max_lsn)
     }
 
+    /// Removes closed log segments whose contents have a durable replacement in the sidecar.
+    ///
+    /// The caller owns the handoff policy: every supplied segment must be strictly behind the
+    /// durable consumed cursor, and its matching ingest segment must no longer need sealing. This
+    /// layer only intersects the supplied ids with files that actually exist, unlinks them, and
+    /// fsyncs the directory so a completed cleanup remains completed after a crash.
+    pub fn remove_segments(
+        root_dir: impl AsRef<Path>,
+        segment_ids: &BTreeSet<SegmentId>,
+    ) -> Result<usize> {
+        if segment_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let root_dir = root_dir.as_ref();
+        let present = active_delta_log_segment_ids(root_dir)?;
+        let targets = present
+            .intersection(segment_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let mut removed = 0;
+        let mut first_error = None;
+        for segment_id in &targets {
+            let path = Self::path(root_dir, *segment_id);
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    if first_error.is_none() {
+                        first_error = Some(Error::Io { path, source });
+                    }
+                }
+            }
+        }
+
+        if removed > 0 {
+            sync_parent_dir(&Self::path(root_dir, targets[0]))?;
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(removed)
+    }
+
     pub fn append(&mut self, delta: &AccountingDelta) -> Result<()> {
         let frame_len = frame_len(delta)?;
         let next_offset = self

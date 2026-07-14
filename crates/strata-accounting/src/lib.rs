@@ -118,7 +118,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{collections::BTreeSet, num::NonZeroU32};
 
     use strata_core::{
         BlobKey, BlobLifecycle, RecordRef, SegmentGcLiveRecord, SegmentGcOverlayMergeOp,
@@ -353,6 +353,25 @@ mod tests {
         assert_eq!(state.durable_lsn, 1);
         let reopened = ActiveDeltaLog::open(dir.path(), state.segment_id, state).unwrap();
         assert_eq!(reopened.state(), state);
+    }
+
+    #[test]
+    fn active_delta_log_removes_selected_segments_and_syncs_directory() {
+        let dir = tempdir().unwrap();
+        for segment_id in 1..=3 {
+            drop(
+                ActiveDeltaLog::open(dir.path(), segment_id, ActiveDeltaLogState::default())
+                    .unwrap(),
+            );
+        }
+
+        let removed =
+            ActiveDeltaLog::remove_segments(dir.path(), &BTreeSet::from([1, 3, 4])).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!ActiveDeltaLog::path(dir.path(), 1).exists());
+        assert!(ActiveDeltaLog::path(dir.path(), 2).exists());
+        assert!(!ActiveDeltaLog::path(dir.path(), 3).exists());
     }
 
     #[test]

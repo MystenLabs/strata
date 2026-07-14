@@ -121,7 +121,9 @@
 //! so crash retry reopens from one published sidecar state instead of replaying blob keys from the
 //! packed version rows. Accounting delta log files are aligned with ingest segments. The writer
 //! appends deltas in LSN order and rolls the active accounting log with the active segment; seal
-//! workers fsync closed accounting logs in parallel with their matching segment files.
+//! workers fsync closed accounting logs in parallel with their matching segment files. Once the
+//! sidecar cursor has moved past a sealed segment, the accounting worker unlinks that segment's
+//! delta log; recovery treats the cursor's max LSN as the checkpointed prefix.
 
 mod accounting;
 mod config;
@@ -3478,9 +3480,17 @@ fn recover_active_accounting_delta_log(
     // `durable_lsn`, the durable promise is already broken and recovery must stop. Otherwise
     // `rollback_operations_from` rewinds only the non-durable committed tail, so recompute
     // `committed_lsn`.
-    let delta_log_lsn =
+    // The sidecar manifest and consumed cursor are published atomically. Once a closed delta log
+    // segment is behind that cursor, its records have a durable replacement in the manifest and
+    // the accounting worker may unlink the original file. Recovery therefore combines the
+    // checkpointed prefix with the retained raw log suffix instead of requiring raw files forever.
+    let consumed_lsn = index
+        .get_accounting_active_delta_log_consumed_cursor()?
+        .map_or(0, |cursor| cursor.max_lsn);
+    let retained_log_lsn =
         ActiveDeltaLog::max_lsn_through(config.accounting_index_dir(), active_segment_id)?
             .unwrap_or_default();
+    let delta_log_lsn = consumed_lsn.max(retained_log_lsn);
     if delta_log_lsn < committed_lsn {
         let durable_lsn = index.get_durable_lsn()?;
         if delta_log_lsn < durable_lsn {
