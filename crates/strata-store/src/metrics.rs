@@ -1,7 +1,15 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry};
-use strata_core::{Epoch, SegmentId, StrataLsn};
+use prometheus::{
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
+};
+use strata_accounting::Manifest;
+use strata_core::{Epoch, SegmentGcSummary, SegmentId, StrataLsn};
 
 #[cfg(feature = "internal-profiling")]
 use crate::StoreProfileSink;
@@ -10,6 +18,10 @@ use crate::{StoreSyncProfile, StoreWriteProfile};
 const OPERATION_LATENCY_BUCKETS: &[f64] = &[
     0.000_001, 0.000_005, 0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001,
     0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0,
+];
+
+const ACCOUNTING_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.010, 0.050, 0.100, 0.500, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 1_200.0, 3_600.0,
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -58,6 +70,21 @@ struct PrometheusMetrics {
     active_segment_durable_offset: IntGauge,
     next_lsn: IntGauge,
     durable_lsn: IntGauge,
+    accounting_frontier: Mutex<AccountingFrontierMetric>,
+    accounted_lsn: IntGauge,
+    accounting_lag_lsn: IntGauge,
+    accounting_runs_total: IntCounterVec,
+    accounting_run_duration_seconds: HistogramVec,
+    accounting_input_bytes_total: IntCounterVec,
+    accounting_output_bytes_total: IntCounterVec,
+    accounting_ref_events_total: IntCounterVec,
+    accounting_sidecar_run_count: IntGaugeVec,
+    accounting_sidecar_run_bytes: IntGaugeVec,
+    gc_known_total_bytes: IntGauge,
+    gc_known_live_bytes: IntGauge,
+    gc_known_retired_bytes: IntGauge,
+    gc_known_expired_bytes: IntGauge,
+    gc_known_live_ref_count: IntGauge,
     current_epoch: IntGauge,
     pending_lsn_count: IntGauge,
     unsealed_segments: IntGauge,
@@ -325,6 +352,99 @@ impl StrataStoreMetrics {
                     &labels,
                     "durable_lsn",
                     "Highest contiguous durable Strata LSN.",
+                )?,
+                accounting_frontier: Mutex::new(AccountingFrontierMetric::default()),
+                accounted_lsn: register_gauge(
+                    registry,
+                    &labels,
+                    "accounted_lsn",
+                    "Highest Strata LSN durably materialized into GC accounting state.",
+                )?,
+                accounting_lag_lsn: register_gauge(
+                    registry,
+                    &labels,
+                    "accounting_lag_lsn",
+                    "Durable Strata LSNs not yet materialized into GC accounting state.",
+                )?,
+                accounting_runs_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "accounting_runs_total",
+                    "Total Strata accounting stage attempts by stage and durable publication result.",
+                    &["stage", "result"],
+                )?,
+                accounting_run_duration_seconds: register_histogram_vec(
+                    registry,
+                    &labels,
+                    "accounting_run_duration_seconds",
+                    "Strata accounting stage duration in seconds.",
+                    &["stage"],
+                    ACCOUNTING_DURATION_BUCKETS,
+                )?,
+                accounting_input_bytes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "accounting_input_bytes_total",
+                    "Encoded input-file bytes consumed by successfully published Strata accounting stages; this is not a device I/O counter.",
+                    &["stage"],
+                )?,
+                accounting_output_bytes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "accounting_output_bytes_total",
+                    "Encoded output-file bytes created by successfully published Strata accounting stages; this is not a device I/O counter.",
+                    &["stage"],
+                )?,
+                accounting_ref_events_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "accounting_ref_events_total",
+                    "Total durable Strata accounting reference events by event type.",
+                    &["event"],
+                )?,
+                accounting_sidecar_run_count: register_gauge_vec(
+                    registry,
+                    &labels,
+                    "accounting_sidecar_run_count",
+                    "Current live accounting sidecar run count by run kind.",
+                    &["kind"],
+                )?,
+                accounting_sidecar_run_bytes: register_gauge_vec(
+                    registry,
+                    &labels,
+                    "accounting_sidecar_run_bytes",
+                    "Current live accounting sidecar bytes by run kind.",
+                    &["kind"],
+                )?,
+                gc_known_total_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_known_total_bytes",
+                    "Encoded segment bytes classified in Strata GC accounting overlays.",
+                )?,
+                gc_known_live_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_known_live_bytes",
+                    "Encoded segment bytes currently classified live in Strata GC accounting overlays.",
+                )?,
+                gc_known_retired_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_known_retired_bytes",
+                    "Encoded segment bytes currently classified retired in Strata GC accounting overlays.",
+                )?,
+                gc_known_expired_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_known_expired_bytes",
+                    "Encoded segment bytes currently classified expired in Strata GC accounting overlays.",
+                )?,
+                gc_known_live_ref_count: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_known_live_ref_count",
+                    "Physical references currently classified live in Strata GC accounting overlays.",
                 )?,
                 current_epoch: register_gauge(
                     registry,
@@ -701,7 +821,7 @@ impl StrataStoreMetrics {
             return;
         };
         metrics.next_lsn.set(to_i64(next_lsn));
-        metrics.durable_lsn.set(to_i64(durable_lsn));
+        update_accounting_frontier(metrics, Some(durable_lsn), None);
         set_pending_lsn_count(metrics, next_lsn, durable_lsn);
     }
 
@@ -717,8 +837,96 @@ impl StrataStoreMetrics {
         let Some(metrics) = &self.inner else {
             return;
         };
-        metrics.durable_lsn.set(to_i64(durable_lsn));
+        update_accounting_frontier(metrics, Some(durable_lsn), None);
         set_pending_lsn_count(metrics, lsn_from_i64(metrics.next_lsn.get()), durable_lsn);
+    }
+
+    pub(crate) fn initialize_accounting(
+        &self,
+        accounted_lsn: StrataLsn,
+        manifest: Option<&Manifest>,
+        summary: &SegmentGcSummary,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        update_accounting_frontier(metrics, None, Some(accounted_lsn));
+        set_sidecar_shape(metrics, manifest);
+        set_gc_known_summary(metrics, summary);
+    }
+
+    pub(crate) fn publish_accounting_state(
+        &self,
+        accounted_lsn: StrataLsn,
+        manifest: Option<&Manifest>,
+        overlay_delta: AccountingOverlayDelta,
+        events: AccountingEventCounts,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        update_accounting_frontier(metrics, None, Some(accounted_lsn));
+        if let Some(manifest) = manifest {
+            set_sidecar_shape(metrics, Some(manifest));
+        }
+        apply_gc_known_delta(metrics, overlay_delta);
+        for (event, count) in events.values() {
+            if count != 0 {
+                metrics
+                    .accounting_ref_events_total
+                    .with_label_values(&[event])
+                    .inc_by(count);
+            }
+        }
+    }
+
+    pub(crate) fn apply_gc_known_delta(&self, delta: AccountingOverlayDelta) {
+        if let Some(metrics) = &self.inner {
+            apply_gc_known_delta(metrics, delta);
+        }
+    }
+
+    pub(crate) fn remove_gc_known_summary(&self, summary: &SegmentGcSummary) {
+        self.apply_gc_known_delta(AccountingOverlayDelta {
+            total_bytes: -i128::from(summary.total_bytes),
+            live_bytes: -i128::from(summary.live_bytes),
+            retired_bytes: -i128::from(summary.retired_bytes),
+            expired_bytes: -i128::from(summary.expired_bytes),
+            live_ref_count: -i128::from(summary.live_ref_count),
+        });
+    }
+
+    pub(crate) fn record_accounting_stage(
+        &self,
+        stage: AccountingStage,
+        success: bool,
+        elapsed: Duration,
+        input_bytes: u64,
+        output_bytes: u64,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        let stage = stage.as_str();
+        let result = if success { "success" } else { "failure" };
+        metrics
+            .accounting_runs_total
+            .with_label_values(&[stage, result])
+            .inc();
+        metrics
+            .accounting_run_duration_seconds
+            .with_label_values(&[stage])
+            .observe(duration_seconds(elapsed));
+        if success {
+            metrics
+                .accounting_input_bytes_total
+                .with_label_values(&[stage])
+                .inc_by(input_bytes);
+            metrics
+                .accounting_output_bytes_total
+                .with_label_values(&[stage])
+                .inc_by(output_bytes);
+        }
     }
 
     pub(crate) fn set_current_epoch(&self, epoch: Epoch) {
@@ -906,6 +1114,59 @@ pub(crate) struct PutMetric {
     pub record_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountingStage {
+    Ingest,
+    DeltaCompaction,
+    MajorCompaction,
+}
+
+impl AccountingStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::DeltaCompaction => "delta_compaction",
+            Self::MajorCompaction => "major_compaction",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountingEventCounts {
+    pub live: u64,
+    pub retired: u64,
+    pub expired: u64,
+    pub lifecycle_changed: u64,
+    pub mapped: u64,
+}
+
+impl AccountingEventCounts {
+    fn values(self) -> [(&'static str, u64); 5] {
+        [
+            ("live", self.live),
+            ("retired", self.retired),
+            ("expired", self.expired),
+            ("lifecycle_changed", self.lifecycle_changed),
+            ("mapped", self.mapped),
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountingOverlayDelta {
+    pub total_bytes: i128,
+    pub live_bytes: i128,
+    pub retired_bytes: i128,
+    pub expired_bytes: i128,
+    pub live_ref_count: i128,
+}
+
+#[derive(Debug, Default)]
+struct AccountingFrontierMetric {
+    durable_lsn: StrataLsn,
+    accounted_lsn: StrataLsn,
+}
+
 fn register_counter(
     registry: &Registry,
     labels: &HashMap<String, String>,
@@ -943,6 +1204,48 @@ fn register_histogram(
     Ok(histogram)
 }
 
+fn register_counter_vec(
+    registry: &Registry,
+    labels: &HashMap<String, String>,
+    name: &str,
+    help: &str,
+    variable_labels: &[&str],
+) -> Result<IntCounterVec, prometheus::Error> {
+    let counter = IntCounterVec::new(opts(labels, name, help), variable_labels)?;
+    registry.register(Box::new(counter.clone()))?;
+    Ok(counter)
+}
+
+fn register_gauge_vec(
+    registry: &Registry,
+    labels: &HashMap<String, String>,
+    name: &str,
+    help: &str,
+    variable_labels: &[&str],
+) -> Result<IntGaugeVec, prometheus::Error> {
+    let gauge = IntGaugeVec::new(opts(labels, name, help), variable_labels)?;
+    registry.register(Box::new(gauge.clone()))?;
+    Ok(gauge)
+}
+
+fn register_histogram_vec(
+    registry: &Registry,
+    labels: &HashMap<String, String>,
+    name: &str,
+    help: &str,
+    variable_labels: &[&str],
+    buckets: &[f64],
+) -> Result<HistogramVec, prometheus::Error> {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(metric_name(name), help)
+            .const_labels(labels.clone())
+            .buckets(buckets.to_vec()),
+        variable_labels,
+    )?;
+    registry.register(Box::new(histogram.clone()))?;
+    Ok(histogram)
+}
+
 fn opts(labels: &HashMap<String, String>, name: &str, help: &str) -> Opts {
     Opts::new(metric_name(name), help).const_labels(labels.clone())
 }
@@ -959,6 +1262,88 @@ fn set_pending_lsn_count(metrics: &PrometheusMetrics, next_lsn: StrataLsn, durab
     metrics.pending_lsn_count.set(to_i64(
         next_lsn.saturating_sub(durable_lsn).saturating_sub(1),
     ));
+}
+
+fn update_accounting_frontier(
+    metrics: &PrometheusMetrics,
+    durable_lsn: Option<StrataLsn>,
+    accounted_lsn: Option<StrataLsn>,
+) {
+    let mut frontier = metrics
+        .accounting_frontier
+        .lock()
+        .expect("accounting metric frontier lock poisoned");
+    if let Some(durable_lsn) = durable_lsn {
+        frontier.durable_lsn = durable_lsn;
+        metrics.durable_lsn.set(to_i64(durable_lsn));
+    }
+    if let Some(accounted_lsn) = accounted_lsn {
+        frontier.accounted_lsn = accounted_lsn;
+        metrics.accounted_lsn.set(to_i64(accounted_lsn));
+    }
+    metrics.accounting_lag_lsn.set(to_i64(
+        frontier.durable_lsn.saturating_sub(frontier.accounted_lsn),
+    ));
+}
+
+fn set_sidecar_shape(metrics: &PrometheusMetrics, manifest: Option<&Manifest>) {
+    let mut counts = [0_u64; 3];
+    let mut bytes = [0_u64; 3];
+    if let Some(manifest) = manifest {
+        for partition in manifest.partitions.values() {
+            if let Some(base) = &partition.base {
+                counts[0] = counts[0].saturating_add(1);
+                bytes[0] = bytes[0].saturating_add(base.file_len);
+            }
+            for patch in &partition.patches {
+                counts[1] = counts[1].saturating_add(1);
+                bytes[1] = bytes[1].saturating_add(patch.file_len);
+            }
+            for delta in &partition.deltas {
+                counts[2] = counts[2].saturating_add(1);
+                bytes[2] = bytes[2].saturating_add(delta.file_len);
+            }
+        }
+    }
+    for (index, kind) in ["base", "patch", "delta"].into_iter().enumerate() {
+        metrics
+            .accounting_sidecar_run_count
+            .with_label_values(&[kind])
+            .set(to_i64(counts[index]));
+        metrics
+            .accounting_sidecar_run_bytes
+            .with_label_values(&[kind])
+            .set(to_i64(bytes[index]));
+    }
+}
+
+fn set_gc_known_summary(metrics: &PrometheusMetrics, summary: &SegmentGcSummary) {
+    metrics
+        .gc_known_total_bytes
+        .set(to_i64(summary.total_bytes));
+    metrics.gc_known_live_bytes.set(to_i64(summary.live_bytes));
+    metrics
+        .gc_known_retired_bytes
+        .set(to_i64(summary.retired_bytes));
+    metrics
+        .gc_known_expired_bytes
+        .set(to_i64(summary.expired_bytes));
+    metrics
+        .gc_known_live_ref_count
+        .set(to_i64(summary.live_ref_count));
+}
+
+fn apply_gc_known_delta(metrics: &PrometheusMetrics, delta: AccountingOverlayDelta) {
+    apply_gauge_delta(&metrics.gc_known_total_bytes, delta.total_bytes);
+    apply_gauge_delta(&metrics.gc_known_live_bytes, delta.live_bytes);
+    apply_gauge_delta(&metrics.gc_known_retired_bytes, delta.retired_bytes);
+    apply_gauge_delta(&metrics.gc_known_expired_bytes, delta.expired_bytes);
+    apply_gauge_delta(&metrics.gc_known_live_ref_count, delta.live_ref_count);
+}
+
+fn apply_gauge_delta(gauge: &IntGauge, delta: i128) {
+    let next = i128::from(gauge.get()).saturating_add(delta);
+    gauge.set(next.clamp(0, i128::from(i64::MAX)) as i64);
 }
 
 fn lsn_from_i64(value: i64) -> StrataLsn {
@@ -981,6 +1366,31 @@ mod tests {
             .find(|family| family.name() == name)
             .expect("metric family registered");
         let metric = &family.metric[0];
+        match family.type_() {
+            MetricType::COUNTER => metric.counter.value(),
+            MetricType::GAUGE => metric.gauge.value(),
+            other => panic!("unexpected metric type {other:?} for {name}"),
+        }
+    }
+
+    fn metric_value_with_labels(registry: &Registry, name: &str, labels: &[(&str, &str)]) -> f64 {
+        let family = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .expect("metric family registered");
+        let metric = family
+            .metric
+            .iter()
+            .find(|metric| {
+                labels.iter().all(|(name, value)| {
+                    metric
+                        .label
+                        .iter()
+                        .any(|label| label.name() == *name && label.value() == *value)
+                })
+            })
+            .expect("metric with labels registered");
         match family.type_() {
             MetricType::COUNTER => metric.counter.value(),
             MetricType::GAUGE => metric.gauge.value(),
@@ -1012,6 +1422,92 @@ mod tests {
         assert_eq!(
             metric_value(&registry, "strata_store_gc_consecutive_run_failures"),
             0.0
+        );
+    }
+
+    #[test]
+    fn accounting_metrics_move_only_when_publication_is_recorded() {
+        let registry = Registry::new();
+        let metrics = StrataStoreMetrics::new(&registry, "test").unwrap();
+        metrics.set_lsn_state(101, 100);
+        metrics.initialize_accounting(
+            40,
+            None,
+            &SegmentGcSummary {
+                total_bytes: 1_000,
+                live_bytes: 800,
+                retired_bytes: 200,
+                live_ref_count: 8,
+                ..SegmentGcSummary::default()
+            },
+        );
+
+        assert_eq!(
+            metric_value(&registry, "strata_store_accounting_lag_lsn"),
+            60.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_gc_known_retired_bytes"),
+            200.0
+        );
+
+        metrics.record_accounting_stage(
+            AccountingStage::MajorCompaction,
+            true,
+            Duration::from_millis(5),
+            500,
+            300,
+        );
+        metrics.publish_accounting_state(
+            100,
+            None,
+            AccountingOverlayDelta {
+                live_bytes: -300,
+                retired_bytes: 300,
+                live_ref_count: -3,
+                ..AccountingOverlayDelta::default()
+            },
+            AccountingEventCounts {
+                retired: 3,
+                ..AccountingEventCounts::default()
+            },
+        );
+
+        assert_eq!(
+            metric_value(&registry, "strata_store_accounting_lag_lsn"),
+            0.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_gc_known_live_bytes"),
+            500.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_gc_known_retired_bytes"),
+            500.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_accounting_runs_total",
+                &[("stage", "major_compaction"), ("result", "success")],
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_accounting_input_bytes_total",
+                &[("stage", "major_compaction")],
+            ),
+            500.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_accounting_ref_events_total",
+                &[("event", "retired")],
+            ),
+            3.0
         );
     }
 }

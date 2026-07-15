@@ -9,8 +9,8 @@ use std::{
 
 use strata_core::{
     BlobLifecycle, DecodedRecord, FIXED_RECORD_HEADER_LEN, PlacementClass, RecordRef,
-    SegmentFileState, SegmentGcOverlay, SegmentGcRecordRange, SegmentId, SegmentOwner,
-    SegmentState, ShardCleanupState, ShardKey, StrataLsn,
+    SegmentFileState, SegmentGcOverlay, SegmentGcRecordRange, SegmentGcSummary, SegmentId,
+    SegmentOwner, SegmentState, ShardCleanupState, ShardKey, StrataLsn,
 };
 use strata_gc::{
     DestinationClass, GcAction, GcCopyRecord, GcCopySelector, GcPlan, GcPlanner, GcSnapshot,
@@ -1132,11 +1132,30 @@ impl GcExecutor {
             if current_job.state != ShardCleanupState::ReadyForGc {
                 continue;
             }
+            let mut removed_summary = SegmentGcSummary::default();
             for segment_id in &owned_segments {
+                if let Some(overlay) = self.index.get_segment_gc_overlay(*segment_id)? {
+                    removed_summary.total_bytes = removed_summary
+                        .total_bytes
+                        .saturating_add(overlay.summary.total_bytes);
+                    removed_summary.live_bytes = removed_summary
+                        .live_bytes
+                        .saturating_add(overlay.summary.live_bytes);
+                    removed_summary.retired_bytes = removed_summary
+                        .retired_bytes
+                        .saturating_add(overlay.summary.retired_bytes);
+                    removed_summary.expired_bytes = removed_summary
+                        .expired_bytes
+                        .saturating_add(overlay.summary.expired_bytes);
+                    removed_summary.live_ref_count = removed_summary
+                        .live_ref_count
+                        .saturating_add(overlay.summary.live_ref_count);
+                }
                 self.reader_cache.evict(*segment_id);
                 self.metrics.record_reader_cache_eviction();
             }
             remove_shard_retention_generation(&self.config, &self.index, job.shard)?;
+            self.metrics.remove_gc_known_summary(&removed_summary);
             let mut batch = self.index.batch();
             self.index
                 .delete_shard_cleanup_job_batch(&mut batch, job.shard)?;

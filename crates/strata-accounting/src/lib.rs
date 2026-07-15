@@ -268,6 +268,7 @@ mod tests {
         let cursor = ActiveDeltaLogReadCursor::default();
         let read = ActiveDeltaLog::read_durable_range(dir.path(), cursor, state).unwrap();
         assert_eq!(read.deltas.len(), 2);
+        assert!(read.bytes_read > 0);
         assert_eq!(read.max_lsn, Some(2));
 
         let cursor = read.next_cursor(cursor);
@@ -276,6 +277,7 @@ mod tests {
         assert_eq!(cursor.max_lsn, 2);
         let read = ActiveDeltaLog::read_durable_range(dir.path(), cursor, state).unwrap();
         assert!(read.deltas.is_empty());
+        assert_eq!(read.bytes_read, 0);
         assert_eq!(read.end_offset, state.durable_offset);
     }
 

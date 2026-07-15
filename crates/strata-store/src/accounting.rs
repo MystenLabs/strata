@@ -31,13 +31,18 @@ use strata_accounting::{
 };
 use strata_core::{
     BlobLifecycle, Epoch, GcRelocation, RecordRef, SegmentFileState, SegmentGcLifetimeUpdate,
-    SegmentGcLiveRecord, SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId, SegmentRefEvent,
-    SegmentRefEventKey, ShardCleanupState, StrataLsn,
+    SegmentGcLiveRecord, SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentGcSummary,
+    SegmentId, SegmentRefEvent, SegmentRefEventKey, ShardCleanupState, StrataLsn,
 };
 use strata_index::StrataIndex;
 use typed_store::rocks::DBBatch;
 
-use crate::{Error, Result, config::StrataStoreConfig, gc::GcCommand};
+use crate::{
+    Error, Result,
+    config::StrataStoreConfig,
+    gc::GcCommand,
+    metrics::{AccountingEventCounts, AccountingOverlayDelta, AccountingStage, StrataStoreMetrics},
+};
 
 #[derive(Debug)]
 pub(crate) enum AccountingCommand {
@@ -110,6 +115,35 @@ pub(crate) fn accounting_request_channel() -> (
     )
 }
 
+/// Aggregates persisted per-segment accounting summaries for metric initialization and snapshots.
+/// This is intentionally an open-time scan; normal publications update the gauges from only the
+/// segments touched by a durable accounting batch.
+pub(crate) fn gc_known_summary(index: &StrataIndex) -> Result<SegmentGcSummary> {
+    let mut total = SegmentGcSummary::default();
+    for (segment_id, state) in index.iter_segment_states()? {
+        if state.state == SegmentFileState::Deleted {
+            continue;
+        }
+        let Some(overlay) = index.get_segment_gc_overlay(segment_id)? else {
+            continue;
+        };
+        total.total_bytes = total
+            .total_bytes
+            .saturating_add(overlay.summary.total_bytes);
+        total.live_bytes = total.live_bytes.saturating_add(overlay.summary.live_bytes);
+        total.retired_bytes = total
+            .retired_bytes
+            .saturating_add(overlay.summary.retired_bytes);
+        total.expired_bytes = total
+            .expired_bytes
+            .saturating_add(overlay.summary.expired_bytes);
+        total.live_ref_count = total
+            .live_ref_count
+            .saturating_add(overlay.summary.live_ref_count);
+    }
+    Ok(total)
+}
+
 /// Background accounting loop for one store.
 ///
 /// It owns no mutable store state itself; instead it serializes sidecar maintenance over the shared
@@ -128,6 +162,7 @@ pub(crate) struct AccountingWorker {
     pub(crate) pending_materialize_through_lsn: Arc<AtomicU64>,
     pub(crate) run_lock: Arc<Mutex<()>>,
     pub(crate) gc_txs: Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
+    pub(crate) metrics: StrataStoreMetrics,
 }
 
 impl AccountingWorker {
@@ -138,7 +173,12 @@ impl AccountingWorker {
     /// such as shard cleanup and epoch changes. Timer ticks retain the wall-clock backstop that
     /// eventually materializes quiet stores.
     pub(crate) fn run(self) {
-        let mut sidecar = AccountingSidecar::open(self.config.clone(), self.index.clone()).ok();
+        let mut sidecar = AccountingSidecar::open(
+            self.config.clone(),
+            self.index.clone(),
+            self.metrics.clone(),
+        )
+        .ok();
         loop {
             match self.command_rx.recv_timeout(self.interval) {
                 Ok(AccountingCommand::Wake) => {
@@ -174,6 +214,7 @@ impl AccountingWorker {
                         &self.config,
                         &self.index,
                         &self.gc_txs,
+                        &self.metrics,
                         mode,
                     );
                     if let Some(through_lsn) = materialize_through_lsn {
@@ -198,6 +239,7 @@ impl AccountingWorker {
                         &self.config,
                         &self.index,
                         &self.gc_txs,
+                        &self.metrics,
                         SidecarRunMode::Maintenance,
                     );
                 }
@@ -213,12 +255,13 @@ impl AccountingWorker {
         config: &StrataStoreConfig,
         index: &StrataIndex,
         gc_txs: &Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
+        metrics: &StrataStoreMetrics,
         mode: SidecarRunMode,
     ) -> bool {
         if sidecar.is_none() {
             // Future-maintainer note: sidecar setup can fail transiently while the active log or
             // manifest is being initialized. Retry later instead of killing the worker.
-            *sidecar = AccountingSidecar::open(config.clone(), index.clone()).ok();
+            *sidecar = AccountingSidecar::open(config.clone(), index.clone(), metrics.clone()).ok();
         }
         let failed = if let Some(current_sidecar) = sidecar.as_mut() {
             let result = match mode {
@@ -345,7 +388,8 @@ pub(crate) fn run_accounting_sidecar_once(
     config: &StrataStoreConfig,
     force: bool,
 ) -> Result<()> {
-    let mut sidecar = AccountingSidecar::open(config.clone(), index.clone())?;
+    let mut sidecar =
+        AccountingSidecar::open(config.clone(), index.clone(), StrataStoreMetrics::default())?;
     sidecar.run_once(force)
 }
 
@@ -354,7 +398,8 @@ pub(crate) fn run_accounting_sidecar_nudged_once(
     index: &StrataIndex,
     config: &StrataStoreConfig,
 ) -> Result<()> {
-    let mut sidecar = AccountingSidecar::open(config.clone(), index.clone())?;
+    let mut sidecar =
+        AccountingSidecar::open(config.clone(), index.clone(), StrataStoreMetrics::default())?;
     sidecar.run_nudged().map(|_| ())
 }
 
@@ -363,7 +408,8 @@ pub(crate) fn run_accounting_sidecar_materializing_once(
     index: &StrataIndex,
     config: &StrataStoreConfig,
 ) -> Result<()> {
-    let mut sidecar = AccountingSidecar::open(config.clone(), index.clone())?;
+    let mut sidecar =
+        AccountingSidecar::open(config.clone(), index.clone(), StrataStoreMetrics::default())?;
     sidecar.run_materializing().map(|_| ())
 }
 
@@ -379,6 +425,7 @@ struct AccountingSidecar {
     config: StrataStoreConfig,
     index: StrataIndex,
     accounting_index: AccountingIndex,
+    metrics: StrataStoreMetrics,
     last_forced_run: Instant,
 }
 
@@ -387,7 +434,11 @@ impl AccountingSidecar {
     ///
     /// Failure example: opening from directory contents alone would resurrect files that were
     /// created by a crashed compaction but never committed to the manifest.
-    fn open(config: StrataStoreConfig, index: StrataIndex) -> Result<Self> {
+    fn open(
+        config: StrataStoreConfig,
+        index: StrataIndex,
+        metrics: StrataStoreMetrics,
+    ) -> Result<Self> {
         let manifest = index.get_accounting_index_manifest()?;
         let accounting_index = AccountingIndex::open_with_manifest(
             AccountingIndexConfig::new(
@@ -400,6 +451,7 @@ impl AccountingSidecar {
             config,
             index,
             accounting_index,
+            metrics,
             last_forced_run: Instant::now(),
         })
     }
@@ -521,11 +573,24 @@ impl AccountingSidecar {
         // Retry cleanup from an already durable cursor before doing more sidecar work. This makes a
         // prior unlink failure recoverable without needing another cursor transition.
         self.reclaim_consumed_delta_logs(cursor)?;
-        let read = ActiveDeltaLog::read_durable_range(
+        let started = Instant::now();
+        let read = match ActiveDeltaLog::read_durable_range(
             self.config.accounting_index_dir(),
             cursor,
             durable_state,
-        )?;
+        ) {
+            Ok(read) => read,
+            Err(error) => {
+                self.metrics.record_accounting_stage(
+                    AccountingStage::Ingest,
+                    false,
+                    started.elapsed(),
+                    0,
+                    0,
+                );
+                return Err(error.into());
+            }
+        };
         let next_cursor = read.next_cursor(cursor);
         if read.deltas.is_empty() {
             if next_cursor != cursor {
@@ -545,15 +610,50 @@ impl AccountingSidecar {
             return Ok(false);
         }
 
-        let prepared = self
-            .accounting_index
-            .prepare_accounting_deltas(read.deltas)?;
+        let input_bytes = read.bytes_read;
+        let prepared = match self.accounting_index.prepare_accounting_deltas(read.deltas) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.metrics.record_accounting_stage(
+                    AccountingStage::Ingest,
+                    false,
+                    started.elapsed(),
+                    input_bytes,
+                    0,
+                );
+                return Err(error.into());
+            }
+        };
+        let output_bytes = prepared
+            .delta_metas
+            .iter()
+            .map(|run| run.file_len)
+            .sum::<u64>();
         let manifest = prepared.manifest().clone();
         // Systems invariant: publish manifest + cursor before applying the in-memory manifest.
         // The run files were already written by `prepare_accounting_deltas`; if we crash after this
         // batch, reopening from RocksDB sees the new manifest and cursor together.
         let should_nudge_gc =
-            self.commit_sidecar_state(Some(&manifest), Some(next_cursor), None)?;
+            match self.commit_sidecar_state(Some(&manifest), Some(next_cursor), None) {
+                Ok(should_nudge_gc) => should_nudge_gc,
+                Err(error) => {
+                    self.metrics.record_accounting_stage(
+                        AccountingStage::Ingest,
+                        false,
+                        started.elapsed(),
+                        input_bytes,
+                        output_bytes,
+                    );
+                    return Err(error);
+                }
+            };
+        self.metrics.record_accounting_stage(
+            AccountingStage::Ingest,
+            true,
+            started.elapsed(),
+            input_bytes,
+            output_bytes,
+        );
         self.accounting_index
             .apply_prepared_accounting_deltas(prepared)?;
         self.reclaim_consumed_delta_logs(next_cursor)?;
@@ -609,29 +709,88 @@ impl AccountingSidecar {
         // Iterating the map directly while mutating it would either fail borrowing or skip work.
         for partition in partitions {
             if self.should_compact_deltas(partition, force_delta_compaction) {
-                let prepared = self.accounting_index.prepare_compact_partition(partition)?;
+                let input_bytes = self.accounting_index.manifest().partitions[&partition]
+                    .deltas
+                    .iter()
+                    .map(|run| run.file_len)
+                    .sum::<u64>();
+                let started = Instant::now();
+                let prepared = match self.accounting_index.prepare_compact_partition(partition) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.metrics.record_accounting_stage(
+                            AccountingStage::DeltaCompaction,
+                            false,
+                            started.elapsed(),
+                            input_bytes,
+                            0,
+                        );
+                        return Err(error.into());
+                    }
+                };
                 if !prepared.event_batch.input_run_ids.is_empty() {
                     let manifest = prepared.manifest().clone();
-                    should_nudge_gc |= self.commit_sidecar_state(
+                    let output_bytes = output_run_bytes(&manifest, &prepared.event_batch);
+                    let committed = self.commit_sidecar_state(
                         Some(&manifest),
                         None,
                         Some(&prepared.event_batch),
-                    )?;
+                    );
+                    let published = committed.is_ok();
+                    self.metrics.record_accounting_stage(
+                        AccountingStage::DeltaCompaction,
+                        published,
+                        started.elapsed(),
+                        input_bytes,
+                        output_bytes,
+                    );
+                    should_nudge_gc |= committed?;
                     self.accounting_index.apply_prepared_compaction(prepared)?;
                 }
             }
 
             if self.should_major_compact(partition, force_major_compaction) {
-                let prepared = self
+                let input = &self.accounting_index.manifest().partitions[&partition];
+                let input_bytes = input
+                    .base
+                    .iter()
+                    .chain(input.patches.iter())
+                    .map(|run| run.file_len)
+                    .sum::<u64>();
+                let started = Instant::now();
+                let prepared = match self
                     .accounting_index
-                    .prepare_major_compact_partition(partition)?;
+                    .prepare_major_compact_partition(partition)
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.metrics.record_accounting_stage(
+                            AccountingStage::MajorCompaction,
+                            false,
+                            started.elapsed(),
+                            input_bytes,
+                            0,
+                        );
+                        return Err(error.into());
+                    }
+                };
                 if prepared.output.is_some() {
+                    let output_bytes = prepared.output.as_ref().map_or(0, |run| run.file_len);
                     let manifest = prepared.manifest().clone();
-                    should_nudge_gc |= self.commit_sidecar_state(
+                    let committed = self.commit_sidecar_state(
                         Some(&manifest),
                         None,
                         Some(&prepared.event_batch),
-                    )?;
+                    );
+                    let published = committed.is_ok();
+                    self.metrics.record_accounting_stage(
+                        AccountingStage::MajorCompaction,
+                        published,
+                        started.elapsed(),
+                        input_bytes,
+                        output_bytes,
+                    );
+                    should_nudge_gc |= committed?;
                     self.accounting_index
                         .apply_prepared_major_compaction(prepared)?;
                 }
@@ -775,6 +934,8 @@ impl AccountingSidecar {
         } else {
             false
         };
+        let overlay_delta = context.overlay_summary_delta()?;
+        let event_counts = context.event_counts(event_batch);
         context.write_to_batch(&mut batch)?;
         if let Some(frontier) = frontier.as_ref()
             && frontier.accounted_lsn > current_accounted_lsn
@@ -793,8 +954,35 @@ impl AccountingSidecar {
         batch
             .write_with_sync(true)
             .map_err(strata_index::Error::from)?;
+        let published_accounted_lsn = frontier
+            .as_ref()
+            .map_or(current_accounted_lsn, |frontier| frontier.accounted_lsn);
+        self.metrics.publish_accounting_state(
+            published_accounted_lsn,
+            manifest,
+            overlay_delta,
+            event_counts,
+        );
         Ok(should_nudge_gc)
     }
+}
+
+fn output_run_bytes(manifest: &Manifest, event_batch: &CompactionEventBatch) -> u64 {
+    let Some(output_run_id) = event_batch.output_run_id else {
+        return 0;
+    };
+    manifest
+        .partitions
+        .values()
+        .flat_map(|partition| {
+            partition
+                .base
+                .iter()
+                .chain(partition.patches.iter())
+                .chain(partition.deltas.iter())
+        })
+        .find(|run| run.id == output_run_id)
+        .map_or(0, |run| run.file_len)
 }
 
 fn accounting_frontier_unblocks_empty_delete(
@@ -997,6 +1185,60 @@ impl<'a> SidecarAccountingContext<'a> {
             self.index.delete_gc_relocation_batch(batch, from)?;
         }
         Ok(())
+    }
+
+    /// Computes the exact aggregate summary change that the staged merge operands will publish.
+    /// This reads only touched segments and is evaluated before the synced batch; the caller updates
+    /// Prometheus only after that batch succeeds.
+    fn overlay_summary_delta(&self) -> Result<AccountingOverlayDelta> {
+        let mut delta = AccountingOverlayDelta::default();
+        for (segment_id, ops) in &self.gc_overlay_ops {
+            let before = self
+                .index
+                .get_segment_gc_overlay(*segment_id)?
+                .unwrap_or_default();
+            let mut after = before.clone();
+            after.apply_merge_ops(ops.clone());
+            delta.total_bytes +=
+                i128::from(after.summary.total_bytes) - i128::from(before.summary.total_bytes);
+            delta.live_bytes +=
+                i128::from(after.summary.live_bytes) - i128::from(before.summary.live_bytes);
+            delta.retired_bytes +=
+                i128::from(after.summary.retired_bytes) - i128::from(before.summary.retired_bytes);
+            delta.expired_bytes +=
+                i128::from(after.summary.expired_bytes) - i128::from(before.summary.expired_bytes);
+            delta.live_ref_count += i128::from(after.summary.live_ref_count)
+                - i128::from(before.summary.live_ref_count);
+        }
+        Ok(delta)
+    }
+
+    fn event_counts(&self, event_batch: Option<&CompactionEventBatch>) -> AccountingEventCounts {
+        let mut counts = AccountingEventCounts::default();
+        if let Some(event_batch) = event_batch {
+            for event in &event_batch.events {
+                match event {
+                    AccountingRefEvent::Live { .. } => {
+                        counts.live = counts.live.saturating_add(1);
+                    }
+                    AccountingRefEvent::Retired { .. } => {
+                        counts.retired = counts.retired.saturating_add(1);
+                    }
+                    AccountingRefEvent::LifecycleChanged { .. } => {
+                        counts.lifecycle_changed = counts.lifecycle_changed.saturating_add(1);
+                    }
+                    AccountingRefEvent::Mapped { .. } => {
+                        counts.mapped = counts.mapped.saturating_add(1);
+                    }
+                }
+            }
+        }
+        counts.expired = self
+            .ref_events
+            .values()
+            .filter(|event| matches!(event, SegmentRefEvent::Expired))
+            .count() as u64;
+        counts
     }
 
     /// Adds a newly materialized payload ref to the main-index accounting rows.

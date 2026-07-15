@@ -192,8 +192,8 @@ use gc_rate_limiter::GcIoLimiter;
 use layout::{
     parse_segment_file_name, relative_segment_path, retention_dir, segment_path, segment_state_path,
 };
-use metrics::PutMetric;
 pub use metrics::StrataStoreMetrics;
+use metrics::{AccountingOverlayDelta, PutMetric};
 pub use read::{ReadOptions, StoreGetProfile};
 use reader_cache::SegmentReaderCache;
 use seal::{
@@ -389,6 +389,12 @@ impl StrataStore {
             durable_offset,
         );
         metrics.set_lsn_state(store_state.next_lsn, store_state.durable_lsn);
+        let accounting_manifest = index.get_accounting_index_manifest()?;
+        metrics.initialize_accounting(
+            index.get_accounted_lsn()?,
+            accounting_manifest.as_ref(),
+            &accounting::gc_known_summary(&index)?,
+        );
         metrics.set_current_epoch(current_epoch);
         metrics.set_unsealed_segments(unsealed_ingest_segment_count(&index)?);
         let (seal_tx, seal_rx) = mpsc::channel();
@@ -419,6 +425,7 @@ impl StrataStore {
                 pending_materialize_through_lsn,
                 run_lock: Arc::clone(&accounting_lock),
                 gc_txs: Arc::clone(&accounting_gc_txs),
+                metrics: metrics.clone(),
             };
             Some(
                 thread::Builder::new()
@@ -2087,6 +2094,7 @@ impl WriteCoordinator {
 
         let pending_rollovers = self.take_pending_rollovers();
         let accounting_delta = gc_publish_accounting_delta(&published_records);
+        let mut skipped_output_delta = AccountingOverlayDelta::default();
         let commit_result = (|| {
             let mut batch = self.index.batch();
             for rollover in &pending_rollovers {
@@ -2131,11 +2139,15 @@ impl WriteCoordinator {
                 )?;
             }
             for ((segment_id, kind), ranges) in skipped_output_ranges {
+                let bytes = ranges.iter().map(|range| range.len).sum::<u64>();
+                skipped_output_delta.total_bytes += i128::from(bytes);
                 let op = match kind {
                     GcSkippedCopiedRecordKind::Retired => {
+                        skipped_output_delta.retired_bytes += i128::from(bytes);
                         SegmentGcOverlayMergeOp::AddRetiredBatch { ranges }
                     }
                     GcSkippedCopiedRecordKind::Expired => {
+                        skipped_output_delta.expired_bytes += i128::from(bytes);
                         SegmentGcOverlayMergeOp::AddExpiredBatch { ranges }
                     }
                 };
@@ -2163,6 +2175,7 @@ impl WriteCoordinator {
 
         match commit_result {
             Ok(()) => {
+                self.metrics.apply_gc_known_delta(skipped_output_delta);
                 self.run_rollover_post_commit(pending_rollovers);
                 let next_lsn = published_records
                     .last()
@@ -2219,6 +2232,7 @@ impl WriteCoordinator {
     fn delete_empty_gc_segments(&self, segment_ids: &[SegmentId]) -> Result<()> {
         let mut states = Vec::with_capacity(segment_ids.len());
         let mut states_to_commit = Vec::new();
+        let mut summaries_to_remove = Vec::new();
         for segment_id in segment_ids {
             let mut state = self.index.get_segment_state(*segment_id)?.ok_or(
                 Error::GcMissingSourceSegment {
@@ -2249,6 +2263,7 @@ impl WriteCoordinator {
             }
 
             state.state = SegmentFileState::Deleted;
+            summaries_to_remove.push(summary);
             states_to_commit.push(state.clone());
             states.push(state);
         }
@@ -2261,6 +2276,9 @@ impl WriteCoordinator {
             batch
                 .write_with_sync(true)
                 .map_err(strata_index::Error::from)?;
+            for summary in &summaries_to_remove {
+                self.metrics.remove_gc_known_summary(summary);
+            }
         }
 
         for state in &states {

@@ -103,6 +103,8 @@ impl ActiveDeltaLogReadCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveDeltaLogRead {
     pub deltas: Vec<AccountingDelta>,
+    /// Encoded active-log frame bytes consumed to produce `deltas`.
+    pub bytes_read: u64,
     pub end_segment_id: SegmentId,
     pub end_offset: u64,
     pub max_lsn: Option<StrataLsn>,
@@ -489,6 +491,7 @@ fn read_durable_range(
     let Some(mut last_segment_id) = segment_ids.first().copied() else {
         return Ok(ActiveDeltaLogRead {
             deltas: Vec::new(),
+            bytes_read: 0,
             end_segment_id: durable_state.segment_id,
             end_offset: durable_state.durable_offset,
             max_lsn: None,
@@ -496,6 +499,7 @@ fn read_durable_range(
     };
     let mut last_offset = 0;
     let mut deltas = Vec::new();
+    let mut bytes_read = 0_u64;
     let mut max_lsn = None;
 
     for segment_id in segment_ids {
@@ -515,6 +519,7 @@ fn read_durable_range(
         let read =
             read_durable_range_from_file(&path, segment_id, start_cursor_offset, durable_offset)?;
         last_offset = read.end_offset;
+        bytes_read = bytes_read.saturating_add(read.bytes_read);
         if let Some(read_max_lsn) = read.max_lsn {
             max_lsn = Some(max_lsn.map_or(read_max_lsn, |max: StrataLsn| max.max(read_max_lsn)));
         }
@@ -523,6 +528,7 @@ fn read_durable_range(
 
     Ok(ActiveDeltaLogRead {
         deltas,
+        bytes_read,
         end_segment_id: last_segment_id,
         end_offset: last_offset,
         max_lsn,
@@ -547,6 +553,7 @@ fn read_durable_range_from_file(
     if cursor_offset == durable_offset {
         return Ok(ActiveDeltaLogRead {
             deltas: Vec::new(),
+            bytes_read: 0,
             end_segment_id: segment_id,
             end_offset: cursor_offset,
             max_lsn: None,
@@ -612,6 +619,7 @@ fn read_durable_range_from_file(
 
     Ok(ActiveDeltaLogRead {
         deltas,
+        bytes_read: end_offset.saturating_sub(start_offset),
         end_segment_id: segment_id,
         end_offset,
         max_lsn,

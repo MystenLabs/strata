@@ -935,6 +935,18 @@ struct ReclaimSample {
     path: PathSummary,
     io: Option<ProcessIoSnapshot>,
     workload_counts: SteadyOperationCounts,
+    strata_accounting: Option<StrataAccountingSample>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StrataAccountingSample {
+    durable_lsn: u64,
+    accounted_lsn: u64,
+    known_total_bytes: u64,
+    known_live_bytes: u64,
+    known_retired_bytes: u64,
+    known_expired_bytes: u64,
+    known_live_ref_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1458,6 +1470,7 @@ fn run_store_delete(
             store.sync()?;
             Ok(())
         },
+        || strata_accounting_sample(&store).map(Some),
     )?;
     verify_strata_delete_samples(&store, &keys, &delete_indexes, config.delete_verify_samples)?;
 
@@ -1617,6 +1630,7 @@ fn run_rocksdb_blobdb_delete(config: &Config) -> Result<(), Box<dyn std::error::
             Ok(())
         },
         || flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true),
+        || Ok(None),
     )?;
     verify_rocksdb_delete_samples(&db, &keys, &delete_indexes, config.delete_verify_samples)?;
 
@@ -1871,6 +1885,10 @@ fn run_reclaim_timeline(
     live_original_indexes: &[usize],
     mut perform: impl FnMut(SteadyAction) -> Result<(), Box<dyn std::error::Error>>,
     mut sync: impl FnMut() -> Result<(), Box<dyn std::error::Error>>,
+    mut sample_accounting: impl FnMut() -> Result<
+        Option<StrataAccountingSample>,
+        Box<dyn std::error::Error>,
+    >,
 ) -> Result<ReclaimTimeline, Box<dyn std::error::Error>> {
     let sample_at = config.effective_reclaim_sample_at();
     let mut timeline = ReclaimTimeline::default();
@@ -1974,10 +1992,47 @@ fn run_reclaim_timeline(
             path: summarize_path_if_exists(&config.root_dir)?,
             io: process_io_snapshot()?,
             workload_counts: timeline.workload.counts,
+            strata_accounting: sample_accounting()?,
         });
     }
 
     Ok(timeline)
+}
+
+fn strata_accounting_sample(
+    store: &StrataStore,
+) -> Result<StrataAccountingSample, Box<dyn std::error::Error>> {
+    let durable_lsn = store.durable_lsn()?;
+    let accounted_lsn = store.accounted_lsn()?;
+    let mut sample = StrataAccountingSample {
+        durable_lsn,
+        accounted_lsn,
+        ..StrataAccountingSample::default()
+    };
+    for (segment_id, state) in store.index().iter_segment_states()? {
+        if state.state == SegmentFileState::Deleted {
+            continue;
+        }
+        let Some(overlay) = store.index().get_segment_gc_overlay(segment_id)? else {
+            continue;
+        };
+        sample.known_total_bytes = sample
+            .known_total_bytes
+            .saturating_add(overlay.summary.total_bytes);
+        sample.known_live_bytes = sample
+            .known_live_bytes
+            .saturating_add(overlay.summary.live_bytes);
+        sample.known_retired_bytes = sample
+            .known_retired_bytes
+            .saturating_add(overlay.summary.retired_bytes);
+        sample.known_expired_bytes = sample
+            .known_expired_bytes
+            .saturating_add(overlay.summary.expired_bytes);
+        sample.known_live_ref_count = sample
+            .known_live_ref_count
+            .saturating_add(overlay.summary.live_ref_count);
+    }
+    Ok(sample)
 }
 
 fn next_steady_action(
@@ -2721,6 +2776,36 @@ fn print_delete_report(inputs: DeleteReportInputs<'_>) {
             "{prefix}_post_delete_syncs={}",
             sample.workload_counts.syncs
         );
+        if let Some(accounting) = sample.strata_accounting {
+            println!("{prefix}_strata_durable_lsn={}", accounting.durable_lsn);
+            println!("{prefix}_strata_accounted_lsn={}", accounting.accounted_lsn);
+            println!(
+                "{prefix}_strata_accounting_lag_lsn={}",
+                accounting
+                    .durable_lsn
+                    .saturating_sub(accounting.accounted_lsn)
+            );
+            println!(
+                "{prefix}_strata_gc_known_total_bytes={}",
+                accounting.known_total_bytes
+            );
+            println!(
+                "{prefix}_strata_gc_known_live_bytes={}",
+                accounting.known_live_bytes
+            );
+            println!(
+                "{prefix}_strata_gc_known_retired_bytes={}",
+                accounting.known_retired_bytes
+            );
+            println!(
+                "{prefix}_strata_gc_known_expired_bytes={}",
+                accounting.known_expired_bytes
+            );
+            println!(
+                "{prefix}_strata_gc_known_live_ref_count={}",
+                accounting.known_live_ref_count
+            );
+        }
         print_path_summary(&prefix, &sample.path);
         if let (Some(sample_io), Some(t0_io)) = (sample.io, post_delete_io) {
             print_process_io_delta(
