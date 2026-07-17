@@ -12,12 +12,11 @@ use std::{
 use strata_core::{BlobKey, BlobState, PlacementClass, SegmentFileState, SegmentId, StrataLsn};
 use strata_index::StrataIndex;
 use strata_store::{
-    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
-    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
+    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
+    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
+    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
+    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
+    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
@@ -428,7 +427,7 @@ fn validate_segment_states(cfg: &StrataStoreConfig, store: &StrataStore, fault: 
         );
         match state.state {
             SegmentFileState::Deleted => {}
-            SegmentFileState::Sealed => {
+            SegmentFileState::Sealed | SegmentFileState::GcRelocating => {
                 let sealed_len = state.sealed_len.expect("sealed segment has sealed_len");
                 assert_eq!(state.write_offset, sealed_len);
                 assert_eq!(state.durable_offset, sealed_len);
@@ -505,18 +504,14 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         accounting_worker_enabled: true,
         accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
         accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-        accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
-        accounting_sidecar_interval: DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
-        accounting_sidecar_ingest_record_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD,
-        accounting_sidecar_delta_run_count_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
-        accounting_sidecar_delta_run_bytes_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
-        accounting_sidecar_major_patch_count_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
-        accounting_sidecar_major_patch_bytes_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+        accounting_materialize_lag_threshold: DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
+        accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
+        accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
+        accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
+        accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
+        accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
+        accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
+        accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
         gc_workers_enabled: true,
         gc_interval: Duration::from_secs(3600),
         gc_worker_count: DEFAULT_GC_WORKER_COUNT,

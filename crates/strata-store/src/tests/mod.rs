@@ -11,7 +11,7 @@ use std::{
 
 use prometheus::Registry;
 use strata_accounting::{
-    AccountingIndex, AccountingIndexConfig, ActiveDeltaLogReadCursor, ActiveDeltaLogState,
+    AccountingIndex, AccountingIndexConfig, AccountingLogDurablePosition, ActiveDeltaLogReadCursor,
 };
 use strata_core::{
     BlobLifecycle, EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcLifetimeRange,
@@ -43,7 +43,7 @@ fn test_active_accounting_log(cfg: &StrataStoreConfig, segment_id: SegmentId) ->
     ActiveDeltaLog::open(
         cfg.accounting_index_dir(),
         segment_id,
-        ActiveDeltaLogState::default(),
+        AccountingLogDurablePosition::default(),
     )
     .unwrap()
 }
@@ -147,9 +147,9 @@ fn segment_summary(index: &StrataIndex, segment_id: SegmentId) -> strata_core::S
         .summary
 }
 
-fn active_delta_log_state(index: &StrataIndex) -> ActiveDeltaLogState {
+fn accounting_log_durable_position(index: &StrataIndex) -> AccountingLogDurablePosition {
     index
-        .get_accounting_active_delta_log_state()
+        .get_accounting_log_durable_position()
         .unwrap()
         .unwrap()
 }
@@ -230,7 +230,7 @@ async fn durable_frontier_advances_across_durable_gc_map_ref() {
         durable_lsn_with_accounting_frontier(
             &index,
             None,
-            Some(ActiveDeltaLogState {
+            Some(AccountingLogDurablePosition {
                 segment_id: 1,
                 durable_offset: 0,
                 durable_lsn: 2,
@@ -251,7 +251,7 @@ async fn durable_frontier_advances_across_durable_gc_map_ref() {
         durable_lsn_with_accounting_frontier(
             &index,
             None,
-            Some(ActiveDeltaLogState {
+            Some(AccountingLogDurablePosition {
                 segment_id: 1,
                 durable_offset: 0,
                 durable_lsn: 2,
@@ -271,7 +271,7 @@ async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let from_kept = RecordRef {
-        segment_id: 1,
+        segment_id: 4,
         offset: 0,
         len: TEST_RECORD_LEN,
     };
@@ -314,6 +314,21 @@ async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
         sealed_len: Some(output_len),
         sealed_sha256: None,
     };
+    let source_state = SegmentState {
+        owner: INGEST_SEGMENT_OWNER,
+        segment_id: from_hidden.segment_id,
+        volume_id: 0,
+        path: relative_segment_path(&cfg, segment_path(&cfg, from_hidden.segment_id)),
+        placement_class: PlacementClass::Ingest,
+        state: SegmentFileState::GcRelocating,
+        write_offset: from_hidden.end_offset().unwrap(),
+        durable_offset: from_hidden.end_offset().unwrap(),
+        min_lsn: Some(entry.lsn),
+        max_lsn: Some(entry.lsn),
+        sealed_before_lsn: Some(5),
+        sealed_len: Some(from_hidden.end_offset().unwrap()),
+        sealed_sha256: None,
+    };
 
     let mut batch = index.batch();
     index.put_next_lsn_batch(&mut batch, 7).unwrap();
@@ -341,6 +356,9 @@ async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
         .unwrap();
     index
         .put_segment_state_batch(&mut batch, &output_state)
+        .unwrap();
+    index
+        .put_segment_state_batch(&mut batch, &source_state)
         .unwrap();
     index
         .put_gc_relocation_batch(
@@ -392,6 +410,14 @@ async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
         })
     );
     assert_eq!(index.get_gc_relocation(from_hidden).unwrap(), None);
+    assert_eq!(
+        index
+            .get_segment_state(from_hidden.segment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        SegmentFileState::Sealed
+    );
 }
 
 #[tokio::test]
@@ -453,12 +479,12 @@ async fn open_cleans_stale_gc_staging_dirs() {
     assert!(store.config().ingest_dir().exists());
 }
 
-fn open_accounting_sidecar(store: &StrataStore) -> AccountingIndex {
+fn open_accounting_index(store: &StrataStore) -> AccountingIndex {
     let manifest = store.index().get_accounting_index_manifest().unwrap();
     AccountingIndex::open_with_manifest(
         AccountingIndexConfig::new(
             store.config().accounting_index_dir(),
-            store.config().accounting_sidecar_partition_count(),
+            store.config().accounting_partition_count(),
         ),
         manifest,
     )
@@ -535,18 +561,14 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         accounting_worker_enabled: true,
         accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
         accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-        accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
-        accounting_sidecar_interval: DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
-        accounting_sidecar_ingest_record_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD,
-        accounting_sidecar_delta_run_count_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
-        accounting_sidecar_delta_run_bytes_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
-        accounting_sidecar_major_patch_count_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
-        accounting_sidecar_major_patch_bytes_threshold:
-            DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+        accounting_materialize_lag_threshold: DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
+        accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
+        accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
+        accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
+        accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
+        accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
+        accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
+        accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
         gc_workers_enabled: true,
         gc_interval: Duration::from_secs(3600),
         gc_worker_count: DEFAULT_GC_WORKER_COUNT,
@@ -636,8 +658,7 @@ fn wait_for_accounted_lsn(store: &StrataStore, expected_lsn: StrataLsn) {
                 .accounting_lock
                 .lock()
                 .expect("accounting run lock poisoned");
-            accounting::run_accounting_sidecar_materializing_once(store.index(), store.config())
-                .unwrap();
+            accounting::run_accounting_materializing_once(store.index(), store.config()).unwrap();
         }
         let accounted_lsn = store.accounted_lsn().unwrap();
         if accounted_lsn >= expected_lsn {
@@ -645,12 +666,9 @@ fn wait_for_accounted_lsn(store: &StrataStore, expected_lsn: StrataLsn) {
         }
         assert!(
             started.elapsed() < Duration::from_secs(60),
-            "timed out waiting for accounted_lsn to reach {expected_lsn}; current accounted_lsn was {accounted_lsn}; durable_lsn was {}; active_delta_state was {:?}; active_delta_cursor was {:?}",
+            "timed out waiting for accounted_lsn to reach {expected_lsn}; current accounted_lsn was {accounted_lsn}; durable_lsn was {}; accounting_log_durable_position was {:?}; active_delta_cursor was {:?}",
             store.durable_lsn().unwrap(),
-            store
-                .index()
-                .get_accounting_active_delta_log_state()
-                .unwrap(),
+            store.index().get_accounting_log_durable_position().unwrap(),
             store
                 .index()
                 .get_accounting_active_delta_log_consumed_cursor()
@@ -676,8 +694,7 @@ fn wait_for_shard_cleanup(store: &StrataStore, shard: ShardKey) {
                 .accounting_lock
                 .lock()
                 .expect("accounting run lock poisoned");
-            accounting::run_accounting_sidecar_materializing_once(store.index(), store.config())
-                .unwrap();
+            accounting::run_accounting_materializing_once(store.index(), store.config()).unwrap();
         }
         store
             .gc_executor()
@@ -1170,7 +1187,7 @@ async fn store_batch_can_mix_epoch_changes_with_blob_ops() {
 }
 
 #[tokio::test]
-async fn sync_publishes_active_accounting_delta_log_state() {
+async fn sync_publishes_accounting_log_durable_position() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -1184,46 +1201,46 @@ async fn sync_publishes_active_accounting_delta_log_state() {
     store.sync().unwrap();
 
     assert_eq!(store.durable_lsn().unwrap(), epoch_lsn);
-    let state = store
+    let durable_position = store
         .index()
-        .get_accounting_active_delta_log_state()
+        .get_accounting_log_durable_position()
         .unwrap()
         .unwrap();
-    assert_eq!(state.durable_lsn, epoch_lsn);
-    assert!(state.durable_offset > 0);
+    assert_eq!(durable_position.durable_lsn, epoch_lsn);
+    assert!(durable_position.durable_offset > 0);
 }
 
 #[tokio::test]
-async fn accounting_sidecar_ingests_active_delta_log_and_compacts_to_patch() {
+async fn accounting_ingests_active_delta_log_and_compacts_to_patch() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"sidecar-ingest".to_vec()).unwrap();
+    let key = BlobKey::new(b"processor-ingest".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
-    cfg.accounting_sidecar_major_patch_count_threshold = 0;
-    cfg.accounting_sidecar_major_patch_bytes_threshold = 0;
+    cfg.accounting_ingest_record_threshold = usize::MAX;
+    cfg.accounting_major_patch_count_threshold = 0;
+    cfg.accounting_major_patch_bytes_threshold = 0;
     let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     stop_accounting_worker(&mut store.store);
 
     store.put(&key, b"payload").unwrap();
     store.sync().unwrap();
-    accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+    accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
 
-    let active_state = active_delta_log_state(store.index());
+    let durable_position = accounting_log_durable_position(store.index());
     let consumed_cursor = active_delta_log_read_cursor(store.index());
-    assert_eq!(consumed_cursor.offset, active_state.durable_offset);
-    assert_eq!(consumed_cursor.max_lsn, active_state.durable_lsn);
+    assert_eq!(consumed_cursor.offset, durable_position.durable_offset);
+    assert_eq!(consumed_cursor.max_lsn, durable_position.durable_lsn);
 
-    let sidecar = open_accounting_sidecar(&store);
-    let partition = sidecar.manifest().partitions.values().next().unwrap();
-    let delta_count = sidecar
+    let processor = open_accounting_index(&store);
+    let partition = processor.manifest().partitions.values().next().unwrap();
+    let delta_count = processor
         .manifest()
         .partitions
         .values()
         .map(|partition| partition.deltas.len())
         .sum::<usize>();
-    let patch_count = sidecar
+    let patch_count = processor
         .manifest()
         .partitions
         .values()
@@ -1235,43 +1252,43 @@ async fn accounting_sidecar_ingests_active_delta_log_and_compacts_to_patch() {
 }
 
 #[tokio::test]
-async fn accounting_sidecar_nudge_ingests_without_forcing_compaction() {
+async fn accounting_nudge_ingests_without_forcing_compaction() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"sidecar-nudge".to_vec()).unwrap();
+    let key = BlobKey::new(b"processor-nudge".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    cfg.accounting_ingest_record_threshold = usize::MAX;
+    cfg.accounting_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
     let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     stop_accounting_worker(&mut store.store);
 
     store.put(&key, b"payload").unwrap();
     store.sync().unwrap();
-    accounting::run_accounting_sidecar_nudged_once(store.index(), store.config()).unwrap();
+    accounting::run_accounting_nudged_once(store.index(), store.config()).unwrap();
 
-    let active_state = active_delta_log_state(store.index());
+    let durable_position = accounting_log_durable_position(store.index());
     let consumed_cursor = active_delta_log_read_cursor(store.index());
-    assert_eq!(consumed_cursor.offset, active_state.durable_offset);
-    assert_eq!(consumed_cursor.max_lsn, active_state.durable_lsn);
+    assert_eq!(consumed_cursor.offset, durable_position.durable_offset);
+    assert_eq!(consumed_cursor.max_lsn, durable_position.durable_lsn);
 
-    let sidecar = open_accounting_sidecar(&store);
-    let delta_count = sidecar
+    let processor = open_accounting_index(&store);
+    let delta_count = processor
         .manifest()
         .partitions
         .values()
         .map(|partition| partition.deltas.len())
         .sum::<usize>();
-    let patch_count = sidecar
+    let patch_count = processor
         .manifest()
         .partitions
         .values()
         .map(|partition| partition.patches.len())
         .sum::<usize>();
-    let base_count = sidecar
+    let base_count = processor
         .manifest()
         .partitions
         .values()
@@ -1284,7 +1301,63 @@ async fn accounting_sidecar_nudge_ingests_without_forcing_compaction() {
 }
 
 #[tokio::test]
-async fn accounting_sidecar_reclaims_sealed_consumed_logs_and_recovery_uses_cursor() {
+async fn accounting_lag_threshold_promotes_nudge_to_materialization() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let first_key = BlobKey::new(b"lag-threshold-first".to_vec()).unwrap();
+    let second_key = BlobKey::new(b"lag-threshold-second".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.accounting_interval = Duration::from_secs(3600);
+    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
+    cfg.accounting_unaccounted_threshold = usize::MAX;
+    cfg.accounting_materialize_lag_threshold = 2;
+    cfg.accounting_ingest_record_threshold = usize::MAX;
+    cfg.accounting_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    assert_eq!(store.put(&first_key, b"first").unwrap(), 1);
+    store.sync().unwrap();
+
+    let started = Instant::now();
+    loop {
+        let consumed_lsn = store
+            .index()
+            .get_accounting_active_delta_log_consumed_cursor()
+            .unwrap()
+            .map_or(0, |cursor| cursor.max_lsn);
+        if consumed_lsn >= 1 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "accounting did not ingest the below-threshold LSN"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(store.accounted_lsn().unwrap(), 0);
+
+    assert_eq!(store.put(&second_key, b"second").unwrap(), 2);
+    store.sync().unwrap();
+
+    let started = Instant::now();
+    loop {
+        if store.accounted_lsn().unwrap() >= 2 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "lag-triggered materialization did not reach the durable frontier"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[tokio::test]
+async fn accounting_reclaims_sealed_consumed_logs_and_recovery_uses_cursor() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -1299,7 +1372,7 @@ async fn accounting_sidecar_reclaims_sealed_consumed_logs_and_recovery_uses_curs
         stop_accounting_worker(&mut store.store);
         assert_eq!(store.put(&key, b"payload").unwrap(), 1);
         store.sync().unwrap();
-        accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
         assert_eq!(active_delta_log_read_cursor(store.index()).segment_id, 1);
     }
 
@@ -1326,12 +1399,12 @@ async fn accounting_sidecar_reclaims_sealed_consumed_logs_and_recovery_uses_curs
     );
     drop(second_writer);
 
-    let prior_delta_state = active_delta_log_state(&index);
-    let second_delta_state = {
+    let prior_durable_position = accounting_log_durable_position(&index);
+    let second_durable_position = {
         let mut log =
-            ActiveDeltaLog::open(cfg.accounting_index_dir(), 2, prior_delta_state).unwrap();
+            ActiveDeltaLog::open(cfg.accounting_index_dir(), 2, prior_durable_position).unwrap();
         log.sync_data().unwrap();
-        log.state()
+        log.durable_position()
     };
     let mut batch = index.batch();
     index
@@ -1341,13 +1414,13 @@ async fn accounting_sidecar_reclaims_sealed_consumed_logs_and_recovery_uses_curs
         .put_segment_state_batch(&mut batch, &second_state)
         .unwrap();
     index
-        .put_accounting_active_delta_log_state_batch(&mut batch, second_delta_state)
+        .put_accounting_log_durable_position_batch(&mut batch, second_durable_position)
         .unwrap();
     batch.write_with_sync(true).unwrap();
 
     // Advancing the cursor into an empty next log is not enough to reclaim the previous file: its
     // seal worker may still need to fsync it.
-    accounting::run_accounting_sidecar_once(&index, &cfg, true).unwrap();
+    accounting::run_accounting_once(&index, &cfg, true).unwrap();
     let cursor = active_delta_log_read_cursor(&index);
     assert_eq!(cursor.segment_id, 2);
     assert_eq!(cursor.max_lsn, 1);
@@ -1359,7 +1432,7 @@ async fn accounting_sidecar_reclaims_sealed_consumed_logs_and_recovery_uses_curs
     index.put_segment_state(&first_state).unwrap();
     index.flush_wal(true).unwrap();
 
-    accounting::run_accounting_sidecar_once(&index, &cfg, true).unwrap();
+    accounting::run_accounting_once(&index, &cfg, true).unwrap();
     assert!(!first_log_path.exists());
     assert!(second_log_path.exists());
     drop(index);
@@ -1378,12 +1451,12 @@ async fn semantic_materialization_request_survives_until_target_lsn_is_durable()
     let key = BlobKey::new(b"semantic-materialization".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
+    cfg.accounting_ingest_record_threshold = usize::MAX;
+    cfg.accounting_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
     store.put(&key, b"payload").unwrap();
@@ -1407,12 +1480,12 @@ async fn explicit_accounting_materialization_advances_a_quiet_store() {
     let key = BlobKey::new(b"explicit-materialization".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
+    cfg.accounting_ingest_record_threshold = usize::MAX;
+    cfg.accounting_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
     cfg.gc_workers_enabled = false;
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
@@ -1465,12 +1538,12 @@ async fn shard_drop_materializes_immediately_despite_compaction_thresholds() {
     let key = BlobKey::new(b"shard-drop-materialization".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_sidecar_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_sidecar_major_patch_bytes_threshold = u64::MAX;
+    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
+    cfg.accounting_ingest_record_threshold = usize::MAX;
+    cfg.accounting_delta_run_count_threshold = usize::MAX;
+    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
+    cfg.accounting_major_patch_count_threshold = usize::MAX;
+    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
     cfg.gc_workers_enabled = false;
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
@@ -1494,29 +1567,29 @@ async fn shard_drop_materializes_immediately_despite_compaction_thresholds() {
 }
 
 #[tokio::test]
-async fn accounting_sidecar_major_compacts_when_patch_threshold_reached() {
+async fn accounting_major_compacts_when_patch_threshold_reached() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"sidecar-major".to_vec()).unwrap();
+    let key = BlobKey::new(b"processor-major".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_ingest_record_threshold = usize::MAX;
-    cfg.accounting_sidecar_major_patch_count_threshold = 1;
+    cfg.accounting_ingest_record_threshold = usize::MAX;
+    cfg.accounting_major_patch_count_threshold = 1;
     let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     stop_accounting_worker(&mut store.store);
 
     store.put(&key, b"payload").unwrap();
     store.sync().unwrap();
-    accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+    accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
 
-    let sidecar = open_accounting_sidecar(&store);
-    let base_count = sidecar
+    let processor = open_accounting_index(&store);
+    let base_count = processor
         .manifest()
         .partitions
         .values()
         .filter(|partition| partition.base.is_some())
         .count();
-    let patch_count = sidecar
+    let patch_count = processor
         .manifest()
         .partitions
         .values()
@@ -1634,7 +1707,7 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
-    cfg.accounting_sidecar_major_patch_count_threshold = 1;
+    cfg.accounting_major_patch_count_threshold = 1;
     let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     stop_accounting_worker(&mut store.store);
     let shard = store.add_shard(41).unwrap();
@@ -1681,7 +1754,7 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
         .unwrap_or_default();
     assert!(overlay.retired.is_empty());
 
-    accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+    accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
     assert_eq!(
         store
             .index()
@@ -4528,6 +4601,16 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(
         store
             .index()
+            .get_segment_state(ref_b.segment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        SegmentFileState::GcRelocating
+    );
+    assert!(store.prepare_gc_plan(&planner).unwrap().is_none());
+    assert_eq!(
+        store
+            .index()
             .get_blob_entry(&key_b)
             .unwrap()
             .unwrap()
@@ -4562,6 +4645,26 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(output_summary.live_bytes, ref_b.len);
     assert_eq!(output_summary.live_ref_count, 1);
     assert_eq!(output_summary.total_bytes, ref_b.len);
+
+    let prepared_delete = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    assert_eq!(prepared_delete.plan.scenario, GcScenario::EmptyDelete);
+    assert_eq!(
+        prepared_delete.plan.action,
+        GcAction::DeleteSegments {
+            segment_ids: vec![ref_b.segment_id]
+        }
+    );
+    let copied_delete = store.copy_prepared_gc_plan(prepared_delete).unwrap();
+    store.publish_prepared_gc_copy(copied_delete).unwrap();
+    assert_eq!(
+        store
+            .index()
+            .get_segment_state(ref_b.segment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        SegmentFileState::Deleted
+    );
 }
 
 #[tokio::test]
@@ -4659,7 +4762,7 @@ async fn gc_publish_tombstoned_unaccounted_copy_retires_destination_after_forwar
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_major_patch_count_threshold = 1;
+    cfg.accounting_major_patch_count_threshold = 1;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -4728,7 +4831,7 @@ async fn gc_publish_tombstoned_unaccounted_copy_retires_destination_after_forwar
 
     store.sync().unwrap();
     for _ in 0..4 {
-        accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
         if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
             break;
         }
@@ -4759,7 +4862,7 @@ async fn gc_publish_unaccounted_epoch_change_expires_relocated_destination() {
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_major_patch_count_threshold = 1;
+    cfg.accounting_major_patch_count_threshold = 1;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -4831,7 +4934,7 @@ async fn gc_publish_unaccounted_epoch_change_expires_relocated_destination() {
 
     store.sync().unwrap();
     for _ in 0..4 {
-        accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
         if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
             break;
         }
@@ -4862,7 +4965,7 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
     cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_sidecar_major_patch_count_threshold = 1;
+    cfg.accounting_major_patch_count_threshold = 1;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -4933,7 +5036,7 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
 
     store.sync().unwrap();
     for _ in 0..4 {
-        accounting::run_accounting_sidecar_once(store.index(), store.config(), true).unwrap();
+        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
         if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
             break;
         }
@@ -5403,7 +5506,10 @@ async fn recovery_rejects_missing_active_delta_log_for_durable_lsn() {
         let mut batch = store.index().batch();
         store
             .index()
-            .put_accounting_active_delta_log_state_batch(&mut batch, ActiveDeltaLogState::default())
+            .put_accounting_log_durable_position_batch(
+                &mut batch,
+                AccountingLogDurablePosition::default(),
+            )
             .unwrap();
         store
             .index()
@@ -5508,13 +5614,13 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
         let mut segment_1_delta_log = ActiveDeltaLog::open(
             cfg.accounting_index_dir(),
             1,
-            ActiveDeltaLogState::default(),
+            AccountingLogDurablePosition::default(),
         )
         .unwrap();
         for (key, record_ref, lsn) in [(&key_a, out_a.record_ref, 1), (&key_b, out_b.record_ref, 2)]
         {
             segment_1_delta_log
-                .append(&AccountingDelta::Blob(BlobUpdate::Put {
+                .append(&AccountingLogEntry::Blob(BlobUpdate::Put {
                     lsn,
                     key: key.clone(),
                     shard: STANDALONE_SHARD,
@@ -5525,11 +5631,14 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
                 .unwrap();
         }
         segment_1_delta_log.sync_data().unwrap();
-        let mut active_delta_log =
-            ActiveDeltaLog::open(cfg.accounting_index_dir(), 2, segment_1_delta_log.state())
-                .unwrap();
+        let mut active_delta_log = ActiveDeltaLog::open(
+            cfg.accounting_index_dir(),
+            2,
+            segment_1_delta_log.durable_position(),
+        )
+        .unwrap();
         active_delta_log
-            .append(&AccountingDelta::Blob(BlobUpdate::Put {
+            .append(&AccountingLogEntry::Blob(BlobUpdate::Put {
                 lsn: 3,
                 key: key_c.clone(),
                 shard: STANDALONE_SHARD,
@@ -5569,7 +5678,10 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
             .put_segment_state_batch(&mut batch, &segment_2_state)
             .unwrap();
         index
-            .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_log.state())
+            .put_accounting_log_durable_position_batch(
+                &mut batch,
+                active_delta_log.durable_position(),
+            )
             .unwrap();
         batch.write().unwrap();
         index.flush_wal(true).unwrap();
@@ -5702,7 +5814,7 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
                 sealed_before_lsn: 1,
             },
             sealed_sha256: None,
-            active_delta_state: ActiveDeltaLogState::default(),
+            accounting_log_durable_position: AccountingLogDurablePosition::default(),
         },
     );
     seal::publish_ready_completed_seals(
@@ -5735,7 +5847,7 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
                 sealed_before_lsn: 1,
             },
             sealed_sha256: None,
-            active_delta_state: ActiveDeltaLogState::default(),
+            accounting_log_durable_position: AccountingLogDurablePosition::default(),
         },
     );
     seal::publish_ready_completed_seals(

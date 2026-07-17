@@ -62,7 +62,7 @@ impl StrataIndex {
         batch: &mut DBBatch,
         accounted_lsn: StrataLsn,
     ) -> Result<()> {
-        // AccountedLsn is the store-global cursor for sidecar materialization. Once this row is
+        // AccountedLsn is the store-global cursor for accounting materialization. Once this row is
         // committed, segment ref events and GC overlay operands are durable
         // through this LSN.
         batch.insert_batch(

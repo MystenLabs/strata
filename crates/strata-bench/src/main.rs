@@ -46,12 +46,11 @@ use serde_with::{Bytes, serde_as};
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
 use strata_segment::SegmentWriter;
 use strata_store::{
-    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
-    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
+    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
+    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
+    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
+    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
+    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
@@ -329,6 +328,7 @@ struct Config {
     reader_cache_capacity: usize,
     starting_epoch: Epoch,
     strata_accounting: bool,
+    strata_accounting_materialize_lag_threshold: u64,
     strata_gc: bool,
     strata_gc_io_bytes_per_sec: u64,
     strata_gc_min_io_bytes_per_sec: u64,
@@ -389,6 +389,8 @@ impl Config {
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             starting_epoch: DEFAULT_STARTING_EPOCH,
             strata_accounting: true,
+            strata_accounting_materialize_lag_threshold:
+                DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
             strata_gc: true,
             strata_gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
             strata_gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
@@ -491,6 +493,12 @@ impl Config {
                 "--strata-accounting" => {
                     config.strata_accounting =
                         parse_bool(&next_value(&mut args, "--strata-accounting")?)?
+                }
+                "--strata-accounting-materialize-lag-threshold" => {
+                    config.strata_accounting_materialize_lag_threshold = parse_u64(&next_value(
+                        &mut args,
+                        "--strata-accounting-materialize-lag-threshold",
+                    )?)?
                 }
                 "--strata-gc" => {
                     config.strata_gc = parse_bool(&next_value(&mut args, "--strata-gc")?)?
@@ -786,18 +794,14 @@ impl Config {
             accounting_worker_enabled: self.strata_accounting,
             accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
             accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-            accounting_sidecar_partition_count: DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT,
-            accounting_sidecar_interval: DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
-            accounting_sidecar_ingest_record_threshold:
-                DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD,
-            accounting_sidecar_delta_run_count_threshold:
-                DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
-            accounting_sidecar_delta_run_bytes_threshold:
-                DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
-            accounting_sidecar_major_patch_count_threshold:
-                DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
-            accounting_sidecar_major_patch_bytes_threshold:
-                DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
+            accounting_materialize_lag_threshold: self.strata_accounting_materialize_lag_threshold,
+            accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
+            accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
+            accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
+            accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
+            accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
+            accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
+            accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
             gc_workers_enabled: self.strata_gc,
             gc_interval: DEFAULT_GC_INTERVAL,
             gc_worker_count: DEFAULT_GC_WORKER_COUNT,
@@ -2942,6 +2946,10 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     );
     println!("reader_cache_capacity={}", config.reader_cache_capacity);
     println!(
+        "strata_accounting_materialize_lag_threshold={}",
+        config.strata_accounting_materialize_lag_threshold
+    );
+    println!(
         "strata_gc_io_bytes_per_sec={}",
         config.strata_gc_io_bytes_per_sec
     );
@@ -3401,6 +3409,10 @@ fn print_strata_store_metrics(store: &StrataStore) {
         store_config.accounting_worker_enabled
     );
     println!("strata_accounting_delta_log_enabled=true");
+    println!(
+        "strata_accounting_materialize_lag_threshold={}",
+        store_config.accounting_materialize_lag_threshold
+    );
     println!("strata_gc_enabled={}", store_config.gc_workers_enabled);
     println!(
         "strata_accounting_interval_ms={:.3}",
@@ -3469,6 +3481,7 @@ fn print_strata_segment_state_metrics(
     let mut sealed_count = 0_u64;
     let mut deleted_count = 0_u64;
     let mut pending_gc_output_count = 0_u64;
+    let mut gc_relocating_count = 0_u64;
     let mut write_offset_bytes = 0_u64;
     let mut durable_offset_bytes = 0_u64;
     let mut sealed_len_bytes = 0_u64;
@@ -3487,6 +3500,7 @@ fn print_strata_segment_state_metrics(
             SegmentFileState::Sealed => sealed_count += 1,
             SegmentFileState::Deleted => deleted_count += 1,
             SegmentFileState::PendingGcOutput => pending_gc_output_count += 1,
+            SegmentFileState::GcRelocating => gc_relocating_count += 1,
         }
     }
 
@@ -3500,6 +3514,7 @@ fn print_strata_segment_state_metrics(
     println!("strata_segment_sealed_count={sealed_count}");
     println!("strata_segment_deleted_count={deleted_count}");
     println!("strata_segment_pending_gc_output_count={pending_gc_output_count}");
+    println!("strata_segment_gc_relocating_count={gc_relocating_count}");
     println!("strata_segment_write_offset_bytes={write_offset_bytes}");
     println!("strata_segment_durable_offset_bytes={durable_offset_bytes}");
     println!("strata_segment_sealed_len_bytes={sealed_len_bytes}");
@@ -4071,6 +4086,8 @@ options:
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --starting-epoch <epoch>
   --strata-accounting <true|false>      background accounting worker
+  --strata-accounting-materialize-lag-threshold <LSNs>
+                                        full accounting pass at this durable/accounted gap; 0 disables
   --strata-gc <true|false>              background GC workers
   --strata-gc-io-bytes-per-sec <size>
   --strata-gc-min-io-bytes-per-sec <size>
@@ -4227,6 +4244,8 @@ mod tests {
                 "false",
                 "--strata-accounting",
                 "false",
+                "--strata-accounting-materialize-lag-threshold",
+                "12345",
                 "--strata-gc",
                 "false",
                 "--rocksdb-disable-auto-compactions",
@@ -4259,6 +4278,7 @@ mod tests {
         assert!(config.store_get_profile);
         assert!(!config.store_get_verify_checksum);
         assert!(!config.strata_accounting);
+        assert_eq!(config.strata_accounting_materialize_lag_threshold, 12345);
         assert!(!config.strata_gc);
         assert!(config.rocksdb_disable_auto_compactions);
         assert!(config.rocksdb_disable_wal);

@@ -78,13 +78,14 @@ struct PrometheusMetrics {
     accounting_input_bytes_total: IntCounterVec,
     accounting_output_bytes_total: IntCounterVec,
     accounting_ref_events_total: IntCounterVec,
-    accounting_sidecar_run_count: IntGaugeVec,
-    accounting_sidecar_run_bytes: IntGaugeVec,
+    accounting_run_count: IntGaugeVec,
+    accounting_run_bytes: IntGaugeVec,
     gc_known_total_bytes: IntGauge,
     gc_known_live_bytes: IntGauge,
     gc_known_retired_bytes: IntGauge,
     gc_known_expired_bytes: IntGauge,
     gc_known_live_ref_count: IntGauge,
+    gc_relocating_segments: IntGauge,
     current_epoch: IntGauge,
     pending_lsn_count: IntGauge,
     unsealed_segments: IntGauge,
@@ -402,18 +403,18 @@ impl StrataStoreMetrics {
                     "Total durable Strata accounting reference events by event type.",
                     &["event"],
                 )?,
-                accounting_sidecar_run_count: register_gauge_vec(
+                accounting_run_count: register_gauge_vec(
                     registry,
                     &labels,
-                    "accounting_sidecar_run_count",
-                    "Current live accounting sidecar run count by run kind.",
+                    "accounting_run_count",
+                    "Current live accounting-index run count by run kind.",
                     &["kind"],
                 )?,
-                accounting_sidecar_run_bytes: register_gauge_vec(
+                accounting_run_bytes: register_gauge_vec(
                     registry,
                     &labels,
-                    "accounting_sidecar_run_bytes",
-                    "Current live accounting sidecar bytes by run kind.",
+                    "accounting_run_bytes",
+                    "Current live accounting-index bytes by run kind.",
                     &["kind"],
                 )?,
                 gc_known_total_bytes: register_gauge(
@@ -445,6 +446,12 @@ impl StrataStoreMetrics {
                     &labels,
                     "gc_known_live_ref_count",
                     "Physical references currently classified live in Strata GC accounting overlays.",
+                )?,
+                gc_relocating_segments: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_relocating_segments",
+                    "Sealed source segments fenced between GC relocation publish and final deletion.",
                 )?,
                 current_epoch: register_gauge(
                     registry,
@@ -851,7 +858,7 @@ impl StrataStoreMetrics {
             return;
         };
         update_accounting_frontier(metrics, None, Some(accounted_lsn));
-        set_sidecar_shape(metrics, manifest);
+        set_accounting_index_shape(metrics, manifest);
         set_gc_known_summary(metrics, summary);
     }
 
@@ -867,7 +874,7 @@ impl StrataStoreMetrics {
         };
         update_accounting_frontier(metrics, None, Some(accounted_lsn));
         if let Some(manifest) = manifest {
-            set_sidecar_shape(metrics, Some(manifest));
+            set_accounting_index_shape(metrics, Some(manifest));
         }
         apply_gc_known_delta(metrics, overlay_delta);
         for (event, count) in events.values() {
@@ -1061,6 +1068,24 @@ impl StrataStoreMetrics {
     pub(crate) fn set_gc_in_flight_workers(&self, in_flight: usize) {
         if let Some(metrics) = &self.inner {
             metrics.gc_in_flight_workers.set(to_i64(in_flight as u64));
+        }
+    }
+
+    pub(crate) fn set_gc_relocating_segments(&self, count: usize) {
+        if let Some(metrics) = &self.inner {
+            metrics.gc_relocating_segments.set(to_i64(count as u64));
+        }
+    }
+
+    pub(crate) fn add_gc_relocating_segments(&self, count: usize) {
+        if let Some(metrics) = &self.inner {
+            apply_gauge_delta(&metrics.gc_relocating_segments, count as i128);
+        }
+    }
+
+    pub(crate) fn remove_gc_relocating_segments(&self, count: usize) {
+        if let Some(metrics) = &self.inner {
+            apply_gauge_delta(&metrics.gc_relocating_segments, -(count as i128));
         }
     }
 
@@ -1286,7 +1311,7 @@ fn update_accounting_frontier(
     ));
 }
 
-fn set_sidecar_shape(metrics: &PrometheusMetrics, manifest: Option<&Manifest>) {
+fn set_accounting_index_shape(metrics: &PrometheusMetrics, manifest: Option<&Manifest>) {
     let mut counts = [0_u64; 3];
     let mut bytes = [0_u64; 3];
     if let Some(manifest) = manifest {
@@ -1307,11 +1332,11 @@ fn set_sidecar_shape(metrics: &PrometheusMetrics, manifest: Option<&Manifest>) {
     }
     for (index, kind) in ["base", "patch", "delta"].into_iter().enumerate() {
         metrics
-            .accounting_sidecar_run_count
+            .accounting_run_count
             .with_label_values(&[kind])
             .set(to_i64(counts[index]));
         metrics
-            .accounting_sidecar_run_bytes
+            .accounting_run_bytes
             .with_label_values(&[kind])
             .set(to_i64(bytes[index]));
     }

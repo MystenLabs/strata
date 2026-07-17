@@ -80,7 +80,7 @@ impl SegmentGcSummaryDelta {
 ///
 /// This batch is in-memory until the owner publishes it, but its contents are intended to become
 /// durable database rows in the same RocksDB batch as the prepared manifest. It is born during
-/// `prepare_compact_partition` or `prepare_major_compact_partition` and retired after the owner has
+/// `prepare_delta_compaction` or `prepare_major_compact_partition` and retired after the owner has
 /// persisted the rows and applied the matching prepared manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CompactionEventBatch {
@@ -99,16 +99,16 @@ pub struct CompactionEventBatch {
     /// materialization watermark.
     pub max_lsn: StrataLsn,
     /// Logical ref transitions are kept as an audit trail and as the source from which the physical
-    /// summary and overlay mutations were derived. They are not replayed by future sidecar reads;
+    /// summary and overlay mutations were derived. They are not replayed by future index reads;
     /// future reads follow the manifest's run stack.
     pub events: Vec<RefEvent>,
-    /// Summary deltas are retained for callers that inspect prepared sidecar output directly. The
+    /// Summary deltas are retained for callers that inspect prepared compaction output directly. The
     /// store's durable GC summary is folded into `SegmentGcOverlay`.
     pub segment_summary: BTreeMap<SegmentId, SegmentGcSummaryDelta>,
     /// GC overlay operands are already grouped by physical segment because RocksDB merge application
     /// is the lifecycle boundary for collectability. Publishing these operands with the manifest
     /// prevents GC from seeing a segment range as retired or lifetime-adjusted without the matching
-    /// sidecar root.
+    /// accounting-index root.
     pub segment_gc_overlay_ops: BTreeMap<SegmentId, Vec<SegmentGcOverlayMergeOp>>,
 }
 
@@ -117,7 +117,7 @@ impl CompactionEventBatch {
         // RefEvents are the logical history; signed summary deltas and GC-overlay merge operands
         // are physical consequences that can be published beside that history. The store treats the
         // overlay summary as the canonical GC accounting view, but these deltas are still retained
-        // for tests and for callers that inspect prepared sidecar output directly.
+        // for tests and for callers that inspect prepared compaction output directly.
         match &event {
             RefEvent::Live { record_ref, .. } => {
                 self.segment_summary

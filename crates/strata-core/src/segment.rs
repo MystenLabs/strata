@@ -597,11 +597,23 @@ pub enum PlacementClass {
 /// Durable segment file lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentFileState {
+    /// The active ingest segment. New records may be appended, and only the durable prefix is
+    /// guaranteed to survive a crash.
     Open,
+    /// An ingest segment that has stopped accepting appends and is waiting for the seal worker to
+    /// flush, checksum, and publish it as immutable.
     Sealing,
+    /// An immutable segment whose complete contents and sealed metadata are durable and readable.
     Sealed,
+    /// A segment that is no longer readable or eligible for planning. Its file has been removed or
+    /// is scheduled for idempotent removal.
     Deleted,
+    /// A sealed GC output installed at its final path before its `MapRef`s are published. Recovery
+    /// deletes it if publication does not commit.
     PendingGcOutput,
+    /// A sealed GC source whose replacement refs have been published. The source remains readable
+    /// and fenced from rewrites until accounting makes it eligible for final empty deletion.
+    GcRelocating,
 }
 
 /// Durable metadata for one segment file.

@@ -10,7 +10,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use strata_accounting::{ActiveDeltaLog, ActiveDeltaLogState};
+use strata_accounting::{AccountingLogDurablePosition, ActiveDeltaLog};
 use strata_core::{
     BlobKey, MapRefOp, SegmentFileState, SegmentId, SegmentOwner, SegmentState, StrataLsn,
 };
@@ -147,7 +147,7 @@ impl SealWorker {
 pub(crate) struct CompletedSeal {
     pub(crate) task: SegmentSealTask,
     pub(crate) sealed_sha256: Option<[u8; 32]>,
-    pub(crate) active_delta_state: ActiveDeltaLogState,
+    pub(crate) accounting_log_durable_position: AccountingLogDurablePosition,
 }
 
 #[derive(Debug)]
@@ -380,20 +380,20 @@ fn prepare_seal_segment(
         SealedSegmentIntegrityPolicy::Checksum => Some(sha256_file_prefix(&path, task.sealed_len)?),
         SealedSegmentIntegrityPolicy::MetadataOnly => None,
     };
-    let active_delta_state =
+    let accounting_log_durable_position =
         ActiveDeltaLog::sync_existing(config.accounting_index_dir(), task.segment_id)?;
     let checkpoint_lsn = task.sealed_before_lsn.saturating_sub(1);
-    if active_delta_state.durable_lsn < checkpoint_lsn {
+    if accounting_log_durable_position.durable_lsn < checkpoint_lsn {
         return Err(Error::DurabilityAccountingGap {
             required_lsn: checkpoint_lsn,
-            active_delta_log_lsn: active_delta_state.durable_lsn,
+            active_delta_log_lsn: accounting_log_durable_position.durable_lsn,
         });
     }
 
     Ok(Some(CompletedSeal {
         task,
         sealed_sha256,
-        active_delta_state,
+        accounting_log_durable_position,
     }))
 }
 
@@ -439,11 +439,20 @@ fn publish_sealed_segment(
             .expect("durability publish lock poisoned");
         let mut batch = index.batch();
         index.put_segment_state_batch(&mut batch, &state)?;
-        let active_delta_state = durable_active_delta_state(index, completed.active_delta_state)?;
-        let durable_lsn =
-            durable_lsn_from_checkpoint(index, task.sealed_before_lsn, active_delta_state)?;
+        let accounting_log_durable_position = latest_accounting_log_durable_position(
+            index,
+            completed.accounting_log_durable_position,
+        )?;
+        let durable_lsn = durable_lsn_from_checkpoint(
+            index,
+            task.sealed_before_lsn,
+            accounting_log_durable_position,
+        )?;
         index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
-        index.put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+        index.put_accounting_log_durable_position_batch(
+            &mut batch,
+            accounting_log_durable_position,
+        )?;
         batch
             .write_with_sync(true)
             .map_err(strata_index::Error::from)?;
@@ -459,11 +468,11 @@ fn publish_sealed_segment(
     Ok(())
 }
 
-fn durable_active_delta_state(
+fn latest_accounting_log_durable_position(
     index: &StrataIndex,
-    candidate: ActiveDeltaLogState,
-) -> Result<ActiveDeltaLogState> {
-    let Some(current) = index.get_accounting_active_delta_log_state()? else {
+    candidate: AccountingLogDurablePosition,
+) -> Result<AccountingLogDurablePosition> {
+    let Some(current) = index.get_accounting_log_durable_position()? else {
         return Ok(candidate);
     };
     if current.durable_lsn > candidate.durable_lsn {
@@ -478,7 +487,7 @@ fn durable_active_delta_state(
     if current.segment_id < candidate.segment_id {
         return Ok(candidate);
     }
-    Ok(ActiveDeltaLogState {
+    Ok(AccountingLogDurablePosition {
         segment_id: current.segment_id,
         durable_offset: current.durable_offset.max(candidate.durable_offset),
         durable_lsn: current.durable_lsn,
@@ -488,12 +497,12 @@ fn durable_active_delta_state(
 fn durable_lsn_from_checkpoint(
     index: &StrataIndex,
     sealed_before_lsn: StrataLsn,
-    active_delta_state: ActiveDeltaLogState,
+    accounting_log_durable_position: AccountingLogDurablePosition,
 ) -> Result<StrataLsn> {
     let current_durable_lsn = index.get_durable_lsn()?;
     let checkpoint_lsn = sealed_before_lsn.saturating_sub(1);
     Ok(checkpoint_lsn
-        .min(active_delta_state.durable_lsn)
+        .min(accounting_log_durable_position.durable_lsn)
         .max(current_durable_lsn))
 }
 
@@ -534,7 +543,10 @@ pub(crate) fn verify_sealed_segments(
     index: &StrataIndex,
 ) -> Result<()> {
     for (_, state) in index.iter_segment_states()? {
-        if state.state == SegmentFileState::Sealed {
+        if matches!(
+            state.state,
+            SegmentFileState::Sealed | SegmentFileState::GcRelocating
+        ) {
             verify_sealed_segment(config, &state)?;
         }
     }
@@ -633,18 +645,18 @@ pub(crate) fn active_segment_durable_offset(
 /// same committed prefix.
 ///
 /// Foreground sync fsyncs the segment file and active accounting log first, then publishes
-/// `store_state[DurableLsn]` and `accounting_index[ActiveDeltaLogState]` in one synced RocksDB
+/// `store_state[DurableLsn]` and `accounting_index[AccountingLogDurablePosition]` in one synced RocksDB
 /// batch. That single batch is what keeps recovery from seeing a new store durable LSN without the
-/// matching accounting-log state row. The batch atomicity does not replace the filesystem ordering:
+/// matching accounting-log durable position. The batch atomicity does not replace the filesystem ordering:
 /// if we persisted the metadata before fsyncing either file, a crash could leave `durable_lsn`
-/// pointing at missing payload bytes or missing accounting deltas.
+/// pointing at missing payload bytes or missing accounting log entries.
 ///
 /// The final `max(current_durable_lsn)` is a monotonicity floor, not a way to newly publish an LSN
 /// past the accounting log. In a healthy store, the persisted delta-log frontier is never below the
 /// already-published store durable LSN; otherwise accounting could be unable to replay the missing
 /// LSNs. Normal foreground sync and recovery callers first raise the in-memory
-/// `ActiveDeltaLogState::durable_lsn` to at least `current_durable_lsn`, then commit the store
-/// durable LSN and `ActiveDeltaLogState` together. The max only prevents this helper from moving a
+/// `AccountingLogDurablePosition::durable_lsn` to at least `current_durable_lsn`, then commit the store
+/// durable LSN and `AccountingLogDurablePosition` together. The max only prevents this helper from moving a
 /// public durable promise backward if it is called while repairing or observing pre-existing skew.
 ///
 /// Examples:
@@ -656,19 +668,19 @@ pub(crate) fn active_segment_durable_offset(
 /// - accounting deltas are durable through LSN 12, but payload is durable only through LSN 10:
 ///   return 10. The accounting log may be ahead, the store cannot publish the extra LSNs yet.
 /// - both are durable through LSN 10: return 10, and the store durable LSN plus
-///   `ActiveDeltaLogState` become visible together in the metadata batch.
+///   `AccountingLogDurablePosition` become visible together in the metadata batch.
 pub(crate) fn durable_lsn_with_accounting_frontier(
     index: &StrataIndex,
     override_state: Option<&SegmentState>,
-    active_delta_state: Option<ActiveDeltaLogState>,
+    accounting_log_durable_position: Option<AccountingLogDurablePosition>,
 ) -> Result<StrataLsn> {
     let current_durable_lsn = index.get_durable_lsn()?;
     let payload_durable_lsn = compute_durable_lsn(index, current_durable_lsn, override_state)?;
-    let delta_durable_lsn = active_delta_state
-        .or(index.get_accounting_active_delta_log_state()?)
+    let accounting_log_durable_lsn = accounting_log_durable_position
+        .or(index.get_accounting_log_durable_position()?)
         .map_or(current_durable_lsn, |state| state.durable_lsn);
     Ok(payload_durable_lsn
-        .min(delta_durable_lsn)
+        .min(accounting_log_durable_lsn)
         .max(current_durable_lsn))
 }
 

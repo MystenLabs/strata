@@ -117,7 +117,7 @@ pub struct GcSnapshot {
 /// Per-source segment facts used by the planner.
 ///
 /// `SegmentState` says what the file is and where it is placed; `SegmentGcSummary` says what the
-/// accounting sidecar currently knows about the bytes inside it. Keeping both together makes tests
+/// accounting view currently knows about the bytes inside it. Keeping both together makes tests
 /// and future schedulers explicit about the view they are planning from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentSnapshot {
@@ -143,6 +143,13 @@ impl SegmentSnapshot {
         self.state.state == SegmentFileState::Sealed
     }
 
+    fn is_empty_delete_source(&self) -> bool {
+        matches!(
+            self.state.state,
+            SegmentFileState::Sealed | SegmentFileState::GcRelocating
+        )
+    }
+
     fn liveness_complete(&self, accounted_lsn: StrataLsn) -> bool {
         self.state
             .max_lsn
@@ -151,6 +158,13 @@ impl SegmentSnapshot {
 
     fn eligible_source(&self, accounted_lsn: StrataLsn) -> bool {
         self.is_sealed()
+            && !self.claimed
+            && self.liveness_complete(accounted_lsn)
+            && self.summary.total_bytes > 0
+    }
+
+    fn eligible_empty_delete_source(&self, accounted_lsn: StrataLsn) -> bool {
+        self.is_empty_delete_source()
             && !self.claimed
             && self.liveness_complete(accounted_lsn)
             && self.summary.total_bytes > 0
@@ -329,7 +343,7 @@ impl GcPlanner {
         let mut candidates = snapshot
             .segments
             .iter()
-            .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
+            .filter(|segment| segment.eligible_empty_delete_source(snapshot.accounted_lsn))
             .filter(|segment| segment.summary.live_ref_count == 0)
             .map(|segment| {
                 (
@@ -753,6 +767,28 @@ mod tests {
         );
         assert_eq!(plan.copied_bytes, 0);
         assert_eq!(plan.expected_reclaim_bytes, 1_200);
+    }
+
+    #[test]
+    fn planner_fences_relocating_source_until_it_is_empty() {
+        let mut relocating = sealed_segment(1, PlacementClass::Spillover, summary(1_000, 100, 900));
+        relocating.state.state = SegmentFileState::GcRelocating;
+
+        assert!(
+            planner()
+                .plan(&snapshot(vec![relocating.clone()]))
+                .is_none()
+        );
+
+        relocating.summary = summary(1_000, 0, 1_000);
+        let plan = planner().plan(&snapshot(vec![relocating])).unwrap();
+        assert_eq!(plan.scenario, GcScenario::EmptyDelete);
+        assert_eq!(
+            plan.action,
+            GcAction::DeleteSegments {
+                segment_ids: vec![1]
+            }
+        );
     }
 
     #[test]

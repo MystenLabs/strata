@@ -104,4 +104,4 @@ publishing `MapRef`s. Skipped records do not need payload checksum verification 
 - Should index checksums be per-entry, file-level, or both?
 - Should the index include payload checksums to support selective verification without reading key
   trailers from the data file?
-- Should index state live in `SegmentState` directly or in a separate versioned sidecar manifest?
+- Should index state live in `SegmentState` directly or in a separate versioned accounting manifest?

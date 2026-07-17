@@ -43,7 +43,7 @@
 //!   -> fsync the active segment's accounting delta log through the committed LSN
 //!   -> advance segment_states[active].durable_offset
 //!   -> advance durable_lsn while unaccounted blob LSNs are covered by durable bytes
-//!   -> publish store_state[DurableLsn] and ActiveDeltaLogState together
+//!   -> publish store_state[DurableLsn] and AccountingLogDurablePosition together
 //!   -> fsync RocksDB WAL
 //! ```
 //!
@@ -106,23 +106,23 @@
 //! ```text
 //! accounting worker (interval tick or nudge from the writer)
 //!   -> read the durable range of segment-aligned accounting delta logs
-//!   -> write immutable sidecar delta runs and publish manifest + consumed cursor together
+//!   -> write immutable processor delta runs and publish manifest + consumed cursor together
 //!   -> compact delta runs into patch runs
 //!   -> major-compact patches/base state, producing ordered ref events
 //!   -> apply those events to segment ref events and GC overlay summary/ranges
-//!   -> advance accounted_lsn while sidecar materialization covers the next durable LSN
+//!   -> advance accounted_lsn while processor materialization covers the next durable LSN
 //! ```
 //!
 //! The accounting worker is the writer of GC overlay summary/ranges, including mixed-ingest
 //! retirements caused by shard drop. The foreground blob write path only appends cheap accounting
 //! deltas and persists resumable cleanup jobs.
-//! Accounting lag is expected: `accounted_lsn` says how far sidecar compaction events have been
-//! reflected in the GC-facing rows. The sidecar manifest/cursor and derived rows commit atomically,
-//! so crash retry reopens from one published sidecar state instead of replaying blob keys from the
+//! Accounting lag is expected: `accounted_lsn` says how far processor compaction events have been
+//! reflected in the GC-facing rows. The processor manifest/cursor and derived rows commit atomically,
+//! so crash retry reopens from one published processor state instead of replaying blob keys from the
 //! packed version rows. Accounting delta log files are aligned with ingest segments. The writer
 //! appends deltas in LSN order and rolls the active accounting log with the active segment; seal
 //! workers fsync closed accounting logs in parallel with their matching segment files. Once the
-//! sidecar cursor has moved past a sealed segment, the accounting worker unlinks that segment's
+//! processor cursor has moved past a sealed segment, the accounting worker unlinks that segment's
 //! delta log; recovery treats the cursor's max LSN as the checkpointed prefix.
 
 mod accounting;
@@ -147,8 +147,8 @@ use std::{
 };
 
 use strata_accounting::{
-    AccountingDelta, ActiveDeltaLog, ActiveDeltaLogState, BlobUpdate,
-    EpochChange as AccountingEpochChange, GcMapRefDelta,
+    AccountingLogDurablePosition, AccountingLogEntry, ActiveDeltaLog, BlobUpdate,
+    EpochChange as AccountingEpochChange, GcMapRefEntry,
 };
 #[cfg(test)]
 use strata_core::SegmentGcLiveRecord;
@@ -166,12 +166,11 @@ use strata_segment::{SegmentScanner, SegmentWriter};
 
 use accounting::{AccountingRequestSender, AccountingWorker, accounting_request_channel};
 pub use config::{
-    DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_SIDECAR_INTERVAL,
-    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
+    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
+    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
+    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
+    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
+    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
@@ -395,6 +394,7 @@ impl StrataStore {
             accounting_manifest.as_ref(),
             &accounting::gc_known_summary(&index)?,
         );
+        metrics.set_gc_relocating_segments(gc_relocating_segment_count(&index)?);
         metrics.set_current_epoch(current_epoch);
         metrics.set_unsealed_segments(unsealed_ingest_segment_count(&index)?);
         let (seal_tx, seal_rx) = mpsc::channel();
@@ -418,7 +418,7 @@ impl StrataStore {
         let accounting_handle = if config.accounting_worker_enabled {
             let accounting_worker = AccountingWorker {
                 config: config.clone(),
-                index: index.clone(),
+                store_index: index.clone(),
                 interval: config.accounting_interval,
                 command_rx: accounting_rx,
                 pending_request: pending_accounting_request,
@@ -1272,7 +1272,7 @@ enum PreparedBatchOp {
     },
 }
 
-fn accounting_delta_for_prepared_op(op: &PreparedBatchOp) -> Option<AccountingDelta> {
+fn accounting_log_entry_for_prepared_op(op: &PreparedBatchOp) -> Option<AccountingLogEntry> {
     match op {
         PreparedBatchOp::Put {
             shard,
@@ -1281,7 +1281,7 @@ fn accounting_delta_for_prepared_op(op: &PreparedBatchOp) -> Option<AccountingDe
             current_epoch,
             record_ref,
             ..
-        } => Some(AccountingDelta::Blob(BlobUpdate::Put {
+        } => Some(AccountingLogEntry::Blob(BlobUpdate::Put {
             lsn: *lsn,
             key: key.clone(),
             shard: *shard,
@@ -1303,7 +1303,7 @@ fn accounting_delta_for_prepared_op(op: &PreparedBatchOp) -> Option<AccountingDe
                             current_epoch,
                         },
                 }),
-        } => Some(AccountingDelta::Blob(BlobUpdate::SetLifetime {
+        } => Some(AccountingLogEntry::Blob(BlobUpdate::SetLifetime {
             lsn: *lsn,
             key: key.clone(),
             logical_end_epoch: *logical_end_epoch,
@@ -1317,7 +1317,7 @@ fn accounting_delta_for_prepared_op(op: &PreparedBatchOp) -> Option<AccountingDe
                     lsn,
                     action: BlobLifecycleAction::Tombstone,
                 }),
-        } => Some(AccountingDelta::Blob(BlobUpdate::Tombstone {
+        } => Some(AccountingLogEntry::Blob(BlobUpdate::Tombstone {
             lsn: *lsn,
             key: key.clone(),
         })),
@@ -1326,7 +1326,7 @@ fn accounting_delta_for_prepared_op(op: &PreparedBatchOp) -> Option<AccountingDe
             ..
         } => None,
         PreparedBatchOp::EpochChange { lsn, epoch } => {
-            Some(AccountingDelta::Epoch(AccountingEpochChange {
+            Some(AccountingLogEntry::Epoch(AccountingEpochChange {
                 lsn: *lsn,
                 epoch: *epoch,
             }))
@@ -1644,8 +1644,8 @@ impl WriteCoordinator {
             .ok_or(strata_segment::Error::RangeOverflow)?;
 
         let commit_result = (|| {
-            let active_delta_state = self.append_and_sync_accounting_delta(
-                AccountingDelta::ShardDropped {
+            let accounting_log_durable_position = self.append_and_sync_accounting_log_entry(
+                AccountingLogEntry::ShardDropped {
                     lsn: drop_lsn,
                     shard,
                 },
@@ -1669,8 +1669,10 @@ impl WriteCoordinator {
             )?;
             self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
             self.index.put_durable_lsn_batch(&mut batch, drop_lsn)?;
-            self.index
-                .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+            self.index.put_accounting_log_durable_position_batch(
+                &mut batch,
+                accounting_log_durable_position,
+            )?;
             batch
                 .write_with_sync(true)
                 .map_err(strata_index::Error::from)?;
@@ -1911,7 +1913,7 @@ impl WriteCoordinator {
             let accounting_result = profile_phase(
                 profile.as_deref_mut(),
                 |profile, elapsed| profile.accounting_delta_append += elapsed,
-                || self.append_accounting_delta_for_op(op),
+                || self.append_accounting_log_entry_for_op(op),
             );
             if let Err(error) = accounting_result {
                 self.halt_submit_batch_failure(
@@ -2088,12 +2090,13 @@ impl WriteCoordinator {
             &survivors,
             &output_plan.staged_to_final_segment_id,
         )?;
+        let relocating_source_states = self.plan_gc_relocating_source_states(&published_records)?;
         apply_gc_output_lsn_bounds(&mut output_plan.segment_states, &published_records);
         let skipped_output_ranges =
             skipped_gc_output_ranges(&skipped_records, &output_plan.staged_to_final_segment_id);
 
         let pending_rollovers = self.take_pending_rollovers();
-        let accounting_delta = gc_publish_accounting_delta(&published_records);
+        let accounting_log_entry = gc_publish_accounting_log_entry(&published_records);
         let mut skipped_output_delta = AccountingOverlayDelta::default();
         let commit_result = (|| {
             let mut batch = self.index.batch();
@@ -2101,6 +2104,9 @@ impl WriteCoordinator {
                 rollover.apply_batch(&self.index, &mut batch)?;
             }
             for state in &output_plan.segment_states {
+                self.index.put_segment_state_batch(&mut batch, state)?;
+            }
+            for state in &relocating_source_states {
                 self.index.put_segment_state_batch(&mut batch, state)?;
             }
             for output in &copy.outputs {
@@ -2160,8 +2166,8 @@ impl WriteCoordinator {
                 .and_then(|record| record.publish_lsn.checked_add(1))
                 .ok_or(strata_segment::Error::RangeOverflow)?;
             self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-            if let Some(delta) = accounting_delta.as_ref() {
-                self.append_accounting_delta(delta)?;
+            if let Some(entry) = accounting_log_entry.as_ref() {
+                self.append_accounting_log_entry(entry)?;
             }
             if let Err(error) = batch
                 .write()
@@ -2176,6 +2182,8 @@ impl WriteCoordinator {
         match commit_result {
             Ok(()) => {
                 self.metrics.apply_gc_known_delta(skipped_output_delta);
+                self.metrics
+                    .add_gc_relocating_segments(relocating_source_states.len());
                 self.run_rollover_post_commit(pending_rollovers);
                 let next_lsn = published_records
                     .last()
@@ -2229,10 +2237,42 @@ impl WriteCoordinator {
         Ok(())
     }
 
+    /// Fences every source that published at least one surviving relocation.
+    ///
+    /// The state transition shares the same RocksDB batch as the `MapRef`s and relocation rows.
+    /// A planner therefore cannot observe a committed relocation without also observing that its
+    /// source is ineligible for another copy plan.
+    fn plan_gc_relocating_source_states(
+        &self,
+        published_records: &[GcPublishedRecord],
+    ) -> Result<Vec<SegmentState>> {
+        let source_ids = published_records
+            .iter()
+            .map(|record| record.source.from.segment_id)
+            .collect::<BTreeSet<_>>();
+        let mut states = Vec::with_capacity(source_ids.len());
+        for segment_id in source_ids {
+            let mut state = self
+                .index
+                .get_segment_state(segment_id)?
+                .ok_or(Error::GcMissingSourceSegment { segment_id })?;
+            if state.state != SegmentFileState::Sealed {
+                return Err(Error::GcSourceSegmentNotSealed {
+                    segment_id,
+                    state: state.state,
+                });
+            }
+            state.state = SegmentFileState::GcRelocating;
+            states.push(state);
+        }
+        Ok(states)
+    }
+
     fn delete_empty_gc_segments(&self, segment_ids: &[SegmentId]) -> Result<()> {
         let mut states = Vec::with_capacity(segment_ids.len());
         let mut states_to_commit = Vec::new();
         let mut summaries_to_remove = Vec::new();
+        let mut relocating_segments_to_remove = 0;
         for segment_id in segment_ids {
             let mut state = self.index.get_segment_state(*segment_id)?.ok_or(
                 Error::GcMissingSourceSegment {
@@ -2243,11 +2283,17 @@ impl WriteCoordinator {
                 states.push(state);
                 continue;
             }
-            if state.state != SegmentFileState::Sealed {
+            if !matches!(
+                state.state,
+                SegmentFileState::Sealed | SegmentFileState::GcRelocating
+            ) {
                 return Err(Error::GcSourceSegmentNotSealed {
                     segment_id: *segment_id,
                     state: state.state,
                 });
+            }
+            if state.state == SegmentFileState::GcRelocating {
+                relocating_segments_to_remove += 1;
             }
 
             let summary = self
@@ -2279,6 +2325,8 @@ impl WriteCoordinator {
             for summary in &summaries_to_remove {
                 self.metrics.remove_gc_known_summary(summary);
             }
+            self.metrics
+                .remove_gc_relocating_segments(relocating_segments_to_remove);
         }
 
         for state in &states {
@@ -2580,35 +2628,35 @@ impl WriteCoordinator {
         Ok(())
     }
 
-    /// Appends the ordered accounting delta for one prepared op to the currently active accounting
+    /// Appends the ordered accounting log entry for one prepared op to the currently active accounting
     /// epoch.
-    fn append_accounting_delta_for_op(&mut self, op: &PreparedBatchOp) -> Result<()> {
-        let Some(delta) = accounting_delta_for_prepared_op(op) else {
+    fn append_accounting_log_entry_for_op(&mut self, op: &PreparedBatchOp) -> Result<()> {
+        let Some(entry) = accounting_log_entry_for_prepared_op(op) else {
             return Ok(());
         };
-        self.append_accounting_delta(&delta)
+        self.append_accounting_log_entry(&entry)
     }
 
-    fn append_accounting_delta(&mut self, delta: &AccountingDelta) -> Result<()> {
-        self.active_accounting_delta_log.append(delta)?;
+    fn append_accounting_log_entry(&mut self, entry: &AccountingLogEntry) -> Result<()> {
+        self.active_accounting_delta_log.append(entry)?;
         Ok(())
     }
 
-    fn append_and_sync_accounting_delta(
+    fn append_and_sync_accounting_log_entry(
         &mut self,
-        delta: AccountingDelta,
+        entry: AccountingLogEntry,
         durable_lsn: StrataLsn,
-    ) -> Result<ActiveDeltaLogState> {
-        self.active_accounting_delta_log.append(&delta)?;
+    ) -> Result<AccountingLogDurablePosition> {
+        self.active_accounting_delta_log.append(&entry)?;
         self.active_accounting_delta_log.sync_data()?;
-        let state = self.active_accounting_delta_log.state();
-        if state.durable_lsn < durable_lsn {
+        let durable_position = self.active_accounting_delta_log.durable_position();
+        if durable_position.durable_lsn < durable_lsn {
             return Err(Error::DurabilityAccountingGap {
                 required_lsn: durable_lsn,
-                active_delta_log_lsn: state.durable_lsn,
+                active_delta_log_lsn: durable_position.durable_lsn,
             });
         }
-        Ok(state)
+        Ok(durable_position)
     }
 
     /// Returns the active generation key for a shard that can accept writes.
@@ -2720,7 +2768,7 @@ impl WriteCoordinator {
         let new_accounting_log = ActiveDeltaLog::open(
             self.config.accounting_index_dir(),
             new_segment_id,
-            self.active_accounting_delta_log.state(),
+            self.active_accounting_delta_log.durable_position(),
         )?;
         let new_state = active_segment_state(&self.config, self.ingest_owner, &new_writer, 0);
         let mut old_state = self.active_segment_state.clone();
@@ -2843,7 +2891,7 @@ impl WriteCoordinator {
             || {
                 let committed_lsn = self.index.get_next_lsn()?.saturating_sub(1);
                 self.active_accounting_delta_log.sync_data()?;
-                let state = self.active_accounting_delta_log.state();
+                let state = self.active_accounting_delta_log.durable_position();
                 if state.durable_lsn < committed_lsn {
                     return Err(Error::DurabilityAccountingGap {
                         required_lsn: committed_lsn,
@@ -2853,7 +2901,7 @@ impl WriteCoordinator {
                 Ok(state)
             },
         );
-        let active_delta_state = match accounting_sync_result {
+        let accounting_log_durable_position = match accounting_sync_result {
             Ok(state) => state,
             Err(error) => {
                 self.metrics.record_sync(Err(()), started.elapsed());
@@ -2889,17 +2937,20 @@ impl WriteCoordinator {
                 let mut batch = self.index.batch();
                 self.index.put_segment_state_batch(&mut batch, &state)?;
                 let current_durable_lsn = self.index.get_durable_lsn()?;
-                let mut active_delta_state = active_delta_state;
-                active_delta_state.durable_lsn =
-                    active_delta_state.durable_lsn.max(current_durable_lsn);
+                let mut accounting_log_durable_position = accounting_log_durable_position;
+                accounting_log_durable_position.durable_lsn = accounting_log_durable_position
+                    .durable_lsn
+                    .max(current_durable_lsn);
                 let durable_lsn = durable_lsn_with_accounting_frontier(
                     &self.index,
                     Some(&state),
-                    Some(active_delta_state),
+                    Some(accounting_log_durable_position),
                 )?;
                 self.index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
-                self.index
-                    .put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+                self.index.put_accounting_log_durable_position_batch(
+                    &mut batch,
+                    accounting_log_durable_position,
+                )?;
                 Ok::<_, Error>((state, batch, durable_lsn))
             },
         )?;
@@ -3163,15 +3214,15 @@ fn skipped_gc_output_ranges(
 /// Builds the bulk active log delta that makes GC relocations visible to blob accounting.
 ///
 /// Each record still has its own logical publish LSN, but the active log stores the whole publish
-/// chunk as one frame. Sidecar ingestion expands the frame back into ordered `MapRef` updates using
+/// chunk as one frame. Processor ingestion expands the frame back into ordered `MapRef` updates using
 /// `base_lsn + index`.
-fn gc_publish_accounting_delta(records: &[GcPublishedRecord]) -> Option<AccountingDelta> {
+fn gc_publish_accounting_log_entry(records: &[GcPublishedRecord]) -> Option<AccountingLogEntry> {
     let base_lsn = records.first()?.publish_lsn;
-    Some(AccountingDelta::GcMapRefBatch {
+    Some(AccountingLogEntry::GcMapRefBatch {
         base_lsn,
         maps: records
             .iter()
-            .map(|record| GcMapRefDelta {
+            .map(|record| GcMapRefEntry {
                 key: record.source.key.clone(),
                 from: record.source.from,
                 to: record.to,
@@ -3503,7 +3554,7 @@ fn recover_unsealed_segments(
 
 /// Reopens the active accounting delta log and makes it agree with the recovered index prefix.
 ///
-/// The active log is a sidecar replay source for accounting. The writer appends deltas before it
+/// The active log is a processor replay source for accounting. The writer appends deltas before it
 /// commits the matching RocksDB index batch, but the log append is not made durable until a later
 /// sync, so a crash can leave the two prefixes disagreeing in either direction:
 ///
@@ -3542,7 +3593,7 @@ fn recover_active_accounting_delta_log(
     // `durable_lsn`, the durable promise is already broken and recovery must stop. Otherwise
     // `rollback_operations_from` rewinds only the non-durable committed tail, so recompute
     // `committed_lsn`.
-    // The sidecar manifest and consumed cursor are published atomically. Once a closed delta log
+    // The processor manifest and consumed cursor are published atomically. Once a closed delta log
     // segment is behind that cursor, its records have a durable replacement in the manifest and
     // the accounting worker may unlink the original file. Recovery therefore combines the
     // checkpointed prefix with the retained raw log suffix instead of requiring raw files forever.
@@ -3570,7 +3621,7 @@ fn recover_active_accounting_delta_log(
     // Persist the recovered log prefix before publishing a recomputed durable frontier that depends
     // on it. This is the recovery equivalent of the foreground sync ordering.
     log.sync_data()?;
-    advance_recovered_durable_lsn(index, metrics, log.state())?;
+    advance_recovered_durable_lsn(index, metrics, log.durable_position())?;
     Ok(log)
 }
 
@@ -3585,20 +3636,20 @@ fn open_active_accounting_delta_log(
     index: &StrataIndex,
     active_segment_id: SegmentId,
 ) -> Result<ActiveDeltaLog> {
-    let mut durable_state =
+    let mut durable_position =
         index
-            .get_accounting_active_delta_log_state()?
-            .unwrap_or(ActiveDeltaLogState {
+            .get_accounting_log_durable_position()?
+            .unwrap_or(AccountingLogDurablePosition {
                 segment_id: 0,
                 durable_offset: 0,
                 durable_lsn: index.get_durable_lsn()?,
             });
 
-    durable_state.durable_lsn = durable_state.durable_lsn.max(index.get_durable_lsn()?);
+    durable_position.durable_lsn = durable_position.durable_lsn.max(index.get_durable_lsn()?);
     Ok(ActiveDeltaLog::open(
         config.accounting_index_dir(),
         active_segment_id,
-        durable_state,
+        durable_position,
     )?)
 }
 
@@ -3982,6 +4033,8 @@ fn rollback_operations_from(
     }
     index.remove_blob_ops_at_lsns_batch(&mut batch, &hidden_versions)?;
     index.remove_epoch_changes_batch(&mut batch, &hidden_epoch_changes)?;
+    let restored_gc_sources =
+        restore_gc_relocating_sources_from_lsn_batch(index, &mut batch, rollback_from)?;
     let hidden_relocations =
         index.remove_gc_relocations_from_lsn_batch(&mut batch, rollback_from)?;
     let hidden_gc_outputs =
@@ -4004,12 +4057,51 @@ fn rollback_operations_from(
         rollback_from,
         rollback_ops
             .saturating_add(hidden_relocations as u64)
+            .saturating_add(restored_gc_sources as u64)
             .saturating_add(hidden_gc_outputs.len() as u64),
     );
     for state in hidden_gc_outputs {
         unlink_gc_segment_file(config, &state)?;
     }
     Ok(())
+}
+
+/// Restores source eligibility when recovery rolls back the unpublished tail of a GC relocation.
+///
+/// `GcRelocating` is committed atomically with the relocation rows. If those rows are outside the
+/// recovered accounting-log prefix, leaving the state fenced would strand a live source forever.
+fn restore_gc_relocating_sources_from_lsn_batch(
+    index: &StrataIndex,
+    batch: &mut typed_store::rocks::DBBatch,
+    rollback_from: StrataLsn,
+) -> Result<usize> {
+    let relocations = index.iter_gc_relocations()?;
+    let hidden_source_ids = relocations
+        .iter()
+        .filter_map(|(from, relocation)| {
+            (relocation.publish_lsn >= rollback_from).then_some(from.segment_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let surviving_source_ids = relocations
+        .iter()
+        .filter_map(|(from, relocation)| {
+            (relocation.publish_lsn < rollback_from).then_some(from.segment_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let source_ids = hidden_source_ids.difference(&surviving_source_ids).copied();
+    let mut restored = 0;
+    for segment_id in source_ids {
+        let Some(mut state) = index.get_segment_state(segment_id)? else {
+            continue;
+        };
+        if state.state != SegmentFileState::GcRelocating {
+            continue;
+        }
+        state.state = SegmentFileState::Sealed;
+        index.put_segment_state_batch(batch, &state)?;
+        restored += 1;
+    }
+    Ok(restored)
 }
 
 fn remove_gc_output_segments_from_lsn_batch(
@@ -4044,15 +4136,18 @@ fn gc_output_segment_is_hidden_by_rollback(state: &SegmentState, rollback_from: 
 fn advance_recovered_durable_lsn(
     index: &StrataIndex,
     metrics: &StrataStoreMetrics,
-    active_delta_state: ActiveDeltaLogState,
+    accounting_log_durable_position: AccountingLogDurablePosition,
 ) -> Result<()> {
     let mut batch = index.batch();
     let current_durable_lsn = index.get_durable_lsn()?;
-    let mut active_delta_state = active_delta_state;
-    active_delta_state.durable_lsn = active_delta_state.durable_lsn.max(current_durable_lsn);
-    let durable_lsn = durable_lsn_with_accounting_frontier(index, None, Some(active_delta_state))?;
+    let mut accounting_log_durable_position = accounting_log_durable_position;
+    accounting_log_durable_position.durable_lsn = accounting_log_durable_position
+        .durable_lsn
+        .max(current_durable_lsn);
+    let durable_lsn =
+        durable_lsn_with_accounting_frontier(index, None, Some(accounting_log_durable_position))?;
     index.put_durable_lsn_batch(&mut batch, durable_lsn)?;
-    index.put_accounting_active_delta_log_state_batch(&mut batch, active_delta_state)?;
+    index.put_accounting_log_durable_position_batch(&mut batch, accounting_log_durable_position)?;
     batch
         .write_with_sync(true)
         .map_err(strata_index::Error::from)?;
@@ -4266,18 +4361,18 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
             "gc workers require the accounting worker",
         ));
     }
+    if config.accounting_maintenance_interval.is_zero() {
+        return Err(Error::InvalidConfig(
+            "accounting_maintenance_interval must be non-zero",
+        ));
+    }
+    if config.accounting_partition_count == 0 {
+        return Err(Error::InvalidConfig(
+            "accounting_partition_count must be non-zero",
+        ));
+    }
     if config.accounting_interval.is_zero() {
         return Err(Error::InvalidConfig("accounting_interval must be non-zero"));
-    }
-    if config.accounting_sidecar_partition_count == 0 {
-        return Err(Error::InvalidConfig(
-            "accounting_sidecar_partition_count must be non-zero",
-        ));
-    }
-    if config.accounting_sidecar_interval.is_zero() {
-        return Err(Error::InvalidConfig(
-            "accounting_sidecar_interval must be non-zero",
-        ));
     }
     if config.gc_interval.is_zero() {
         return Err(Error::InvalidConfig("gc_interval must be non-zero"));
@@ -4354,6 +4449,14 @@ fn next_segment_id_after(index: &StrataIndex, active_segment_id: SegmentId) -> R
         .max()
         .and_then(|segment_id| segment_id.checked_add(1))
         .ok_or_else(|| strata_segment::Error::RangeOverflow.into())
+}
+
+fn gc_relocating_segment_count(index: &StrataIndex) -> Result<usize> {
+    Ok(index
+        .iter_segment_states()?
+        .into_iter()
+        .filter(|(_, state)| state.state == SegmentFileState::GcRelocating)
+        .count())
 }
 
 /// Cleans up pending GC output segments.

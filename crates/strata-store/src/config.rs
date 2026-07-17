@@ -10,13 +10,14 @@ const ACCOUNTING_INDEX_DIR: &str = "accounting-index";
 pub const DEFAULT_SEGMENT_READER_CACHE_CAPACITY: usize = 64_000;
 pub const DEFAULT_ACCOUNTING_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD: usize = 1024;
-pub const DEFAULT_ACCOUNTING_SIDECAR_PARTITION_COUNT: u32 = 64;
-pub const DEFAULT_ACCOUNTING_SIDECAR_INTERVAL: Duration = Duration::from_secs(20 * 60);
-pub const DEFAULT_ACCOUNTING_SIDECAR_INGEST_RECORD_THRESHOLD: usize = 4096;
-pub const DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_COUNT_THRESHOLD: usize = 8;
-pub const DEFAULT_ACCOUNTING_SIDECAR_DELTA_RUN_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_COUNT_THRESHOLD: usize = 8;
-pub const DEFAULT_ACCOUNTING_SIDECAR_MAJOR_PATCH_BYTES_THRESHOLD: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD: StrataLsn = 64 * 1024;
+pub const DEFAULT_ACCOUNTING_PARTITION_COUNT: u32 = 64;
+pub const DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(20 * 60);
+pub const DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD: usize = 4096;
+pub const DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD: usize = 8;
+pub const DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD: usize = 8;
+pub const DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_GC_WORKER_COUNT: usize = 1;
 pub const DEFAULT_GC_INITIAL_WORKER_COUNT: usize = 1;
@@ -48,13 +49,18 @@ pub struct StrataStoreConfig {
     pub accounting_worker_enabled: bool,
     pub accounting_interval: Duration,
     pub accounting_unaccounted_threshold: usize,
-    pub accounting_sidecar_partition_count: u32,
-    pub accounting_sidecar_interval: Duration,
-    pub accounting_sidecar_ingest_record_threshold: usize,
-    pub accounting_sidecar_delta_run_count_threshold: usize,
-    pub accounting_sidecar_delta_run_bytes_threshold: u64,
-    pub accounting_sidecar_major_patch_count_threshold: usize,
-    pub accounting_sidecar_major_patch_bytes_threshold: u64,
+    /// Durable/accounted LSN gap that promotes the next ingest nudge to a full materialization.
+    ///
+    /// Zero disables lag-triggered materialization. A non-zero threshold bounds accounting lag
+    /// without forcing delta and major compaction on every foreground nudge.
+    pub accounting_materialize_lag_threshold: StrataLsn,
+    pub accounting_partition_count: u32,
+    pub accounting_maintenance_interval: Duration,
+    pub accounting_ingest_record_threshold: usize,
+    pub accounting_delta_run_count_threshold: usize,
+    pub accounting_delta_run_bytes_threshold: u64,
+    pub accounting_major_patch_count_threshold: usize,
+    pub accounting_major_patch_bytes_threshold: u64,
     /// Whether background GC workers are started.
     pub gc_workers_enabled: bool,
     /// Background GC cadence for one planning/copy/publish attempt.
@@ -131,9 +137,9 @@ impl StrataStoreConfig {
         self.namespace_dir().join(ACCOUNTING_INDEX_DIR)
     }
 
-    pub(crate) fn accounting_sidecar_partition_count(&self) -> NonZeroU32 {
-        NonZeroU32::new(self.accounting_sidecar_partition_count)
-            .expect("accounting sidecar partition count is validated before use")
+    pub(crate) fn accounting_partition_count(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.accounting_partition_count)
+            .expect("accounting processor partition count is validated before use")
     }
 
     pub fn index_cf_prefix(&self) -> String {

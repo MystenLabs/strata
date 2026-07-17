@@ -1,7 +1,7 @@
-//! File-backed sidecar index for Strata accounting.
+//! File-backed index for Strata accounting.
 //!
 //! This crate does not serve user reads. RocksDB can remain the current read index while this
-//! sidecar materializes blob update history into ref events and GC overlay operands.
+//! index compaction materializes blob update history into ref events and GC overlay operands.
 //! The physical shape is deliberately small:
 //!
 //! ```text
@@ -25,7 +25,6 @@ mod active_log;
 mod events;
 mod index;
 mod manifest;
-mod merge;
 mod run_io;
 mod state;
 
@@ -36,12 +35,12 @@ pub(crate) const FORMAT_VERSION: u32 = 2;
 pub(crate) const ACTIVE_DELTA_LOG_FORMAT_VERSION: u32 = 1;
 
 pub use active_log::{
-    AccountingDelta, ActiveDeltaLog, ActiveDeltaLogPosition, ActiveDeltaLogReadCursor,
-    ActiveDeltaLogState, GcMapRefDelta,
+    AccountingLogDurablePosition, AccountingLogEntry, ActiveDeltaLog, ActiveDeltaLogPosition,
+    ActiveDeltaLogReadCursor, GcMapRefEntry,
 };
 pub use events::{CompactionEventBatch, RefEvent, RetireReason, SegmentGcSummaryDelta};
 pub use index::{
-    AccountingIndex, AccountingIndexConfig, PreparedAccountingDeltas, PreparedCompaction,
+    AccountingIndex, AccountingIndexConfig, PreparedAccountingDeltas, PreparedDeltaCompaction,
     PreparedDeltaRuns, PreparedEpochChange, PreparedMajorCompaction, PreparedShardDrop,
 };
 pub use manifest::{
@@ -94,7 +93,7 @@ pub enum Error {
     EmptyDeltaRun,
 
     #[error(
-        "shard drop {shard:?} at LSN {lsn} requires all sidecar partitions to be major compacted"
+        "shard drop {shard:?} at LSN {lsn} requires all accounting partitions to be major compacted"
     )]
     ShardDropRequiresCompaction {
         shard: strata_core::ShardKey,
@@ -204,20 +203,24 @@ mod tests {
         let key = key(b"active-log");
         let state = {
             let mut log =
-                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
-            log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
+                ActiveDeltaLog::open(dir.path(), 1, AccountingLogDurablePosition::default())
+                    .unwrap();
+            log.append(&AccountingLogEntry::Blob(put(1, &key, record_ref(10, 0))))
                 .unwrap();
-            log.append(&AccountingDelta::Epoch(EpochChange { lsn: 2, epoch: 43 }))
-                .unwrap();
+            log.append(&AccountingLogEntry::Epoch(EpochChange {
+                lsn: 2,
+                epoch: 43,
+            }))
+            .unwrap();
             log.sync_data().unwrap();
-            log.state()
+            log.durable_position()
         };
 
         assert_eq!(state.durable_lsn, 2);
         assert!(state.durable_offset > 0);
 
         let reopened = ActiveDeltaLog::open(dir.path(), state.segment_id, state).unwrap();
-        assert_eq!(reopened.state(), state);
+        assert_eq!(reopened.durable_position(), state);
     }
 
     #[test]
@@ -225,14 +228,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = {
             let mut log =
-                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
-            log.append(&AccountingDelta::ShardDropped {
+                ActiveDeltaLog::open(dir.path(), 1, AccountingLogDurablePosition::default())
+                    .unwrap();
+            log.append(&AccountingLogEntry::ShardDropped {
                 lsn: 7,
                 shard: SHARD,
             })
             .unwrap();
             log.sync_data().unwrap();
-            log.state()
+            log.durable_position()
         };
 
         let read = ActiveDeltaLog::read_durable_range(
@@ -242,8 +246,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read.deltas,
-            vec![AccountingDelta::ShardDropped {
+            read.entries,
+            vec![AccountingLogEntry::ShardDropped {
                 lsn: 7,
                 shard: SHARD,
             }]
@@ -256,18 +260,19 @@ mod tests {
         let key = key(b"active-log-read");
         let state = {
             let mut log =
-                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
-            log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
+                ActiveDeltaLog::open(dir.path(), 1, AccountingLogDurablePosition::default())
+                    .unwrap();
+            log.append(&AccountingLogEntry::Blob(put(1, &key, record_ref(10, 0))))
                 .unwrap();
-            log.append(&AccountingDelta::Blob(put(2, &key, record_ref(11, 0))))
+            log.append(&AccountingLogEntry::Blob(put(2, &key, record_ref(11, 0))))
                 .unwrap();
             log.sync_data().unwrap();
-            log.state()
+            log.durable_position()
         };
 
         let cursor = ActiveDeltaLogReadCursor::default();
         let read = ActiveDeltaLog::read_durable_range(dir.path(), cursor, state).unwrap();
-        assert_eq!(read.deltas.len(), 2);
+        assert_eq!(read.entries.len(), 2);
         assert!(read.bytes_read > 0);
         assert_eq!(read.max_lsn, Some(2));
 
@@ -276,7 +281,7 @@ mod tests {
         assert_eq!(cursor.offset, state.durable_offset);
         assert_eq!(cursor.max_lsn, 2);
         let read = ActiveDeltaLog::read_durable_range(dir.path(), cursor, state).unwrap();
-        assert!(read.deltas.is_empty());
+        assert!(read.entries.is_empty());
         assert_eq!(read.bytes_read, 0);
         assert_eq!(read.end_offset, state.durable_offset);
     }
@@ -288,16 +293,17 @@ mod tests {
         let key_b = key(b"gc-map-b");
         let state = {
             let mut log =
-                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
-            log.append(&AccountingDelta::GcMapRefBatch {
+                ActiveDeltaLog::open(dir.path(), 1, AccountingLogDurablePosition::default())
+                    .unwrap();
+            log.append(&AccountingLogEntry::GcMapRefBatch {
                 base_lsn: 10,
                 maps: vec![
-                    GcMapRefDelta {
+                    GcMapRefEntry {
                         key: key_a.clone(),
                         from: record_ref(1, 0),
                         to: record_ref(3, 0),
                     },
-                    GcMapRefDelta {
+                    GcMapRefEntry {
                         key: key_b.clone(),
                         from: record_ref(2, 0),
                         to: record_ref(3, 64),
@@ -306,7 +312,7 @@ mod tests {
             })
             .unwrap();
             log.sync_data().unwrap();
-            log.state()
+            log.durable_position()
         };
 
         assert_eq!(state.durable_lsn, 11);
@@ -316,7 +322,7 @@ mod tests {
             state,
         )
         .unwrap();
-        assert_eq!(read.deltas.len(), 1);
+        assert_eq!(read.entries.len(), 1);
         assert_eq!(read.max_lsn, Some(11));
     }
 
@@ -324,16 +330,17 @@ mod tests {
     fn active_delta_log_rolls_back_failed_commit_append() {
         let dir = tempdir().unwrap();
         let key = key(b"rollback");
-        let mut log = ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
+        let mut log =
+            ActiveDeltaLog::open(dir.path(), 1, AccountingLogDurablePosition::default()).unwrap();
         let before = log.position();
 
-        log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
+        log.append(&AccountingLogEntry::Blob(put(1, &key, record_ref(10, 0))))
             .unwrap();
         log.rollback_to(before).unwrap();
         log.sync_data().unwrap();
 
-        assert_eq!(log.state().durable_lsn, 0);
-        assert!(log.state().durable_offset > 0);
+        assert_eq!(log.durable_position().durable_lsn, 0);
+        assert!(log.durable_position().durable_offset > 0);
     }
 
     #[test]
@@ -342,19 +349,20 @@ mod tests {
         let key = key(b"truncate");
         let state = {
             let mut log =
-                ActiveDeltaLog::open(dir.path(), 1, ActiveDeltaLogState::default()).unwrap();
-            log.append(&AccountingDelta::Blob(put(1, &key, record_ref(10, 0))))
+                ActiveDeltaLog::open(dir.path(), 1, AccountingLogDurablePosition::default())
+                    .unwrap();
+            log.append(&AccountingLogEntry::Blob(put(1, &key, record_ref(10, 0))))
                 .unwrap();
-            log.append(&AccountingDelta::Blob(put(2, &key, record_ref(11, 0))))
+            log.append(&AccountingLogEntry::Blob(put(2, &key, record_ref(11, 0))))
                 .unwrap();
             log.truncate_after_lsn(1).unwrap();
             log.sync_data().unwrap();
-            log.state()
+            log.durable_position()
         };
 
         assert_eq!(state.durable_lsn, 1);
         let reopened = ActiveDeltaLog::open(dir.path(), state.segment_id, state).unwrap();
-        assert_eq!(reopened.state(), state);
+        assert_eq!(reopened.durable_position(), state);
     }
 
     #[test]
@@ -362,8 +370,12 @@ mod tests {
         let dir = tempdir().unwrap();
         for segment_id in 1..=3 {
             drop(
-                ActiveDeltaLog::open(dir.path(), segment_id, ActiveDeltaLogState::default())
-                    .unwrap(),
+                ActiveDeltaLog::open(
+                    dir.path(),
+                    segment_id,
+                    AccountingLogDurablePosition::default(),
+                )
+                .unwrap(),
             );
         }
 
@@ -437,7 +449,7 @@ mod tests {
             ])
             .unwrap();
 
-        let batch = index.compact_partition(0).unwrap();
+        let batch = index.compact_delta_runs(0).unwrap();
 
         assert_eq!(batch.max_lsn, 4);
         assert_eq!(batch.events.len(), 5);
@@ -528,7 +540,7 @@ mod tests {
             }])
             .unwrap();
 
-        let batch = index.compact_partition(0).unwrap();
+        let batch = index.compact_delta_runs(0).unwrap();
         let state = index.materialized_state(&key).unwrap().unwrap();
 
         assert_eq!(batch.max_lsn, 30);
@@ -556,7 +568,7 @@ mod tests {
                 put_for_shard(2, &key, OTHER_SHARD, other_ref),
             ])
             .unwrap();
-        let shallow = index.compact_partition(0).unwrap();
+        let shallow = index.compact_delta_runs(0).unwrap();
         assert!(shallow.events.is_empty());
         let prepared = index.prepare_major_compact_partition(0).unwrap();
         let initial = prepared.event_batch.clone();
@@ -581,7 +593,7 @@ mod tests {
         index
             .append_delta_run(vec![put_for_shard(3, &key, SHARD, replacement_ref)])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
         let prepared = index.prepare_major_compact_partition(0).unwrap();
         let replacement = prepared.event_batch.clone();
         index.apply_prepared_major_compaction(prepared).unwrap();
@@ -622,11 +634,11 @@ mod tests {
                 },
             ])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
         index.major_compact_partition(0).unwrap();
 
         let prepared = index
-            .prepare_accounting_deltas(vec![AccountingDelta::ShardDropped {
+            .prepare_accounting_deltas(vec![AccountingLogEntry::ShardDropped {
                 lsn: 4,
                 shard: SHARD,
             }])
@@ -672,7 +684,7 @@ mod tests {
         index
             .append_delta_run(vec![put(1, &key, base_ref)])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
         index.major_compact_partition(0).unwrap();
 
         index
@@ -684,7 +696,7 @@ mod tests {
                 },
             ])
             .unwrap();
-        let batch = index.compact_partition(0).unwrap();
+        let batch = index.compact_delta_runs(0).unwrap();
         assert!(
             matches!(batch.events[0], RefEvent::Live { record_ref, .. } if record_ref == transient_ref)
         );
@@ -728,7 +740,7 @@ mod tests {
         index
             .append_delta_run(vec![put(1, &key, record_ref(10, 0))])
             .unwrap();
-        let prepared = index.prepare_compact_partition(0).unwrap();
+        let prepared = index.prepare_delta_compaction(0).unwrap();
         let manifest = prepared.manifest_bytes().unwrap();
 
         assert!(index.materialized_state(&key).unwrap().is_none());
@@ -741,7 +753,7 @@ mod tests {
                 .is_live()
         );
 
-        index.apply_prepared_compaction(prepared).unwrap();
+        index.apply_prepared_delta_compaction(prepared).unwrap();
         assert!(index.materialized_state(&key).unwrap().unwrap().is_live());
     }
 
@@ -789,7 +801,7 @@ mod tests {
             }])
             .unwrap();
 
-        let batch = index.compact_partition(0).unwrap();
+        let batch = index.compact_delta_runs(0).unwrap();
         let state = index.materialized_state(&key).unwrap().unwrap();
 
         assert!(batch.events.is_empty());
@@ -812,10 +824,10 @@ mod tests {
                 to,
             }])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
 
         index.append_delta_run(vec![put(8, &key, from)]).unwrap();
-        let batch = index.compact_partition(0).unwrap();
+        let batch = index.compact_delta_runs(0).unwrap();
         assert!(batch.events.is_empty());
 
         let prepared = index.prepare_major_compact_partition(0).unwrap();
@@ -853,13 +865,13 @@ mod tests {
                 put(2, &key_b, record_ref(10, 100)),
             ])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
         let base = index.major_compact_partition(0).unwrap().unwrap();
 
         index
             .append_delta_run(vec![put(3, &key_a, record_ref(11, 0))])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
 
         let partition = index.manifest().partitions.get(&0).unwrap();
         assert_eq!(partition.base.as_ref().unwrap().id, base.id);
@@ -885,17 +897,17 @@ mod tests {
         index
             .append_delta_run(vec![put(1, &key, record_ref(10, 0))])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
         index.major_compact_partition(0).unwrap();
 
         index
             .append_delta_run(vec![put(2, &key, record_ref(11, 0))])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
         index
             .append_delta_run(vec![put(3, &key, record_ref(12, 0))])
             .unwrap();
-        index.compact_partition(0).unwrap();
+        index.compact_delta_runs(0).unwrap();
         index.major_compact_partition(0).unwrap();
 
         let state = index.materialized_state(&key).unwrap().unwrap();
@@ -918,7 +930,7 @@ mod tests {
             index
                 .append_delta_run(vec![put(1, &key, record_ref(10, 0))])
                 .unwrap();
-            index.compact_partition(0).unwrap();
+            index.compact_delta_runs(0).unwrap();
             index.manifest_bytes().unwrap()
         };
 

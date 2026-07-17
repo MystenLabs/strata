@@ -56,7 +56,7 @@ use std::{
 
 pub use accounting::{
     ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_CONSUMED_CURSOR_KEY,
-    ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_STATE_KEY, AccountingIndexKey, AccountingIndexValue,
+    ACCOUNTING_INDEX_LOG_DURABLE_POSITION_KEY, AccountingIndexKey, AccountingIndexValue,
     AccountingRefEvent, AccountingSnapshot, AccountingSnapshotGuard,
 };
 pub use cf::StrataIndexCfNames;
@@ -115,7 +115,7 @@ pub struct StrataIndex {
     /// Blob-key operations keyed by store-global LSN, retained until accounting consumes them.
     /// Unaccounted lsn ops need the blob key to partition delta log operations.
     unaccounted_lsn_ops: DBMap<StrataLsn, BlobKey>,
-    /// Sidecar accounting-index metadata committed atomically with GC state.
+    /// Accounting-index metadata committed atomically with GC state.
     accounting_index: DBMap<AccountingIndexKey, AccountingIndexValue>,
 }
 

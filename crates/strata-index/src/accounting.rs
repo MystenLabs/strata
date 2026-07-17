@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use strata_accounting::{ActiveDeltaLogReadCursor, ActiveDeltaLogState, Manifest};
+use strata_accounting::{AccountingLogDurablePosition, ActiveDeltaLogReadCursor, Manifest};
 use strata_core::{
     SegmentRefEvent, SegmentRefEventKey, ShardCleanupJob, ShardKey, StoreStateKey, StrataLsn,
     StrataStoreState,
@@ -16,15 +16,15 @@ use crate::{Error, Result};
 use super::StrataIndex;
 
 pub(crate) const ACCOUNTING_INDEX_MANIFEST_KEY: AccountingIndexKey = AccountingIndexKey::Manifest;
-pub const ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_STATE_KEY: AccountingIndexKey =
-    AccountingIndexKey::ActiveDeltaLogState;
+pub const ACCOUNTING_INDEX_LOG_DURABLE_POSITION_KEY: AccountingIndexKey =
+    AccountingIndexKey::AccountingLogDurablePosition;
 pub const ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_CONSUMED_CURSOR_KEY: AccountingIndexKey =
     AccountingIndexKey::ActiveDeltaLogConsumedCursor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AccountingIndexKey {
     Manifest,
-    ActiveDeltaLogState,
+    AccountingLogDurablePosition,
     ActiveDeltaLogConsumedCursor,
     ShardCleanup(ShardKey),
 }
@@ -115,7 +115,7 @@ pub struct AccountingRefEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountingIndexValue {
     Manifest(Manifest),
-    ActiveDeltaLogState(ActiveDeltaLogState),
+    AccountingLogDurablePosition(AccountingLogDurablePosition),
     ActiveDeltaLogConsumedCursor(ActiveDeltaLogReadCursor),
     ShardCleanupJob(ShardCleanupJob),
 }
@@ -124,7 +124,9 @@ impl AccountingIndexValue {
     pub(crate) fn key(&self) -> AccountingIndexKey {
         match self {
             Self::Manifest(_) => AccountingIndexKey::Manifest,
-            Self::ActiveDeltaLogState(_) => AccountingIndexKey::ActiveDeltaLogState,
+            Self::AccountingLogDurablePosition(_) => {
+                AccountingIndexKey::AccountingLogDurablePosition
+            }
             Self::ActiveDeltaLogConsumedCursor(_) => {
                 AccountingIndexKey::ActiveDeltaLogConsumedCursor
             }
@@ -147,7 +149,7 @@ impl StrataIndex {
         key: AccountingIndexKey,
         value: &AccountingIndexValue,
     ) -> Result<()> {
-        // The accounting sidecar stores several singleton rows in one typed column family so the
+        // Accounting stores several singleton rows in one typed column family so the
         // owner can commit manifest, active-log cursor, derived ref events, and GC overlay
         // operands in one RocksDB batch. The key/value shape check prevents a bad caller from
         // publishing a manifest under the cursor key and making recovery skip or replay deltas.
@@ -179,7 +181,7 @@ impl StrataIndex {
         batch: &mut DBBatch,
         manifest: &Manifest,
     ) -> Result<()> {
-        // The manifest is the durable root set for sidecar run files. This method only stages the
+        // The manifest is the durable root set for accounting-index run files. This method only stages the
         // row; callers must place it in the same batch as the derived ref/overlay rows
         // that were produced from that manifest's compaction event batch.
         self.put_accounting_index_value_batch(
@@ -196,26 +198,30 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn get_accounting_active_delta_log_state(&self) -> Result<Option<ActiveDeltaLogState>> {
-        match self.get_accounting_index_value(ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_STATE_KEY)? {
-            Some(AccountingIndexValue::ActiveDeltaLogState(state)) => Ok(Some(state)),
+    pub fn get_accounting_log_durable_position(
+        &self,
+    ) -> Result<Option<AccountingLogDurablePosition>> {
+        match self.get_accounting_index_value(ACCOUNTING_INDEX_LOG_DURABLE_POSITION_KEY)? {
+            Some(AccountingIndexValue::AccountingLogDurablePosition(durable_position)) => {
+                Ok(Some(durable_position))
+            }
             Some(value) => Err(unexpected_accounting_index_value(
-                ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_STATE_KEY,
+                ACCOUNTING_INDEX_LOG_DURABLE_POSITION_KEY,
                 value,
             )),
             None => Ok(None),
         }
     }
 
-    pub fn put_accounting_active_delta_log_state_batch(
+    pub fn put_accounting_log_durable_position_batch(
         &self,
         batch: &mut DBBatch,
-        state: ActiveDeltaLogState,
+        durable_position: AccountingLogDurablePosition,
     ) -> Result<()> {
         self.put_accounting_index_value_batch(
             batch,
-            ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_STATE_KEY,
-            &AccountingIndexValue::ActiveDeltaLogState(state),
+            ACCOUNTING_INDEX_LOG_DURABLE_POSITION_KEY,
+            &AccountingIndexValue::AccountingLogDurablePosition(durable_position),
         )
     }
 
@@ -241,7 +247,7 @@ impl StrataIndex {
     ) -> Result<()> {
         // Cursor and manifest move together. Advancing the consumed cursor without the manifest that
         // contains the corresponding delta runs would make recovery skip active-log records whose
-        // physical sidecar files are not reachable from the durable root.
+        // physical accounting-index files are not reachable from the durable root.
         self.put_accounting_index_value_batch(
             batch,
             ACCOUNTING_INDEX_ACTIVE_DELTA_LOG_CONSUMED_CURSOR_KEY,

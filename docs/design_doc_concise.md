@@ -10,7 +10,7 @@ Core crates:
 - `strata-segment`: blocking append/read/scan for segment `.data` files.
 - `strata-index`: RocksDB-backed metadata index.
 - `strata-store`: high-level store protocol and workers.
-- `strata-accounting-index`: file-backed sidecar LSM for accounting/GC-derived state.
+- `strata-accounting-index`: file-backed LSM for accounting/GC-derived state.
 
 Physical namespace layout:
 
@@ -61,7 +61,7 @@ The most important distinction is GC scheduling. Integrated BlobDB garbage colle
 
 For large blob workloads, this coupling is the wrong control surface. Heavy metadata compaction can become heavy blob-file GC because compaction is also the path that reads old blob references and rewrites live blob values. Conversely, if compaction does not touch the SSTs that reference garbage-heavy blob files, blob space reclamation can lag until force-GC targeted compactions run.
 
-Strata decouples these concerns. RocksDB compaction only manages compact metadata and merge operands. Payload GC/reorganization is driven by Strata-owned segment state, accounting sidecars, ref events, and GC overlays. The system can choose when to copy, tier, or delete segment bytes based on application-level liveness and disk policy, without making every metadata compaction an implicit blob-GC event.
+Strata decouples these concerns. RocksDB compaction only manages compact metadata and merge operands. Payload GC/reorganization is driven by Strata-owned segment state, accounting processors, ref events, and GC overlays. The system can choose when to copy, tier, or delete segment bytes based on application-level liveness and disk policy, without making every metadata compaction an implicit blob-GC event.
 
 BlobDB moves large values out of the main LSM value path, but it is still coupled to RocksDB's generic key-value abstraction:
 
@@ -158,7 +158,7 @@ For a payload write:
    - return `RecordRef { segment_id, offset, len }`
 
 4. Append accounting deltas
-   - write `AccountingDelta::Blob` or `AccountingDelta::Epoch` to `active-delta.log`
+   - write `AccountingLogEntry::Blob` or `AccountingLogEntry::Epoch` to `active-delta.log`
    - if later RocksDB commit fails, roll back `active-delta.log` to the saved position
 
 5. `commit_write_batch()`
@@ -287,7 +287,10 @@ Caching and indexing properties:
 
 ## Background Maintenance & Resource Management
 
-### Accounting Sidecar
+### Accounting Processor
+
+See [`accounting.md`](accounting.md) for the implementation map, terminology, publication protocol,
+and invariants.
 
 The foreground writer appends cheap accounting deltas. A background `AccountingWorker` materializes those deltas into GC-facing rows.
 
@@ -305,7 +308,7 @@ AccountingWorker
   -> advance accounted_lsn
 ```
 
-Sidecar run model:
+Accounting-index run model:
 
 ```text
 delta-*.run  raw sorted BlobUpdate records

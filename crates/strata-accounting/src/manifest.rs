@@ -15,7 +15,7 @@ pub enum RunKind {
 /// Durable manifest row for one physical run file on disk.
 ///
 /// `RunMeta` is not the run contents; it is the durable root pointer that makes a file part of the
-/// live LSM sidecar. A run file is born first as a synced file under `partition-N/`, then becomes
+/// live accounting LSM. A run file is born first as a synced file under `partition-N/`, then becomes
 /// reachable only when a manifest containing this row is accepted by the owner. The row is retired
 /// when a later manifest replaces the run through delta or major compaction; only after that publish
 /// may the file be removed.
@@ -35,7 +35,7 @@ pub struct RunMeta {
     /// would otherwise make per-partition folding silently wrong.
     pub partition: PartitionId,
     /// Relative path keeps the durable manifest independent of the process-local root directory. A
-    /// reopened sidecar can relocate its root while preserving the same manifest bytes stored by the
+    /// reopened index can relocate its root while preserving the same manifest bytes stored by the
     /// owner.
     pub path: String,
     /// Compaction needs a watermark for scheduling and event publication before it has folded every
@@ -76,7 +76,7 @@ pub struct PartitionManifest {
     pub materialized_through_lsn: StrataLsn,
 }
 
-/// Durable root row for the entire accounting sidecar.
+/// Durable root row for the entire accounting index.
 ///
 /// The manifest is encoded by this crate but stored by the owner, normally in RocksDB beside the
 /// derived accounting and GC rows. It is the logical root set for all live run files: any run
@@ -87,7 +87,7 @@ pub struct PartitionManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// The manifest bytes are durable across process versions, so the root row carries an explicit
-    /// format fence. Opening with an incompatible format fails before the sidecar interprets stale
+    /// format fence. Opening with an incompatible format fails before the index interprets stale
     /// paths or record layouts.
     pub format_version: u32,
     /// Monotonic generation of the manifest held by this `AccountingIndex` handle.
@@ -99,13 +99,13 @@ pub struct Manifest {
     /// second apply is rejected instead of rewinding the handle.
     ///
     /// Durable stale-write prevention still belongs to the owner that stores the manifest. Today the
-    /// store sidecar serializes durable publication with a single worker/lock and writes the manifest
-    /// in one RocksDB batch with its derived rows. If the design ever allows multiple durable sidecar
+    /// store worker serializes durable publication with a single lock and writes the manifest
+    /// in one RocksDB batch with its derived rows. If the design ever allows multiple durable
     /// publishers, the owner must add a RocksDB-level CAS/transaction or an exclusive process lock
     /// around this generation; the post-publish in-memory check cannot protect already-persisted
     /// state.
     pub generation: u64,
-    /// The hash topology is part of the durable contract. Changing it without rebuilding the sidecar
+    /// The hash topology is part of the durable contract. Changing it without rebuilding the index
     /// would strand keys in the wrong partition directories and make per-partition compaction
     /// incomplete, so open-time validation rejects mismatches.
     pub partition_count: u32,

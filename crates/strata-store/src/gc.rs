@@ -1080,7 +1080,7 @@ impl StrataStore {
     /// Publishes staged GC copies through the serialized writer path.
     ///
     /// This method pauses accounting before it enters the writer queue, so the writer thread never
-    /// blocks waiting for a long-running sidecar pass. The writer still assigns the final LSN range
+    /// blocks waiting for a long-running processor pass. The writer still assigns the final LSN range
     /// and commits metadata in order with user writes; any user writes that were already ahead of
     /// this command in the queue have lower LSNs and are handled later by relocation forwarding.
     pub fn publish_prepared_gc_copy(&self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
@@ -1133,7 +1133,15 @@ impl GcExecutor {
                 continue;
             }
             let mut removed_summary = SegmentGcSummary::default();
+            let mut removed_relocating_segments = 0;
             for segment_id in &owned_segments {
+                if self
+                    .index
+                    .get_segment_state(*segment_id)?
+                    .is_some_and(|state| state.state == SegmentFileState::GcRelocating)
+                {
+                    removed_relocating_segments += 1;
+                }
                 if let Some(overlay) = self.index.get_segment_gc_overlay(*segment_id)? {
                     removed_summary.total_bytes = removed_summary
                         .total_bytes
@@ -1156,6 +1164,8 @@ impl GcExecutor {
             }
             remove_shard_retention_generation(&self.config, &self.index, job.shard)?;
             self.metrics.remove_gc_known_summary(&removed_summary);
+            self.metrics
+                .remove_gc_relocating_segments(removed_relocating_segments);
             let mut batch = self.index.batch();
             self.index
                 .delete_shard_cleanup_job_batch(&mut batch, job.shard)?;
