@@ -85,6 +85,7 @@ Add the same steady stream to each command:
 ```shell
   --post-delete-workload steady \
   --post-delete-ops-per-second 100 \
+  --post-delete-workers 4 \
   --post-delete-put-percent 40 \
   --post-delete-get-percent 20 \
   --post-delete-delete-percent 40 \
@@ -111,7 +112,9 @@ foreground interference.
 - `--reclaim-sample-at`: comma-separated checkpoints. Times after the duration are rejected when
   this list is explicitly provided.
 - `--post-delete-workload idle|steady`: choose quiescent or ongoing foreground traffic.
-- `--post-delete-ops-per-second`: target total steady operations per second.
+- `--post-delete-ops-per-second`: aggregate target steady operations per second across all workers.
+- `--post-delete-workers`: concurrent steady workload producers. Each owns a disjoint generated-key
+  stream; the default is one worker.
 - `--post-delete-put-percent`, `--post-delete-get-percent`, and
   `--post-delete-delete-percent`: steady mix; values must sum to 100.
 - `--post-delete-seed`: deterministic steady operation selection.

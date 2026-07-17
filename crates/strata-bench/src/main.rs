@@ -25,8 +25,6 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(feature = "internal-profiling")]
-use std::sync::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
     env, fs, hint, io,
@@ -34,7 +32,10 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -85,6 +86,7 @@ const DEFAULT_DELETE_VERIFY_SAMPLES: usize = 1024;
 const DEFAULT_DELETE_SETUP_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_RECLAIM_DURATION: Duration = Duration::from_secs(3600);
 const DEFAULT_POST_DELETE_OPS_PER_SECOND: u64 = 10;
+const DEFAULT_POST_DELETE_WORKERS: usize = 1;
 const DEFAULT_POST_DELETE_PUT_PERCENT: f64 = 40.0;
 const DEFAULT_POST_DELETE_GET_PERCENT: f64 = 20.0;
 const DEFAULT_POST_DELETE_DELETE_PERCENT: f64 = 40.0;
@@ -355,6 +357,7 @@ struct Config {
     reclaim_sample_at: Vec<Duration>,
     post_delete_workload: PostDeleteWorkload,
     post_delete_ops_per_second: u64,
+    post_delete_workers: usize,
     post_delete_put_percent: f64,
     post_delete_get_percent: f64,
     post_delete_delete_percent: f64,
@@ -417,6 +420,7 @@ impl Config {
             reclaim_sample_at: default_reclaim_sample_at(),
             post_delete_workload: PostDeleteWorkload::Idle,
             post_delete_ops_per_second: DEFAULT_POST_DELETE_OPS_PER_SECOND,
+            post_delete_workers: DEFAULT_POST_DELETE_WORKERS,
             post_delete_put_percent: DEFAULT_POST_DELETE_PUT_PERCENT,
             post_delete_get_percent: DEFAULT_POST_DELETE_GET_PERCENT,
             post_delete_delete_percent: DEFAULT_POST_DELETE_DELETE_PERCENT,
@@ -608,6 +612,10 @@ impl Config {
                 "--post-delete-ops-per-second" => {
                     config.post_delete_ops_per_second =
                         parse_u64(&next_value(&mut args, "--post-delete-ops-per-second")?)?
+                }
+                "--post-delete-workers" => {
+                    config.post_delete_workers =
+                        parse_nonzero_usize(&next_value(&mut args, "--post-delete-workers")?)?
                 }
                 "--post-delete-put-percent" => {
                     config.post_delete_put_percent = parse_percent_inclusive(&next_value(
@@ -930,6 +938,82 @@ struct SteadyWorkloadSummary {
     get_timings: Vec<Duration>,
     delete_timings: Vec<Duration>,
     sync_timings: Vec<Duration>,
+}
+
+impl SteadyWorkloadSummary {
+    fn record_action(&mut self, action: SteadyAction, elapsed: Duration) {
+        match action {
+            SteadyAction::Put(_) => {
+                self.counts.puts = self.counts.puts.saturating_add(1);
+                self.put_timings.push(elapsed);
+            }
+            SteadyAction::GetOriginal(_) | SteadyAction::GetSteady(_) => {
+                self.counts.gets = self.counts.gets.saturating_add(1);
+                self.get_timings.push(elapsed);
+            }
+            SteadyAction::Delete(_) => {
+                self.counts.deletes = self.counts.deletes.saturating_add(1);
+                self.delete_timings.push(elapsed);
+            }
+        }
+    }
+
+    fn record_sync(&mut self, elapsed: Duration) {
+        self.counts.syncs = self.counts.syncs.saturating_add(1);
+        self.sync_timings.push(elapsed);
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.counts.puts = self.counts.puts.saturating_add(other.counts.puts);
+        self.counts.gets = self.counts.gets.saturating_add(other.counts.gets);
+        self.counts.deletes = self.counts.deletes.saturating_add(other.counts.deletes);
+        self.counts.syncs = self.counts.syncs.saturating_add(other.counts.syncs);
+        self.put_timings.append(&mut other.put_timings);
+        self.get_timings.append(&mut other.get_timings);
+        self.delete_timings.append(&mut other.delete_timings);
+        self.sync_timings.append(&mut other.sync_timings);
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConcurrentSteadyOperationCounts {
+    puts: AtomicU64,
+    gets: AtomicU64,
+    deletes: AtomicU64,
+    syncs: AtomicU64,
+    mutations: AtomicU64,
+}
+
+impl ConcurrentSteadyOperationCounts {
+    fn record_action(&self, action: SteadyAction) -> Option<u64> {
+        match action {
+            SteadyAction::Put(_) => {
+                self.puts.fetch_add(1, Ordering::Relaxed);
+                Some(self.mutations.fetch_add(1, Ordering::Relaxed) + 1)
+            }
+            SteadyAction::GetOriginal(_) | SteadyAction::GetSteady(_) => {
+                self.gets.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            SteadyAction::Delete(_) => {
+                self.deletes.fetch_add(1, Ordering::Relaxed);
+                Some(self.mutations.fetch_add(1, Ordering::Relaxed) + 1)
+            }
+        }
+    }
+
+    fn record_sync(&self) {
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SteadyOperationCounts {
+        SteadyOperationCounts {
+            puts: self.puts.load(Ordering::Relaxed),
+            gets: self.gets.load(Ordering::Relaxed),
+            deletes: self.deletes.load(Ordering::Relaxed),
+            syncs: self.syncs.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1884,16 +1968,52 @@ enum SteadyAction {
     Delete(usize),
 }
 
-fn run_reclaim_timeline(
+fn run_reclaim_timeline<Perform, SyncFn, SampleAccounting>(
     config: &Config,
     live_original_indexes: &[usize],
-    mut perform: impl FnMut(SteadyAction) -> Result<(), Box<dyn std::error::Error>>,
-    mut sync: impl FnMut() -> Result<(), Box<dyn std::error::Error>>,
-    mut sample_accounting: impl FnMut() -> Result<
-        Option<StrataAccountingSample>,
-        Box<dyn std::error::Error>,
-    >,
-) -> Result<ReclaimTimeline, Box<dyn std::error::Error>> {
+    perform: Perform,
+    sync: SyncFn,
+    mut sample_accounting: SampleAccounting,
+) -> Result<ReclaimTimeline, Box<dyn std::error::Error>>
+where
+    Perform: Fn(SteadyAction) -> Result<(), Box<dyn std::error::Error>> + Sync,
+    SyncFn: Fn() -> Result<(), Box<dyn std::error::Error>> + Sync,
+    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+{
+    if config.post_delete_workers == 1
+        || config.post_delete_workload == PostDeleteWorkload::Idle
+        || config.delete_reclaim_mode == DeleteReclaimMode::None
+    {
+        return run_reclaim_timeline_serial(
+            config,
+            live_original_indexes,
+            &perform,
+            &sync,
+            &mut sample_accounting,
+        );
+    }
+
+    run_reclaim_timeline_parallel(
+        config,
+        live_original_indexes,
+        &perform,
+        &sync,
+        &mut sample_accounting,
+    )
+}
+
+fn run_reclaim_timeline_serial<Perform, SyncFn, SampleAccounting>(
+    config: &Config,
+    live_original_indexes: &[usize],
+    perform: &Perform,
+    sync: &SyncFn,
+    sample_accounting: &mut SampleAccounting,
+) -> Result<ReclaimTimeline, Box<dyn std::error::Error>>
+where
+    Perform: Fn(SteadyAction) -> Result<(), Box<dyn std::error::Error>> + Sync,
+    SyncFn: Fn() -> Result<(), Box<dyn std::error::Error>> + Sync,
+    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+{
     let sample_at = config.effective_reclaim_sample_at();
     let mut timeline = ReclaimTimeline::default();
     let started = Instant::now();
@@ -1938,25 +2058,14 @@ fn run_reclaim_timeline(
                 &mut steady_live_keys,
                 &mut next_steady_key,
                 &mut rng,
+                1,
             );
             let operation_started = Instant::now();
             perform(action)?;
             let operation_elapsed = operation_started.elapsed();
-            match action {
-                SteadyAction::Put(key) => {
-                    timeline.workload.counts.puts = timeline.workload.counts.puts.saturating_add(1);
-                    timeline.workload.put_timings.push(operation_elapsed);
-                    steady_live_keys.push_back(key);
-                }
-                SteadyAction::GetOriginal(_) | SteadyAction::GetSteady(_) => {
-                    timeline.workload.counts.gets = timeline.workload.counts.gets.saturating_add(1);
-                    timeline.workload.get_timings.push(operation_elapsed);
-                }
-                SteadyAction::Delete(_) => {
-                    timeline.workload.counts.deletes =
-                        timeline.workload.counts.deletes.saturating_add(1);
-                    timeline.workload.delete_timings.push(operation_elapsed);
-                }
+            timeline.workload.record_action(action, operation_elapsed);
+            if let SteadyAction::Put(key) = action {
+                steady_live_keys.push_back(key);
             }
 
             let mutations = timeline.workload.counts.mutations();
@@ -1966,8 +2075,7 @@ fn run_reclaim_timeline(
             {
                 let sync_started = Instant::now();
                 sync()?;
-                timeline.workload.sync_timings.push(sync_started.elapsed());
-                timeline.workload.counts.syncs = timeline.workload.counts.syncs.saturating_add(1);
+                timeline.workload.record_sync(sync_started.elapsed());
                 last_synced_mutations = mutations;
             }
 
@@ -1986,21 +2094,316 @@ fn run_reclaim_timeline(
             let sync_started = Instant::now();
             sync()?;
             timeline.final_sync = sync_started.elapsed();
-            timeline.workload.sync_timings.push(timeline.final_sync);
-            timeline.workload.counts.syncs = timeline.workload.counts.syncs.saturating_add(1);
+            timeline.workload.record_sync(timeline.final_sync);
         }
 
-        timeline.samples.push(ReclaimSample {
+        timeline.samples.push(capture_reclaim_sample(
+            config,
             target,
-            elapsed: started.elapsed(),
-            path: summarize_path_if_exists(&config.root_dir)?,
-            io: process_io_snapshot()?,
-            workload_counts: timeline.workload.counts,
-            strata_accounting: sample_accounting()?,
-        });
+            started,
+            timeline.workload.counts,
+            sample_accounting,
+        )?);
     }
 
     Ok(timeline)
+}
+
+fn run_reclaim_timeline_parallel<Perform, SyncFn, SampleAccounting>(
+    config: &Config,
+    live_original_indexes: &[usize],
+    perform: &Perform,
+    sync: &SyncFn,
+    sample_accounting: &mut SampleAccounting,
+) -> Result<ReclaimTimeline, Box<dyn std::error::Error>>
+where
+    Perform: Fn(SteadyAction) -> Result<(), Box<dyn std::error::Error>> + Sync,
+    SyncFn: Fn() -> Result<(), Box<dyn std::error::Error>> + Sync,
+    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+{
+    let sample_at = config.effective_reclaim_sample_at();
+    let started = Instant::now();
+    let mut timeline = ReclaimTimeline::default();
+    timeline.samples.push(capture_reclaim_sample(
+        config,
+        Duration::ZERO,
+        started,
+        SteadyOperationCounts::default(),
+        sample_accounting,
+    )?);
+
+    let shared_counts = ConcurrentSteadyOperationCounts::default();
+    let last_synced_mutations = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let worker_error = Mutex::new(None::<String>);
+    let sync_lock = Mutex::new(());
+    let deadline = started
+        .checked_add(config.reclaim_duration)
+        .ok_or_else(|| io::Error::other("reclaim duration exceeds Instant range"))?;
+
+    let worker_summaries = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(config.post_delete_workers);
+        for worker_index in 0..config.post_delete_workers {
+            let shared_counts = &shared_counts;
+            let last_synced_mutations = &last_synced_mutations;
+            let stop = &stop;
+            let worker_error = &worker_error;
+            let sync_lock = &sync_lock;
+            handles.push(scope.spawn(move || {
+                run_post_delete_worker(
+                    config,
+                    live_original_indexes,
+                    worker_index,
+                    started,
+                    deadline,
+                    perform,
+                    sync,
+                    shared_counts,
+                    last_synced_mutations,
+                    stop,
+                    worker_error,
+                    sync_lock,
+                )
+            }));
+        }
+
+        let mut main_error: Option<Box<dyn std::error::Error>> = None;
+        for target in sample_at
+            .iter()
+            .copied()
+            .filter(|target| !target.is_zero() && *target < config.reclaim_duration)
+        {
+            let sample_deadline = started
+                .checked_add(target)
+                .expect("validated reclaim checkpoint should fit in Instant");
+            if let Some(error) = wait_for_post_delete_workers(sample_deadline, &worker_error) {
+                main_error = Some(io::Error::other(error).into());
+                break;
+            }
+            match capture_reclaim_sample(
+                config,
+                target,
+                started,
+                shared_counts.snapshot(),
+                sample_accounting,
+            ) {
+                Ok(sample) => timeline.samples.push(sample),
+                Err(error) => {
+                    main_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if main_error.is_none()
+            && let Some(error) = wait_for_post_delete_workers(deadline, &worker_error)
+        {
+            main_error = Some(io::Error::other(error).into());
+        }
+        stop.store(true, Ordering::Release);
+
+        let mut summaries = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(summary) => summaries.push(summary),
+                Err(_) if main_error.is_none() => {
+                    main_error =
+                        Some(io::Error::other("post-delete workload worker panicked").into());
+                }
+                Err(_) => {}
+            }
+        }
+        if main_error.is_none() {
+            let error = worker_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(error) = error {
+                main_error = Some(io::Error::other(error).into());
+            }
+        }
+
+        match main_error {
+            Some(error) => Err(error),
+            None => Ok(summaries),
+        }
+    })?;
+
+    for summary in worker_summaries {
+        timeline.workload.merge(summary);
+    }
+    if timeline.workload.counts.mutations() != last_synced_mutations.load(Ordering::Acquire) {
+        let sync_started = Instant::now();
+        sync()?;
+        timeline.final_sync = sync_started.elapsed();
+        timeline.workload.record_sync(timeline.final_sync);
+    }
+    timeline.samples.push(capture_reclaim_sample(
+        config,
+        config.reclaim_duration,
+        started,
+        timeline.workload.counts,
+        sample_accounting,
+    )?);
+
+    Ok(timeline)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_post_delete_worker<Perform, SyncFn>(
+    config: &Config,
+    live_original_indexes: &[usize],
+    worker_index: usize,
+    started: Instant,
+    deadline: Instant,
+    perform: &Perform,
+    sync: &SyncFn,
+    shared_counts: &ConcurrentSteadyOperationCounts,
+    last_synced_mutations: &AtomicU64,
+    stop: &AtomicBool,
+    worker_error: &Mutex<Option<String>>,
+    sync_lock: &Mutex<()>,
+) -> SteadyWorkloadSummary
+where
+    Perform: Fn(SteadyAction) -> Result<(), Box<dyn std::error::Error>> + Sync,
+    SyncFn: Fn() -> Result<(), Box<dyn std::error::Error>> + Sync,
+{
+    let global_interval_ns = 1_000_000_000_u64
+        .checked_div(config.post_delete_ops_per_second)
+        .unwrap_or(1)
+        .max(1);
+    let worker_count = u64::try_from(config.post_delete_workers).unwrap_or(u64::MAX);
+    let worker_interval = Duration::from_nanos(global_interval_ns.saturating_mul(worker_count));
+    let initial_delay = Duration::from_nanos(
+        global_interval_ns.saturating_mul(u64::try_from(worker_index).unwrap_or(u64::MAX)),
+    );
+    let mut next_operation_at = started.checked_add(initial_delay).unwrap_or(deadline);
+    let mut summary = SteadyWorkloadSummary::default();
+    let mut rng = SplitMix64::new(
+        config
+            .post_delete_seed
+            .wrapping_add(0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(worker_index as u64)),
+    );
+    let mut next_steady_key = worker_index;
+    let mut steady_live_keys = VecDeque::new();
+
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        let now = Instant::now();
+        if now < next_operation_at {
+            thread::sleep(
+                next_operation_at
+                    .min(deadline)
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(100)),
+            );
+            continue;
+        }
+
+        let action = next_steady_action(
+            config,
+            live_original_indexes,
+            &mut steady_live_keys,
+            &mut next_steady_key,
+            &mut rng,
+            config.post_delete_workers,
+        );
+        let operation_started = Instant::now();
+        if let Err(error) = perform(action) {
+            publish_post_delete_worker_error(worker_error, stop, error.to_string());
+            break;
+        }
+        let operation_elapsed = operation_started.elapsed();
+        summary.record_action(action, operation_elapsed);
+        if let SteadyAction::Put(key) = action {
+            steady_live_keys.push_back(key);
+        }
+
+        let mutation = shared_counts.record_action(action);
+        if let Some(mutation) = mutation
+            && config.sync_every != 0
+            && mutation.is_multiple_of(config.sync_every as u64)
+        {
+            let _guard = sync_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sync_started = Instant::now();
+            if let Err(error) = sync() {
+                publish_post_delete_worker_error(worker_error, stop, error.to_string());
+                break;
+            }
+            let sync_elapsed = sync_started.elapsed();
+            summary.record_sync(sync_elapsed);
+            shared_counts.record_sync();
+            last_synced_mutations.fetch_max(mutation, Ordering::Release);
+        }
+
+        next_operation_at = next_operation_at
+            .checked_add(worker_interval)
+            .unwrap_or_else(Instant::now);
+        if next_operation_at < Instant::now() {
+            next_operation_at = Instant::now();
+        }
+    }
+
+    summary
+}
+
+fn wait_for_post_delete_workers(
+    deadline: Instant,
+    worker_error: &Mutex<Option<String>>,
+) -> Option<String> {
+    loop {
+        if let Some(error) = worker_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Some(error);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+fn publish_post_delete_worker_error(
+    worker_error: &Mutex<Option<String>>,
+    stop: &AtomicBool,
+    error: String,
+) {
+    let mut first_error = worker_error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
+    stop.store(true, Ordering::Release);
+}
+
+fn capture_reclaim_sample<SampleAccounting>(
+    config: &Config,
+    target: Duration,
+    started: Instant,
+    workload_counts: SteadyOperationCounts,
+    sample_accounting: &mut SampleAccounting,
+) -> Result<ReclaimSample, Box<dyn std::error::Error>>
+where
+    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+{
+    Ok(ReclaimSample {
+        target,
+        elapsed: started.elapsed(),
+        path: summarize_path_if_exists(&config.root_dir)?,
+        io: process_io_snapshot()?,
+        workload_counts,
+        strata_accounting: sample_accounting()?,
+    })
 }
 
 fn strata_accounting_sample(
@@ -2045,13 +2448,14 @@ fn next_steady_action(
     steady_live_keys: &mut VecDeque<usize>,
     next_steady_key: &mut usize,
     rng: &mut SplitMix64,
+    steady_key_stride: usize,
 ) -> SteadyAction {
     let put_bps = percent_to_basis_points_inclusive(config.post_delete_put_percent) as u64;
     let get_bps = percent_to_basis_points_inclusive(config.post_delete_get_percent) as u64;
     let roll = rng.next_u64() % 10_000;
 
     if roll < put_bps {
-        return next_steady_put(next_steady_key);
+        return next_steady_put(next_steady_key, steady_key_stride);
     }
 
     if roll < put_bps + get_bps {
@@ -2064,18 +2468,18 @@ fn next_steady_action(
         if let Some(&key) = steady_live_keys.front() {
             return SteadyAction::GetSteady(key);
         }
-        return next_steady_put(next_steady_key);
+        return next_steady_put(next_steady_key, steady_key_stride);
     }
 
     match steady_live_keys.pop_front() {
         Some(key) => SteadyAction::Delete(key),
-        None => next_steady_put(next_steady_key),
+        None => next_steady_put(next_steady_key, steady_key_stride),
     }
 }
 
-fn next_steady_put(next_steady_key: &mut usize) -> SteadyAction {
+fn next_steady_put(next_steady_key: &mut usize, steady_key_stride: usize) -> SteadyAction {
     let key = *next_steady_key;
-    *next_steady_key = next_steady_key.wrapping_add(1);
+    *next_steady_key = next_steady_key.wrapping_add(steady_key_stride);
     SteadyAction::Put(key)
 }
 
@@ -2659,6 +3063,7 @@ fn print_delete_report(inputs: DeleteReportInputs<'_>) {
         "delete_post_delete_target_ops_per_second={}",
         config.post_delete_ops_per_second
     );
+    println!("delete_post_delete_workers={}", config.post_delete_workers);
     println!(
         "delete_post_delete_put_percent={:.6}",
         config.post_delete_put_percent
@@ -4113,7 +4518,8 @@ options:
   --reclaim-duration <duration>          background observation window; default 60m
   --reclaim-sample-at <times>            comma-separated checkpoints; default 0,1m,5m,10m,15m,30m,60m
   --post-delete-workload <idle|steady>   default idle
-  --post-delete-ops-per-second <count>   steady target rate; default 10
+  --post-delete-ops-per-second <count>   aggregate steady target rate; default 10
+  --post-delete-workers <count>          concurrent steady workers; default 1
   --post-delete-put-percent <0..100>     steady mix; default 40
   --post-delete-get-percent <0..100>     steady mix; default 20
   --post-delete-delete-percent <0..100>  steady mix; default 40; mix must sum to 100
@@ -4437,6 +4843,8 @@ mod tests {
                 "steady",
                 "--post-delete-ops-per-second",
                 "250",
+                "--post-delete-workers",
+                "4",
                 "--post-delete-put-percent",
                 "50",
                 "--post-delete-get-percent",
@@ -4482,6 +4890,7 @@ mod tests {
         );
         assert_eq!(config.post_delete_workload, PostDeleteWorkload::Steady);
         assert_eq!(config.post_delete_ops_per_second, 250);
+        assert_eq!(config.post_delete_workers, 4);
         assert_eq!(config.post_delete_put_percent, 50.0);
         assert_eq!(config.post_delete_get_percent, 25.0);
         assert_eq!(config.post_delete_delete_percent, 25.0);
@@ -4492,6 +4901,95 @@ mod tests {
         assert_eq!(config.strata_gc_min_io_bytes_per_sec, 8 << 20);
         assert_eq!(config.strata_gc_min_reclaim_bytes, 16 << 20);
         assert_eq!(config.strata_gc_min_garbage_ratio_bps, 5_550);
+    }
+
+    #[test]
+    fn post_delete_workers_run_concurrently_with_disjoint_generated_keys() {
+        let config = Config::parse(
+            [
+                "--case",
+                "rocksdb-blobdb-delete",
+                "--delete-reclaim",
+                "background",
+                "--reclaim-duration",
+                "250ms",
+                "--reclaim-sample-at",
+                "0,250ms",
+                "--post-delete-workload",
+                "steady",
+                "--post-delete-ops-per-second",
+                "400",
+                "--post-delete-workers",
+                "4",
+                "--post-delete-put-percent",
+                "100",
+                "--post-delete-get-percent",
+                "0",
+                "--post-delete-delete-percent",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("parallel steady workload config should parse");
+        let worker_threads = Mutex::new(std::collections::HashSet::new());
+        let generated_keys = Mutex::new(std::collections::HashSet::new());
+        let syncs = AtomicU64::new(0);
+
+        let timeline = run_reclaim_timeline(
+            &config,
+            &[],
+            |action| {
+                worker_threads
+                    .lock()
+                    .expect("worker thread set should not be poisoned")
+                    .insert(thread::current().id());
+                let SteadyAction::Put(key) = action else {
+                    panic!("100% put mix should only generate puts");
+                };
+                assert!(
+                    generated_keys
+                        .lock()
+                        .expect("generated key set should not be poisoned")
+                        .insert(key),
+                    "workers generated a duplicate key {key}"
+                );
+                Ok::<(), Box<dyn std::error::Error>>(())
+            },
+            || {
+                syncs.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), Box<dyn std::error::Error>>(())
+            },
+            || Ok::<_, Box<dyn std::error::Error>>(None),
+        )
+        .expect("parallel steady workload should complete");
+
+        assert_eq!(
+            worker_threads
+                .lock()
+                .expect("worker thread set should not be poisoned")
+                .len(),
+            4
+        );
+        assert_eq!(
+            timeline.workload.counts.puts,
+            generated_keys
+                .lock()
+                .expect("generated key set should not be poisoned")
+                .len() as u64
+        );
+        assert_eq!(timeline.workload.counts.gets, 0);
+        assert_eq!(timeline.workload.counts.deletes, 0);
+        assert_eq!(syncs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            timeline
+                .samples
+                .last()
+                .expect("timeline should include the final sample")
+                .workload_counts
+                .operations(),
+            timeline.workload.counts.operations()
+        );
     }
 
     #[test]
