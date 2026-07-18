@@ -1,0 +1,404 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping the realistic benchmark",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Logical put and tombstone throughput plus net physical GC reclamation. BlobDB reclaim subtracts GC relocation writes so copied live data is not counted as reclaimed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "MiB/s",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "MiBs"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (engine) (rate(strata_realistic_bench_put_payload_bytes_total{job=\"strata-bench\",engine=~\"$engine\"}[$__rate_interval])) / 1024 / 1024",
+          "legendFormat": "{{engine}} put",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum by (engine) (rate(strata_realistic_bench_retired_payload_bytes_total{job=\"strata-bench\",engine=~\"$engine\"}[$__rate_interval])) / 1024 / 1024",
+          "legendFormat": "{{engine}} tombstone",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(strata_store_gc_reclaimed_bytes_total{job=\"strata-bench\",store=\"strata\"}[$__rate_interval])) / 1024 / 1024",
+          "legendFormat": "strata net GC reclaim",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clamp_min(sum(rate(strata_realistic_bench_blobdb_blob_file_bytes_written{job=\"strata-bench\",engine=\"blobdb\"}[$__rate_interval])) - sum(deriv(strata_realistic_bench_blobdb_total_blob_file_bytes{job=\"strata-bench\",engine=\"blobdb\"}[$__rate_interval])) - sum(rate(strata_realistic_bench_blobdb_gc_bytes_relocated{job=\"strata-bench\",engine=\"blobdb\"}[$__rate_interval])), 0) / 1024 / 1024",
+          "legendFormat": "blobdb net GC reclaim",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Put / Tombstone / Net GC Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "id": 2,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, operation) (rate(strata_realistic_bench_operation_successes_total{job=\"strata-bench\",engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "{{engine}} {{operation}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Successful Client Operations / second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "id": 3,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (engine, operation, le) (rate(strata_realistic_bench_operation_duration_seconds_bucket{job=\"strata-bench\",engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "{{engine}} {{operation}} p99",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client-visible Operation p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 17 },
+      "id": 4,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "strata_realistic_bench_active_write_workers{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} writers",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "strata_realistic_bench_controller_healthy{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} healthy",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "strata_realistic_bench_client_load_active{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} client load active",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Adaptive Writer Controller",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 17 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (engine, le) (rate(strata_realistic_bench_delete_lag_seconds_bucket{job=\"strata-bench\",engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "{{engine}} delete lag p99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "strata_realistic_bench_oldest_overdue_seconds{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} oldest outstanding",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Delete Promptness",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 17 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "strata_realistic_bench_overdue_delete_keys{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} outstanding",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (engine) (rate(strata_realistic_bench_delete_timely_total{job=\"strata-bench\",engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "{{engine}} timely/s",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (engine) (rate(strata_realistic_bench_delete_late_total{job=\"strata-bench\",engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "{{engine}} late/s",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Delete Obligations",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 24 },
+      "id": 7,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "strata_realistic_bench_directory_allocated_bytes{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} allocated",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "strata_realistic_bench_directory_apparent_bytes{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} apparent",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "strata_realistic_bench_logical_live_bytes{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} logical live",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Database Directory and Logical Live Bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "decimals": 2, "unit": "none" },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 24 },
+      "id": 8,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "strata_realistic_bench_space_amplification_ratio{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Space Amplification (allocated / logical live)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 33 },
+      "id": 9,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "min"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "strata_realistic_bench_filesystem_available_bytes{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} available",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Filesystem Available Bytes (sanity check)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 33 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "strata_realistic_bench_correctness_errors_total{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} correctness",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (engine, operation) (strata_realistic_bench_operation_errors_total{job=\"strata-bench\",engine=~\"$engine\"})",
+          "legendFormat": "{{engine}} {{operation}} errors",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Correctness and Storage Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 33 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "strata_realistic_bench_blobdb_total_blob_file_bytes{job=\"strata-bench\",engine=\"blobdb\"}",
+          "legendFormat": "total blob files",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "strata_realistic_bench_blobdb_live_garbage_bytes{job=\"strata-bench\",engine=\"blobdb\"}",
+          "legendFormat": "reported blob garbage",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "BlobDB Physical State",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 41,
+  "tags": ["strata", "blobdb", "benchmark", "lifecycle"],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(strata_realistic_bench_put_payload_bytes_total{job=\"strata-bench\"}, engine)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Engine",
+        "multi": true,
+        "name": "engine",
+        "options": [],
+        "query": {
+          "query": "label_values(strata_realistic_bench_put_payload_bytes_total{job=\"strata-bench\"}, engine)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Strata vs BlobDB — Realistic Lifecycle",
+  "uid": "strata-realistic-lifecycle",
+  "version": 1,
+  "weekStart": ""
+}

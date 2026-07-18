@@ -8045,6 +8045,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-realistic-bench"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "prometheus",
+ "rocksdb",
+ "serde",
+ "serde_with",
+ "strata-core",
+ "strata-store",
+ "tokio",
+ "typed-store",
+]
+
+[[package]]
 name = "strata-segment"
 version = "0.1.0"
 dependencies = [

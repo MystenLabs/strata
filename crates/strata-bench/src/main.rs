@@ -97,6 +97,7 @@ const DEFAULT_POST_DELETE_WORKERS: usize = 1;
 const DEFAULT_POST_DELETE_PUT_PERCENT: f64 = 40.0;
 const DEFAULT_POST_DELETE_GET_PERCENT: f64 = 20.0;
 const DEFAULT_POST_DELETE_DELETE_PERCENT: f64 = 40.0;
+const DEFAULT_POST_DELETE_DELETE_LAG_BYTES: u64 = 0;
 const DEFAULT_POST_DELETE_SEED: u64 = 0x57ea_d1e7_bacc_600d;
 const DEFAULT_ROCKSDB_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
 const DEFAULT_ROCKSDB_BLOB_GC_FORCE_THRESHOLD: f64 = 1.0;
@@ -373,6 +374,7 @@ struct Config {
     post_delete_put_percent: f64,
     post_delete_get_percent: f64,
     post_delete_delete_percent: f64,
+    post_delete_delete_lag_bytes: u64,
     post_delete_seed: u64,
     metrics_listen: Option<String>,
     metrics_drain_seconds: u64,
@@ -440,6 +442,7 @@ impl Config {
             post_delete_put_percent: DEFAULT_POST_DELETE_PUT_PERCENT,
             post_delete_get_percent: DEFAULT_POST_DELETE_GET_PERCENT,
             post_delete_delete_percent: DEFAULT_POST_DELETE_DELETE_PERCENT,
+            post_delete_delete_lag_bytes: DEFAULT_POST_DELETE_DELETE_LAG_BYTES,
             post_delete_seed: DEFAULT_POST_DELETE_SEED,
             metrics_listen: None,
             metrics_drain_seconds: DEFAULT_METRICS_DRAIN_SECONDS,
@@ -670,6 +673,15 @@ impl Config {
                         &mut args,
                         "--post-delete-delete-percent",
                     )?)?
+                }
+                "--post-delete-delete-lag-bytes" => {
+                    config.post_delete_delete_lag_bytes = u64::try_from(parse_size(&next_value(
+                        &mut args,
+                        "--post-delete-delete-lag-bytes",
+                    )?)?)
+                    .map_err(|_| {
+                        "--post-delete-delete-lag-bytes exceeds the supported range".to_owned()
+                    })?
                 }
                 "--post-delete-seed" => {
                     config.post_delete_seed =
@@ -1036,21 +1048,34 @@ struct ConcurrentSteadyOperationCounts {
 }
 
 impl ConcurrentSteadyOperationCounts {
-    fn record_action(&self, action: SteadyAction) -> Option<u64> {
+    fn record_action(&self, action: SteadyAction) -> RecordedSteadyAction {
         match action {
             SteadyAction::Put(_) => {
-                self.puts.fetch_add(1, Ordering::Relaxed);
-                Some(self.mutations.fetch_add(1, Ordering::Relaxed) + 1)
+                let put_sequence = self.puts.fetch_add(1, Ordering::Relaxed) + 1;
+                RecordedSteadyAction {
+                    mutation: Some(self.mutations.fetch_add(1, Ordering::Relaxed) + 1),
+                    put_sequence: Some(put_sequence),
+                }
             }
             SteadyAction::GetOriginal(_) | SteadyAction::GetSteady(_) => {
                 self.gets.fetch_add(1, Ordering::Relaxed);
-                None
+                RecordedSteadyAction {
+                    mutation: None,
+                    put_sequence: None,
+                }
             }
             SteadyAction::Delete(_) => {
                 self.deletes.fetch_add(1, Ordering::Relaxed);
-                Some(self.mutations.fetch_add(1, Ordering::Relaxed) + 1)
+                RecordedSteadyAction {
+                    mutation: Some(self.mutations.fetch_add(1, Ordering::Relaxed) + 1),
+                    put_sequence: None,
+                }
             }
         }
+    }
+
+    fn completed_puts(&self) -> u64 {
+        self.puts.load(Ordering::Relaxed)
     }
 
     fn record_sync(&self) {
@@ -2064,6 +2089,19 @@ enum SteadyAction {
     Delete(usize),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SteadyLiveKey {
+    key: usize,
+    /// One-based sequence among successfully completed steady-workload puts.
+    put_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordedSteadyAction {
+    mutation: Option<u64>,
+    put_sequence: Option<u64>,
+}
+
 fn run_reclaim_timeline<Perform, SyncFn, SampleAccounting>(
     config: &Config,
     live_original_indexes: &[usize],
@@ -2122,7 +2160,7 @@ where
     );
     let mut rng = SplitMix64::new(config.post_delete_seed);
     let mut next_steady_key = 0_usize;
-    let mut steady_live_keys = VecDeque::new();
+    let mut steady_live_keys = VecDeque::<SteadyLiveKey>::new();
     let mut last_synced_mutations = 0_u64;
 
     for target in sample_at {
@@ -2155,13 +2193,17 @@ where
                 &mut next_steady_key,
                 &mut rng,
                 1,
+                timeline.workload.counts.puts,
             );
             let operation_started = Instant::now();
             perform(action)?;
             let operation_elapsed = operation_started.elapsed();
             timeline.workload.record_action(action, operation_elapsed);
             if let SteadyAction::Put(key) = action {
-                steady_live_keys.push_back(key);
+                steady_live_keys.push_back(SteadyLiveKey {
+                    key,
+                    put_sequence: timeline.workload.counts.puts,
+                });
             }
 
             let mutations = timeline.workload.counts.mutations();
@@ -2381,7 +2423,7 @@ where
             .wrapping_add(0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(worker_index as u64)),
     );
     let mut next_steady_key = worker_index;
-    let mut steady_live_keys = VecDeque::new();
+    let mut steady_live_keys = VecDeque::<SteadyLiveKey>::new();
 
     while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
         let now = Instant::now();
@@ -2402,6 +2444,7 @@ where
             &mut next_steady_key,
             &mut rng,
             config.post_delete_workers,
+            shared_counts.completed_puts(),
         );
         let operation_started = Instant::now();
         if let Err(error) = perform(action) {
@@ -2410,12 +2453,12 @@ where
         }
         let operation_elapsed = operation_started.elapsed();
         summary.record_action(action, operation_elapsed);
-        if let SteadyAction::Put(key) = action {
-            steady_live_keys.push_back(key);
+        let recorded = shared_counts.record_action(action);
+        if let (SteadyAction::Put(key), Some(put_sequence)) = (action, recorded.put_sequence) {
+            steady_live_keys.push_back(SteadyLiveKey { key, put_sequence });
         }
 
-        let mutation = shared_counts.record_action(action);
-        if let Some(mutation) = mutation
+        if let Some(mutation) = recorded.mutation
             && config.sync_every != 0
             && mutation.is_multiple_of(config.sync_every as u64)
         {
@@ -2541,10 +2584,11 @@ fn strata_accounting_sample(
 fn next_steady_action(
     config: &Config,
     live_original_indexes: &[usize],
-    steady_live_keys: &mut VecDeque<usize>,
+    steady_live_keys: &mut VecDeque<SteadyLiveKey>,
     next_steady_key: &mut usize,
     rng: &mut SplitMix64,
     steady_key_stride: usize,
+    completed_puts: u64,
 ) -> SteadyAction {
     let put_bps = percent_to_basis_points_inclusive(config.post_delete_put_percent) as u64;
     let get_bps = percent_to_basis_points_inclusive(config.post_delete_get_percent) as u64;
@@ -2561,16 +2605,37 @@ fn next_steady_action(
             let index = (rng.next_u64() as usize) % live_original_indexes.len();
             return SteadyAction::GetOriginal(live_original_indexes[index]);
         }
-        if let Some(&key) = steady_live_keys.front() {
-            return SteadyAction::GetSteady(key);
+        if let Some(live_key) = steady_live_keys.front() {
+            return SteadyAction::GetSteady(live_key.key);
         }
         return next_steady_put(next_steady_key, steady_key_stride);
     }
 
-    match steady_live_keys.pop_front() {
-        Some(key) => SteadyAction::Delete(key),
-        None => next_steady_put(next_steady_key, steady_key_stride),
+    let delete_lag_puts = post_delete_delete_lag_puts(config);
+    let oldest_is_eligible = steady_live_keys.front().is_some_and(|live_key| {
+        completed_puts.saturating_sub(live_key.put_sequence) >= delete_lag_puts
+    });
+    if oldest_is_eligible {
+        let live_key = steady_live_keys
+            .pop_front()
+            .expect("eligible steady key must exist");
+        SteadyAction::Delete(live_key.key)
+    } else {
+        // Preserve an on-disk-sized generation gap by turning premature delete attempts into
+        // puts. With a lag larger than RocksDB's memtable capacity, the oldest value must cross a
+        // flush before the benchmark can retire it.
+        next_steady_put(next_steady_key, steady_key_stride)
     }
+}
+
+fn post_delete_delete_lag_puts(config: &Config) -> u64 {
+    let payload_size = u64::try_from(config.payload_size)
+        .unwrap_or(u64::MAX)
+        .max(1);
+    config
+        .post_delete_delete_lag_bytes
+        .saturating_add(payload_size - 1)
+        / payload_size
 }
 
 fn next_steady_put(next_steady_key: &mut usize, steady_key_stride: usize) -> SteadyAction {
@@ -3337,6 +3402,14 @@ fn print_delete_report(inputs: DeleteReportInputs<'_>) {
     println!(
         "delete_post_delete_delete_percent={:.6}",
         config.post_delete_delete_percent
+    );
+    println!(
+        "delete_post_delete_delete_lag_bytes={}",
+        config.post_delete_delete_lag_bytes
+    );
+    println!(
+        "delete_post_delete_delete_lag_puts={}",
+        post_delete_delete_lag_puts(config)
     );
     println!("delete_post_delete_seed={}", config.post_delete_seed);
     println!("delete_loaded_payload_bytes={logical_loaded_payload_bytes}");
@@ -4811,6 +4884,9 @@ options:
   --post-delete-put-percent <0..100>     steady mix; default 40
   --post-delete-get-percent <0..100>     steady mix; default 20
   --post-delete-delete-percent <0..100>  steady mix; default 40; mix must sum to 100
+  --post-delete-delete-lag-bytes <bytes|KiB|MiB|GiB>
+                                        newer successful put payload required before a generated
+                                        key can be deleted; use more than total memtable capacity
   --post-delete-seed <u64>
   --metrics-listen <addr>              serve Prometheus metrics on /metrics
   --metrics-drain-seconds <seconds>    wait after benchmark when metrics are enabled; default 30
@@ -5177,6 +5253,8 @@ mod tests {
                 "25",
                 "--post-delete-delete-percent",
                 "25",
+                "--post-delete-delete-lag-bytes",
+                "4GiB",
                 "--post-delete-seed",
                 "1234",
                 "--rocksdb-blob-gc-age-cutoff",
@@ -5220,6 +5298,8 @@ mod tests {
         assert_eq!(config.post_delete_put_percent, 50.0);
         assert_eq!(config.post_delete_get_percent, 25.0);
         assert_eq!(config.post_delete_delete_percent, 25.0);
+        assert_eq!(config.post_delete_delete_lag_bytes, 4_u64 << 30);
+        assert_eq!(post_delete_delete_lag_puts(&config), 4096);
         assert_eq!(config.post_delete_seed, 1234);
         assert_eq!(config.rocksdb_blob_gc_age_cutoff, 0.75);
         assert_eq!(config.rocksdb_blob_gc_force_threshold, 0.9);
@@ -5227,6 +5307,58 @@ mod tests {
         assert_eq!(config.strata_gc_min_io_bytes_per_sec, 8 << 20);
         assert_eq!(config.strata_gc_min_reclaim_bytes, 16 << 20);
         assert_eq!(config.strata_gc_min_garbage_ratio_bps, 5_550);
+    }
+
+    #[test]
+    fn steady_delete_lag_requires_enough_newer_put_payload() {
+        let config = Config::parse(
+            [
+                "--post-delete-put-percent",
+                "0",
+                "--post-delete-get-percent",
+                "0",
+                "--post-delete-delete-percent",
+                "100",
+                "--post-delete-delete-lag-bytes",
+                "4MiB",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("delete lag config should parse");
+        let mut steady_live_keys = VecDeque::from([SteadyLiveKey {
+            key: 7,
+            put_sequence: 1,
+        }]);
+        let mut next_steady_key = 8;
+        let mut rng = SplitMix64::new(1);
+
+        let premature = next_steady_action(
+            &config,
+            &[],
+            &mut steady_live_keys,
+            &mut next_steady_key,
+            &mut rng,
+            1,
+            4,
+        );
+        assert!(matches!(premature, SteadyAction::Put(8)));
+        assert_eq!(
+            steady_live_keys.front().map(|live_key| live_key.key),
+            Some(7)
+        );
+
+        let eligible = next_steady_action(
+            &config,
+            &[],
+            &mut steady_live_keys,
+            &mut next_steady_key,
+            &mut rng,
+            1,
+            5,
+        );
+        assert!(matches!(eligible, SteadyAction::Delete(7)));
+        assert!(steady_live_keys.is_empty());
     }
 
     #[test]

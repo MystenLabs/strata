@@ -17,6 +17,7 @@ strata-store.workspace = true
 members = [
     ".",
     "crates/strata-bench",
+    "crates/strata-realistic-bench",
     "crates/strata-accounting",
     "crates/strata-core",
     "crates/strata-gc",
