@@ -139,6 +139,20 @@ fn gc_publish_reconciliation_rejects_obsolete_shard_generation() {
     );
 }
 
+#[test]
+fn gc_output_byte_attribution_includes_skipped_bytes_retained_in_used_output() {
+    let survivor = gc_staged_record(10, 0);
+    let skipped_record = gc_staged_record(30, 8);
+    let skipped = vec![GcSkippedCopiedRecord {
+        record: skipped_record,
+        kind: GcSkippedCopiedRecordKind::Retired,
+    }];
+
+    let bytes = gc_output_bytes_by_source(&[survivor], &skipped, &BTreeSet::from([1])).unwrap();
+
+    assert_eq!(bytes, BTreeMap::from([(7, 16)]));
+}
+
 fn segment_summary(index: &StrataIndex, segment_id: SegmentId) -> strata_core::SegmentGcSummary {
     index
         .get_segment_gc_overlay(segment_id)
@@ -4541,7 +4555,9 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
+    let store = try_open_standalone_store(cfg, metrics).unwrap();
 
     let lsn_a = store.put(&key_a, b"payload-a").unwrap();
     let lsn_b = store.put(&key_b, b"payload-b").unwrap();
@@ -4593,6 +4609,18 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(published.skipped_records, Vec::new());
     assert_eq!(published.output_segments.len(), 1);
     assert_eq!(published.published_records.len(), 1);
+    assert_eq!(
+        counter_value(&registry, "strata_store_gc_output_bytes_total"),
+        ref_b.len as f64
+    );
+    assert_eq!(
+        counter_value(&registry, "strata_store_gc_source_deleted_bytes_total"),
+        0.0
+    );
+    assert_eq!(
+        counter_value(&registry, "strata_store_gc_reclaimed_bytes_total"),
+        0.0
+    );
     assert!(!staged_path.exists());
     assert!(published.output_segments[0].path.exists());
 
@@ -4664,6 +4692,14 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
             .unwrap()
             .state,
         SegmentFileState::Deleted
+    );
+    assert_eq!(
+        counter_value(&registry, "strata_store_gc_source_deleted_bytes_total"),
+        (ref_a.len + ref_b.len) as f64
+    );
+    assert_eq!(
+        counter_value(&registry, "strata_store_gc_reclaimed_bytes_total"),
+        ref_a.len as f64
     );
 }
 

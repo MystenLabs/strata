@@ -112,6 +112,69 @@ impl StrataIndex {
             .map_err(Error::from)
     }
 
+    /// Persists GC output bytes that must be subtracted when the source is eventually unlinked.
+    pub fn put_gc_reclaim_pending_batch(
+        &self,
+        batch: &mut DBBatch,
+        source_segment_id: SegmentId,
+        publish_lsn: StrataLsn,
+        output_bytes: u64,
+    ) -> Result<()> {
+        let key = (source_segment_id, publish_lsn);
+        batch
+            .insert_batch(self.gc_reclaim_pending(), [(&key, &output_bytes)])
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// Returns all pending reclaim attribution rows, ordered by source segment and publish LSN.
+    pub fn iter_gc_reclaim_pending(&self) -> Result<Vec<((SegmentId, StrataLsn), u64)>> {
+        self.gc_reclaim_pending
+            .safe_iter()?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    /// Removes and sums published-output attribution for deleted source segments in one scan.
+    pub fn remove_gc_reclaim_pending_for_sources_batch(
+        &self,
+        batch: &mut DBBatch,
+        source_segment_ids: &[SegmentId],
+    ) -> Result<BTreeMap<SegmentId, u64>> {
+        let rows = self.iter_gc_reclaim_pending()?;
+        let mut keys = Vec::new();
+        let mut output_bytes = source_segment_ids
+            .iter()
+            .copied()
+            .map(|segment_id| (segment_id, 0_u64))
+            .collect::<BTreeMap<_, _>>();
+        for (key, bytes) in rows {
+            let Some(total) = output_bytes.get_mut(&key.0) else {
+                continue;
+            };
+            keys.push(key);
+            *total = total.saturating_add(bytes);
+        }
+        batch.delete_batch(self.gc_reclaim_pending(), keys)?;
+        Ok(output_bytes)
+    }
+
+    /// Removes reclaim attribution created by GC publications hidden during recovery rollback.
+    pub fn remove_gc_reclaim_pending_from_lsn_batch(
+        &self,
+        batch: &mut DBBatch,
+        rollback_from: StrataLsn,
+    ) -> Result<usize> {
+        let keys = self
+            .iter_gc_reclaim_pending()?
+            .into_iter()
+            .filter_map(|(key, _)| (key.1 >= rollback_from).then_some(key))
+            .collect::<Vec<_>>();
+        let removed = keys.len();
+        batch.delete_batch(self.gc_reclaim_pending(), keys)?;
+        Ok(removed)
+    }
+
     /// Removes relocation rows whose publish LSN has already been accounted.
     pub fn remove_gc_relocations_through_lsn_batch(
         &self,

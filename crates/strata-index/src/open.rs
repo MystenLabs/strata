@@ -13,9 +13,9 @@ use typed_store::{
 use crate::Result;
 
 use super::cf::{
-    ACCOUNTING_INDEX_CF, BLOB_VERSIONS_CF, EPOCH_CHANGES_CF, GC_RELOCATIONS_CF,
-    SEGMENT_GC_OVERLAY_CF, SEGMENT_REF_EVENTS_CF, SEGMENT_STATES_CF, SHARDS_CF, STORE_STATE_CF,
-    UNACCOUNTED_LSN_OPS_CF,
+    ACCOUNTING_INDEX_CF, BLOB_VERSIONS_CF, EPOCH_CHANGES_CF, GC_RECLAIM_PENDING_CF,
+    GC_RELOCATIONS_CF, SEGMENT_GC_OVERLAY_CF, SEGMENT_REF_EVENTS_CF, SEGMENT_STATES_CF, SHARDS_CF,
+    STORE_STATE_CF, UNACCOUNTED_LSN_OPS_CF,
 };
 use super::options::cf_options;
 use super::{StrataIndex, StrataIndexCfNames};
@@ -116,6 +116,13 @@ impl StrataIndex {
             &rw_options,
             true,
         )?;
+        let gc_reclaim_pending = DBMap::reopen_with_class(
+            &db,
+            Some(&cf_names.gc_reclaim_pending),
+            Some(GC_RECLAIM_PENDING_CF),
+            &rw_options,
+            true,
+        )?;
         let shards = DBMap::reopen_with_class(
             &db,
             Some(&cf_names.shards),
@@ -162,6 +169,7 @@ impl StrataIndex {
             segment_ref_events,
             segment_gc_overlay,
             gc_relocations,
+            gc_reclaim_pending,
             shards,
             store_state,
             epoch_changes,

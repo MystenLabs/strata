@@ -44,6 +44,10 @@ impl StrataIndex {
         &self.gc_relocations
     }
 
+    pub fn gc_reclaim_pending(&self) -> &DBMap<(SegmentId, StrataLsn), u64> {
+        &self.gc_reclaim_pending
+    }
+
     pub fn shards(&self) -> &DBMap<ShardId, ShardInfo> {
         &self.shards
     }

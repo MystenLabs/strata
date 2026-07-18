@@ -140,6 +140,18 @@ impl StrataIndex {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)?;
             batch.delete_batch(&self.gc_relocations, relocation_keys)?;
+
+            let reclaim_pending_keys = self
+                .gc_reclaim_pending
+                .safe_iter()?
+                .filter_map(|result| match result {
+                    Ok((key, _)) if segment_ids.contains(&key.0) => Some(Ok(key)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)?;
+            batch.delete_batch(&self.gc_reclaim_pending, reclaim_pending_keys)?;
         }
 
         Ok(())

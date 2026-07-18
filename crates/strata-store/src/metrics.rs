@@ -86,6 +86,9 @@ struct PrometheusMetrics {
     gc_known_expired_bytes: IntGauge,
     gc_known_live_ref_count: IntGauge,
     gc_relocating_segments: IntGauge,
+    gc_output_bytes_total: IntCounter,
+    gc_source_deleted_bytes_total: IntCounter,
+    gc_reclaimed_bytes_total: IntCounter,
     current_epoch: IntGauge,
     pending_lsn_count: IntGauge,
     unsealed_segments: IntGauge,
@@ -452,6 +455,24 @@ impl StrataStoreMetrics {
                     &labels,
                     "gc_relocating_segments",
                     "Sealed source segments fenced between GC relocation publish and final deletion.",
+                )?,
+                gc_output_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_output_bytes_total",
+                    "Encoded bytes in GC output segments that were successfully published.",
+                )?,
+                gc_source_deleted_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_source_deleted_bytes_total",
+                    "Physical bytes in GC source segment files that were successfully unlinked.",
+                )?,
+                gc_reclaimed_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "gc_reclaimed_bytes_total",
+                    "Net physical bytes reclaimed by GC after subtracting replacement output bytes from successfully unlinked source bytes.",
                 )?,
                 current_epoch: register_gauge(
                     registry,
@@ -1087,6 +1108,25 @@ impl StrataStoreMetrics {
         if let Some(metrics) = &self.inner {
             apply_gauge_delta(&metrics.gc_relocating_segments, -(count as i128));
         }
+    }
+
+    /// Records physical bytes installed by a successful GC relocation publication.
+    pub(crate) fn record_gc_output_published(&self, output_bytes: u64) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics.gc_output_bytes_total.inc_by(output_bytes);
+    }
+
+    /// Records a source file that GC successfully unlinked.
+    pub(crate) fn record_gc_source_deleted(&self, source_bytes: u64, copied_bytes: u64) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics.gc_source_deleted_bytes_total.inc_by(source_bytes);
+        metrics
+            .gc_reclaimed_bytes_total
+            .inc_by(source_bytes.saturating_sub(copied_bytes));
     }
 
     pub(crate) fn record_gc_admitted(&self) {

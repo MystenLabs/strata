@@ -2085,11 +2085,41 @@ impl WriteCoordinator {
         }
 
         let mut output_plan = self.plan_gc_output_segments(&copy.outputs, &survivors)?;
+        let published_output_bytes =
+            output_plan
+                .published_outputs
+                .iter()
+                .try_fold(0_u64, |total, output| {
+                    total
+                        .checked_add(output.sealed_len)
+                        .ok_or(strata_segment::Error::RangeOverflow)
+                })?;
+        let output_bytes_by_source =
+            gc_output_bytes_by_source(&survivors, &skipped_records, &output_plan.used_staged_ids)?;
+        let attributed_output_bytes =
+            output_bytes_by_source
+                .values()
+                .try_fold(0_u64, |total, bytes| {
+                    total
+                        .checked_add(*bytes)
+                        .ok_or(strata_segment::Error::RangeOverflow)
+                })?;
+        if attributed_output_bytes != published_output_bytes {
+            return Err(Error::InvariantViolation {
+                reason: format!(
+                    "published GC output bytes {published_output_bytes} do not match source-attributed bytes {attributed_output_bytes}"
+                ),
+            });
+        }
         let published_records = assign_gc_publish_lsns(
             self.index.get_next_lsn()?,
             &survivors,
             &output_plan.staged_to_final_segment_id,
         )?;
+        let reclaim_publish_lsn = published_records
+            .first()
+            .expect("surviving GC records are non-empty")
+            .publish_lsn;
         let relocating_source_states = self.plan_gc_relocating_source_states(&published_records)?;
         apply_gc_output_lsn_bounds(&mut output_plan.segment_states, &published_records);
         let skipped_output_ranges =
@@ -2108,6 +2138,14 @@ impl WriteCoordinator {
             }
             for state in &relocating_source_states {
                 self.index.put_segment_state_batch(&mut batch, state)?;
+            }
+            for (source_segment_id, output_bytes) in &output_bytes_by_source {
+                self.index.put_gc_reclaim_pending_batch(
+                    &mut batch,
+                    *source_segment_id,
+                    reclaim_publish_lsn,
+                    *output_bytes,
+                )?;
             }
             for output in &copy.outputs {
                 if !output_plan
@@ -2184,6 +2222,8 @@ impl WriteCoordinator {
                 self.metrics.apply_gc_known_delta(skipped_output_delta);
                 self.metrics
                     .add_gc_relocating_segments(relocating_source_states.len());
+                self.metrics
+                    .record_gc_output_published(published_output_bytes);
                 self.run_rollover_post_commit(pending_rollovers);
                 let next_lsn = published_records
                     .last()
@@ -2333,7 +2373,27 @@ impl WriteCoordinator {
             self.reader_cache.evict(state.segment_id);
             self.metrics.record_reader_cache_eviction();
         }
-        unlink_gc_segment_files(&self.config, &states)
+        let unlinked_segments = unlink_gc_segment_files(&self.config, &states)?;
+        if !unlinked_segments.is_empty() {
+            let source_segment_ids = unlinked_segments
+                .iter()
+                .map(|(segment_id, _)| *segment_id)
+                .collect::<Vec<_>>();
+            let mut batch = self.index.batch();
+            let output_bytes_by_source = self
+                .index
+                .remove_gc_reclaim_pending_for_sources_batch(&mut batch, &source_segment_ids)?;
+            batch.write().map_err(strata_index::Error::from)?;
+            for (segment_id, source_bytes) in unlinked_segments {
+                let output_bytes = output_bytes_by_source
+                    .get(&segment_id)
+                    .copied()
+                    .unwrap_or(0);
+                self.metrics
+                    .record_gc_source_deleted(source_bytes, output_bytes);
+            }
+        }
+        Ok(())
     }
 
     fn reclassify_gc_segment(
@@ -3123,6 +3183,34 @@ fn split_gc_copied_records(
     (survivors, skipped)
 }
 
+/// Attributes every byte retained in published GC outputs to its original source segment.
+///
+/// A published output can contain a staged record that became stale during copy reconciliation as
+/// long as another record in the same output survived. Those stale bytes still occupy disk, so
+/// they must be included when computing net reclamation for the eventual source deletion.
+fn gc_output_bytes_by_source(
+    survivors: &[GcStagedCopiedRecord],
+    skipped: &[GcSkippedCopiedRecord],
+    used_staged_ids: &BTreeSet<SegmentId>,
+) -> Result<BTreeMap<SegmentId, u64>> {
+    let mut bytes_by_source = BTreeMap::new();
+    let records = survivors
+        .iter()
+        .chain(skipped.iter().map(|skipped| &skipped.record));
+    for record in records {
+        if !used_staged_ids.contains(&record.staged.segment_id) {
+            continue;
+        }
+        let bytes = bytes_by_source
+            .entry(record.source.from.segment_id)
+            .or_insert(0_u64);
+        *bytes = bytes
+            .checked_add(record.staged.len)
+            .ok_or(strata_segment::Error::RangeOverflow)?;
+    }
+    Ok(bytes_by_source)
+}
+
 /// Assigns consecutive publish LSNs and final destination refs to copied survivors.
 ///
 /// The staged record already knows its offset and length inside a temporary output file. This helper
@@ -3240,15 +3328,25 @@ fn gc_segment_file_path(config: &StrataStoreConfig, state: &SegmentState) -> std
 }
 
 fn unlink_gc_segment_file(config: &StrataStoreConfig, state: &SegmentState) -> Result<()> {
-    unlink_gc_segment_files(config, std::slice::from_ref(state))
+    unlink_gc_segment_files(config, std::slice::from_ref(state)).map(|_| ())
 }
 
-fn unlink_gc_segment_files(config: &StrataStoreConfig, states: &[SegmentState]) -> Result<()> {
+fn unlink_gc_segment_files(
+    config: &StrataStoreConfig,
+    states: &[SegmentState],
+) -> Result<Vec<(SegmentId, u64)>> {
     let mut parents = BTreeSet::new();
+    let mut unlinked_segments = Vec::new();
     for state in states {
         let path = gc_segment_file_path(config, state);
+        let file_len = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(Error::Io { path, source }),
+        };
         match fs::remove_file(&path) {
             Ok(()) => {
+                unlinked_segments.push((state.segment_id, file_len));
                 if let Some(parent) = path.parent() {
                     parents.insert(parent.to_path_buf());
                 }
@@ -3262,7 +3360,7 @@ fn unlink_gc_segment_files(config: &StrataStoreConfig, states: &[SegmentState]) 
         sync_dir(&parent)?;
         prune_empty_retention_dirs(config, parent)?;
     }
-    Ok(())
+    Ok(unlinked_segments)
 }
 
 pub(crate) fn prune_empty_retention_dirs(
@@ -4037,6 +4135,8 @@ fn rollback_operations_from(
         restore_gc_relocating_sources_from_lsn_batch(index, &mut batch, rollback_from)?;
     let hidden_relocations =
         index.remove_gc_relocations_from_lsn_batch(&mut batch, rollback_from)?;
+    let hidden_gc_reclaim_pending =
+        index.remove_gc_reclaim_pending_from_lsn_batch(&mut batch, rollback_from)?;
     let hidden_gc_outputs =
         remove_gc_output_segments_from_lsn_batch(index, &mut batch, rollback_from)?;
     let rollback_ops = hidden_version_count.saturating_add(hidden_epoch_changes.len()) as u64;
@@ -4057,6 +4157,7 @@ fn rollback_operations_from(
         rollback_from,
         rollback_ops
             .saturating_add(hidden_relocations as u64)
+            .saturating_add(hidden_gc_reclaim_pending as u64)
             .saturating_add(restored_gc_sources as u64)
             .saturating_add(hidden_gc_outputs.len() as u64),
     );

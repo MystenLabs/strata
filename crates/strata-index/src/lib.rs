@@ -12,6 +12,7 @@
 //! | segment_ref_events | SegmentRefEventKey -> SegmentRefEvent       |
 //! | segment_gc_overlay | SegmentId -> SegmentGcOverlay + summary     |
 //! | gc_relocations | RecordRef -> GcRelocation                      |
+//! | gc_reclaim_pending | (SegmentId, StrataLsn) -> output bytes      |
 //! | shards          | ShardId -> ShardInfo                          |
 //! | store_state     | StoreStateKey -> u64                         |
 //! | epoch_changes   | StrataLsn -> current Epoch                   |
@@ -106,6 +107,8 @@ pub struct StrataIndex {
     segment_gc_overlay: DBMap<SegmentId, SegmentGcOverlay>,
     /// Active GC publish forwarding rows used while accounting replays pre-publish events.
     gc_relocations: DBMap<RecordRef, GcRelocation>,
+    /// GC output bytes attributed to each source until that source file is unlinked.
+    gc_reclaim_pending: DBMap<(SegmentId, StrataLsn), u64>,
     /// Shard registry used to resolve the current internal generation for each logical shard.
     shards: DBMap<ShardId, ShardInfo>,
     /// Store-global cursors.

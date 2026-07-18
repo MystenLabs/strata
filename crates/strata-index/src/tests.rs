@@ -817,6 +817,47 @@ async fn rollback_prunes_gc_relocations_by_publish_lsn() {
 }
 
 #[tokio::test]
+async fn gc_reclaim_pending_rows_survive_until_source_delete_or_rollback() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = open_test_index(&dir);
+
+    let mut batch = index.batch();
+    index
+        .put_gc_reclaim_pending_batch(&mut batch, 1, 4, 10)
+        .unwrap();
+    index
+        .put_gc_reclaim_pending_batch(&mut batch, 1, 6, 20)
+        .unwrap();
+    index
+        .put_gc_reclaim_pending_batch(&mut batch, 2, 6, 30)
+        .unwrap();
+    batch.write().unwrap();
+    drop(index);
+    let index = open_test_index(&dir);
+
+    let mut batch = index.batch();
+    assert_eq!(
+        index
+            .remove_gc_reclaim_pending_from_lsn_batch(&mut batch, 5)
+            .unwrap(),
+        2
+    );
+    batch.write().unwrap();
+    assert_eq!(index.iter_gc_reclaim_pending().unwrap(), vec![((1, 4), 10)]);
+
+    let mut batch = index.batch();
+    assert_eq!(
+        index
+            .remove_gc_reclaim_pending_for_sources_batch(&mut batch, &[1])
+            .unwrap(),
+        BTreeMap::from([(1, 10)])
+    );
+    batch.write().unwrap();
+    assert!(index.iter_gc_reclaim_pending().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn segment_gc_overlay_merge_coalesces_retired_ranges() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
@@ -1469,6 +1510,12 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
     index
         .put_blob_unaccounted_lsn_op_batch(&mut batch, 2, &other_key)
         .unwrap();
+    index
+        .put_gc_reclaim_pending_batch(&mut batch, shard_state.segment_id, 3, 100)
+        .unwrap();
+    index
+        .put_gc_reclaim_pending_batch(&mut batch, other_state.segment_id, 4, 200)
+        .unwrap();
     batch.write().unwrap();
 
     let mut batch = index.batch();
@@ -1499,6 +1546,10 @@ async fn removing_shard_keyed_metadata_skips_blob_versions() {
     assert_eq!(
         index.get_segment_state_for_shard(other_shard, 2).unwrap(),
         Some(other_state)
+    );
+    assert_eq!(
+        index.iter_gc_reclaim_pending().unwrap(),
+        vec![((2, 4), 200)]
     );
 }
 
