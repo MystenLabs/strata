@@ -349,6 +349,7 @@ struct Config {
     rocksdb_write_buffer_size: usize,
     rocksdb_db_write_buffer_size: usize,
     rocksdb_max_write_buffer_number: usize,
+    rocksdb_max_background_flushes: Option<usize>,
     rocksdb_high_pri_background_threads: usize,
     rocksdb_low_pri_background_threads: usize,
     rocksdb_blob_gc: bool,
@@ -415,6 +416,7 @@ impl Config {
             rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
             rocksdb_db_write_buffer_size: DEFAULT_ROCKSDB_DB_WRITE_BUFFER_SIZE,
             rocksdb_max_write_buffer_number: DEFAULT_ROCKSDB_MAX_WRITE_BUFFER_NUMBER,
+            rocksdb_max_background_flushes: None,
             rocksdb_high_pri_background_threads: DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS,
             rocksdb_low_pri_background_threads: DEFAULT_ROCKSDB_LOW_PRI_BACKGROUND_THREADS,
             rocksdb_blob_gc: true,
@@ -559,6 +561,12 @@ impl Config {
                     config.rocksdb_max_write_buffer_number =
                         parse_usize(&next_value(&mut args, "--rocksdb-max-write-buffer-number")?)?
                 }
+                "--rocksdb-max-background-flushes" => {
+                    config.rocksdb_max_background_flushes = Some(parse_usize(&next_value(
+                        &mut args,
+                        "--rocksdb-max-background-flushes",
+                    )?)?)
+                }
                 "--rocksdb-high-pri-background-threads" => {
                     config.rocksdb_high_pri_background_threads = parse_usize(&next_value(
                         &mut args,
@@ -698,6 +706,13 @@ impl Config {
         if !(2..=i32::MAX as usize).contains(&config.rocksdb_max_write_buffer_number) {
             return Err(
                 "rocksdb_max_write_buffer_number must be between 2 and i32::MAX".to_owned(),
+            );
+        }
+        if let Some(max_flushes) = config.rocksdb_max_background_flushes
+            && !(1..=(i32::MAX as usize / 4)).contains(&max_flushes)
+        {
+            return Err(
+                "rocksdb_max_background_flushes must be between 1 and i32::MAX / 4".to_owned(),
             );
         }
         if config.rocksdb_high_pri_background_threads > i32::MAX as usize {
@@ -2820,6 +2835,12 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     options.set_write_buffer_size(config.rocksdb_write_buffer_size);
     options.set_db_write_buffer_size(config.rocksdb_db_write_buffer_size);
     options.set_max_write_buffer_number(config.rocksdb_max_write_buffer_number as i32);
+    if let Some(max_flushes) = config.rocksdb_max_background_flushes {
+        // RocksDB 8.10 derives the flush limit as max_background_jobs / 4. Use the modern
+        // aggregate option instead of max_background_flushes, whose compatibility behavior would
+        // reduce max_background_compactions to one when set on its own.
+        options.set_max_background_jobs((max_flushes * 4) as i32);
+    }
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
     options.set_blob_gc_age_cutoff(config.rocksdb_blob_gc_age_cutoff);
     options.set_blob_gc_force_threshold(config.rocksdb_blob_gc_force_threshold);
@@ -3624,6 +3645,12 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!(
         "rocksdb_max_write_buffer_number={}",
         config.rocksdb_max_write_buffer_number
+    );
+    println!(
+        "rocksdb_max_background_flushes={}",
+        config
+            .rocksdb_max_background_flushes
+            .map_or_else(|| "auto".to_owned(), |value| value.to_string())
     );
     println!(
         "rocksdb_high_pri_background_threads={}",
@@ -4758,6 +4785,9 @@ options:
                                         total memtable budget; 0 disables the DB-wide limit
   --rocksdb-max-write-buffer-number <count>
                                         maximum active and immutable memtables; minimum 2
+  --rocksdb-max-background-flushes <count>
+                                        target concurrent flush jobs; sets max background jobs
+                                        to 4x this value to preserve RocksDB's 1:3 allocation
   --rocksdb-high-pri-background-threads <count>
   --rocksdb-low-pri-background-threads <count>
   --rocksdb-blob-gc <true|false>
@@ -4948,6 +4978,8 @@ mod tests {
                 "4GiB",
                 "--rocksdb-max-write-buffer-number",
                 "8",
+                "--rocksdb-max-background-flushes",
+                "4",
                 "--rocksdb-high-pri-background-threads",
                 "8",
                 "--rocksdb-low-pri-background-threads",
@@ -4981,6 +5013,7 @@ mod tests {
         assert_eq!(config.rocksdb_write_buffer_size, 512 << 20);
         assert_eq!(config.rocksdb_db_write_buffer_size, 4 << 30);
         assert_eq!(config.rocksdb_max_write_buffer_number, 8);
+        assert_eq!(config.rocksdb_max_background_flushes, Some(4));
         assert_eq!(config.rocksdb_high_pri_background_threads, 8);
         assert_eq!(config.rocksdb_low_pri_background_threads, 6);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
