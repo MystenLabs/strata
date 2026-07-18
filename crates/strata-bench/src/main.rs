@@ -83,6 +83,8 @@ const DEFAULT_STARTING_EPOCH: Epoch = 1;
 const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
 const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE: usize = 512 << 20;
+const DEFAULT_ROCKSDB_DB_WRITE_BUFFER_SIZE: usize = 1 << 30;
+const DEFAULT_ROCKSDB_MAX_WRITE_BUFFER_NUMBER: usize = 2;
 const DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS: usize = 4;
 const DEFAULT_ROCKSDB_LOW_PRI_BACKGROUND_THREADS: usize = 1;
 const DEFAULT_DELETE_PERCENT: f64 = 50.0;
@@ -345,6 +347,8 @@ struct Config {
     rocksdb_min_blob_size: u64,
     rocksdb_blob_file_size: u64,
     rocksdb_write_buffer_size: usize,
+    rocksdb_db_write_buffer_size: usize,
+    rocksdb_max_write_buffer_number: usize,
     rocksdb_high_pri_background_threads: usize,
     rocksdb_low_pri_background_threads: usize,
     rocksdb_blob_gc: bool,
@@ -409,6 +413,8 @@ impl Config {
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
             rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
+            rocksdb_db_write_buffer_size: DEFAULT_ROCKSDB_DB_WRITE_BUFFER_SIZE,
+            rocksdb_max_write_buffer_number: DEFAULT_ROCKSDB_MAX_WRITE_BUFFER_NUMBER,
             rocksdb_high_pri_background_threads: DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS,
             rocksdb_low_pri_background_threads: DEFAULT_ROCKSDB_LOW_PRI_BACKGROUND_THREADS,
             rocksdb_blob_gc: true,
@@ -545,6 +551,14 @@ impl Config {
                     config.rocksdb_write_buffer_size =
                         parse_size(&next_value(&mut args, "--rocksdb-write-buffer-size")?)?
                 }
+                "--rocksdb-db-write-buffer-size" => {
+                    config.rocksdb_db_write_buffer_size =
+                        parse_size(&next_value(&mut args, "--rocksdb-db-write-buffer-size")?)?
+                }
+                "--rocksdb-max-write-buffer-number" => {
+                    config.rocksdb_max_write_buffer_number =
+                        parse_usize(&next_value(&mut args, "--rocksdb-max-write-buffer-number")?)?
+                }
                 "--rocksdb-high-pri-background-threads" => {
                     config.rocksdb_high_pri_background_threads = parse_usize(&next_value(
                         &mut args,
@@ -680,6 +694,11 @@ impl Config {
         }
         if config.rocksdb_write_buffer_size == 0 {
             return Err("rocksdb_write_buffer_size must be non-zero".to_owned());
+        }
+        if !(2..=i32::MAX as usize).contains(&config.rocksdb_max_write_buffer_number) {
+            return Err(
+                "rocksdb_max_write_buffer_number must be between 2 and i32::MAX".to_owned(),
+            );
         }
         if config.rocksdb_high_pri_background_threads > i32::MAX as usize {
             return Err("rocksdb_high_pri_background_threads exceeds i32::MAX".to_owned());
@@ -2799,6 +2818,8 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     options.set_min_blob_size(config.rocksdb_min_blob_size);
     options.set_blob_file_size(config.rocksdb_blob_file_size);
     options.set_write_buffer_size(config.rocksdb_write_buffer_size);
+    options.set_db_write_buffer_size(config.rocksdb_db_write_buffer_size);
+    options.set_max_write_buffer_number(config.rocksdb_max_write_buffer_number as i32);
     options.set_enable_blob_gc(config.rocksdb_blob_gc);
     options.set_blob_gc_age_cutoff(config.rocksdb_blob_gc_age_cutoff);
     options.set_blob_gc_force_threshold(config.rocksdb_blob_gc_force_threshold);
@@ -3595,6 +3616,14 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!(
         "rocksdb_write_buffer_size={}",
         config.rocksdb_write_buffer_size
+    );
+    println!(
+        "rocksdb_db_write_buffer_size={}",
+        config.rocksdb_db_write_buffer_size
+    );
+    println!(
+        "rocksdb_max_write_buffer_number={}",
+        config.rocksdb_max_write_buffer_number
     );
     println!(
         "rocksdb_high_pri_background_threads={}",
@@ -4725,6 +4754,10 @@ options:
   --rocksdb-min-blob-size <bytes|KiB|MiB|GiB>
   --rocksdb-blob-file-size <bytes|KiB|MiB|GiB>
   --rocksdb-write-buffer-size <bytes|KiB|MiB|GiB>
+  --rocksdb-db-write-buffer-size <bytes|KiB|MiB|GiB>
+                                        total memtable budget; 0 disables the DB-wide limit
+  --rocksdb-max-write-buffer-number <count>
+                                        maximum active and immutable memtables; minimum 2
   --rocksdb-high-pri-background-threads <count>
   --rocksdb-low-pri-background-threads <count>
   --rocksdb-blob-gc <true|false>
@@ -4911,6 +4944,10 @@ mod tests {
                 "true",
                 "--rocksdb-write-buffer-size",
                 "512MiB",
+                "--rocksdb-db-write-buffer-size",
+                "4GiB",
+                "--rocksdb-max-write-buffer-number",
+                "8",
                 "--rocksdb-high-pri-background-threads",
                 "8",
                 "--rocksdb-low-pri-background-threads",
@@ -4942,6 +4979,8 @@ mod tests {
         assert!(config.rocksdb_disable_auto_compactions);
         assert!(config.rocksdb_disable_wal);
         assert_eq!(config.rocksdb_write_buffer_size, 512 << 20);
+        assert_eq!(config.rocksdb_db_write_buffer_size, 4 << 30);
+        assert_eq!(config.rocksdb_max_write_buffer_number, 8);
         assert_eq!(config.rocksdb_high_pri_background_threads, 8);
         assert_eq!(config.rocksdb_low_pri_background_threads, 6);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
