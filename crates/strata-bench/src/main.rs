@@ -40,8 +40,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use prometheus::{Encoder, GaugeVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
-use rocksdb::{DB, Env, PerfContext, PerfStatsLevel, WriteOptions, perf::set_perf_stats};
+use prometheus::{
+    Encoder, GaugeVec, IntCounter, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+};
+use rocksdb::{
+    DB, Env, PerfContext, PerfStatsLevel, WriteOptions, perf::set_perf_stats, statistics::Ticker,
+};
 use serde::{Deserialize, Serialize};
 use serde_with::{Bytes, serde_as};
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
@@ -80,6 +84,7 @@ const DEFAULT_ROCKSDB_MIN_BLOB_SIZE: u64 = 1;
 const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
 const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE: usize = 512 << 20;
 const DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS: usize = 4;
+const DEFAULT_ROCKSDB_LOW_PRI_BACKGROUND_THREADS: usize = 1;
 const DEFAULT_DELETE_PERCENT: f64 = 50.0;
 const DEFAULT_DELETE_SEED: u64 = 0xd1e7_e001_cafe_f00d;
 const DEFAULT_DELETE_VERIFY_SAMPLES: usize = 1024;
@@ -96,6 +101,7 @@ const DEFAULT_ROCKSDB_BLOB_GC_FORCE_THRESHOLD: f64 = 1.0;
 const ROCKSDB_BLOBDB_CF_CLASS: &str = "rocksdb_blobdb";
 const DEFAULT_METRICS_DRAIN_SECONDS: u64 = 30;
 const ROCKSDB_PERF_METRICS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+const ROCKSDB_BLOBDB_METRICS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const BENCH_SEGMENT_ID: u64 = 1;
 
 /// Stores blob payloads using Serde's byte-buffer path instead of treating every byte as one
@@ -340,6 +346,7 @@ struct Config {
     rocksdb_blob_file_size: u64,
     rocksdb_write_buffer_size: usize,
     rocksdb_high_pri_background_threads: usize,
+    rocksdb_low_pri_background_threads: usize,
     rocksdb_blob_gc: bool,
     rocksdb_blob_gc_age_cutoff: f64,
     rocksdb_blob_gc_force_threshold: f64,
@@ -403,6 +410,7 @@ impl Config {
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
             rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
             rocksdb_high_pri_background_threads: DEFAULT_ROCKSDB_HIGH_PRI_BACKGROUND_THREADS,
+            rocksdb_low_pri_background_threads: DEFAULT_ROCKSDB_LOW_PRI_BACKGROUND_THREADS,
             rocksdb_blob_gc: true,
             rocksdb_blob_gc_age_cutoff: DEFAULT_ROCKSDB_BLOB_GC_AGE_CUTOFF,
             rocksdb_blob_gc_force_threshold: DEFAULT_ROCKSDB_BLOB_GC_FORCE_THRESHOLD,
@@ -543,6 +551,12 @@ impl Config {
                         "--rocksdb-high-pri-background-threads",
                     )?)?
                 }
+                "--rocksdb-low-pri-background-threads" => {
+                    config.rocksdb_low_pri_background_threads = parse_usize(&next_value(
+                        &mut args,
+                        "--rocksdb-low-pri-background-threads",
+                    )?)?
+                }
                 "--rocksdb-blob-gc" => {
                     config.rocksdb_blob_gc =
                         parse_bool(&next_value(&mut args, "--rocksdb-blob-gc")?)?
@@ -669,6 +683,9 @@ impl Config {
         }
         if config.rocksdb_high_pri_background_threads > i32::MAX as usize {
             return Err("rocksdb_high_pri_background_threads exceeds i32::MAX".to_owned());
+        }
+        if config.rocksdb_low_pri_background_threads > i32::MAX as usize {
+            return Err("rocksdb_low_pri_background_threads exceeds i32::MAX".to_owned());
         }
         if config.max_unsealed_segments < 2 {
             return Err("--max-unsealed-segments must be at least 2".to_owned());
@@ -1226,14 +1243,14 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         BenchCase::StorePutArc => run_store_put_arc(&config, &bench_metrics),
         BenchCase::StoreGet => run_store_get(&config, &bench_metrics),
         BenchCase::StoreDelete => run_store_delete(&config, &bench_metrics),
-        BenchCase::RocksDbBlobDbPut => run_rocksdb_blobdb_put(&config),
+        BenchCase::RocksDbBlobDbPut => run_rocksdb_blobdb_put(&config, &bench_metrics),
         BenchCase::RocksDbBlobDbGet => {
             run_rocksdb_blobdb_get(&config, &bench_metrics, RocksDbGetMode::Decoded)
         }
         BenchCase::RocksDbBlobDbGetPinned => {
             run_rocksdb_blobdb_get(&config, &bench_metrics, RocksDbGetMode::Pinned)
         }
-        BenchCase::RocksDbBlobDbDelete => run_rocksdb_blobdb_delete(&config),
+        BenchCase::RocksDbBlobDbDelete => run_rocksdb_blobdb_delete(&config, &bench_metrics),
     };
 
     if bench_metrics.is_enabled() && config.metrics_drain_seconds != 0 {
@@ -1589,9 +1606,13 @@ fn run_store_delete(
     Ok(())
 }
 
-fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_rocksdb_blobdb_put(
+    config: &Config,
+    bench_metrics: &BenchMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
+    let _metrics_reporter = bench_metrics.start_blobdb_reporter(&db)?;
     let mut timings = Vec::with_capacity(config.ops);
     let mut phases = PhaseTimings::new("rocksdb_put", config.ops);
     let started = Instant::now();
@@ -1601,7 +1622,13 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
         let key = key.as_bytes().to_vec();
         let op_started = Instant::now();
         let phase_started = Instant::now();
-        insert_rocksdb_blobdb(&db, &key, &payload, config.rocksdb_disable_wal)?;
+        insert_rocksdb_blobdb(
+            &db,
+            &key,
+            &payload,
+            config.rocksdb_disable_wal,
+            bench_metrics.blobdb.as_ref(),
+        )?;
         phases.primary.push(phase_started.elapsed());
         if let Some(sync_elapsed) = record_sync_timed(config.sync_every, op + 1, || {
             flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)
@@ -1625,9 +1652,13 @@ fn run_rocksdb_blobdb_put(config: &Config) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn run_rocksdb_blobdb_delete(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_rocksdb_blobdb_delete(
+    config: &Config,
+    bench_metrics: &BenchMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
+    let _metrics_reporter = bench_metrics.start_blobdb_reporter(&db)?;
     let keys = (0..config.ops)
         .map(|op| bench_key(b"rocksdb-delete-key-", op))
         .map(|result| result.map(|key| key.as_bytes().to_vec()))
@@ -1635,7 +1666,13 @@ fn run_rocksdb_blobdb_delete(config: &Config) -> Result<(), Box<dyn std::error::
     let empty_io = process_io_snapshot()?;
 
     for key in &keys {
-        insert_rocksdb_blobdb(&db, key, &payload, config.rocksdb_disable_wal)?;
+        insert_rocksdb_blobdb(
+            &db,
+            key,
+            &payload,
+            config.rocksdb_disable_wal,
+            bench_metrics.blobdb.as_ref(),
+        )?;
     }
     flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
     db.flush()?;
@@ -1656,7 +1693,13 @@ fn run_rocksdb_blobdb_delete(config: &Config) -> Result<(), Box<dyn std::error::
     for (completed, key_index) in delete_indexes.iter().copied().enumerate() {
         let op_started = Instant::now();
         let phase_started = Instant::now();
-        delete_rocksdb_blobdb(&db, &keys[key_index], config.rocksdb_disable_wal)?;
+        delete_rocksdb_blobdb(
+            &db,
+            &keys[key_index],
+            config.rocksdb_disable_wal,
+            config.payload_size,
+            bench_metrics.blobdb.as_ref(),
+        )?;
         phases.primary.push(phase_started.elapsed());
         if let Some(sync_elapsed) = record_sync_timed(config.sync_every, completed + 1, || {
             flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)
@@ -1683,7 +1726,13 @@ fn run_rocksdb_blobdb_delete(config: &Config) -> Result<(), Box<dyn std::error::
                     let key = bench_key(b"rocksdb-post-delete-key-", index)?
                         .as_bytes()
                         .to_vec();
-                    insert_rocksdb_blobdb(&db, &key, &payload, config.rocksdb_disable_wal)?;
+                    insert_rocksdb_blobdb(
+                        &db,
+                        &key,
+                        &payload,
+                        config.rocksdb_disable_wal,
+                        bench_metrics.blobdb.as_ref(),
+                    )?;
                 }
                 SteadyAction::GetOriginal(index) => {
                     let value = db.get(&keys[index])?;
@@ -1712,7 +1761,13 @@ fn run_rocksdb_blobdb_delete(config: &Config) -> Result<(), Box<dyn std::error::
                     let key = bench_key(b"rocksdb-post-delete-key-", index)?
                         .as_bytes()
                         .to_vec();
-                    delete_rocksdb_blobdb(&db, &key, config.rocksdb_disable_wal)?;
+                    delete_rocksdb_blobdb(
+                        &db,
+                        &key,
+                        config.rocksdb_disable_wal,
+                        config.payload_size,
+                        bench_metrics.blobdb.as_ref(),
+                    )?;
                 }
             }
             Ok(())
@@ -1806,6 +1861,7 @@ fn run_rocksdb_blobdb_get(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload = BlobDbValue(payload(config.payload_size));
     let db = open_typed_rocksdb_blobdb(config)?;
+    let _metrics_reporter = bench_metrics.start_blobdb_reporter(&db)?;
     let read_set_size = config.effective_read_set_size();
     let key_prefix: &[u8] = if config.reuse_existing {
         b"rocksdb-key-"
@@ -1819,7 +1875,13 @@ fn run_rocksdb_blobdb_get(
 
     if !config.reuse_existing {
         for key in &keys {
-            insert_rocksdb_blobdb(&db, key, &payload, config.rocksdb_disable_wal)?;
+            insert_rocksdb_blobdb(
+                &db,
+                key,
+                &payload,
+                config.rocksdb_disable_wal,
+                bench_metrics.blobdb.as_ref(),
+            )?;
         }
         flush_typed_rocksdb_wal(db.rocksdb.as_ref(), true)?;
     }
@@ -2643,16 +2705,36 @@ fn delete_rocksdb_blobdb(
     db: &BlobDbMap,
     key: &Vec<u8>,
     disable_wal: bool,
+    payload_size: usize,
+    bench_metrics: Option<&BlobDbBenchMetrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !disable_wal {
         db.remove(key)?;
+        if let Some(metrics) = bench_metrics {
+            metrics.record_retire(payload_size);
+        }
         return Ok(());
     }
 
+    let db_metrics = DBMetrics::get();
+    let timer = db_metrics
+        .op_metrics
+        .rocksdb_delete_latency_seconds
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .start_timer();
     let key_buf = be_fix_int_ser(key)?;
     let mut write_options = WriteOptions::default();
     write_options.disable_wal(true);
     db.rocksdb.delete_cf(&db.cf()?, key_buf, &write_options)?;
+    db_metrics
+        .op_metrics
+        .rocksdb_deletes
+        .with_label_values(&[ROCKSDB_BLOBDB_CF_CLASS])
+        .inc();
+    timer.stop_and_record();
+    if let Some(metrics) = bench_metrics {
+        metrics.record_retire(payload_size);
+    }
     Ok(())
 }
 
@@ -2661,9 +2743,13 @@ fn insert_rocksdb_blobdb(
     key: &Vec<u8>,
     value: &BlobDbValue,
     disable_wal: bool,
+    bench_metrics: Option<&BlobDbBenchMetrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !disable_wal {
         db.insert(key, value)?;
+        if let Some(metrics) = bench_metrics {
+            metrics.record_put(value.0.len());
+        }
         return Ok(());
     }
 
@@ -2696,6 +2782,9 @@ fn insert_rocksdb_blobdb(
     db.rocksdb
         .put_cf(&db.cf()?, key_buf, value_buf, &write_options)?;
     timer.stop_and_record();
+    if let Some(metrics) = bench_metrics {
+        metrics.record_put(value.0.len());
+    }
     Ok(())
 }
 
@@ -2703,6 +2792,7 @@ fn open_typed_rocksdb_blobdb(config: &Config) -> Result<BlobDbMap, Box<dyn std::
     let mut options = default_db_options().options;
     let mut env = Env::new()?;
     env.set_high_priority_background_threads(config.rocksdb_high_pri_background_threads as i32);
+    env.set_low_priority_background_threads(config.rocksdb_low_pri_background_threads as i32);
     options.set_env(&env);
     options.create_if_missing(true);
     options.set_enable_blob_files(true);
@@ -2757,6 +2847,7 @@ fn should_sync(sync_every: usize, completed_ops: usize) -> bool {
 
 struct BenchMetrics {
     registry: Option<Arc<Registry>>,
+    blobdb: Option<BlobDbBenchMetrics>,
     rocksdb_perf: Option<RocksDbPerfPrometheusMetrics>,
     _server: Option<MetricsServer>,
 }
@@ -2766,6 +2857,7 @@ impl BenchMetrics {
         let Some(listen_addr) = config.metrics_listen.as_deref() else {
             return Ok(Self {
                 registry: None,
+                blobdb: None,
                 rocksdb_perf: None,
                 _server: None,
             });
@@ -2773,6 +2865,7 @@ impl BenchMetrics {
 
         let registry = Arc::new(Registry::new());
         DBMetrics::init(&registry);
+        let blobdb = Some(BlobDbBenchMetrics::new(&registry)?);
         let rocksdb_perf = config
             .rocksdb_get_profile
             .then(|| RocksDbPerfPrometheusMetrics::new(&registry))
@@ -2780,6 +2873,7 @@ impl BenchMetrics {
         let server = start_metrics_server(listen_addr, Arc::clone(&registry))?;
         Ok(Self {
             registry: Some(registry),
+            blobdb,
             rocksdb_perf,
             _server: Some(server),
         })
@@ -2804,6 +2898,132 @@ impl BenchMetrics {
 
     fn rocksdb_perf_is_enabled(&self) -> bool {
         self.rocksdb_perf.is_some()
+    }
+
+    fn start_blobdb_reporter(&self, db: &BlobDbMap) -> io::Result<Option<BlobDbMetricsReporter>> {
+        self.blobdb
+            .as_ref()
+            .map(|metrics| BlobDbMetricsReporter::start(Arc::clone(&db.rocksdb), metrics.clone()))
+            .transpose()
+    }
+}
+
+#[derive(Clone)]
+struct BlobDbBenchMetrics {
+    put_payload_bytes: IntCounter,
+    retired_payload_bytes: IntCounter,
+    live_garbage_bytes: IntGauge,
+    total_blob_file_bytes: IntGauge,
+    blob_file_bytes_written: IntGauge,
+    gc_bytes_relocated: IntGauge,
+}
+
+impl BlobDbBenchMetrics {
+    fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
+        let put_payload_bytes = IntCounter::new(
+            "strata_bench_blobdb_put_payload_bytes_total",
+            "Logical BlobDB value bytes accepted by successful benchmark puts.",
+        )?;
+        let retired_payload_bytes = IntCounter::new(
+            "strata_bench_blobdb_retired_payload_bytes_total",
+            "Logical BlobDB value bytes retired by successful benchmark point deletes.",
+        )?;
+        let live_garbage_bytes = IntGauge::new(
+            "strata_bench_blobdb_live_garbage_bytes",
+            "RocksDB-reported garbage bytes in live BlobDB blob files.",
+        )?;
+        let total_blob_file_bytes = IntGauge::new(
+            "strata_bench_blobdb_total_blob_file_bytes",
+            "RocksDB-reported total bytes in BlobDB blob files.",
+        )?;
+        let blob_file_bytes_written = IntGauge::new(
+            "strata_bench_blobdb_blob_file_bytes_written",
+            "Cumulative physical bytes RocksDB has written to BlobDB blob files.",
+        )?;
+        let gc_bytes_relocated = IntGauge::new(
+            "strata_bench_blobdb_gc_bytes_relocated",
+            "Cumulative BlobDB value bytes RocksDB has copied forward during garbage collection.",
+        )?;
+
+        registry.register(Box::new(put_payload_bytes.clone()))?;
+        registry.register(Box::new(retired_payload_bytes.clone()))?;
+        registry.register(Box::new(live_garbage_bytes.clone()))?;
+        registry.register(Box::new(total_blob_file_bytes.clone()))?;
+        registry.register(Box::new(blob_file_bytes_written.clone()))?;
+        registry.register(Box::new(gc_bytes_relocated.clone()))?;
+
+        Ok(Self {
+            put_payload_bytes,
+            retired_payload_bytes,
+            live_garbage_bytes,
+            total_blob_file_bytes,
+            blob_file_bytes_written,
+            gc_bytes_relocated,
+        })
+    }
+
+    fn record_put(&self, payload_bytes: usize) {
+        self.put_payload_bytes.inc_by(payload_bytes as u64);
+    }
+
+    fn record_retire(&self, payload_bytes: usize) {
+        self.retired_payload_bytes.inc_by(payload_bytes as u64);
+    }
+
+    fn update_blob_properties(&self, db: &RocksDB) {
+        self.blob_file_bytes_written.set(saturating_i64(
+            db.db_options()
+                .get_ticker_count(Ticker::BlobDbBlobFileBytesWritten),
+        ));
+        self.gc_bytes_relocated.set(saturating_i64(
+            db.db_options()
+                .get_ticker_count(Ticker::BlobDbGcBytesRelocated),
+        ));
+        let Some(db) = standard_rocksdb(db) else {
+            return;
+        };
+        if let Ok(Some(value)) = db.property_int_value("rocksdb.live-blob-file-garbage-size") {
+            self.live_garbage_bytes.set(saturating_i64(value));
+        }
+        if let Ok(Some(value)) = db.property_int_value("rocksdb.total-blob-file-size") {
+            self.total_blob_file_bytes.set(saturating_i64(value));
+        }
+    }
+}
+
+struct BlobDbMetricsReporter {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl BlobDbMetricsReporter {
+    fn start(db: Arc<RocksDB>, metrics: BlobDbBenchMetrics) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reporter_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("strata-bench-blobdb-metrics".to_owned())
+            .spawn(move || {
+                while !reporter_stop.load(Ordering::Acquire) {
+                    metrics.update_blob_properties(db.as_ref());
+                    thread::park_timeout(ROCKSDB_BLOBDB_METRICS_PUBLISH_INTERVAL);
+                }
+                metrics.update_blob_properties(db.as_ref());
+            })
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for BlobDbMetricsReporter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
     }
 }
 
@@ -3379,6 +3599,10 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!(
         "rocksdb_high_pri_background_threads={}",
         config.rocksdb_high_pri_background_threads
+    );
+    println!(
+        "rocksdb_low_pri_background_threads={}",
+        config.rocksdb_low_pri_background_threads
     );
     println!("rocksdb_blob_gc={}", config.rocksdb_blob_gc);
     println!(
@@ -4502,6 +4726,7 @@ options:
   --rocksdb-blob-file-size <bytes|KiB|MiB|GiB>
   --rocksdb-write-buffer-size <bytes|KiB|MiB|GiB>
   --rocksdb-high-pri-background-threads <count>
+  --rocksdb-low-pri-background-threads <count>
   --rocksdb-blob-gc <true|false>
   --rocksdb-blob-gc-age-cutoff <0..1>
   --rocksdb-blob-gc-force-threshold <0..1>
@@ -4611,6 +4836,32 @@ mod tests {
     }
 
     #[test]
+    fn blobdb_logical_byte_metrics_are_published() {
+        let registry = Registry::new();
+        let metrics = BlobDbBenchMetrics::new(&registry).expect("BlobDB metrics should register");
+
+        metrics.record_put(2 << 20);
+        metrics.record_retire(1 << 20);
+        metrics.live_garbage_bytes.set(3 << 20);
+        metrics.total_blob_file_bytes.set(4 << 20);
+        metrics.blob_file_bytes_written.set(5 << 20);
+        metrics.gc_bytes_relocated.set(6 << 20);
+
+        let mut encoded = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut encoded)
+            .expect("BlobDB metrics should encode");
+        let encoded = String::from_utf8(encoded).expect("Prometheus output should be UTF-8");
+
+        assert!(encoded.contains("strata_bench_blobdb_put_payload_bytes_total 2097152"));
+        assert!(encoded.contains("strata_bench_blobdb_retired_payload_bytes_total 1048576"));
+        assert!(encoded.contains("strata_bench_blobdb_live_garbage_bytes 3145728"));
+        assert!(encoded.contains("strata_bench_blobdb_total_blob_file_bytes 4194304"));
+        assert!(encoded.contains("strata_bench_blobdb_blob_file_bytes_written 5242880"));
+        assert!(encoded.contains("strata_bench_blobdb_gc_bytes_relocated 6291456"));
+    }
+
+    #[test]
     fn read_key_sequence_round_robins_for_sequential_pattern() {
         let indexes = ReadKeySequence::new(ReadPattern::Sequential, 3, 99)
             .take(8)
@@ -4662,6 +4913,8 @@ mod tests {
                 "512MiB",
                 "--rocksdb-high-pri-background-threads",
                 "8",
+                "--rocksdb-low-pri-background-threads",
+                "6",
                 "--metrics-listen",
                 "127.0.0.1:0",
                 "--metrics-drain-seconds",
@@ -4690,6 +4943,7 @@ mod tests {
         assert!(config.rocksdb_disable_wal);
         assert_eq!(config.rocksdb_write_buffer_size, 512 << 20);
         assert_eq!(config.rocksdb_high_pri_background_threads, 8);
+        assert_eq!(config.rocksdb_low_pri_background_threads, 6);
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(config.metrics_drain_seconds, 7);
         assert_eq!(config.max_unsealed_segments, 12);
