@@ -64,6 +64,7 @@ const DEFAULT_DELETE_WORKERS: usize = 4;
 const DEFAULT_DELETE_LAG_SLO: Duration = Duration::from_secs(30);
 const DEFAULT_DELETE_TIMELY_PERCENT: f64 = 99.0;
 const DEFAULT_CONTROL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_CONTROLLER_DEBOUNCE_WINDOWS: usize = 3;
 const DEFAULT_WRITER_INCREASE_PERCENT: u64 = 25;
 const DEFAULT_WRITER_DECREASE_PERCENT: u64 = 25;
 const DEFAULT_SPACE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
@@ -155,6 +156,7 @@ struct Config {
     delete_lag_slo: Duration,
     delete_timely_percent: f64,
     control_interval: Duration,
+    controller_debounce_windows: usize,
     writer_increase_percent: u64,
     writer_decrease_percent: u64,
     sync_interval: Duration,
@@ -203,6 +205,7 @@ impl Config {
             delete_lag_slo: DEFAULT_DELETE_LAG_SLO,
             delete_timely_percent: DEFAULT_DELETE_TIMELY_PERCENT,
             control_interval: DEFAULT_CONTROL_INTERVAL,
+            controller_debounce_windows: DEFAULT_CONTROLLER_DEBOUNCE_WINDOWS,
             writer_increase_percent: DEFAULT_WRITER_INCREASE_PERCENT,
             writer_decrease_percent: DEFAULT_WRITER_DECREASE_PERCENT,
             sync_interval: Duration::ZERO,
@@ -282,6 +285,10 @@ impl Config {
                 }
                 "--control-interval" => {
                     config.control_interval = parse_duration(&next_value(&mut args, &arg)?)?
+                }
+                "--controller-debounce-windows" => {
+                    config.controller_debounce_windows =
+                        parse_nonzero_usize(&next_value(&mut args, &arg)?)?
                 }
                 "--writer-increase-percent" => {
                     config.writer_increase_percent = parse_u64(&next_value(&mut args, &arg)?)?
@@ -601,6 +608,7 @@ struct HarnessMetrics {
     active_write_workers: IntGauge,
     client_load_active: IntGauge,
     controller_healthy: IntGauge,
+    controller_debounce_streak_windows: IntGauge,
     controller_read_p99_seconds: Gauge,
     controller_read_ops_per_second: Gauge,
     overdue_delete_keys: IntGauge,
@@ -772,6 +780,10 @@ impl HarnessMetrics {
                 "strata_realistic_bench_controller_healthy",
                 "One when the latest read/delete service window met its obligations."
             ),
+            controller_debounce_streak_windows: int_gauge!(
+                "strata_realistic_bench_controller_debounce_streak_windows",
+                "Consecutive controller windows with the current health result since the last writer-count change."
+            ),
             controller_read_p99_seconds: gauge!(
                 "strata_realistic_bench_controller_read_p99_seconds",
                 "Read p99 observed in the latest controller interval."
@@ -865,6 +877,7 @@ impl HarnessMetrics {
             &metrics.active_write_workers,
             &metrics.client_load_active,
             &metrics.controller_healthy,
+            &metrics.controller_debounce_streak_windows,
             &metrics.overdue_delete_keys,
             &metrics.directory_apparent_bytes,
             &metrics.directory_allocated_bytes,
@@ -1644,6 +1657,7 @@ fn run_syncer(context: Arc<WorkloadContext>) {
 }
 
 fn run_controller(context: Arc<WorkloadContext>) {
+    let mut debounce = ControllerDebounce::default();
     context
         .metrics
         .active_write_workers
@@ -1699,6 +1713,15 @@ fn run_controller(context: Arc<WorkloadContext>) {
             && window.put_errors == 0
             && window.delete_errors == 0;
         context.metrics.controller_healthy.set(i64::from(healthy));
+        let should_adjust = debounce.observe(healthy, context.config.controller_debounce_windows);
+        context
+            .metrics
+            .controller_debounce_streak_windows
+            .set(debounce.streak_windows as i64);
+        if !should_adjust {
+            continue;
+        }
+
         let current = context.active_write_workers.load(Ordering::Acquire);
         let next = next_writer_count(
             current,
@@ -1710,6 +1733,29 @@ fn run_controller(context: Arc<WorkloadContext>) {
         );
         context.active_write_workers.store(next, Ordering::Release);
         context.metrics.active_write_workers.set(next as i64);
+        debounce.reset_streak();
+    }
+}
+
+#[derive(Debug, Default)]
+struct ControllerDebounce {
+    last_healthy: Option<bool>,
+    streak_windows: usize,
+}
+
+impl ControllerDebounce {
+    fn observe(&mut self, healthy: bool, required_windows: usize) -> bool {
+        if self.last_healthy == Some(healthy) {
+            self.streak_windows = self.streak_windows.saturating_add(1);
+        } else {
+            self.last_healthy = Some(healthy);
+            self.streak_windows = 1;
+        }
+        self.streak_windows >= required_windows
+    }
+
+    fn reset_streak(&mut self) {
+        self.streak_windows = 0;
     }
 }
 
@@ -2033,6 +2079,14 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "delete_timely_percent_required={:.3}",
         config.delete_timely_percent
+    );
+    println!(
+        "controller_interval_seconds={:.3}",
+        config.control_interval.as_secs_f64()
+    );
+    println!(
+        "controller_debounce_windows={}",
+        config.controller_debounce_windows
     );
     println!(
         "sync_interval_seconds={:.3}",
@@ -2506,6 +2560,7 @@ workload:
   --delete-lag-slo <duration>            default 30s
   --delete-timely-percent <0..100>       required timely deletes; default 99
   --control-interval <duration>          AIMD window; default 5s
+  --controller-debounce-windows <count>  consecutive equal-health windows required per writer change; default 3
   --writer-increase-percent <count>      healthy-window additive step; default 25
   --writer-decrease-percent <count>      unhealthy-window multiplicative cut; default 25
   --sync-interval <duration>             explicit sync cadence; 0 (default) disables
@@ -2552,6 +2607,23 @@ mod tests {
         assert_eq!(config.engine, EngineKind::BlobDb);
         assert_eq!(config.payload_size, 1 << 20);
         assert!(config.sync_interval.is_zero());
+        assert_eq!(config.controller_debounce_windows, 3);
+    }
+
+    #[test]
+    fn controller_debounce_requires_consecutive_equal_health_windows() {
+        let mut debounce = ControllerDebounce::default();
+
+        assert!(!debounce.observe(true, 3));
+        assert!(!debounce.observe(true, 3));
+        assert!(!debounce.observe(false, 3));
+        assert_eq!(debounce.streak_windows, 1);
+        assert!(!debounce.observe(false, 3));
+        assert!(debounce.observe(false, 3));
+
+        debounce.reset_streak();
+        assert!(!debounce.observe(false, 3));
+        assert_eq!(debounce.streak_windows, 1);
     }
 
     #[test]

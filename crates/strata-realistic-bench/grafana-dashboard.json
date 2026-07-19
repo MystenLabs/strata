@@ -157,6 +157,12 @@
           "legendFormat": "{{engine}} client load active",
           "range": true,
           "refId": "C"
+        },
+        {
+          "expr": "strata_realistic_bench_controller_debounce_streak_windows{job=\"strata-bench\",engine=~\"$engine\"}",
+          "legendFormat": "{{engine}} debounce streak",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "Adaptive Writer Controller",
