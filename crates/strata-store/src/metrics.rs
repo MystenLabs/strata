@@ -114,6 +114,7 @@ struct PrometheusMetrics {
     gc_in_flight_workers: IntGauge,
     gc_admitted_total: IntCounter,
     gc_run_failures_total: IntCounter,
+    gc_run_failures_by_reason_total: IntCounterVec,
     gc_consecutive_run_failures: IntGauge,
     gc_skipped_by_tuner_total: IntCounter,
     gc_tuner_increases_total: IntCounter,
@@ -623,6 +624,13 @@ impl StrataStoreMetrics {
                     &labels,
                     "gc_run_failures_total",
                     "Total admitted background Strata GC attempts that ended in an error.",
+                )?,
+                gc_run_failures_by_reason_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "gc_run_failures_by_reason_total",
+                    "Total admitted background Strata GC attempts that ended in an error, classified by bounded reason.",
+                    &["reason"],
                 )?,
                 gc_consecutive_run_failures: register_gauge(
                     registry,
@@ -1135,9 +1143,13 @@ impl StrataStoreMetrics {
         }
     }
 
-    pub(crate) fn record_gc_run_failure(&self) {
+    pub(crate) fn record_gc_run_failure(&self, reason: &str) {
         if let Some(metrics) = &self.inner {
             metrics.gc_run_failures_total.inc();
+            metrics
+                .gc_run_failures_by_reason_total
+                .with_label_values(&[reason])
+                .inc();
             metrics.gc_consecutive_run_failures.inc();
         }
     }
@@ -1468,11 +1480,27 @@ mod tests {
         let registry = Registry::new();
         let metrics = StrataStoreMetrics::new(&registry, "test").unwrap();
 
-        metrics.record_gc_run_failure();
-        metrics.record_gc_run_failure();
+        metrics.record_gc_run_failure("io");
+        metrics.record_gc_run_failure("source_not_sealed");
         assert_eq!(
             metric_value(&registry, "strata_store_gc_run_failures_total"),
             2.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_gc_run_failures_by_reason_total",
+                &[("reason", "io")],
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_gc_run_failures_by_reason_total",
+                &[("reason", "source_not_sealed")],
+            ),
+            1.0
         );
         assert_eq!(
             metric_value(&registry, "strata_store_gc_consecutive_run_failures"),

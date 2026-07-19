@@ -935,9 +935,15 @@ impl GcWorker {
                                 consecutive_failures = 0;
                                 self.executor.metrics.record_gc_run_success();
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 consecutive_failures = consecutive_failures.saturating_add(1);
-                                self.executor.metrics.record_gc_run_failure();
+                                let reason = error.gc_failure_reason();
+                                self.executor.metrics.record_gc_run_failure(reason);
+                                let current_thread = std::thread::current();
+                                let worker = current_thread.name().unwrap_or("unnamed-gc-worker");
+                                eprintln!(
+                                    "background Strata GC run failed: worker={worker} reason={reason} worker_consecutive_failures={consecutive_failures} error={error:?}"
+                                );
                             }
                         }
                     }

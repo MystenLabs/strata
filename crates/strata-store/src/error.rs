@@ -213,3 +213,59 @@ pub enum Error {
         active_delta_log_lsn: StrataLsn,
     },
 }
+
+impl Error {
+    /// Returns a bounded Prometheus label for a background GC failure.
+    ///
+    /// The full error is emitted to stderr by the GC worker. This classification intentionally
+    /// excludes paths, segment ids, and error messages so the metric cannot create unbounded label
+    /// cardinality.
+    pub(crate) fn gc_failure_reason(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "io",
+            Self::Index(_) => "index",
+            Self::AccountingIndex(_) => "accounting_index",
+            Self::Segment(_) => "segment",
+            Self::GcSelection(_) => "selection",
+            Self::GcInvalidPlan(_) => "invalid_plan",
+            Self::WriteQueueClosed | Self::WriteResponseDropped | Self::GcQueueClosed => "queue",
+            Self::StoreHalted { .. } => "store_halted",
+            Self::InvariantViolation { .. } => "invariant_violation",
+            Self::GcMissingSourceSegment { .. } => "missing_source",
+            Self::GcMissingStagedOutput { .. } => "missing_staged_output",
+            Self::GcOutputSegmentExists { .. } => "output_exists",
+            Self::GcSourceSegmentNotSealed { .. } => "source_not_sealed",
+            Self::GcSourceSegmentNotEmpty { .. } => "source_not_empty",
+            Self::GcSourceSegmentInvalidPrefix { .. } => "invalid_source_prefix",
+            Self::GcOverlayPartialRecordRange { .. } => "overlay_partial_record",
+            Self::SealedSegmentMissing { .. }
+            | Self::SealedSegmentMissingLength { .. }
+            | Self::SealedSegmentMissingChecksum { .. }
+            | Self::SealedSegmentLengthMismatch { .. }
+            | Self::SealedSegmentChecksumMismatch { .. } => "sealed_segment_integrity",
+            _ => "other",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_failure_reasons_are_specific_and_bounded() {
+        let source_state_error = Error::GcSourceSegmentNotSealed {
+            segment_id: 7,
+            state: SegmentFileState::Deleted,
+        };
+        assert_eq!(source_state_error.gc_failure_reason(), "source_not_sealed");
+
+        let io_error = Error::Io {
+            path: PathBuf::from("/tmp/gc-output"),
+            source: std::io::Error::other("test failure"),
+        };
+        assert_eq!(io_error.gc_failure_reason(), "io");
+
+        assert_eq!(Error::InvalidConfig("test").gc_failure_reason(), "other");
+    }
+}
