@@ -263,7 +263,7 @@ impl Config {
                     config.read_workers = parse_nonzero_usize(&next_value(&mut args, &arg)?)?
                 }
                 "--read-ops-per-second" => {
-                    config.read_ops_per_second = parse_nonzero_u64(&next_value(&mut args, &arg)?)?
+                    config.read_ops_per_second = parse_u64(&next_value(&mut args, &arg)?)?
                 }
                 "--read-deleted-percent" => {
                     config.read_deleted_percent = parse_percent(&next_value(&mut args, &arg)?)?
@@ -1496,6 +1496,7 @@ fn run_deleter(worker_index: usize, context: Arc<WorkloadContext>) {
 }
 
 fn run_reader(worker_index: usize, context: Arc<WorkloadContext>) {
+    debug_assert!(context.config.read_ops_per_second > 0);
     let global_interval_ns = 1_000_000_000_u64
         .checked_div(context.config.read_ops_per_second)
         .unwrap_or(1)
@@ -2175,13 +2176,15 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 .spawn(move || run_deleter(worker_index, worker_context))?,
         );
     }
-    for worker_index in 0..config.read_workers {
-        let worker_context = Arc::clone(&context);
-        workers.push(
-            thread::Builder::new()
-                .name(format!("realistic-reader-{worker_index}"))
-                .spawn(move || run_reader(worker_index, worker_context))?,
-        );
+    if config.read_ops_per_second > 0 {
+        for worker_index in 0..config.read_workers {
+            let worker_context = Arc::clone(&context);
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("realistic-reader-{worker_index}"))
+                    .spawn(move || run_reader(worker_index, worker_context))?,
+            );
+        }
     }
     {
         let worker_context = Arc::clone(&context);
@@ -2439,14 +2442,6 @@ fn parse_u64(value: &str) -> Result<u64, String> {
         .map_err(|error| format!("invalid integer '{value}': {error}"))
 }
 
-fn parse_nonzero_u64(value: &str) -> Result<u64, String> {
-    let parsed = parse_u64(value)?;
-    if parsed == 0 {
-        return Err(format!("value must be non-zero, got '{value}'"));
-    }
-    Ok(parsed)
-}
-
 fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -2552,7 +2547,7 @@ workload:
   --min-write-workers <count>            default 1
   --max-write-workers <count>            default 64
   --read-workers <count>                 default 4
-  --read-ops-per-second <count>          aggregate read obligation; default 1000
+  --read-ops-per-second <count>          aggregate read obligation; 0 disables reads; default 1000
   --read-deleted-percent <0..100>        negative-read share; default 50
   --read-p99-slo <duration>              default 100ms
   --read-attainment-percent <0..100>     required target-rate attainment; default 95
@@ -2624,6 +2619,25 @@ mod tests {
         debounce.reset_streak();
         assert!(!debounce.observe(false, 3));
         assert_eq!(debounce.streak_windows, 1);
+    }
+
+    #[test]
+    fn zero_read_rate_disables_the_read_obligation() {
+        let config = Config::parse(
+            [
+                "--engine",
+                "strata",
+                "--root",
+                "/tmp/realistic",
+                "--read-ops-per-second",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("zero read rate should parse");
+
+        assert_eq!(config.read_ops_per_second, 0);
     }
 
     #[test]
