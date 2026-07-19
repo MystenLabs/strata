@@ -431,8 +431,8 @@ async fn gc_snapshot_reads_segment_metadata_from_one_index_view() {
     batch.write().unwrap();
 
     let accounting_snapshot = index.create_accounting_snapshot().unwrap();
-    let snapshot = index
-        .build_gc_snapshot(&accounting_snapshot)
+    let (snapshot, overlays) = index
+        .build_gc_snapshot_with_overlays(&accounting_snapshot)
         .unwrap()
         .unwrap();
 
@@ -442,6 +442,10 @@ async fn gc_snapshot_reads_segment_metadata_from_one_index_view() {
     assert_eq!(snapshot.segments[0].state, state);
     assert_eq!(snapshot.segments[0].summary, summary);
     assert!(!snapshot.segments[0].claimed);
+    assert_eq!(
+        overlays.get(&state.segment_id).unwrap().summary,
+        snapshot.segments[0].summary
+    );
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: 1_000,

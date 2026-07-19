@@ -3961,6 +3961,99 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
 }
 
 #[tokio::test]
+async fn gc_copy_uses_planning_snapshot_overlay_across_concurrent_retirement() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_RECORD_LEN * 4 - 1;
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+    let key_d = BlobKey::new(b"blob-d".to_vec()).unwrap();
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+    let lsn_d = store.put(&key_d, b"payload-d").unwrap();
+    store.sync().unwrap();
+    wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+    store.sync().unwrap();
+    wait_for_accounted_lsn(&store, lsn_d);
+
+    let ref_b = store
+        .index()
+        .get_blob_version(&version_key(&key_b, lsn_b))
+        .unwrap()
+        .unwrap()
+        .record_ref
+        .unwrap();
+    let ref_c = store
+        .index()
+        .get_blob_version(&version_key(&key_c, lsn_c))
+        .unwrap()
+        .unwrap()
+        .record_ref
+        .unwrap();
+    assert_eq!(ref_b.segment_id, FIRST_SEGMENT_ID);
+    assert_eq!(ref_c.segment_id, FIRST_SEGMENT_ID);
+
+    let first_tombstone_lsn = store.tombstone(&key_a).unwrap();
+    store.sync().unwrap();
+    wait_for_accounted_lsn(&store, first_tombstone_lsn);
+
+    let planner = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
+        min_reclaim_bytes: 1,
+        min_garbage_ratio_bps: 1,
+        min_exact_epoch_bucket_bytes: 1,
+        min_exact_epoch_distance: 1,
+        max_exact_epoch_extension_count: 1,
+        min_join_output_bytes: 1,
+        max_join_sources: 4,
+    });
+    let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    assert_eq!(prepared.plan.scenario, GcScenario::L0Compaction);
+    assert_eq!(prepared.plan.copied_bytes, ref_b.len + ref_c.len);
+
+    // Materialize another tombstone after planning. The live overlay in RocksDB now differs from
+    // the retained planning overlay, which previously caused CopyBytesMismatch during the scan.
+    let second_tombstone_lsn = store.tombstone(&key_b).unwrap();
+    store.sync().unwrap();
+    wait_for_accounted_lsn(&store, second_tombstone_lsn);
+    assert_eq!(
+        segment_summary(store.index(), FIRST_SEGMENT_ID).live_bytes,
+        ref_c.len
+    );
+
+    let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+    assert_eq!(copied.copied_records.len(), 2);
+    assert_eq!(
+        copied
+            .copied_records
+            .iter()
+            .map(|record| record.source.key.clone())
+            .collect::<Vec<_>>(),
+        vec![key_b.clone(), key_c.clone()]
+    );
+
+    let published = store.publish_prepared_gc_copy(copied).unwrap();
+    assert_eq!(published.skipped_records.len(), 1);
+    assert_eq!(published.skipped_records[0].source.key, key_b);
+    assert_eq!(published.published_records.len(), 1);
+    assert_eq!(published.published_records[0].source.key, key_c.clone());
+    assert_eq!(store.get(&key_b).unwrap(), None);
+    assert_eq!(store.get(&key_c).unwrap(), Some(b"payload-c".to_vec()));
+
+    // Keep the write LSN assertions explicit so the fixture cannot silently stop placing the
+    // intended records before the planning frontier.
+    assert!(lsn_a < lsn_b && lsn_b < lsn_c && lsn_c < lsn_d);
+}
+
+#[tokio::test]
 async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();

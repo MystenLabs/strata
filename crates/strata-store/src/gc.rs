@@ -40,6 +40,8 @@ pub struct PreparedGcPlan {
     pub accounting_snapshot: AccountingSnapshotGuard,
     /// Aggregate pure-planner recommendation.
     pub plan: GcPlan,
+    /// Source overlays captured from the same RocksDB snapshot as the aggregate plan.
+    source_overlays: BTreeMap<SegmentId, SegmentGcOverlay>,
     /// In-memory source segment claim held until this plan is copied or dropped.
     #[doc(hidden)]
     pub claim: Option<GcSourceClaimGuard>,
@@ -1213,7 +1215,10 @@ impl GcExecutor {
         }
 
         let accounting_snapshot = self.index.create_accounting_snapshot()?;
-        let Some(mut snapshot) = self.index.build_gc_snapshot(&accounting_snapshot)? else {
+        let Some((mut snapshot, snapshot_overlays)) = self
+            .index
+            .build_gc_snapshot_with_overlays(&accounting_snapshot)?
+        else {
             return Ok(None);
         };
         self.claims.mark_snapshot(&mut snapshot);
@@ -1222,10 +1227,25 @@ impl GcExecutor {
             let Some(claim) = self.claims.try_claim(source_segments) else {
                 continue;
             };
+            let source_overlays = copy_source_segment_ids(&plan)
+                .into_iter()
+                .map(|segment_id| {
+                    snapshot_overlays
+                        .get(&segment_id)
+                        .cloned()
+                        .map(|overlay| (segment_id, overlay))
+                        .ok_or_else(|| Error::InvariantViolation {
+                            reason: format!(
+                                "GC planning snapshot omitted overlay for selected source segment {segment_id}"
+                            ),
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
 
             return Ok(Some(PreparedGcPlan {
                 accounting_snapshot,
                 plan,
+                source_overlays,
                 claim: Some(claim),
             }));
         }
@@ -1242,6 +1262,7 @@ impl GcExecutor {
         let PreparedGcPlan {
             accounting_snapshot,
             plan,
+            source_overlays,
             claim,
         } = prepared;
         if !plan_has_copy_action(&plan) {
@@ -1255,7 +1276,7 @@ impl GcExecutor {
         }
 
         let staging_dir = create_gc_staging_dir(&self.config)?;
-        let copy_result = self.copy_gc_plan_to_staging(&staging_dir, &plan);
+        let copy_result = self.copy_gc_plan_to_staging(&staging_dir, &plan, &source_overlays);
         let (outputs, copied_records) = match copy_result {
             Ok(copy) => copy,
             Err(error) => {
@@ -1472,6 +1493,7 @@ impl GcExecutor {
         &self,
         staging_dir: &Path,
         plan: &GcPlan,
+        source_overlays: &BTreeMap<SegmentId, SegmentGcOverlay>,
     ) -> Result<(Vec<GcStagedOutputSegment>, Vec<GcStagedCopiedRecord>)> {
         let selector = GcCopySelector::new(plan)?;
         let mut copier = GcStagingCopier::new(
@@ -1481,7 +1503,15 @@ impl GcExecutor {
         );
 
         for segment_id in copy_source_segment_ids(plan) {
-            self.copy_gc_source_segment_to_staging(segment_id, &selector, &mut copier)?;
+            let overlay =
+                source_overlays
+                    .get(&segment_id)
+                    .ok_or_else(|| Error::InvariantViolation {
+                        reason: format!(
+                            "GC copy plan omitted snapshot overlay for source segment {segment_id}"
+                        ),
+                    })?;
+            self.copy_gc_source_segment_to_staging(segment_id, overlay, &selector, &mut copier)?;
         }
 
         selector.validate_copied_bytes(copier.copied_bytes())?;
@@ -1496,6 +1526,7 @@ impl GcExecutor {
     fn copy_gc_source_segment_to_staging(
         &self,
         segment_id: SegmentId,
+        overlay: &SegmentGcOverlay,
         selector: &GcCopySelector,
         copier: &mut GcStagingCopier<'_>,
     ) -> Result<()> {
@@ -1512,10 +1543,6 @@ impl GcExecutor {
         let sealed_len = state
             .sealed_len
             .ok_or(Error::SealedSegmentMissingLength { segment_id })?;
-        let overlay = self
-            .index
-            .get_segment_gc_overlay(segment_id)?
-            .unwrap_or_default();
         let path = gc_source_segment_path(&self.config, &state);
         let file_len = fs::metadata(&path)
             .map_err(|source| Error::Io {
@@ -1536,7 +1563,7 @@ impl GcExecutor {
             path: path.clone(),
             source,
         })?;
-        let mut classifier = OverlayRecordClassifier::new(segment_id, &overlay);
+        let mut classifier = OverlayRecordClassifier::new(segment_id, overlay);
         let mut offset = 0_u64;
 
         while offset < sealed_len {

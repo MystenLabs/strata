@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use strata_core::{
-    GcRelocation, RecordRef, SegmentId, SegmentOwner, ShardId, ShardInfo, StoreStateKey, StrataLsn,
+    GcRelocation, RecordRef, SegmentGcOverlay, SegmentId, SegmentOwner, ShardId, ShardInfo,
+    StoreStateKey, StrataLsn,
 };
 use strata_gc::{GcSnapshot, SegmentSnapshot};
 use typed_store::Map;
@@ -32,6 +33,23 @@ impl StrataIndex {
         &self,
         accounting_snapshot: &AccountingSnapshotGuard,
     ) -> Result<Option<GcSnapshot>> {
+        Ok(self
+            .build_gc_snapshot_with_overlays(accounting_snapshot)?
+            .map(|(snapshot, _)| snapshot))
+    }
+
+    /// Builds one GC planning view and captures every segment overlay from that same RocksDB
+    /// snapshot.
+    ///
+    /// Callers that execute a selected plan should retain the overlays for only its source
+    /// segments and discard the rest. Copying from those retained overlays keeps aggregate route
+    /// estimates and exact record selection on one metadata view. Later accounting changes remain
+    /// safe because the accounting snapshot guard retains their ref events for publish-time
+    /// reconciliation.
+    pub fn build_gc_snapshot_with_overlays(
+        &self,
+        accounting_snapshot: &AccountingSnapshotGuard,
+    ) -> Result<Option<(GcSnapshot, BTreeMap<SegmentId, SegmentGcOverlay>)>> {
         let snapshot = self.db.snapshot();
         let Some(current_epoch) = self
             .store_state
@@ -46,6 +64,7 @@ impl StrataIndex {
             .map_err(Error::from)?;
 
         let mut segments = Vec::new();
+        let mut overlays = BTreeMap::new();
         for result in self.segment_states.safe_iter_with_snapshot(&snapshot)? {
             let (_, state) = result?;
             if let SegmentOwner::Shard(shard) = state.owner
@@ -53,7 +72,12 @@ impl StrataIndex {
             {
                 continue;
             }
-            let summary = self.segment_gc_summary_with_snapshot(&snapshot, state.segment_id)?;
+            let overlay = self
+                .segment_gc_overlay
+                .get_with_snapshot(&snapshot, &state.segment_id)?
+                .unwrap_or_default();
+            let summary = overlay.summary.clone();
+            overlays.insert(state.segment_id, overlay);
             segments.push(SegmentSnapshot {
                 state,
                 summary,
@@ -62,22 +86,14 @@ impl StrataIndex {
         }
         segments.sort_by_key(|segment| (segment.state.owner, segment.state.segment_id));
 
-        Ok(Some(GcSnapshot {
-            current_epoch,
-            accounted_lsn: accounting_snapshot.accounted_lsn(),
-            segments,
-        }))
-    }
-
-    fn segment_gc_summary_with_snapshot(
-        &self,
-        snapshot: &typed_store::rocks::RocksDBSnapshot<'_>,
-        segment_id: SegmentId,
-    ) -> Result<strata_core::SegmentGcSummary> {
-        self.segment_gc_overlay
-            .get_with_snapshot(snapshot, &segment_id)
-            .map(|overlay| overlay.unwrap_or_default().summary)
-            .map_err(Error::from)
+        Ok(Some((
+            GcSnapshot {
+                current_epoch,
+                accounted_lsn: accounting_snapshot.accounted_lsn(),
+                segments,
+            },
+            overlays,
+        )))
     }
 
     /// Installs or updates a GC relocation forwarding row in the caller's atomic batch.
