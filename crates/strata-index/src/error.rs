@@ -12,4 +12,16 @@ pub enum Error {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    #[error("invalid LSM manifest: {0}")]
+    InvalidLsmManifest(String),
+
+    #[error("invalid LSM checkpoint: {0}")]
+    InvalidLsmCheckpoint(String),
+
+    #[error(transparent)]
+    Lsm(#[from] strata_lsm::Error),
+
+    #[error("invalid garbage-log sweep: {0}")]
+    InvalidGarbageSweep(String),
 }

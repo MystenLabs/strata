@@ -77,7 +77,7 @@ The main advantages for this workload are:
 
 - **Predictable payload layout**: blobs are appended to segment files named and tracked by `SegmentState`; the store owns rollover, sealing, verification, and recovery.
 - **Lower foreground write amplification**: payload writes are sequential appends, while RocksDB receives compact metadata and merge operands instead of large values.
-- **Explicit durability frontier**: `durable_lsn` is computed from fsynced segment offsets, fsynced accounting deltas, and RocksDB WAL state.
+- **Explicit durability frontier**: `published_lsn` is computed from fsynced segment offsets, fsynced accounting deltas, and RocksDB WAL state.
 - **Application-aware accounting**: `accounted_lsn`, segment ref events, and GC overlays materialize blob lifecycle transitions without scanning payload files on the hot path.
 - **Decoupled GC control**: metadata compaction does not automatically drive payload relocation; segment-copy, reclaim, and tiering work can be scheduled by disk pressure, garbage ratio, epoch expiry, or coldness.
 - **Cheap payload streaming**: reads resolve `BlobKey -> RecordRef` in RocksDB, then read or stream the payload directly from the segment file.
@@ -177,12 +177,12 @@ Write visibility vs durability:
 ```text
 put returns after:
   segment bytes written to OS
-  active-delta.log appended
+  blob-LSM WAL mutation appended
   RocksDB metadata batch committed
 
 put does not imply:
   segment fsync
-  active-delta.log fsync
+  blob-LSM WAL fsync
   RocksDB WAL fsync
 ```
 
@@ -190,16 +190,16 @@ Durability is published by `StrataStore::sync`:
 
 ```text
 sync
-  -> fsync active segment file
-  -> fsync active-delta.log
+  -> fsync pending segment files and blob-LSM WAL
   -> write segment durable_offset
-  -> compute durable_lsn
-  -> write store_state[DurableLsn]
-  -> write accounting active delta log state
+  -> write the exact LSM checkpoint
+  -> write store_state[PublishedLsn]
   -> RocksDB flush_wal(true)
 ```
 
-`durable_lsn` advances only while the next LSN is covered by durable payload bytes or is an epoch-only operation, and only up to the durable accounting delta frontier.
+`published_lsn` advances only to the LSN covered by the synced blob-LSM checkpoint. Recovery
+promotes a complete committed WAL tail, but rolls an incomplete unpublished tail back to the last
+published checkpoint.
 
 Rollover path:
 
@@ -222,7 +222,7 @@ SealWorker
   -> compute SHA-256 over sealed_len
   -> write SegmentFileState::Sealed
   -> write sealed_len and sealed_sha256
-  -> recompute/publish durable_lsn
+  -> recompute/publish published_lsn
   -> RocksDB flush_wal(true)
 ```
 
@@ -287,10 +287,10 @@ Caching and indexing properties:
 
 ## Background Maintenance & Resource Management
 
-### Accounting Processor
+### Historical Accounting Processor (retired)
 
-See [`accounting.md`](accounting.md) for the implementation map, terminology, publication protocol,
-and invariants.
+See [`lsm_gc.md`](lsm_gc.md) for the current implementation, publication protocol, and invariants.
+The remainder of this section documents the pre-blob-LSM pipeline.
 
 The foreground writer appends cheap accounting deltas. A background `AccountingWorker` materializes those deltas into GC-facing rows.
 
@@ -320,7 +320,7 @@ Run files are written, synced, and renamed before they become reachable. The Roc
 
 `accounted_lsn` means accounting-derived rows are durable through that global LSN. After `accounted_lsn` advances, consumed `unaccounted_lsn_ops` rows are removed.
 
-`blob_versions` compaction follows `durable_lsn`, not `accounted_lsn`. The active accounting delta log is the accounting input, so packed per-key tail entries may fold into heads once the corresponding logical operations are durable.
+`blob_versions` compaction follows `published_lsn`, not `accounted_lsn`. The active accounting delta log is the accounting input, so packed per-key tail entries may fold into heads once the corresponding logical operations are durable.
 
 ### Asynchronous Shard Drop
 
@@ -371,7 +371,7 @@ open
   -> discard later unsealed segments after first incomplete prefix
   -> rollback lost unaccounted operations
   -> reconcile active-delta.log with RocksDB committed prefix
-  -> recompute durable_lsn
+  -> recompute published_lsn
   -> verify sealed segments
   -> choose active segment
   -> start accounting, sealer, writer
@@ -402,3 +402,7 @@ find first unaccounted LSN whose operation did not survive
 ```
 
 Sealed segment recovery is verification-only. A sealed segment must exist with the indexed `sealed_len`; under checksum policy, its SHA-256 must match `sealed_sha256`.
+# Historical Design Summary
+
+> This summary describes the retired projection-engine architecture. It is retained for design
+> context, not as current operational documentation. See [`lsm_gc.md`](lsm_gc.md).

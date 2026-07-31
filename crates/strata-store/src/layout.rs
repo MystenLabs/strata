@@ -50,7 +50,7 @@ pub(crate) fn relative_segment_path(config: &StrataStoreConfig, path: PathBuf) -
 }
 
 pub(crate) fn segment_file_name(segment_id: SegmentId) -> String {
-    format!("{segment_id:012}.data")
+    strata_segment::segment_file_name(segment_id)
 }
 
 pub(crate) fn shard_dir_name(shard: ShardKey) -> String {

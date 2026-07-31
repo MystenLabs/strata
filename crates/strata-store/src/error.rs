@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use strata_core::{
-    BlobKey, Epoch, SegmentFileState, SegmentId, ShardGeneration, ShardId, ShardState, StrataLsn,
+    BlobKey, Epoch, SegmentFileState, SegmentId, ShardGeneration, ShardId, ShardState,
 };
 
 /// Result type used by `strata-store`.
@@ -35,11 +35,14 @@ pub enum Error {
     #[error("index error: {0}")]
     Index(#[from] strata_index::Error),
 
-    #[error("accounting index error: {0}")]
-    AccountingIndex(#[from] strata_accounting::Error),
-
     #[error("segment error: {0}")]
     Segment(#[from] strata_segment::Error),
+
+    #[error("LSM error: {0}")]
+    Lsm(#[from] strata_lsm::Error),
+
+    #[error("relocation error: {0}")]
+    Relocation(#[from] strata_relocation::Error),
 
     #[error("gc selection error: {0}")]
     GcSelection(#[from] strata_gc::GcSelectionError),
@@ -61,9 +64,6 @@ pub enum Error {
 
     #[error("durability queue is closed")]
     DurabilityQueueClosed,
-
-    #[error("accounting queue is closed")]
-    AccountingQueueClosed,
 
     #[error("gc queue is closed")]
     GcQueueClosed,
@@ -103,9 +103,6 @@ pub enum Error {
         current_generation: ShardGeneration,
         state: ShardState,
     },
-
-    #[error("segment {segment_id} has no index state for accounting")]
-    AccountingMissingSegmentState { segment_id: SegmentId },
 
     #[error("gc source segment {segment_id} has no index state")]
     GcMissingSourceSegment { segment_id: SegmentId },
@@ -196,22 +193,6 @@ pub enum Error {
         expected_write_offset: u64,
         recovered_write_offset: u64,
     },
-
-    #[error(
-        "recovery found active accounting delta log only through LSN {active_delta_log_lsn}, below durable LSN {durable_lsn}"
-    )]
-    RecoveryDurableAccountingGap {
-        durable_lsn: StrataLsn,
-        active_delta_log_lsn: StrataLsn,
-    },
-
-    #[error(
-        "active accounting delta log is durable only through LSN {active_delta_log_lsn}, below checkpoint LSN {required_lsn}"
-    )]
-    DurabilityAccountingGap {
-        required_lsn: StrataLsn,
-        active_delta_log_lsn: StrataLsn,
-    },
 }
 
 impl Error {
@@ -224,7 +205,6 @@ impl Error {
         match self {
             Self::Io { .. } => "io",
             Self::Index(_) => "index",
-            Self::AccountingIndex(_) => "accounting_index",
             Self::Segment(_) => "segment",
             Self::GcSelection(_) => "selection",
             Self::GcInvalidPlan(_) => "invalid_plan",

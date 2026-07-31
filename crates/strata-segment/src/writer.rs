@@ -152,6 +152,26 @@ impl SegmentWriter {
         self.file.sync_data().at_path(&self.path)
     }
 
+    /// Clones the active file descriptor for an asynchronous sync task.
+    pub fn clone_file_for_sync(&self) -> Result<File> {
+        self.file.try_clone().at_path(&self.path)
+    }
+
+    /// Checks whether one complete batch fits without changing writer state.
+    pub fn ensure_capacity(&self, additional_bytes: u64) -> Result<()> {
+        let attempted_size = self
+            .write_offset
+            .checked_add(additional_bytes)
+            .ok_or(Error::RangeOverflow)?;
+        if self.sealed || attempted_size > self.max_size {
+            return Err(Error::SegmentFull {
+                max_size: self.max_size,
+                attempted_size,
+            });
+        }
+        Ok(())
+    }
+
     pub fn seal(&mut self) -> Result<u64> {
         self.sync_data()?;
         self.sealed = true;
@@ -160,6 +180,10 @@ impl SegmentWriter {
 
     pub fn write_offset(&self) -> u64 {
         self.write_offset
+    }
+
+    pub fn max_size(&self) -> u64 {
+        self.max_size
     }
 
     pub fn segment_id(&self) -> SegmentId {
@@ -200,6 +224,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::SegmentWriter;
+    use crate::Error;
 
     #[test]
     fn rollback_failed_append_truncates_and_repositions_writer() {
@@ -219,5 +244,18 @@ mod tests {
         assert_eq!(writer.file.stream_position().unwrap(), offset);
         let outcome = writer.append(&key, 1, b"second").unwrap();
         assert_eq!(outcome.record_ref.offset, offset);
+    }
+
+    #[test]
+    fn capacity_check_does_not_change_the_writer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("000001.data");
+        let writer = SegmentWriter::create(&path, 1, PlacementClass::Ingest, 10).unwrap();
+
+        assert!(matches!(
+            writer.ensure_capacity(11),
+            Err(Error::SegmentFull { .. })
+        ));
+        assert_eq!(writer.write_offset(), 0);
     }
 }

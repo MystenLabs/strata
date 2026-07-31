@@ -18,10 +18,11 @@ members = [
     ".",
     "crates/strata-bench",
     "crates/strata-realistic-bench",
-    "crates/strata-accounting",
     "crates/strata-core",
     "crates/strata-gc",
     "crates/strata-index",
+    "crates/strata-lsm",
+    "crates/strata-relocation",
     "crates/strata-segment",
     "crates/strata-store",
 ]
@@ -40,10 +41,11 @@ rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "mu
 serde = { version = "1", features = ["derive"] }
 serde_with = "3.20"
 sha2 = "0.10"
-strata-accounting = { path = "crates/strata-accounting" }
 strata-core = { path = "crates/strata-core" }
 strata-gc = { path = "crates/strata-gc" }
 strata-index = { path = "crates/strata-index" }
+strata-lsm = { path = "crates/strata-lsm" }
+strata-relocation = { path = "crates/strata-relocation" }
 strata-segment = { path = "crates/strata-segment" }
 strata-store = { path = "crates/strata-store" }
 tempfile = "3"

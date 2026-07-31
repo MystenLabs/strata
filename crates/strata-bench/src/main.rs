@@ -51,17 +51,12 @@ use serde_with::{Bytes, serde_as};
 use strata_core::{BlobKey, Epoch, PlacementClass, SegmentFileState};
 use strata_segment::SegmentWriter;
 use strata_store::{
-    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
-    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
-    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
-    DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
-    GcPlannerConfig, ReadOptions, SealedSegmentIntegrityPolicy, StoreGetProfile,
-    StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
+    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEAL_WORKER_COUNT,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig, ReadOptions,
+    SealedSegmentIntegrityPolicy, StoreGetProfile, StrataRecoveryPolicy, StrataStore,
+    StrataStoreConfig, StrataStoreMetrics,
 };
 #[cfg(feature = "internal-profiling")]
 use strata_store::{StoreProfileSink, StoreSyncProfile, StoreWriteProfile};
@@ -338,8 +333,6 @@ struct Config {
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     reader_cache_capacity: usize,
     starting_epoch: Epoch,
-    strata_accounting: bool,
-    strata_accounting_materialize_lag_threshold: u64,
     strata_gc: bool,
     strata_gc_io_bytes_per_sec: u64,
     strata_gc_min_io_bytes_per_sec: u64,
@@ -405,9 +398,6 @@ impl Config {
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             starting_epoch: DEFAULT_STARTING_EPOCH,
-            strata_accounting: true,
-            strata_accounting_materialize_lag_threshold:
-                DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
             strata_gc: true,
             strata_gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
             strata_gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
@@ -512,16 +502,6 @@ impl Config {
                 }
                 "--starting-epoch" => {
                     config.starting_epoch = parse_u64(&next_value(&mut args, "--starting-epoch")?)?
-                }
-                "--strata-accounting" => {
-                    config.strata_accounting =
-                        parse_bool(&next_value(&mut args, "--strata-accounting")?)?
-                }
-                "--strata-accounting-materialize-lag-threshold" => {
-                    config.strata_accounting_materialize_lag_threshold = parse_u64(&next_value(
-                        &mut args,
-                        "--strata-accounting-materialize-lag-threshold",
-                    )?)?
                 }
                 "--strata-gc" => {
                     config.strata_gc = parse_bool(&next_value(&mut args, "--strata-gc")?)?
@@ -736,9 +716,6 @@ impl Config {
         if config.max_unsealed_segments < 2 {
             return Err("--max-unsealed-segments must be at least 2".to_owned());
         }
-        if config.strata_gc && !config.strata_accounting {
-            return Err("--strata-gc true requires --strata-accounting true".to_owned());
-        }
         if config.strata_gc_io_bytes_per_sec == 0 {
             return Err("--strata-gc-io-bytes-per-sec must be non-zero".to_owned());
         }
@@ -862,17 +839,6 @@ impl Config {
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
-            accounting_worker_enabled: self.strata_accounting,
-            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
-            accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-            accounting_materialize_lag_threshold: self.strata_accounting_materialize_lag_threshold,
-            accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
-            accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
-            accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
-            accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-            accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
-            accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
-            accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
             gc_workers_enabled: self.strata_gc,
             gc_interval: DEFAULT_GC_INTERVAL,
             gc_worker_count: DEFAULT_GC_WORKER_COUNT,
@@ -882,7 +848,6 @@ impl Config {
             gc_io_bytes_per_sec: self.strata_gc_io_bytes_per_sec,
             gc_min_io_bytes_per_sec: self.strata_gc_min_io_bytes_per_sec,
             gc_planner_config: self.gc_planner_config(),
-            gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: self.starting_epoch,
         }
@@ -923,7 +888,7 @@ impl StoreGetProfileSummary {
         self.key_validate += profile.key_validate;
     }
 
-    fn accounted(&self) -> Duration {
+    fn attributed(&self) -> Duration {
         self.record_lookup
             + self.reader_acquire
             + self.fixed_header
@@ -1099,13 +1064,12 @@ struct ReclaimSample {
     path: PathSummary,
     io: Option<ProcessIoSnapshot>,
     workload_counts: SteadyOperationCounts,
-    strata_accounting: Option<StrataAccountingSample>,
+    strata_gc: Option<StrataGcSample>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct StrataAccountingSample {
-    durable_lsn: u64,
-    accounted_lsn: u64,
+struct StrataGcSample {
+    published_lsn: u64,
     known_total_bytes: u64,
     known_live_bytes: u64,
     known_retired_bytes: u64,
@@ -1159,10 +1123,8 @@ struct StoreWriteProfileSummary {
     prepare_batch: Duration,
     segment_capacity: Duration,
     segment_append: Duration,
-    accounting_delta_append: Duration,
     index_batch_commit: Duration,
     rollover_post_commit: Duration,
-    accounting_nudge: Duration,
     response_send: Duration,
     writer_total: Duration,
 }
@@ -1176,10 +1138,8 @@ impl StoreWriteProfileSummary {
         self.prepare_batch += profile.prepare_batch;
         self.segment_capacity += profile.segment_capacity;
         self.segment_append += profile.segment_append;
-        self.accounting_delta_append += profile.accounting_delta_append;
         self.index_batch_commit += profile.index_batch_commit;
         self.rollover_post_commit += profile.rollover_post_commit;
-        self.accounting_nudge += profile.accounting_nudge;
         self.response_send += profile.response_send;
         self.writer_total += profile.writer_total;
     }
@@ -1192,11 +1152,9 @@ struct StoreSyncProfileSummary {
     queue_send: Duration,
     queue_wait: Duration,
     segment_sync: Duration,
-    accounting_delta_sync: Duration,
-    durable_lsn_compute: Duration,
+    published_lsn_compute: Duration,
     index_batch_commit: Duration,
     state_update: Duration,
-    accounting_nudge: Duration,
     response_send: Duration,
     writer_total: Duration,
 }
@@ -1208,11 +1166,9 @@ impl StoreSyncProfileSummary {
         self.queue_send += profile.queue_send;
         self.queue_wait += profile.queue_wait;
         self.segment_sync += profile.segment_sync;
-        self.accounting_delta_sync += profile.accounting_delta_sync;
-        self.durable_lsn_compute += profile.durable_lsn_compute;
+        self.published_lsn_compute += profile.published_lsn_compute;
         self.index_batch_commit += profile.index_batch_commit;
         self.state_update += profile.state_update;
-        self.accounting_nudge += profile.accounting_nudge;
         self.response_send += profile.response_send;
         self.writer_total += profile.writer_total;
     }
@@ -1555,7 +1511,7 @@ fn run_store_delete(
     store.sync()?;
     store.checkpoint_active_segment()?;
     wait_for_strata_sealing(&store, config.delete_setup_timeout)?;
-    wait_for_strata_accounting(&store, config.delete_setup_timeout)?;
+    wait_for_strata_lsm_materialization(&store, config.delete_setup_timeout)?;
 
     let loaded = summarize_path_if_exists(&config.root_dir)?;
     let loaded_io = process_io_snapshot()?;
@@ -1574,7 +1530,7 @@ fn run_store_delete(
     for (completed, key_index) in delete_indexes.iter().copied().enumerate() {
         let op_started = Instant::now();
         let phase_started = Instant::now();
-        let lsn = store.tombstone(&keys[key_index])?;
+        let lsn = store.tombstone(0, &keys[key_index])?;
         phases.primary.push(phase_started.elapsed());
         hint::black_box(lsn);
         if should_sync(config.sync_every, completed + 1) {
@@ -1625,7 +1581,7 @@ fn run_store_delete(
                 }
                 SteadyAction::Delete(index) => {
                     let key = bench_key(b"store-post-delete-key-", index)?;
-                    hint::black_box(store.tombstone(&key)?);
+                    hint::black_box(store.tombstone(0, &key)?);
                 }
             }
             Ok(())
@@ -1634,7 +1590,7 @@ fn run_store_delete(
             store.sync()?;
             Ok(())
         },
-        || strata_accounting_sample(&store).map(Some),
+        || strata_gc_sample(&store).map(Some),
     )?;
     verify_strata_delete_samples(&store, &keys, &delete_indexes, config.delete_verify_samples)?;
 
@@ -2102,17 +2058,17 @@ struct RecordedSteadyAction {
     put_sequence: Option<u64>,
 }
 
-fn run_reclaim_timeline<Perform, SyncFn, SampleAccounting>(
+fn run_reclaim_timeline<Perform, SyncFn, SampleGc>(
     config: &Config,
     live_original_indexes: &[usize],
     perform: Perform,
     sync: SyncFn,
-    mut sample_accounting: SampleAccounting,
+    mut sample_gc: SampleGc,
 ) -> Result<ReclaimTimeline, Box<dyn std::error::Error>>
 where
     Perform: Fn(SteadyAction) -> Result<(), Box<dyn std::error::Error>> + Sync,
     SyncFn: Fn() -> Result<(), Box<dyn std::error::Error>> + Sync,
-    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+    SampleGc: FnMut() -> Result<Option<StrataGcSample>, Box<dyn std::error::Error>>,
 {
     if config.post_delete_workers == 1
         || config.post_delete_workload == PostDeleteWorkload::Idle
@@ -2123,7 +2079,7 @@ where
             live_original_indexes,
             &perform,
             &sync,
-            &mut sample_accounting,
+            &mut sample_gc,
         );
     }
 
@@ -2132,21 +2088,21 @@ where
         live_original_indexes,
         &perform,
         &sync,
-        &mut sample_accounting,
+        &mut sample_gc,
     )
 }
 
-fn run_reclaim_timeline_serial<Perform, SyncFn, SampleAccounting>(
+fn run_reclaim_timeline_serial<Perform, SyncFn, SampleGc>(
     config: &Config,
     live_original_indexes: &[usize],
     perform: &Perform,
     sync: &SyncFn,
-    sample_accounting: &mut SampleAccounting,
+    sample_gc: &mut SampleGc,
 ) -> Result<ReclaimTimeline, Box<dyn std::error::Error>>
 where
     Perform: Fn(SteadyAction) -> Result<(), Box<dyn std::error::Error>> + Sync,
     SyncFn: Fn() -> Result<(), Box<dyn std::error::Error>> + Sync,
-    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+    SampleGc: FnMut() -> Result<Option<StrataGcSample>, Box<dyn std::error::Error>>,
 {
     let sample_at = config.effective_reclaim_sample_at();
     let mut timeline = ReclaimTimeline::default();
@@ -2240,24 +2196,24 @@ where
             target,
             started,
             timeline.workload.counts,
-            sample_accounting,
+            sample_gc,
         )?);
     }
 
     Ok(timeline)
 }
 
-fn run_reclaim_timeline_parallel<Perform, SyncFn, SampleAccounting>(
+fn run_reclaim_timeline_parallel<Perform, SyncFn, SampleGc>(
     config: &Config,
     live_original_indexes: &[usize],
     perform: &Perform,
     sync: &SyncFn,
-    sample_accounting: &mut SampleAccounting,
+    sample_gc: &mut SampleGc,
 ) -> Result<ReclaimTimeline, Box<dyn std::error::Error>>
 where
     Perform: Fn(SteadyAction) -> Result<(), Box<dyn std::error::Error>> + Sync,
     SyncFn: Fn() -> Result<(), Box<dyn std::error::Error>> + Sync,
-    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+    SampleGc: FnMut() -> Result<Option<StrataGcSample>, Box<dyn std::error::Error>>,
 {
     let sample_at = config.effective_reclaim_sample_at();
     let started = Instant::now();
@@ -2267,7 +2223,7 @@ where
         Duration::ZERO,
         started,
         SteadyOperationCounts::default(),
-        sample_accounting,
+        sample_gc,
     )?);
 
     let shared_counts = ConcurrentSteadyOperationCounts::default();
@@ -2323,7 +2279,7 @@ where
                 target,
                 started,
                 shared_counts.snapshot(),
-                sample_accounting,
+                sample_gc,
             ) {
                 Ok(sample) => timeline.samples.push(sample),
                 Err(error) => {
@@ -2381,7 +2337,7 @@ where
         config.reclaim_duration,
         started,
         timeline.workload.counts,
-        sample_accounting,
+        sample_gc,
     )?);
 
     Ok(timeline)
@@ -2525,15 +2481,15 @@ fn publish_post_delete_worker_error(
     stop.store(true, Ordering::Release);
 }
 
-fn capture_reclaim_sample<SampleAccounting>(
+fn capture_reclaim_sample<SampleGc>(
     config: &Config,
     target: Duration,
     started: Instant,
     workload_counts: SteadyOperationCounts,
-    sample_accounting: &mut SampleAccounting,
+    sample_gc: &mut SampleGc,
 ) -> Result<ReclaimSample, Box<dyn std::error::Error>>
 where
-    SampleAccounting: FnMut() -> Result<Option<StrataAccountingSample>, Box<dyn std::error::Error>>,
+    SampleGc: FnMut() -> Result<Option<StrataGcSample>, Box<dyn std::error::Error>>,
 {
     Ok(ReclaimSample {
         target,
@@ -2541,42 +2497,34 @@ where
         path: summarize_path_if_exists(&config.root_dir)?,
         io: process_io_snapshot()?,
         workload_counts,
-        strata_accounting: sample_accounting()?,
+        strata_gc: sample_gc()?,
     })
 }
 
-fn strata_accounting_sample(
-    store: &StrataStore,
-) -> Result<StrataAccountingSample, Box<dyn std::error::Error>> {
-    let durable_lsn = store.durable_lsn()?;
-    let accounted_lsn = store.accounted_lsn()?;
-    let mut sample = StrataAccountingSample {
-        durable_lsn,
-        accounted_lsn,
-        ..StrataAccountingSample::default()
+fn strata_gc_sample(store: &StrataStore) -> Result<StrataGcSample, Box<dyn std::error::Error>> {
+    let published_lsn = store.published_lsn()?;
+    let mut sample = StrataGcSample {
+        published_lsn,
+        ..StrataGcSample::default()
     };
     for (segment_id, state) in store.index().iter_segment_states()? {
         if state.state == SegmentFileState::Deleted {
             continue;
         }
-        let Some(overlay) = store.index().get_segment_gc_overlay(segment_id)? else {
+        let Some(summary) = store.index().get_segment_gc_summary(segment_id)? else {
             continue;
         };
-        sample.known_total_bytes = sample
-            .known_total_bytes
-            .saturating_add(overlay.summary.total_bytes);
-        sample.known_live_bytes = sample
-            .known_live_bytes
-            .saturating_add(overlay.summary.live_bytes);
+        sample.known_total_bytes = sample.known_total_bytes.saturating_add(summary.total_bytes);
+        sample.known_live_bytes = sample.known_live_bytes.saturating_add(summary.live_bytes);
         sample.known_retired_bytes = sample
             .known_retired_bytes
-            .saturating_add(overlay.summary.retired_bytes);
+            .saturating_add(summary.retired_bytes);
         sample.known_expired_bytes = sample
             .known_expired_bytes
-            .saturating_add(overlay.summary.expired_bytes);
+            .saturating_add(summary.expired_bytes);
         sample.known_live_ref_count = sample
             .known_live_ref_count
-            .saturating_add(overlay.summary.live_ref_count);
+            .saturating_add(summary.live_ref_count);
     }
     Ok(sample)
 }
@@ -2674,21 +2622,38 @@ fn wait_for_strata_sealing(
     }
 }
 
-fn wait_for_strata_accounting(
+fn wait_for_strata_lsm_materialization(
     store: &StrataStore,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let target_lsn = store.durable_lsn()?;
-    store.request_accounting_materialization(target_lsn)?;
+    let target_lsn = store.published_lsn()?;
     let started = Instant::now();
     loop {
-        if store.accounted_lsn()? >= target_lsn {
+        let manifest = store.index().get_lsm_manifest("blob")?;
+        let materialized = manifest.as_ref().is_some_and(|manifest| {
+            manifest
+                .materialized_through
+                .is_some_and(|lsn| lsn >= target_lsn)
+                && manifest
+                    .partitions
+                    .get(&0)
+                    .is_none_or(|partition| partition.patches.is_empty())
+        });
+        let head = store
+            .index()
+            .get_garbage_log_position("lsm-garbage")?
+            .unwrap_or_default();
+        let swept = store
+            .index()
+            .get_garbage_log_position("lsm-garbage-sweep")?
+            .unwrap_or_default();
+        if materialized && swept == head {
             return Ok(());
         }
         if started.elapsed() >= timeout {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("timed out waiting for Strata accounting LSN {target_lsn}"),
+                format!("timed out waiting for Strata LSM materialization through {target_lsn}"),
             )
             .into());
         }
@@ -3520,34 +3485,27 @@ fn print_delete_report(inputs: DeleteReportInputs<'_>) {
             "{prefix}_post_delete_syncs={}",
             sample.workload_counts.syncs
         );
-        if let Some(accounting) = sample.strata_accounting {
-            println!("{prefix}_strata_durable_lsn={}", accounting.durable_lsn);
-            println!("{prefix}_strata_accounted_lsn={}", accounting.accounted_lsn);
-            println!(
-                "{prefix}_strata_accounting_lag_lsn={}",
-                accounting
-                    .durable_lsn
-                    .saturating_sub(accounting.accounted_lsn)
-            );
+        if let Some(gc) = sample.strata_gc {
+            println!("{prefix}_strata_published_lsn={}", gc.published_lsn);
             println!(
                 "{prefix}_strata_gc_known_total_bytes={}",
-                accounting.known_total_bytes
+                gc.known_total_bytes
             );
             println!(
                 "{prefix}_strata_gc_known_live_bytes={}",
-                accounting.known_live_bytes
+                gc.known_live_bytes
             );
             println!(
                 "{prefix}_strata_gc_known_retired_bytes={}",
-                accounting.known_retired_bytes
+                gc.known_retired_bytes
             );
             println!(
                 "{prefix}_strata_gc_known_expired_bytes={}",
-                accounting.known_expired_bytes
+                gc.known_expired_bytes
             );
             println!(
                 "{prefix}_strata_gc_known_live_ref_count={}",
-                accounting.known_live_ref_count
+                gc.known_live_ref_count
             );
         }
         print_path_summary(&prefix, &sample.path);
@@ -3685,10 +3643,6 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
         sealed_integrity_as_str(config.sealed_segment_integrity_policy)
     );
     println!("reader_cache_capacity={}", config.reader_cache_capacity);
-    println!(
-        "strata_accounting_materialize_lag_threshold={}",
-        config.strata_accounting_materialize_lag_threshold
-    );
     println!(
         "strata_gc_io_bytes_per_sec={}",
         config.strata_gc_io_bytes_per_sec
@@ -3835,12 +3789,6 @@ fn print_layout_metrics(config: &Config) -> Result<(), Box<dyn std::error::Error
         "strata_index",
         &summarize_path_if_exists(&store_config.standalone_index_dir())?,
     );
-    let accounting_summary = summarize_path_if_exists(&store_config.accounting_index_dir())?;
-    print_path_summary("strata_accounting_index", &accounting_summary);
-    println!(
-        "strata_accounting_active_delta_log_bytes={}",
-        file_len_if_exists(&store_config.accounting_index_dir().join("active-delta.log"))?
-    );
     print_path_summary(
         "rocksdb_blobdb_dir",
         &summarize_path_if_exists(&config.root_dir.join("rocksdb-blobdb"))?,
@@ -3973,13 +3921,6 @@ fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
     metadata.len()
-}
-
-fn file_len_if_exists(path: &Path) -> std::io::Result<u64> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    Ok(fs::metadata(path)?.len())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4162,20 +4103,7 @@ fn print_timing_summary(prefix: &str, timings: &[Duration]) {
 
 fn print_strata_store_metrics(store: &StrataStore) {
     let store_config = store.config();
-    println!(
-        "strata_accounting_enabled={}",
-        store_config.accounting_worker_enabled
-    );
-    println!("strata_accounting_delta_log_enabled=true");
-    println!(
-        "strata_accounting_materialize_lag_threshold={}",
-        store_config.accounting_materialize_lag_threshold
-    );
     println!("strata_gc_enabled={}", store_config.gc_workers_enabled);
-    println!(
-        "strata_accounting_interval_ms={:.3}",
-        store_config.accounting_interval.as_secs_f64() * 1000.0
-    );
     println!(
         "strata_gc_interval_ms={:.3}",
         store_config.gc_interval.as_secs_f64() * 1000.0
@@ -4205,19 +4133,14 @@ fn print_strata_store_metrics(store: &StrataStore) {
         store.gc_active_io_bytes_per_sec()
     );
 
-    match (store.durable_lsn(), store.accounted_lsn()) {
-        (Ok(durable_lsn), Ok(accounted_lsn)) => {
-            println!("strata_durable_lsn={durable_lsn}");
-            println!("strata_accounted_lsn={accounted_lsn}");
-            println!(
-                "strata_accounting_lag_lsn={}",
-                durable_lsn.saturating_sub(accounted_lsn)
-            );
+    match store.published_lsn() {
+        Ok(published_lsn) => {
+            println!("strata_published_lsn={published_lsn}");
         }
-        (durable, accounted) => {
+        Err(error) => {
             println!(
                 "strata_lsn_metrics_error={}",
-                sanitize_property_value(&format!("{durable:?}/{accounted:?}"))
+                sanitize_property_value(&error.to_string())
             );
         }
     }
@@ -4449,10 +4372,10 @@ fn print_store_get_profile(profile: &StoreGetProfileSummary) {
     print_profile_duration("profile_record_body", profile.record_body, profile.count);
     print_profile_duration("profile_decode", profile.decode, profile.count);
     print_profile_duration("profile_key_validate", profile.key_validate, profile.count);
-    let accounted = profile.accounted();
-    print_profile_duration("profile_accounted", accounted, profile.count);
-    let unaccounted = profile.op_total.checked_sub(accounted).unwrap_or_default();
-    print_profile_duration("profile_unaccounted", unaccounted, profile.count);
+    let attributed = profile.attributed();
+    print_profile_duration("profile_attributed", attributed, profile.count);
+    let unattributed = profile.op_total.checked_sub(attributed).unwrap_or_default();
+    print_profile_duration("profile_unattributed", unattributed, profile.count);
 }
 
 #[cfg(feature = "internal-profiling")]
@@ -4495,11 +4418,6 @@ fn print_store_write_profile(profile: &StoreWriteProfileSummary) {
         profile.count,
     );
     print_profile_duration(
-        "write_profile_accounting_delta_append",
-        profile.accounting_delta_append,
-        profile.count,
-    );
-    print_profile_duration(
         "write_profile_index_batch_commit",
         profile.index_batch_commit,
         profile.count,
@@ -4507,11 +4425,6 @@ fn print_store_write_profile(profile: &StoreWriteProfileSummary) {
     print_profile_duration(
         "write_profile_rollover_post_commit",
         profile.rollover_post_commit,
-        profile.count,
-    );
-    print_profile_duration(
-        "write_profile_accounting_nudge",
-        profile.accounting_nudge,
         profile.count,
     );
     print_profile_duration(
@@ -4533,13 +4446,8 @@ fn print_store_sync_profile(profile: &StoreSyncProfileSummary) {
         profile.count,
     );
     print_profile_duration(
-        "sync_profile_accounting_delta_sync",
-        profile.accounting_delta_sync,
-        profile.count,
-    );
-    print_profile_duration(
-        "sync_profile_durable_lsn_compute",
-        profile.durable_lsn_compute,
+        "sync_profile_published_lsn_compute",
+        profile.published_lsn_compute,
         profile.count,
     );
     print_profile_duration(
@@ -4550,11 +4458,6 @@ fn print_store_sync_profile(profile: &StoreSyncProfileSummary) {
     print_profile_duration(
         "sync_profile_state_update",
         profile.state_update,
-        profile.count,
-    );
-    print_profile_duration(
-        "sync_profile_accounting_nudge",
-        profile.accounting_nudge,
         profile.count,
     );
     print_profile_duration(
@@ -4843,9 +4746,6 @@ options:
   --sealed-integrity <metadata-only|checksum>
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --starting-epoch <epoch>
-  --strata-accounting <true|false>      background accounting worker
-  --strata-accounting-materialize-lag-threshold <LSNs>
-                                        full accounting pass at this durable/accounted gap; 0 disables
   --strata-gc <true|false>              background GC workers
   --strata-gc-io-bytes-per-sec <size>
   --strata-gc-min-io-bytes-per-sec <size>
@@ -4875,7 +4775,7 @@ options:
   --delete-seed <u64>
   --delete-verify-samples <count>        deleted and live samples; 0 disables
   --delete-reclaim <none|background>     background observes engine-native workers over time
-  --delete-setup-timeout <duration>      Strata seal/accounting wait; default 5m
+  --delete-setup-timeout <duration>      Strata seal/LSM-GC wait; default 5m
   --reclaim-duration <duration>          background observation window; default 60m
   --reclaim-sample-at <times>            comma-separated checkpoints; default 0,1m,5m,10m,15m,30m,60m
   --post-delete-workload <idle|steady>   default idle
@@ -5038,10 +4938,6 @@ mod tests {
                 "--store-get-profile",
                 "--store-get-verify-checksum",
                 "false",
-                "--strata-accounting",
-                "false",
-                "--strata-accounting-materialize-lag-threshold",
-                "12345",
                 "--strata-gc",
                 "false",
                 "--rocksdb-disable-auto-compactions",
@@ -5081,8 +4977,6 @@ mod tests {
         assert_eq!(config.store_get_mode, StoreGetMode::KeyOnly);
         assert!(config.store_get_profile);
         assert!(!config.store_get_verify_checksum);
-        assert!(!config.strata_accounting);
-        assert_eq!(config.strata_accounting_materialize_lag_threshold, 12345);
         assert!(!config.strata_gc);
         assert!(config.rocksdb_disable_auto_compactions);
         assert!(config.rocksdb_disable_wal);
@@ -5205,18 +5099,6 @@ mod tests {
             error,
             "--reuse-existing is only supported for store-get, rocksdb-blobdb-get, and rocksdb-blobdb-get-pinned"
         );
-    }
-
-    #[test]
-    fn config_rejects_gc_without_accounting() {
-        let error = Config::parse(
-            ["--strata-accounting", "false"]
-                .into_iter()
-                .map(str::to_owned),
-        )
-        .expect_err("GC without accounting should be rejected");
-
-        assert_eq!(error, "--strata-gc true requires --strata-accounting true");
     }
 
     #[test]

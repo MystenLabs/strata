@@ -1,14 +1,6 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry,
-};
-use strata_accounting::Manifest;
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 use strata_core::{Epoch, SegmentGcSummary, SegmentId, StrataLsn};
 
 #[cfg(feature = "internal-profiling")]
@@ -20,7 +12,7 @@ const OPERATION_LATENCY_BUCKETS: &[f64] = &[
     0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0,
 ];
 
-const ACCOUNTING_DURATION_BUCKETS: &[f64] = &[
+const COMPACTION_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.010, 0.050, 0.100, 0.500, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 1_200.0, 3_600.0,
 ];
 
@@ -51,6 +43,18 @@ struct PrometheusMetrics {
     get_errors_total: IntCounter,
     get_duration_seconds: Histogram,
     get_payload_bytes_total: IntCounter,
+    relocation_cache_requests_total: IntCounterVec,
+    relocation_lookups_total: IntCounterVec,
+    relocation_lookup_duration_seconds: Histogram,
+    main_compaction_healed_references_total: IntCounter,
+    main_compaction_duration_seconds: Histogram,
+    main_compaction_input_bytes_total: IntCounter,
+    main_compaction_output_bytes_total: IntCounter,
+    relocation_compaction_entries_examined_total: IntCounter,
+    relocation_compaction_entries_dropped_total: IntCounter,
+    relocation_compaction_duration_seconds: Histogram,
+    relocation_compaction_input_bytes_total: IntCounter,
+    relocation_compaction_output_bytes_total: IntCounter,
     range_read_calls_total: IntCounter,
     range_read_hits_total: IntCounter,
     range_read_misses_total: IntCounter,
@@ -69,17 +73,7 @@ struct PrometheusMetrics {
     active_segment_write_offset: IntGauge,
     active_segment_durable_offset: IntGauge,
     next_lsn: IntGauge,
-    durable_lsn: IntGauge,
-    accounting_frontier: Mutex<AccountingFrontierMetric>,
-    accounted_lsn: IntGauge,
-    accounting_lag_lsn: IntGauge,
-    accounting_runs_total: IntCounterVec,
-    accounting_run_duration_seconds: HistogramVec,
-    accounting_input_bytes_total: IntCounterVec,
-    accounting_output_bytes_total: IntCounterVec,
-    accounting_ref_events_total: IntCounterVec,
-    accounting_run_count: IntGaugeVec,
-    accounting_run_bytes: IntGaugeVec,
+    published_lsn: IntGauge,
     gc_known_total_bytes: IntGauge,
     gc_known_live_bytes: IntGauge,
     gc_known_retired_bytes: IntGauge,
@@ -244,6 +238,82 @@ impl StrataStoreMetrics {
                     "get_payload_bytes_total",
                     "Total payload bytes returned by Strata get calls.",
                 )?,
+                relocation_cache_requests_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "relocation_cache_requests_total",
+                    "Total relocation-cache requests by result.",
+                    &["result"],
+                )?,
+                relocation_lookups_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "relocation_lookups_total",
+                    "Total relocation LSM point lookups by result.",
+                    &["result"],
+                )?,
+                relocation_lookup_duration_seconds: register_histogram(
+                    registry,
+                    &labels,
+                    "relocation_lookup_duration_seconds",
+                    "Relocation LSM point lookup latency in seconds.",
+                )?,
+                main_compaction_healed_references_total: register_counter(
+                    registry,
+                    &labels,
+                    "main_compaction_healed_references_total",
+                    "Total physical references updated by successful main LSM compactions.",
+                )?,
+                main_compaction_duration_seconds: register_histogram_with_buckets(
+                    registry,
+                    &labels,
+                    "main_compaction_duration_seconds",
+                    "Wall-clock duration of successful main LSM compactions.",
+                    COMPACTION_DURATION_BUCKETS.to_vec(),
+                )?,
+                main_compaction_input_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "main_compaction_input_bytes_total",
+                    "Encoded main SST input bytes consumed by successful compactions; this is not a device I/O counter.",
+                )?,
+                main_compaction_output_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "main_compaction_output_bytes_total",
+                    "Encoded main SST output bytes created by successful compactions; this is not a device I/O counter.",
+                )?,
+                relocation_compaction_entries_examined_total: register_counter(
+                    registry,
+                    &labels,
+                    "relocation_compaction_entries_examined_total",
+                    "Total logical relocation entries examined by successful relocation LSM compactions.",
+                )?,
+                relocation_compaction_entries_dropped_total: register_counter(
+                    registry,
+                    &labels,
+                    "relocation_compaction_entries_dropped_total",
+                    "Total relocation entries targeting deleted segments dropped by successful relocation LSM compactions.",
+                )?,
+                relocation_compaction_duration_seconds: register_histogram_with_buckets(
+                    registry,
+                    &labels,
+                    "relocation_compaction_duration_seconds",
+                    "Wall-clock duration of successful relocation LSM compactions.",
+                    COMPACTION_DURATION_BUCKETS.to_vec(),
+                )?,
+                relocation_compaction_input_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "relocation_compaction_input_bytes_total",
+                    "Encoded relocation SST input bytes consumed by successful compactions; this is not a device I/O counter.",
+                )?,
+                relocation_compaction_output_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "relocation_compaction_output_bytes_total",
+                    "Encoded relocation SST output bytes created by successful compactions; this is not a device I/O counter.",
+                )?,
                 range_read_calls_total: register_counter(
                     registry,
                     &labels,
@@ -352,104 +422,41 @@ impl StrataStoreMetrics {
                     "next_lsn",
                     "Next Strata LSN to assign.",
                 )?,
-                durable_lsn: register_gauge(
+                published_lsn: register_gauge(
                     registry,
                     &labels,
-                    "durable_lsn",
+                    "published_lsn",
                     "Highest contiguous durable Strata LSN.",
-                )?,
-                accounting_frontier: Mutex::new(AccountingFrontierMetric::default()),
-                accounted_lsn: register_gauge(
-                    registry,
-                    &labels,
-                    "accounted_lsn",
-                    "Highest Strata LSN durably materialized into GC accounting state.",
-                )?,
-                accounting_lag_lsn: register_gauge(
-                    registry,
-                    &labels,
-                    "accounting_lag_lsn",
-                    "Durable Strata LSNs not yet materialized into GC accounting state.",
-                )?,
-                accounting_runs_total: register_counter_vec(
-                    registry,
-                    &labels,
-                    "accounting_runs_total",
-                    "Total Strata accounting stage attempts by stage and durable publication result.",
-                    &["stage", "result"],
-                )?,
-                accounting_run_duration_seconds: register_histogram_vec(
-                    registry,
-                    &labels,
-                    "accounting_run_duration_seconds",
-                    "Strata accounting stage duration in seconds.",
-                    &["stage"],
-                    ACCOUNTING_DURATION_BUCKETS,
-                )?,
-                accounting_input_bytes_total: register_counter_vec(
-                    registry,
-                    &labels,
-                    "accounting_input_bytes_total",
-                    "Encoded input-file bytes consumed by successfully published Strata accounting stages; this is not a device I/O counter.",
-                    &["stage"],
-                )?,
-                accounting_output_bytes_total: register_counter_vec(
-                    registry,
-                    &labels,
-                    "accounting_output_bytes_total",
-                    "Encoded output-file bytes created by successfully published Strata accounting stages; this is not a device I/O counter.",
-                    &["stage"],
-                )?,
-                accounting_ref_events_total: register_counter_vec(
-                    registry,
-                    &labels,
-                    "accounting_ref_events_total",
-                    "Total durable Strata accounting reference events by event type.",
-                    &["event"],
-                )?,
-                accounting_run_count: register_gauge_vec(
-                    registry,
-                    &labels,
-                    "accounting_run_count",
-                    "Current live accounting-index run count by run kind.",
-                    &["kind"],
-                )?,
-                accounting_run_bytes: register_gauge_vec(
-                    registry,
-                    &labels,
-                    "accounting_run_bytes",
-                    "Current live accounting-index bytes by run kind.",
-                    &["kind"],
                 )?,
                 gc_known_total_bytes: register_gauge(
                     registry,
                     &labels,
                     "gc_known_total_bytes",
-                    "Encoded segment bytes classified in Strata GC accounting overlays.",
+                    "Encoded segment bytes classified in Strata GC summaries.",
                 )?,
                 gc_known_live_bytes: register_gauge(
                     registry,
                     &labels,
                     "gc_known_live_bytes",
-                    "Encoded segment bytes currently classified live in Strata GC accounting overlays.",
+                    "Encoded segment bytes currently classified live in Strata GC summaries.",
                 )?,
                 gc_known_retired_bytes: register_gauge(
                     registry,
                     &labels,
                     "gc_known_retired_bytes",
-                    "Encoded segment bytes currently classified retired in Strata GC accounting overlays.",
+                    "Encoded segment bytes currently classified retired in Strata GC summaries.",
                 )?,
                 gc_known_expired_bytes: register_gauge(
                     registry,
                     &labels,
                     "gc_known_expired_bytes",
-                    "Encoded segment bytes currently classified expired in Strata GC accounting overlays.",
+                    "Encoded segment bytes currently classified expired in Strata GC summaries.",
                 )?,
                 gc_known_live_ref_count: register_gauge(
                     registry,
                     &labels,
                     "gc_known_live_ref_count",
-                    "Physical references currently classified live in Strata GC accounting overlays.",
+                    "Physical references currently classified live in Strata GC summaries.",
                 )?,
                 gc_relocating_segments: register_gauge(
                     registry,
@@ -787,6 +794,86 @@ impl StrataStoreMetrics {
         }
     }
 
+    pub(crate) fn record_relocation_lookup(&self, result: Result<bool, ()>, elapsed: Duration) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        let result = match result {
+            Ok(true) => "hit",
+            Ok(false) => "miss",
+            Err(()) => "error",
+        };
+        metrics
+            .relocation_lookups_total
+            .with_label_values(&[result])
+            .inc();
+        metrics
+            .relocation_lookup_duration_seconds
+            .observe(duration_seconds(elapsed));
+    }
+
+    pub(crate) fn record_relocation_cache_lookup(&self, hit: bool) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics
+            .relocation_cache_requests_total
+            .with_label_values(&[if hit { "hit" } else { "miss" }])
+            .inc();
+    }
+
+    pub(crate) fn record_main_compaction(
+        &self,
+        healed: u64,
+        input_bytes: u64,
+        output_bytes: u64,
+        elapsed: Duration,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics
+            .main_compaction_healed_references_total
+            .inc_by(healed);
+        metrics
+            .main_compaction_duration_seconds
+            .observe(duration_seconds(elapsed));
+        metrics
+            .main_compaction_input_bytes_total
+            .inc_by(input_bytes);
+        metrics
+            .main_compaction_output_bytes_total
+            .inc_by(output_bytes);
+    }
+
+    pub(crate) fn record_relocation_compaction(
+        &self,
+        examined: u64,
+        dropped: u64,
+        input_bytes: u64,
+        output_bytes: u64,
+        elapsed: Duration,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics
+            .relocation_compaction_entries_examined_total
+            .inc_by(examined);
+        metrics
+            .relocation_compaction_entries_dropped_total
+            .inc_by(dropped);
+        metrics
+            .relocation_compaction_duration_seconds
+            .observe(duration_seconds(elapsed));
+        metrics
+            .relocation_compaction_input_bytes_total
+            .inc_by(input_bytes);
+        metrics
+            .relocation_compaction_output_bytes_total
+            .inc_by(output_bytes);
+    }
+
     pub(crate) fn record_range_read(&self, result: Result<Option<u64>, ()>, elapsed: Duration) {
         let Some(metrics) = &self.inner else {
             return;
@@ -852,13 +939,13 @@ impl StrataStoreMetrics {
             .set(to_i64(durable_offset));
     }
 
-    pub(crate) fn set_lsn_state(&self, next_lsn: StrataLsn, durable_lsn: StrataLsn) {
+    pub(crate) fn set_lsn_state(&self, next_lsn: StrataLsn, published_lsn: StrataLsn) {
         let Some(metrics) = &self.inner else {
             return;
         };
         metrics.next_lsn.set(to_i64(next_lsn));
-        update_accounting_frontier(metrics, Some(durable_lsn), None);
-        set_pending_lsn_count(metrics, next_lsn, durable_lsn);
+        metrics.published_lsn.set(to_i64(published_lsn));
+        set_pending_lsn_count(metrics, next_lsn, published_lsn);
     }
 
     pub(crate) fn set_next_lsn(&self, next_lsn: StrataLsn) {
@@ -866,103 +953,38 @@ impl StrataStoreMetrics {
             return;
         };
         metrics.next_lsn.set(to_i64(next_lsn));
-        set_pending_lsn_count(metrics, next_lsn, lsn_from_i64(metrics.durable_lsn.get()));
+        set_pending_lsn_count(metrics, next_lsn, lsn_from_i64(metrics.published_lsn.get()));
     }
 
-    pub(crate) fn set_durable_lsn(&self, durable_lsn: StrataLsn) {
+    pub(crate) fn set_published_lsn(&self, published_lsn: StrataLsn) {
         let Some(metrics) = &self.inner else {
             return;
         };
-        update_accounting_frontier(metrics, Some(durable_lsn), None);
-        set_pending_lsn_count(metrics, lsn_from_i64(metrics.next_lsn.get()), durable_lsn);
+        metrics.published_lsn.set(to_i64(published_lsn));
+        set_pending_lsn_count(metrics, lsn_from_i64(metrics.next_lsn.get()), published_lsn);
     }
 
-    pub(crate) fn initialize_accounting(
-        &self,
-        accounted_lsn: StrataLsn,
-        manifest: Option<&Manifest>,
-        summary: &SegmentGcSummary,
-    ) {
+    pub(crate) fn initialize_gc_known(&self, summary: &SegmentGcSummary) {
         let Some(metrics) = &self.inner else {
             return;
         };
-        update_accounting_frontier(metrics, None, Some(accounted_lsn));
-        set_accounting_index_shape(metrics, manifest);
         set_gc_known_summary(metrics, summary);
     }
 
-    pub(crate) fn publish_accounting_state(
-        &self,
-        accounted_lsn: StrataLsn,
-        manifest: Option<&Manifest>,
-        overlay_delta: AccountingOverlayDelta,
-        events: AccountingEventCounts,
-    ) {
-        let Some(metrics) = &self.inner else {
-            return;
-        };
-        update_accounting_frontier(metrics, None, Some(accounted_lsn));
-        if let Some(manifest) = manifest {
-            set_accounting_index_shape(metrics, Some(manifest));
-        }
-        apply_gc_known_delta(metrics, overlay_delta);
-        for (event, count) in events.values() {
-            if count != 0 {
-                metrics
-                    .accounting_ref_events_total
-                    .with_label_values(&[event])
-                    .inc_by(count);
-            }
-        }
-    }
-
-    pub(crate) fn apply_gc_known_delta(&self, delta: AccountingOverlayDelta) {
+    pub(crate) fn apply_gc_known_delta(&self, delta: GcKnownDelta) {
         if let Some(metrics) = &self.inner {
             apply_gc_known_delta(metrics, delta);
         }
     }
 
     pub(crate) fn remove_gc_known_summary(&self, summary: &SegmentGcSummary) {
-        self.apply_gc_known_delta(AccountingOverlayDelta {
+        self.apply_gc_known_delta(GcKnownDelta {
             total_bytes: -i128::from(summary.total_bytes),
             live_bytes: -i128::from(summary.live_bytes),
             retired_bytes: -i128::from(summary.retired_bytes),
             expired_bytes: -i128::from(summary.expired_bytes),
             live_ref_count: -i128::from(summary.live_ref_count),
         });
-    }
-
-    pub(crate) fn record_accounting_stage(
-        &self,
-        stage: AccountingStage,
-        success: bool,
-        elapsed: Duration,
-        input_bytes: u64,
-        output_bytes: u64,
-    ) {
-        let Some(metrics) = &self.inner else {
-            return;
-        };
-        let stage = stage.as_str();
-        let result = if success { "success" } else { "failure" };
-        metrics
-            .accounting_runs_total
-            .with_label_values(&[stage, result])
-            .inc();
-        metrics
-            .accounting_run_duration_seconds
-            .with_label_values(&[stage])
-            .observe(duration_seconds(elapsed));
-        if success {
-            metrics
-                .accounting_input_bytes_total
-                .with_label_values(&[stage])
-                .inc_by(input_bytes);
-            metrics
-                .accounting_output_bytes_total
-                .with_label_values(&[stage])
-                .inc_by(output_bytes);
-        }
     }
 
     pub(crate) fn set_current_epoch(&self, epoch: Epoch) {
@@ -1118,7 +1140,7 @@ impl StrataStoreMetrics {
         }
     }
 
-    /// Records physical bytes installed by a successful GC relocation publication.
+    /// Records physical bytes made visible by a successful GC relocation publication.
     pub(crate) fn record_gc_output_published(&self, output_bytes: u64) {
         let Some(metrics) = &self.inner else {
             return;
@@ -1191,57 +1213,13 @@ pub(crate) struct PutMetric {
     pub record_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AccountingStage {
-    Ingest,
-    DeltaCompaction,
-    MajorCompaction,
-}
-
-impl AccountingStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Ingest => "ingest",
-            Self::DeltaCompaction => "delta_compaction",
-            Self::MajorCompaction => "major_compaction",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AccountingEventCounts {
-    pub live: u64,
-    pub retired: u64,
-    pub expired: u64,
-    pub lifecycle_changed: u64,
-    pub mapped: u64,
-}
-
-impl AccountingEventCounts {
-    fn values(self) -> [(&'static str, u64); 5] {
-        [
-            ("live", self.live),
-            ("retired", self.retired),
-            ("expired", self.expired),
-            ("lifecycle_changed", self.lifecycle_changed),
-            ("mapped", self.mapped),
-        ]
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AccountingOverlayDelta {
+pub(crate) struct GcKnownDelta {
     pub total_bytes: i128,
     pub live_bytes: i128,
     pub retired_bytes: i128,
     pub expired_bytes: i128,
     pub live_ref_count: i128,
-}
-
-#[derive(Debug, Default)]
-struct AccountingFrontierMetric {
-    durable_lsn: StrataLsn,
-    accounted_lsn: StrataLsn,
 }
 
 fn register_counter(
@@ -1272,10 +1250,26 @@ fn register_histogram(
     name: &str,
     help: &str,
 ) -> Result<Histogram, prometheus::Error> {
+    register_histogram_with_buckets(
+        registry,
+        labels,
+        name,
+        help,
+        OPERATION_LATENCY_BUCKETS.to_vec(),
+    )
+}
+
+fn register_histogram_with_buckets(
+    registry: &Registry,
+    labels: &HashMap<String, String>,
+    name: &str,
+    help: &str,
+    buckets: Vec<f64>,
+) -> Result<Histogram, prometheus::Error> {
     let histogram = Histogram::with_opts(
         HistogramOpts::new(metric_name(name), help)
             .const_labels(labels.clone())
-            .buckets(OPERATION_LATENCY_BUCKETS.to_vec()),
+            .buckets(buckets),
     )?;
     registry.register(Box::new(histogram.clone()))?;
     Ok(histogram)
@@ -1293,36 +1287,6 @@ fn register_counter_vec(
     Ok(counter)
 }
 
-fn register_gauge_vec(
-    registry: &Registry,
-    labels: &HashMap<String, String>,
-    name: &str,
-    help: &str,
-    variable_labels: &[&str],
-) -> Result<IntGaugeVec, prometheus::Error> {
-    let gauge = IntGaugeVec::new(opts(labels, name, help), variable_labels)?;
-    registry.register(Box::new(gauge.clone()))?;
-    Ok(gauge)
-}
-
-fn register_histogram_vec(
-    registry: &Registry,
-    labels: &HashMap<String, String>,
-    name: &str,
-    help: &str,
-    variable_labels: &[&str],
-    buckets: &[f64],
-) -> Result<HistogramVec, prometheus::Error> {
-    let histogram = HistogramVec::new(
-        HistogramOpts::new(metric_name(name), help)
-            .const_labels(labels.clone())
-            .buckets(buckets.to_vec()),
-        variable_labels,
-    )?;
-    registry.register(Box::new(histogram.clone()))?;
-    Ok(histogram)
-}
-
 fn opts(labels: &HashMap<String, String>, name: &str, help: &str) -> Opts {
     Opts::new(metric_name(name), help).const_labels(labels.clone())
 }
@@ -1335,63 +1299,14 @@ fn duration_seconds(elapsed: Duration) -> f64 {
     elapsed.as_secs_f64()
 }
 
-fn set_pending_lsn_count(metrics: &PrometheusMetrics, next_lsn: StrataLsn, durable_lsn: StrataLsn) {
-    metrics.pending_lsn_count.set(to_i64(
-        next_lsn.saturating_sub(durable_lsn).saturating_sub(1),
-    ));
-}
-
-fn update_accounting_frontier(
+fn set_pending_lsn_count(
     metrics: &PrometheusMetrics,
-    durable_lsn: Option<StrataLsn>,
-    accounted_lsn: Option<StrataLsn>,
+    next_lsn: StrataLsn,
+    published_lsn: StrataLsn,
 ) {
-    let mut frontier = metrics
-        .accounting_frontier
-        .lock()
-        .expect("accounting metric frontier lock poisoned");
-    if let Some(durable_lsn) = durable_lsn {
-        frontier.durable_lsn = durable_lsn;
-        metrics.durable_lsn.set(to_i64(durable_lsn));
-    }
-    if let Some(accounted_lsn) = accounted_lsn {
-        frontier.accounted_lsn = accounted_lsn;
-        metrics.accounted_lsn.set(to_i64(accounted_lsn));
-    }
-    metrics.accounting_lag_lsn.set(to_i64(
-        frontier.durable_lsn.saturating_sub(frontier.accounted_lsn),
+    metrics.pending_lsn_count.set(to_i64(
+        next_lsn.saturating_sub(published_lsn).saturating_sub(1),
     ));
-}
-
-fn set_accounting_index_shape(metrics: &PrometheusMetrics, manifest: Option<&Manifest>) {
-    let mut counts = [0_u64; 3];
-    let mut bytes = [0_u64; 3];
-    if let Some(manifest) = manifest {
-        for partition in manifest.partitions.values() {
-            if let Some(base) = &partition.base {
-                counts[0] = counts[0].saturating_add(1);
-                bytes[0] = bytes[0].saturating_add(base.file_len);
-            }
-            for patch in &partition.patches {
-                counts[1] = counts[1].saturating_add(1);
-                bytes[1] = bytes[1].saturating_add(patch.file_len);
-            }
-            for delta in &partition.deltas {
-                counts[2] = counts[2].saturating_add(1);
-                bytes[2] = bytes[2].saturating_add(delta.file_len);
-            }
-        }
-    }
-    for (index, kind) in ["base", "patch", "delta"].into_iter().enumerate() {
-        metrics
-            .accounting_run_count
-            .with_label_values(&[kind])
-            .set(to_i64(counts[index]));
-        metrics
-            .accounting_run_bytes
-            .with_label_values(&[kind])
-            .set(to_i64(bytes[index]));
-    }
 }
 
 fn set_gc_known_summary(metrics: &PrometheusMetrics, summary: &SegmentGcSummary) {
@@ -1410,7 +1325,7 @@ fn set_gc_known_summary(metrics: &PrometheusMetrics, summary: &SegmentGcSummary)
         .set(to_i64(summary.live_ref_count));
 }
 
-fn apply_gc_known_delta(metrics: &PrometheusMetrics, delta: AccountingOverlayDelta) {
+fn apply_gc_known_delta(metrics: &PrometheusMetrics, delta: GcKnownDelta) {
     apply_gauge_delta(&metrics.gc_known_total_bytes, delta.total_bytes);
     apply_gauge_delta(&metrics.gc_known_live_bytes, delta.live_bytes);
     apply_gauge_delta(&metrics.gc_known_retired_bytes, delta.retired_bytes);
@@ -1519,88 +1434,80 @@ mod tests {
     }
 
     #[test]
-    fn accounting_metrics_move_only_when_publication_is_recorded() {
+    fn relocation_metrics_record_lookup_outcomes_and_compaction_work() {
         let registry = Registry::new();
         let metrics = StrataStoreMetrics::new(&registry, "test").unwrap();
-        metrics.set_lsn_state(101, 100);
-        metrics.initialize_accounting(
-            40,
-            None,
-            &SegmentGcSummary {
-                total_bytes: 1_000,
-                live_bytes: 800,
-                retired_bytes: 200,
-                live_ref_count: 8,
-                ..SegmentGcSummary::default()
-            },
-        );
 
-        assert_eq!(
-            metric_value(&registry, "strata_store_accounting_lag_lsn"),
-            60.0
-        );
-        assert_eq!(
-            metric_value(&registry, "strata_store_gc_known_retired_bytes"),
-            200.0
-        );
+        metrics.record_relocation_lookup(Ok(true), Duration::from_millis(1));
+        metrics.record_relocation_lookup(Ok(false), Duration::from_millis(1));
+        metrics.record_relocation_lookup(Err(()), Duration::from_millis(1));
+        metrics.record_relocation_cache_lookup(true);
+        metrics.record_relocation_cache_lookup(false);
+        metrics.record_main_compaction(4, 2_000, 900, Duration::from_millis(2));
+        metrics.record_relocation_compaction(10, 3, 1_000, 400, Duration::from_millis(3));
 
-        metrics.record_accounting_stage(
-            AccountingStage::MajorCompaction,
-            true,
-            Duration::from_millis(5),
-            500,
-            300,
-        );
-        metrics.publish_accounting_state(
-            100,
-            None,
-            AccountingOverlayDelta {
-                live_bytes: -300,
-                retired_bytes: 300,
-                live_ref_count: -3,
-                ..AccountingOverlayDelta::default()
-            },
-            AccountingEventCounts {
-                retired: 3,
-                ..AccountingEventCounts::default()
-            },
-        );
-
+        for result in ["hit", "miss", "error"] {
+            assert_eq!(
+                metric_value_with_labels(
+                    &registry,
+                    "strata_store_relocation_lookups_total",
+                    &[("result", result)],
+                ),
+                1.0
+            );
+        }
+        for result in ["hit", "miss"] {
+            assert_eq!(
+                metric_value_with_labels(
+                    &registry,
+                    "strata_store_relocation_cache_requests_total",
+                    &[("result", result)],
+                ),
+                1.0
+            );
+        }
         assert_eq!(
-            metric_value(&registry, "strata_store_accounting_lag_lsn"),
-            0.0
-        );
-        assert_eq!(
-            metric_value(&registry, "strata_store_gc_known_live_bytes"),
-            500.0
-        );
-        assert_eq!(
-            metric_value(&registry, "strata_store_gc_known_retired_bytes"),
-            500.0
-        );
-        assert_eq!(
-            metric_value_with_labels(
+            metric_value(
                 &registry,
-                "strata_store_accounting_runs_total",
-                &[("stage", "major_compaction"), ("result", "success")],
+                "strata_store_main_compaction_healed_references_total"
             ),
-            1.0
+            4.0
         );
         assert_eq!(
-            metric_value_with_labels(
+            metric_value(&registry, "strata_store_main_compaction_input_bytes_total"),
+            2_000.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_main_compaction_output_bytes_total"),
+            900.0
+        );
+        assert_eq!(
+            metric_value(
                 &registry,
-                "strata_store_accounting_input_bytes_total",
-                &[("stage", "major_compaction")],
+                "strata_store_relocation_compaction_entries_examined_total"
             ),
-            500.0
+            10.0
         );
         assert_eq!(
-            metric_value_with_labels(
+            metric_value(
                 &registry,
-                "strata_store_accounting_ref_events_total",
-                &[("event", "retired")],
+                "strata_store_relocation_compaction_entries_dropped_total"
             ),
             3.0
+        );
+        assert_eq!(
+            metric_value(
+                &registry,
+                "strata_store_relocation_compaction_input_bytes_total"
+            ),
+            1_000.0
+        );
+        assert_eq!(
+            metric_value(
+                &registry,
+                "strata_store_relocation_compaction_output_bytes_total"
+            ),
+            400.0
         );
     }
 }

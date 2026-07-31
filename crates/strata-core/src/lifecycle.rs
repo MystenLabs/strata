@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Epoch, ShardKey, StrataLsn, put::PutState};
+use crate::{Epoch, ShardKey, StrataLsn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobLifecycle {
@@ -56,19 +56,6 @@ pub struct BlobLifecycleHead {
 pub struct BlobLifecycleState {
     pub head: BlobLifecycleHead,
     pub tail: Vec<BlobLifecycleOp>,
-}
-
-/// Packed metadata state for one blob key.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct BlobVersionState {
-    pub versions: PutState,
-    pub lifecycle: BlobLifecycleState,
-}
-
-impl BlobVersionState {
-    pub fn is_empty(&self) -> bool {
-        self.versions.is_empty() && self.lifecycle.is_empty()
-    }
 }
 
 impl BlobLifecycleOp {
@@ -220,26 +207,25 @@ impl BlobLifecycleState {
     }
 }
 
-/// Compatibility view key for a blob version identified by logical LSN.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct BlobVersionKey {
-    pub key: crate::BlobKey,
-    pub lsn: StrataLsn,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StrataStoreState {
-    pub next_lsn: StrataLsn,
-    pub durable_lsn: StrataLsn,
-    pub accounted_lsn: StrataLsn,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StoreStateKey {
     NextLsn,
-    DurableLsn,
+    PublishedLsn,
     CurrentEpoch,
-    AccountedLsn,
+    /// Reserved legacy key. Kept in this position so persisted enum discriminants remain stable.
+    LegacyProjectionFrontier,
+    LsmDurableLsn,
+    LsmWalLogId,
+    LsmWalOffset,
+    LsmActiveSegmentId,
+    LsmActiveSegmentOffset,
+    RelocationLsmDurableLsn,
+    RelocationLsmWalLogId,
+    RelocationLsmWalOffset,
+    /// First LSN whose epoch/shard terminal events are owned by lazy blob-LSM compaction.
+    ///
+    /// Earlier transitions may already have terminal garbage materialized by an older release.
+    LazyGlobalMaterializationFromLsn,
 }
 
 /// Store-state field scoped to one shard generation.
@@ -254,14 +240,4 @@ pub struct ShardStoreStateKey {
 pub struct ShardLsnKey {
     pub shard: ShardKey,
     pub lsn: StrataLsn,
-}
-
-impl Default for StrataStoreState {
-    fn default() -> Self {
-        Self {
-            next_lsn: 1,
-            durable_lsn: 0,
-            accounted_lsn: 0,
-        }
-    }
 }

@@ -11,30 +11,18 @@
 //! offset 0     RecordRef    RecordRef
 //! ```
 //!
-//! Responsibilities:
-//!
-//! - `SegmentWriter` appends one complete encoded record at `write_offset`.
-//! - `SegmentReader` reads full records with checksum validation, or validated payload ranges
-//!   when the caller needs file-range reads.
-//! - `SegmentScanner` walks records from offset 0 and returns the longest valid prefix.
-//!
-//! Recovery behavior is intentionally conservative:
-//!
-//! ```text
-//! valid record | valid record | partial/corrupt tail
-//! <------------- valid prefix ------------->
-//! ```
-//!
-//! A partial tail is expected after a crash and can be truncated by the store layer. Corruption
-//! before the durable prefix is reported as an error. This crate does not allocate LSNs, update
-//! metadata, decide active segments, or seal segments.
+//! `SegmentWriter` appends complete records, `SegmentReader` resolves record references, and
+//! `SegmentScanner` finds the longest valid prefix after a crash. Segment selection, rollover,
+//! and commit visibility belong to the engine using this crate.
 
 mod error;
+mod factory;
 mod reader;
 mod scanner;
 mod writer;
 
 pub use error::{Error, Result};
+pub use factory::{SegmentFactory, SegmentIdAllocator, segment_file_name, segment_path};
 pub use reader::{
     RecordMetadata, SegmentPayloadStream, SegmentReadOptions, SegmentReadProfile, SegmentReader,
 };

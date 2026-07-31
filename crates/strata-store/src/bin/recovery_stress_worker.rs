@@ -13,13 +13,7 @@ use std::{
 
 use strata_core::{BlobKey, Epoch};
 use strata_store::{
-    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
-    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_IO_BYTES_PER_SEC,
-    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
+    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_IO_BYTES_PER_SEC, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
     DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig,
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
@@ -207,17 +201,6 @@ impl Config {
             segment_reader_cache_capacity: 8,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
-            accounting_worker_enabled: true,
-            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
-            accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-            accounting_materialize_lag_threshold: DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-            accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
-            accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
-            accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
-            accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-            accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
-            accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
-            accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
             gc_workers_enabled: true,
             gc_interval: Duration::from_secs(3600),
             gc_worker_count: DEFAULT_GC_WORKER_COUNT,
@@ -227,7 +210,6 @@ impl Config {
             gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
             gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
             gc_planner_config: GcPlannerConfig::default(),
-            gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: self.starting_epoch,
         }
@@ -322,11 +304,11 @@ fn sync_loop(
         if let Err(error) = store.sync() {
             exit_worker(format!("sync failed: {error}"));
         }
-        let durable_lsn = match store.durable_lsn() {
+        let published_lsn = match store.published_lsn() {
             Ok(lsn) => lsn,
-            Err(error) => exit_worker(format!("durable_lsn failed: {error}")),
+            Err(error) => exit_worker(format!("published_lsn failed: {error}")),
         };
-        if let Err(error) = write_line(&output, &format!("SYNC {durable_lsn}")) {
+        if let Err(error) = write_line(&output, &format!("SYNC {published_lsn}")) {
             exit_worker(error);
         }
     }

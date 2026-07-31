@@ -9,16 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use strata_core::{BlobKey, BlobState, PlacementClass, SegmentFileState, SegmentId, StrataLsn};
+use strata_core::{BlobKey, PlacementClass, SegmentFileState, SegmentId, StrataLsn};
 use strata_index::StrataIndex;
 use strata_store::{
-    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
-    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_IO_BYTES_PER_SEC,
-    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
+    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_IO_BYTES_PER_SEC, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
     DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
     DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig,
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
@@ -79,11 +73,11 @@ async fn crash_loop_recovers_synced_puts() {
                 .filter(|put| put.lsn <= run_synced_lsn),
         );
 
-        let durable_lsn_floor = durable_puts.iter().map(|put| put.lsn).max().unwrap_or(0);
-        let fault = inject_post_crash_fault(&root_dir, run_id, durable_lsn_floor);
+        let published_lsn_floor = durable_puts.iter().map(|put| put.lsn).max().unwrap_or(0);
+        let fault = inject_post_crash_fault(&root_dir, run_id, published_lsn_floor);
         validate_recovered_store(
             &root_dir,
-            durable_lsn_floor,
+            published_lsn_floor,
             &durable_puts,
             fault.as_deref(),
             &stderr,
@@ -224,7 +218,7 @@ fn parse_worker_line(line: &str) -> Result<WorkerEvent, String> {
         Some("READY") => Ok(WorkerEvent::Ready),
         Some("SYNC") => Ok(WorkerEvent::Sync(parse_field(
             fields.next(),
-            "sync durable_lsn",
+            "sync published_lsn",
         )?)),
         Some("PUT") => Ok(WorkerEvent::Put(PutEvent {
             lsn: parse_field(fields.next(), "put lsn")?,
@@ -248,7 +242,7 @@ fn parse_field<T: std::str::FromStr>(field: Option<&str>, name: &str) -> Result<
 fn inject_post_crash_fault(
     root_dir: &Path,
     run_id: u64,
-    durable_lsn_floor: StrataLsn,
+    published_lsn_floor: StrataLsn,
 ) -> Option<String> {
     let cfg = store_config(root_dir);
     let index = StrataIndex::open_path(
@@ -276,7 +270,7 @@ fn inject_post_crash_fault(
     match choice {
         0 => truncate_unsealed_tail(&cfg, &unsealed, run_id),
         1 => append_unsealed_garbage(&cfg, &unsealed, run_id),
-        2 => delete_unsealed_without_durable_bytes(&cfg, &unsealed, durable_lsn_floor),
+        2 => delete_unsealed_without_durable_bytes(&cfg, &unsealed, published_lsn_floor),
         _ => create_orphan_segment_file(&cfg, &states, run_id),
     }
 }
@@ -323,14 +317,14 @@ fn append_unsealed_garbage(
 fn delete_unsealed_without_durable_bytes(
     cfg: &StrataStoreConfig,
     unsealed: &[(SegmentId, strata_core::SegmentState)],
-    durable_lsn_floor: StrataLsn,
+    published_lsn_floor: StrataLsn,
 ) -> Option<String> {
     let (segment_id, _) = unsealed.iter().find(|(_, state)| {
         state.durable_offset == 0
             && state.write_offset > 0
             && state
                 .min_lsn
-                .is_some_and(|min_lsn| min_lsn > durable_lsn_floor)
+                .is_some_and(|min_lsn| min_lsn > published_lsn_floor)
     })?;
     let path = segment_path(cfg, *segment_id);
     fs::remove_file(path).ok()?;
@@ -359,7 +353,7 @@ fn create_orphan_segment_file(
 
 fn validate_recovered_store(
     root_dir: &Path,
-    durable_lsn_floor: StrataLsn,
+    published_lsn_floor: StrataLsn,
     durable_puts: &[PutEvent],
     fault: Option<&str>,
     worker_stderr: &str,
@@ -372,10 +366,10 @@ fn validate_recovered_store(
                 fault, worker_stderr, error
             )
         });
-    let durable_lsn = store.durable_lsn().unwrap();
+    let published_lsn = store.published_lsn().unwrap();
     assert!(
-        durable_lsn >= durable_lsn_floor,
-        "durable_lsn regressed after recovery; durable_lsn_floor={durable_lsn_floor} recovered={durable_lsn} fault={fault:?}"
+        published_lsn >= published_lsn_floor,
+        "published_lsn regressed after recovery; published_lsn_floor={published_lsn_floor} recovered={published_lsn} fault={fault:?}"
     );
 
     for put in durable_puts
@@ -400,20 +394,10 @@ fn validate_recovered_store(
         );
     }
 
-    let store_state = store.index().get_store_state().unwrap().unwrap_or_default();
-    assert_eq!(store_state.durable_lsn, durable_lsn);
-    assert!(store_state.next_lsn > durable_lsn);
-
-    for (lsn, _) in store.index().iter_unaccounted_lsn_ops().unwrap() {
-        assert!(
-            lsn < store_state.next_lsn,
-            "unaccounted LSN {lsn} remained at or beyond next_lsn {}; fault={fault:?}",
-            store_state.next_lsn
-        );
-    }
+    assert_eq!(store.index().get_published_lsn().unwrap(), published_lsn);
+    assert!(store.index().get_next_lsn().unwrap() > published_lsn);
 
     validate_segment_states(&cfg, &store, fault);
-    validate_blob_versions(&store, fault);
 }
 
 fn validate_segment_states(cfg: &StrataStoreConfig, store: &StrataStore, fault: Option<&str>) {
@@ -452,44 +436,6 @@ fn validate_segment_states(cfg: &StrataStoreConfig, store: &StrataStore, fault: 
     }
 }
 
-fn validate_blob_versions(store: &StrataStore, fault: Option<&str>) {
-    for (version_key, entry) in store.index().iter_blob_versions().unwrap() {
-        if entry.state == BlobState::Tombstoned {
-            continue;
-        }
-        let Some(record_ref) = entry.record_ref else {
-            continue;
-        };
-        let state = store
-            .index()
-            .get_segment_state(record_ref.segment_id)
-            .unwrap()
-            .unwrap_or_else(|| {
-                panic!(
-                    "blob version lsn={} points at missing segment {}; fault={fault:?}",
-                    version_key.lsn, record_ref.segment_id
-                )
-            });
-        let record_end = record_ref
-            .end_offset()
-            .expect("record ref does not overflow");
-        assert!(
-            record_end <= state.write_offset,
-            "blob version lsn={} points beyond segment {} write_offset {}; fault={fault:?}",
-            version_key.lsn,
-            record_ref.segment_id,
-            state.write_offset
-        );
-        assert!(
-            state.state != SegmentFileState::Deleted,
-            "blob version lsn={} points at unreadable segment {} state {:?}; fault={fault:?}",
-            version_key.lsn,
-            record_ref.segment_id,
-            state.state
-        );
-    }
-}
-
 fn store_config(root_dir: &Path) -> StrataStoreConfig {
     StrataStoreConfig {
         root_dir: root_dir.to_path_buf(),
@@ -501,17 +447,6 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         segment_reader_cache_capacity: 8,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
-        accounting_worker_enabled: true,
-        accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
-        accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-        accounting_materialize_lag_threshold: DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-        accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
-        accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
-        accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
-        accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-        accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
-        accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
-        accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
         gc_workers_enabled: true,
         gc_interval: Duration::from_secs(3600),
         gc_worker_count: DEFAULT_GC_WORKER_COUNT,
@@ -521,7 +456,6 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
         gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
         gc_planner_config: GcPlannerConfig::default(),
-        gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
         shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
         starting_epoch: 1,
     }

@@ -2,7 +2,7 @@
 //!
 //! This crate does not copy bytes or publish metadata. It consumes a snapshot of segment metadata
 //! and returns the best next GC plan under a configurable policy. Execution belongs in a later
-//! layer that can claim jobs, copy records, publish `MapRef` operations, and clean up files.
+//! layer that can claim jobs, copy records, publish relocation entries, and clean up files.
 
 mod control;
 mod planner;

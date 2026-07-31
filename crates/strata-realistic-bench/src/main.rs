@@ -4,10 +4,12 @@
 //! reclamation, and storage pressure active at the same time. Read and delete service levels are
 //! obligations; an AIMD controller greedily raises write concurrency while those obligations hold.
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::{unix::ffi::OsStrExt, unix::fs::MetadataExt};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
@@ -28,19 +30,14 @@ use prometheus::{
 use rocksdb::{DB, Env, statistics::Ticker};
 use serde::{Deserialize, Serialize};
 use serde_with::{Bytes, serde_as};
-use strata_core::{BlobKey, Epoch};
+use strata_core::{BlobKey, Epoch, SegmentFileState, SegmentId};
 use strata_store::{
-    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
-    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
-    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
-    DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
-    GcPlannerConfig, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore,
-    StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
+    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEAL_WORKER_COUNT,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlanner, GcPlannerConfig,
+    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 use typed_store::{
     DBMetrics, Map,
@@ -82,6 +79,8 @@ const DEFAULT_ROCKSDB_HIGH_PRI_THREADS: usize = 4;
 const DEFAULT_ROCKSDB_LOW_PRI_THREADS: usize = 1;
 const DEFAULT_ROCKSDB_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
 const DEFAULT_ROCKSDB_BLOB_GC_FORCE_THRESHOLD: f64 = 1.0;
+const DEFAULT_RELOCATION_PROFILE_READS: usize = 0;
+const DEFAULT_RELOCATION_PROFILE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ROCKSDB_CF_CLASS: &str = "rocksdb_blobdb";
 const KEY_PREFIX: &[u8] = b"realistic-key-";
 
@@ -167,8 +166,9 @@ struct Config {
     max_unsealed_segments: usize,
     segment_max_bytes: u64,
     seal_workers: usize,
-    strata_accounting: bool,
     strata_gc: bool,
+    relocation_profile_reads: usize,
+    relocation_profile_timeout: Duration,
     rocksdb_min_blob_size: u64,
     rocksdb_blob_file_size: u64,
     rocksdb_write_buffer_size: usize,
@@ -216,8 +216,9 @@ impl Config {
             max_unsealed_segments: DEFAULT_MAX_UNSEALED_SEGMENTS,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             seal_workers: DEFAULT_SEAL_WORKER_COUNT,
-            strata_accounting: true,
             strata_gc: true,
+            relocation_profile_reads: DEFAULT_RELOCATION_PROFILE_READS,
+            relocation_profile_timeout: DEFAULT_RELOCATION_PROFILE_TIMEOUT,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
             rocksdb_blob_file_size: DEFAULT_ROCKSDB_BLOB_FILE_SIZE,
             rocksdb_write_buffer_size: DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE,
@@ -324,10 +325,15 @@ impl Config {
                 "--seal-workers" => {
                     config.seal_workers = parse_nonzero_usize(&next_value(&mut args, &arg)?)?
                 }
-                "--strata-accounting" => {
-                    config.strata_accounting = parse_bool(&next_value(&mut args, &arg)?)?
-                }
                 "--strata-gc" => config.strata_gc = parse_bool(&next_value(&mut args, &arg)?)?,
+                "--relocation-profile-reads" => {
+                    config.relocation_profile_reads =
+                        parse_nonzero_usize(&next_value(&mut args, &arg)?)?
+                }
+                "--relocation-profile-timeout" => {
+                    config.relocation_profile_timeout =
+                        parse_duration(&next_value(&mut args, &arg)?)?
+                }
                 "--rocksdb-min-blob-size" => {
                     config.rocksdb_min_blob_size = parse_size(&next_value(&mut args, &arg)?)? as u64
                 }
@@ -436,8 +442,11 @@ impl Config {
         {
             return Err("RocksDB background thread counts must not exceed i32::MAX".to_owned());
         }
-        if self.strata_gc && !self.strata_accounting {
-            return Err("--strata-gc true requires --strata-accounting true".to_owned());
+        if self.relocation_profile_reads > 0 && self.engine != EngineKind::Strata {
+            return Err("--relocation-profile-reads requires --engine strata".to_owned());
+        }
+        if self.relocation_profile_reads > 0 && self.relocation_profile_timeout.is_zero() {
+            return Err("--relocation-profile-timeout must be non-zero".to_owned());
         }
         Ok(())
     }
@@ -453,18 +462,7 @@ impl Config {
             segment_reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
-            accounting_worker_enabled: self.strata_accounting,
-            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
-            accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-            accounting_materialize_lag_threshold: DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-            accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
-            accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
-            accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
-            accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-            accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
-            accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
-            accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
-            gc_workers_enabled: self.strata_gc,
+            gc_workers_enabled: self.strata_gc && self.relocation_profile_reads == 0,
             gc_interval: DEFAULT_GC_INTERVAL,
             gc_worker_count: DEFAULT_GC_WORKER_COUNT,
             gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
@@ -472,8 +470,23 @@ impl Config {
             gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
             gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
             gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
-            gc_planner_config: GcPlannerConfig::default(),
-            gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
+            gc_planner_config: if self.relocation_profile_reads == 0 {
+                GcPlannerConfig::default()
+            } else {
+                GcPlannerConfig {
+                    max_copy_bytes_per_plan: u64::MAX,
+                    max_l0_copy_bytes_per_plan: u64::MAX,
+                    min_l0_rewrite_epoch_distance: 1,
+                    min_l0_rewrite_useful_ratio_bps: 1,
+                    min_reclaim_bytes: 1,
+                    min_garbage_ratio_bps: 1,
+                    min_exact_epoch_bucket_bytes: u64::MAX,
+                    min_exact_epoch_distance: 1,
+                    max_exact_epoch_extension_count: 1,
+                    min_join_output_bytes: u64::MAX,
+                    max_join_sources: 2,
+                }
+            },
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: DEFAULT_STARTING_EPOCH,
         }
@@ -926,7 +939,7 @@ trait BenchEngine: Send + Sync {
 }
 
 struct StrataEngine {
-    store: StrataStore,
+    store: Arc<StrataStore>,
     payload: Arc<[u8]>,
 }
 
@@ -940,7 +953,7 @@ impl BenchEngine for StrataEngine {
 
     fn delete(&self, key: &BlobKey) -> Result<(), String> {
         self.store
-            .tombstone(key)
+            .tombstone(0, key)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -963,7 +976,11 @@ struct BlobDbEngine {
     payload: BlobDbValue,
 }
 
-type OpenedEngine = (Arc<dyn BenchEngine>, Option<BlobDbMetricsReporter>);
+type OpenedEngine = (
+    Arc<dyn BenchEngine>,
+    Option<Arc<StrataStore>>,
+    Option<BlobDbMetricsReporter>,
+);
 
 impl BenchEngine for BlobDbEngine {
     fn put(&self, key: &BlobKey) -> Result<(), String> {
@@ -999,8 +1016,15 @@ fn open_engine(
     match config.engine {
         EngineKind::Strata => {
             let metrics = StrataStoreMetrics::new(registry, config.engine.as_str())?;
-            let store = StrataStore::open(config.store_config(), metrics)?;
-            Ok((Arc::new(StrataEngine { store, payload }), None))
+            let store = Arc::new(StrataStore::open(config.store_config(), metrics)?);
+            Ok((
+                Arc::new(StrataEngine {
+                    store: Arc::clone(&store),
+                    payload,
+                }),
+                Some(store),
+                None,
+            ))
         }
         EngineKind::BlobDb => {
             DBMetrics::init(registry);
@@ -1038,7 +1062,7 @@ fn open_engine(
                 map,
                 payload: BlobDbValue(payload.as_ref().to_vec()),
             });
-            Ok((engine, Some(reporter)))
+            Ok((engine, None, Some(reporter)))
         }
     }
 }
@@ -2045,7 +2069,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map(|address| MetricsServer::start(address, Arc::clone(&registry)))
         .transpose()?;
     let payload = make_payload(config.payload_size);
-    let (engine, _blobdb_reporter) =
+    let (engine, strata_store, _blobdb_reporter) =
         open_engine(&config, Arc::clone(&payload), &registry, metrics.clone())?;
 
     println!("engine={}", config.engine.as_str());
@@ -2097,8 +2121,15 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         EngineKind::Strata => {
             println!("segment_max_bytes={}", config.segment_max_bytes);
             println!("seal_workers={}", config.seal_workers);
-            println!("strata_accounting={}", config.strata_accounting);
             println!("strata_gc={}", config.strata_gc);
+            println!(
+                "relocation_profile_reads={}",
+                config.relocation_profile_reads
+            );
+            println!(
+                "relocation_profile_timeout_seconds={:.3}",
+                config.relocation_profile_timeout.as_secs_f64()
+            );
         }
         EngineKind::BlobDb => {
             println!("rocksdb_wal_enabled=true");
@@ -2269,6 +2300,25 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         terminal_space,
         grace_space,
     );
+    let profile_keys = if config.relocation_profile_reads > 0 && fatal.get().is_none() {
+        prepare_relocation_profile(
+            strata_store
+                .as_deref()
+                .expect("relocation profile requires Strata"),
+            &registry,
+            config.relocation_profile_reads,
+            config.relocation_profile_timeout,
+        )?
+    } else {
+        Vec::new()
+    };
+    drop(context);
+    drop(engine);
+    drop(strata_store);
+    drop(_blobdb_reporter);
+    if config.relocation_profile_reads > 0 && fatal.get().is_none() {
+        run_relocation_read_profile(&config, &profile_keys, &payload)?;
+    }
     if let Some(error) = fatal.get() {
         return Err(error.into());
     }
@@ -2428,6 +2478,572 @@ fn print_scorecard(
     );
 }
 
+fn prepare_relocation_profile(
+    store: &StrataStore,
+    registry: &Registry,
+    sample_size: usize,
+    timeout: Duration,
+) -> Result<Vec<BlobKey>, Box<dyn std::error::Error>> {
+    println!("phase=relocation_profile_setup");
+    let deadline = Instant::now() + timeout;
+    store.sync()?;
+    store.sync()?;
+    store.checkpoint_active_segment()?;
+    store.sync()?;
+    thread::sleep(Duration::from_millis(2_500));
+
+    // Let the normal one-second main-LSM roll/flush/compact loop drain user patches before GC.
+    // Relocation publication itself does not add a user-key patch, so moved keys remain stale until
+    // the explicit healing phase below.
+    loop {
+        let sealed = store
+            .index()
+            .iter_segment_states()?
+            .iter()
+            .any(|(_, state)| state.state == SegmentFileState::Sealed);
+        let patches = store
+            .index()
+            .get_lsm_manifest("blob")?
+            .and_then(|manifest| {
+                manifest
+                    .partitions
+                    .get(&0)
+                    .map(|partition| partition.patches.len())
+            })
+            .unwrap_or_default();
+        if sealed && patches == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out draining the main LSM before relocation profiling".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let main_input_before =
+        counter_metric(registry, "strata_store_main_compaction_input_bytes_total");
+    let main_output_before =
+        counter_metric(registry, "strata_store_main_compaction_output_bytes_total");
+    let main_seconds_before =
+        histogram_sum(registry, "strata_store_main_compaction_duration_seconds");
+    let main_compactions_before =
+        histogram_count(registry, "strata_store_main_compaction_duration_seconds");
+    let relocation_input_before = counter_metric(
+        registry,
+        "strata_store_relocation_compaction_input_bytes_total",
+    );
+    let relocation_output_before = counter_metric(
+        registry,
+        "strata_store_relocation_compaction_output_bytes_total",
+    );
+    let relocation_seconds_before = histogram_sum(
+        registry,
+        "strata_store_relocation_compaction_duration_seconds",
+    );
+    let relocation_compactions_before = histogram_count(
+        registry,
+        "strata_store_relocation_compaction_duration_seconds",
+    );
+
+    let mut moved = Vec::new();
+    let mut seen = HashSet::new();
+    let mut move_batches = 0_u64;
+    let mut flushed_batches = 0_u64;
+    let mut empty_attempts = 0_u32;
+    while Instant::now() < deadline && (moved.len() < sample_size || flushed_batches < 8) {
+        match store.run_gc_once()? {
+            Some(result) if !result.published_records.is_empty() => {
+                move_batches += 1;
+                empty_attempts = 0;
+                for record in result.published_records {
+                    if seen.insert(record.source.key.as_bytes().to_vec()) {
+                        moved.push((record.source.key, record.source.from.segment_id));
+                    }
+                }
+                store.sync()?;
+                thread::sleep(Duration::from_millis(1_100));
+                if store.flush_relocation_memtable_if_due()? {
+                    flushed_batches += 1;
+                }
+            }
+            Some(_) => {
+                empty_attempts = 0;
+                thread::sleep(Duration::from_millis(100));
+            }
+            None => {
+                empty_attempts += 1;
+                thread::sleep(Duration::from_millis(200));
+                if empty_attempts >= 10 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let sampled_sources = moved
+        .iter()
+        .take(sample_size)
+        .map(|(_, source)| *source)
+        .collect::<HashSet<_>>();
+    let delete_only = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: 0,
+        max_l0_copy_bytes_per_plan: 0,
+        min_l0_rewrite_epoch_distance: u64::MAX,
+        min_l0_rewrite_useful_ratio_bps: 10_000,
+        min_reclaim_bytes: u64::MAX,
+        min_garbage_ratio_bps: 10_000,
+        min_exact_epoch_bucket_bytes: u64::MAX,
+        min_exact_epoch_distance: u64::MAX,
+        max_exact_epoch_extension_count: 0,
+        min_join_output_bytes: u64::MAX,
+        max_join_sources: 2,
+    });
+    while Instant::now() < deadline {
+        let deleted = store
+            .index()
+            .iter_segment_states()?
+            .into_iter()
+            .filter_map(|(segment_id, state)| {
+                (state.state == SegmentFileState::Deleted).then_some(segment_id)
+            })
+            .collect::<HashSet<_>>();
+        if sampled_sources
+            .iter()
+            .all(|source| deleted.contains(source))
+        {
+            break;
+        }
+        match store.prepare_gc_plan(&delete_only)? {
+            Some(plan) => {
+                let copied = store.copy_prepared_gc_plan(plan)?;
+                store.publish_prepared_gc_copy(copied)?;
+                store.sync()?;
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    store.sync()?;
+
+    let deleted_sources = store
+        .index()
+        .iter_segment_states()?
+        .into_iter()
+        .filter_map(|(segment_id, state)| {
+            (state.state == SegmentFileState::Deleted).then_some(segment_id)
+        })
+        .collect::<HashSet<SegmentId>>();
+    let mut keys = moved
+        .into_iter()
+        .filter_map(|(key, source)| deleted_sources.contains(&source).then_some(key))
+        .take(sample_size)
+        .collect::<Vec<_>>();
+    keys.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let main_input = counter_metric(registry, "strata_store_main_compaction_input_bytes_total")
+        - main_input_before;
+    let main_output = counter_metric(registry, "strata_store_main_compaction_output_bytes_total")
+        - main_output_before;
+    let main_seconds = histogram_sum(registry, "strata_store_main_compaction_duration_seconds")
+        - main_seconds_before;
+    let main_compactions =
+        histogram_count(registry, "strata_store_main_compaction_duration_seconds")
+            .saturating_sub(main_compactions_before);
+    let relocation_input = counter_metric(
+        registry,
+        "strata_store_relocation_compaction_input_bytes_total",
+    ) - relocation_input_before;
+    let relocation_output = counter_metric(
+        registry,
+        "strata_store_relocation_compaction_output_bytes_total",
+    ) - relocation_output_before;
+    let relocation_seconds = histogram_sum(
+        registry,
+        "strata_store_relocation_compaction_duration_seconds",
+    ) - relocation_seconds_before;
+    let relocation_compactions = histogram_count(
+        registry,
+        "strata_store_relocation_compaction_duration_seconds",
+    )
+    .saturating_sub(relocation_compactions_before);
+
+    println!("relocation_gc_move_batches={move_batches}");
+    println!("relocation_sst_flush_batches={flushed_batches}");
+    println!("relocation_stale_read_keys={}", keys.len());
+    print_compaction_profile(
+        "main",
+        main_input,
+        main_output,
+        main_seconds,
+        main_compactions,
+    );
+    print_compaction_profile(
+        "relocation",
+        relocation_input,
+        relocation_output,
+        relocation_seconds,
+        relocation_compactions,
+    );
+    Ok(keys)
+}
+
+fn run_relocation_read_profile(
+    config: &Config,
+    keys: &[BlobKey],
+    expected_payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("phase=relocation_read_profile");
+    if keys.is_empty() {
+        println!("relocation_read_profile_status=no_deleted_source_references");
+        return Ok(());
+    }
+
+    let evicted_files = evict_file_pages(&config.store_config().namespace_dir())?;
+    println!(
+        "relocation_cold_cache_eviction_supported={}",
+        evicted_files.is_some()
+    );
+    println!(
+        "relocation_cold_cache_evicted_files={}",
+        evicted_files.unwrap_or_default()
+    );
+
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "relocation-profile")?;
+    let store = StrataStore::open(config.store_config(), metrics)?;
+
+    read_relocation_pass("cold", &store, &registry, keys, expected_payload)?;
+    store.clear_relocation_cache();
+    read_relocation_pass("block_warm", &store, &registry, keys, expected_payload)?;
+    read_relocation_pass("cache_warm", &store, &registry, keys, expected_payload)?;
+
+    let healed_before = counter_metric(
+        &registry,
+        "strata_store_main_compaction_healed_references_total",
+    );
+    let input_before = counter_metric(&registry, "strata_store_main_compaction_input_bytes_total");
+    let output_before =
+        counter_metric(&registry, "strata_store_main_compaction_output_bytes_total");
+    let seconds_before = histogram_sum(&registry, "strata_store_main_compaction_duration_seconds");
+    let compactions_before =
+        histogram_count(&registry, "strata_store_main_compaction_duration_seconds");
+    let logical_end_epoch = store.current_epoch()?.saturating_add(1_000_000);
+    for key in keys {
+        store.set_blob_lifetime(key, logical_end_epoch)?;
+    }
+    store.sync()?;
+
+    let deadline = Instant::now() + config.relocation_profile_timeout;
+    loop {
+        let healed = counter_metric(
+            &registry,
+            "strata_store_main_compaction_healed_references_total",
+        ) - healed_before;
+        let patches = store
+            .index()
+            .get_lsm_manifest("blob")?
+            .and_then(|manifest| {
+                manifest
+                    .partitions
+                    .get(&0)
+                    .map(|partition| partition.patches.len())
+            })
+            .unwrap_or_default();
+        if healed >= keys.len() as f64 && patches == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for main-LSM relocation healing".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let input =
+        counter_metric(&registry, "strata_store_main_compaction_input_bytes_total") - input_before;
+    let output = counter_metric(&registry, "strata_store_main_compaction_output_bytes_total")
+        - output_before;
+    let seconds =
+        histogram_sum(&registry, "strata_store_main_compaction_duration_seconds") - seconds_before;
+    let compactions = histogram_count(&registry, "strata_store_main_compaction_duration_seconds")
+        .saturating_sub(compactions_before);
+    print_compaction_profile("main_healing", input, output, seconds, compactions);
+    println!(
+        "main_healed_references={:.0}",
+        counter_metric(
+            &registry,
+            "strata_store_main_compaction_healed_references_total"
+        ) - healed_before
+    );
+    read_relocation_pass("healed", &store, &registry, keys, expected_payload)?;
+    Ok(())
+}
+
+fn read_relocation_pass(
+    name: &str,
+    store: &StrataStore,
+    registry: &Registry,
+    keys: &[BlobKey],
+    expected_payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hit_before = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_lookups_total",
+        "result",
+        "hit",
+    );
+    let miss_before = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_lookups_total",
+        "result",
+        "miss",
+    );
+    let error_before = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_lookups_total",
+        "result",
+        "error",
+    );
+    let cache_hit_before = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_cache_requests_total",
+        "result",
+        "hit",
+    );
+    let cache_miss_before = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_cache_requests_total",
+        "result",
+        "miss",
+    );
+    let main_cache_before = store.main_lsm_block_cache_stats()?;
+    let relocation_block_cache_before = store.relocation_lsm_block_cache_stats();
+    let latency = AtomicLatency::default();
+    let started = Instant::now();
+    for key in keys {
+        let read_started = Instant::now();
+        let value = store.get(key)?;
+        latency.record(read_started.elapsed());
+        if value.as_deref() != Some(expected_payload) {
+            return Err(format!(
+                "{name} relocation read returned incorrect bytes for {:?}",
+                key.as_bytes()
+            )
+            .into());
+        }
+    }
+    let elapsed = started.elapsed();
+    let hits = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_lookups_total",
+        "result",
+        "hit",
+    ) - hit_before;
+    let misses = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_lookups_total",
+        "result",
+        "miss",
+    ) - miss_before;
+    let errors = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_lookups_total",
+        "result",
+        "error",
+    ) - error_before;
+    let cache_hits = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_cache_requests_total",
+        "result",
+        "hit",
+    ) - cache_hit_before;
+    let cache_misses = counter_metric_with_label(
+        registry,
+        "strata_store_relocation_cache_requests_total",
+        "result",
+        "miss",
+    ) - cache_miss_before;
+    let main_cache = store.main_lsm_block_cache_stats()?;
+    let relocation_block_cache = store.relocation_lsm_block_cache_stats();
+    println!("relocation_{name}_read_ops={}", keys.len());
+    println!(
+        "relocation_{name}_read_ops_per_second={:.3}",
+        keys.len() as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
+    );
+    println!(
+        "relocation_{name}_read_p50_us={}",
+        latency.quantile(0.50).as_micros()
+    );
+    println!(
+        "relocation_{name}_read_p99_us={}",
+        latency.quantile(0.99).as_micros()
+    );
+    println!("relocation_{name}_lookup_hits={hits:.0}");
+    println!("relocation_{name}_lookup_misses={misses:.0}");
+    println!("relocation_{name}_lookup_errors={errors:.0}");
+    println!("relocation_{name}_cache_hits={cache_hits:.0}");
+    println!("relocation_{name}_cache_misses={cache_misses:.0}");
+    println!(
+        "relocation_{name}_main_block_cache_hits={}",
+        main_cache.hits.saturating_sub(main_cache_before.hits)
+    );
+    println!(
+        "relocation_{name}_main_block_cache_misses={}",
+        main_cache.misses.saturating_sub(main_cache_before.misses)
+    );
+    println!(
+        "relocation_{name}_relo_block_cache_hits={}",
+        relocation_block_cache
+            .hits
+            .saturating_sub(relocation_block_cache_before.hits)
+    );
+    println!(
+        "relocation_{name}_relo_block_cache_misses={}",
+        relocation_block_cache
+            .misses
+            .saturating_sub(relocation_block_cache_before.misses)
+    );
+    let expected = keys.len() as f64;
+    let path_verified = match name {
+        "cold" | "block_warm" => {
+            hits == expected
+                && misses == 0.0
+                && errors == 0.0
+                && cache_hits == 0.0
+                && cache_misses == expected
+        }
+        "cache_warm" => {
+            hits + misses + errors == 0.0 && cache_hits == expected && cache_misses == 0.0
+        }
+        "healed" => hits + misses + errors == 0.0 && cache_hits + cache_misses == 0.0,
+        _ => false,
+    };
+    println!("relocation_{name}_path_verified={path_verified}");
+    if !path_verified {
+        return Err(format!("{name} pass used an unexpected relocation path").into());
+    }
+    Ok(())
+}
+
+fn print_compaction_profile(
+    name: &str,
+    input_bytes: f64,
+    output_bytes: f64,
+    elapsed_seconds: f64,
+    compactions: u64,
+) {
+    println!("{name}_compactions={compactions}");
+    println!("{name}_compaction_input_bytes={input_bytes:.0}");
+    println!("{name}_compaction_output_bytes={output_bytes:.0}");
+    println!("{name}_compaction_seconds={elapsed_seconds:.6}");
+    println!(
+        "{name}_compaction_input_bytes_per_second={:.3}",
+        input_bytes / elapsed_seconds.max(f64::EPSILON)
+    );
+    println!(
+        "{name}_compaction_output_input_ratio={:.6}",
+        if input_bytes == 0.0 {
+            0.0
+        } else {
+            output_bytes / input_bytes
+        }
+    );
+}
+
+fn counter_metric(registry: &Registry, name: &str) -> f64 {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family
+                .get_metric()
+                .first()
+                .map(|metric| metric.get_counter().value())
+        })
+        .unwrap_or_default()
+}
+
+fn counter_metric_with_label(
+    registry: &Registry,
+    name: &str,
+    label_name: &str,
+    label_value: &str,
+) -> f64 {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family.get_metric().iter().find_map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == label_name && label.value() == label_value)
+                    .then(|| metric.get_counter().value())
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn histogram_sum(registry: &Registry, name: &str) -> f64 {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family
+                .get_metric()
+                .first()
+                .map(|metric| metric.get_histogram().sample_sum())
+        })
+        .unwrap_or_default()
+}
+
+fn histogram_count(registry: &Registry, name: &str) -> u64 {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family
+                .get_metric()
+                .first()
+                .map(|metric| metric.get_histogram().sample_count())
+        })
+        .unwrap_or_default()
+}
+
+fn evict_file_pages(root: &Path) -> io::Result<Option<u64>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut pending = vec![root.to_owned()];
+        let mut evicted = 0_u64;
+        while let Some(path) = pending.pop() {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file() {
+                    let file = fs::File::open(entry.path())?;
+                    let result = unsafe {
+                        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+                    };
+                    if result != 0 {
+                        return Err(io::Error::from_raw_os_error(result));
+                    }
+                    evicted += 1;
+                }
+            }
+        }
+        Ok(Some(evicted))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        Ok(None)
+    }
+}
+
 fn next_value(
     args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
     flag: &str,
@@ -2569,8 +3185,9 @@ strata:
   --max-unsealed-segments <count>
   --segment-max-bytes <size>
   --seal-workers <count>
-  --strata-accounting <true|false>
   --strata-gc <true|false>
+  --relocation-profile-reads <count>    post-workload HDD relocation profile; disables background GC for deterministic setup
+  --relocation-profile-timeout <time>   setup/healing deadline; default 10m
 
 blobdb:
   --rocksdb-min-blob-size <size>
@@ -2638,6 +3255,41 @@ mod tests {
         .expect("zero read rate should parse");
 
         assert_eq!(config.read_ops_per_second, 0);
+    }
+
+    #[test]
+    fn relocation_profile_uses_synchronous_gc() {
+        let config = Config::parse(
+            [
+                "--engine",
+                "strata",
+                "--root",
+                "/tmp/realistic",
+                "--relocation-profile-reads",
+                "32",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("relocation profile should parse");
+
+        assert_eq!(config.relocation_profile_reads, 32);
+        assert!(!config.store_config().gc_workers_enabled);
+        assert!(
+            Config::parse(
+                [
+                    "--engine",
+                    "blobdb",
+                    "--root",
+                    "/tmp/realistic",
+                    "--relocation-profile-reads",
+                    "32",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
     }
 
     #[test]

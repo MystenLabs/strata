@@ -125,7 +125,7 @@ fn shard_drop_reservation_blocks_new_claims_while_existing_claim_drains() {
                 drop(claim);
                 std::thread::yield_now();
             }
-            Some(_) => panic!("drop reservation was not installed"),
+            Some(_) => panic!("drop reservation was not active"),
             None => break,
         }
     }

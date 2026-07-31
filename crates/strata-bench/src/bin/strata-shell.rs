@@ -9,17 +9,12 @@ use std::{
 
 use strata_core::{BlobKey, Epoch};
 use strata_store::{
-    DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD, DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-    DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD, DEFAULT_ACCOUNTING_INTERVAL,
-    DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL, DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
-    DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD, DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-    DEFAULT_ACCOUNTING_PARTITION_COUNT, DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
-    DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
-    DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
-    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
-    GcPlannerConfig, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore,
-    StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
+    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEAL_WORKER_COUNT,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig,
+    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 
 const DEFAULT_NAMESPACE: &str = "default";
@@ -156,17 +151,6 @@ impl Config {
             segment_reader_cache_capacity: self.reader_cache_capacity,
             recovery_policy: self.recovery_policy,
             sealed_segment_integrity_policy: self.sealed_segment_integrity_policy,
-            accounting_worker_enabled: true,
-            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
-            accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-            accounting_materialize_lag_threshold: DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-            accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
-            accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
-            accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
-            accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-            accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
-            accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
-            accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
             gc_workers_enabled: true,
             gc_interval: DEFAULT_GC_INTERVAL,
             gc_worker_count: DEFAULT_GC_WORKER_COUNT,
@@ -176,7 +160,6 @@ impl Config {
             gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
             gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
             gc_planner_config: GcPlannerConfig::default(),
-            gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: self.starting_epoch,
         }
@@ -311,7 +294,9 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
         "delete" | "tombstone" => {
             expect_arg_count(&words, 2, 2)?;
             let key = parse_key(&words[1])?;
-            let lsn = store.tombstone(&key).map_err(|error| error.to_string())?;
+            let lsn = store
+                .tombstone(0, &key)
+                .map_err(|error| error.to_string())?;
             println!("ok lsn={lsn}");
         }
         "extend" | "set-lifetime" => {
@@ -328,18 +313,6 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
             let key = parse_key(&words[1])?;
             let contains = store.contains(&key).map_err(|error| error.to_string())?;
             println!("{contains}");
-        }
-        "entry" => {
-            expect_arg_count(&words, 2, 2)?;
-            let key = parse_key(&words[1])?;
-            match store
-                .index()
-                .get_blob_entry(&key)
-                .map_err(|error| error.to_string())?
-            {
-                Some(entry) => println!("{entry:#?}"),
-                None => println!("not_found"),
-            }
         }
         "segment" => {
             expect_arg_count(&words, 2, 2)?;
@@ -358,7 +331,7 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
             let segment_id = parse_u64(&words[1])?;
             match store
                 .index()
-                .get_segment_gc_overlay(segment_id)
+                .read_segment_garbage_overlay(store.config().namespace_dir(), segment_id)
                 .map_err(|error| error.to_string())?
             {
                 Some(overlay) => println!("{overlay:#?}"),
@@ -369,15 +342,15 @@ fn execute_command(store: &StrataStore, config: &Config, line: &str) -> Result<C
             expect_arg_count(&words, 1, 1)?;
             store.sync().map_err(|error| error.to_string())?;
             println!(
-                "ok durable_lsn={}",
-                store.durable_lsn().map_err(|error| error.to_string())?
+                "ok published_lsn={}",
+                store.published_lsn().map_err(|error| error.to_string())?
             );
         }
-        "durable-lsn" => {
+        "published-lsn" => {
             expect_arg_count(&words, 1, 1)?;
             println!(
                 "{}",
-                store.durable_lsn().map_err(|error| error.to_string())?
+                store.published_lsn().map_err(|error| error.to_string())?
             );
         }
         "config" => {
@@ -621,11 +594,10 @@ fn help() -> &'static str {
   tombstone <key>                 alias for delete
   set-lifetime <key> <epoch>      set blob logical end epoch without moving bytes
   extend <key> <epoch>            alias for set-lifetime
-  entry <key>                     print latest blob index entry
   segment <segment_id>            print segment state
   stats <segment_id>              print GC overlay summary/ranges
-  sync                            fsync active segment and advance durable LSN
-  durable-lsn                     print current durable LSN
+  sync                            fsync active segment and advance published LSN
+  published-lsn                   print current published LSN
   config                          print shell/store config
   help                            show this help
   quit                            exit

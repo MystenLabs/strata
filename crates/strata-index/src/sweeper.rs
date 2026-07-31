@@ -1,0 +1,219 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+use strata_core::{
+    GarbageEvent, SegmentFileState, SegmentGcLifetimeUpdate, SegmentGcOverlay,
+    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId,
+};
+use strata_lsm::{
+    GarbageLog, GarbageRecord, SegmentGarbageLog, fold_segment_garbage, read_segment_garbage,
+};
+use typed_store::{Map, rocks::DBBatch};
+
+use crate::{Error, Result, StrataIndex};
+
+const MAX_SWEEP_FRAMES: usize = 256;
+
+impl StrataIndex {
+    pub fn get_segment_garbage_log_position(&self, segment_id: SegmentId) -> Result<Option<u64>> {
+        Ok(self.segment_garbage_log_positions.get(&segment_id)?)
+    }
+
+    pub fn put_segment_garbage_log_position_batch(
+        &self,
+        batch: &mut DBBatch,
+        segment_id: SegmentId,
+        position: u64,
+    ) -> Result<()> {
+        batch.insert_batch(
+            self.segment_garbage_log_positions(),
+            [(segment_id, position)],
+        )?;
+        Ok(())
+    }
+
+    /// Reads a segment's summary and committed local garbage prefix from the same RocksDB view.
+    pub fn read_segment_garbage_overlay(
+        &self,
+        namespace_dir: impl AsRef<Path>,
+        segment_id: SegmentId,
+    ) -> Result<Option<SegmentGcOverlay>> {
+        let snapshot = self.db.snapshot();
+        let Some(state) = self
+            .segment_states
+            .get_with_snapshot(&snapshot, &segment_id)?
+        else {
+            return Ok(None);
+        };
+        let summary = self
+            .segment_gc_summaries
+            .get_with_snapshot(&snapshot, &segment_id)?;
+        let committed = self
+            .segment_garbage_log_positions
+            .get_with_snapshot(&snapshot, &segment_id)?;
+        let summary = summary.unwrap_or_default();
+        let committed = committed.unwrap_or_default();
+        let ops = if committed == 0 {
+            Vec::new()
+        } else {
+            let path = segment_garbage_log_path(namespace_dir.as_ref(), &state.path);
+            read_segment_garbage(path, committed)?
+        };
+        Ok(Some(fold_segment_garbage(ops, summary)?))
+    }
+
+    /// Reads the committed detail records for one segment.
+    pub fn read_segment_garbage_records(
+        &self,
+        namespace_dir: impl AsRef<Path>,
+        segment_id: SegmentId,
+    ) -> Result<Vec<GarbageRecord>> {
+        let snapshot = self.db.snapshot();
+        let Some(state) = self
+            .segment_states
+            .get_with_snapshot(&snapshot, &segment_id)?
+        else {
+            return Ok(Vec::new());
+        };
+        let committed = self
+            .segment_garbage_log_positions
+            .get_with_snapshot(&snapshot, &segment_id)?
+            .unwrap_or_default();
+        if committed == 0 {
+            return Ok(Vec::new());
+        }
+        let path = segment_garbage_log_path(namespace_dir.as_ref(), &state.path);
+        Ok(read_segment_garbage(path, committed)?)
+    }
+
+    /// Sweeps a bounded batch of committed global frames into segment-local files.
+    ///
+    /// Each touched local file is synced once before its position, full summary, and the sweep
+    /// cursor become visible in one RocksDB batch. Calls for the same log must be serialized by the
+    /// owner.
+    pub fn sweep_garbage_log(
+        &self,
+        global_log_dir: impl AsRef<Path>,
+        namespace_dir: impl AsRef<Path>,
+        head_name: &str,
+        cursor_name: &str,
+    ) -> Result<bool> {
+        if head_name == cursor_name {
+            return Err(Error::InvalidGarbageSweep(
+                "head and sweep cursor names must differ".to_owned(),
+            ));
+        }
+        let global_log_dir = global_log_dir.as_ref();
+        let head_name = head_name.to_owned();
+        let cursor_name = cursor_name.to_owned();
+        let mut batch = self.indexed_batch();
+        let Some(head) = batch.get(self.garbage_log_positions(), &head_name)? else {
+            return Ok(false);
+        };
+        let cursor = batch
+            .get(self.garbage_log_positions(), &cursor_name)?
+            .unwrap_or_default();
+        GarbageLog::reclaim_before(global_log_dir, cursor)?;
+
+        let mut by_segment = BTreeMap::<SegmentId, Vec<GarbageRecord>>::new();
+        let mut next_cursor = cursor;
+        for _ in 0..MAX_SWEEP_FRAMES {
+            let Some((records, position)) =
+                GarbageLog::read_next(global_log_dir, next_cursor, head)?
+            else {
+                break;
+            };
+            for record in records {
+                let segment_id = record.key.segment_id;
+                by_segment.entry(segment_id).or_default().push(record);
+            }
+            next_cursor = position;
+        }
+        if next_cursor == cursor {
+            return Ok(false);
+        }
+
+        let mut states = BTreeMap::new();
+        let mut summaries = BTreeMap::new();
+        let mut deleted_segments = Vec::new();
+        for segment_id in by_segment.keys() {
+            let state = batch
+                .get(self.segment_states(), segment_id)?
+                .ok_or_else(|| {
+                    Error::InvalidGarbageSweep(format!("segment {segment_id} has no state"))
+                })?;
+            if state.state == SegmentFileState::Deleted {
+                deleted_segments.push(*segment_id);
+                continue;
+            }
+            // Leave the frame pending until Store durability publication installs the segment's
+            // allocation baseline.
+            let Some(summary) = batch.get(self.segment_gc_summaries(), segment_id)? else {
+                return Ok(false);
+            };
+            states.insert(*segment_id, state);
+            summaries.insert(*segment_id, summary);
+        }
+        for segment_id in deleted_segments {
+            by_segment.remove(&segment_id);
+        }
+
+        for (segment_id, records) in by_segment {
+            let state = states
+                .remove(&segment_id)
+                .expect("states were resolved above");
+            let committed = batch
+                .get(self.segment_garbage_log_positions(), &segment_id)?
+                .unwrap_or_default();
+            let path = segment_garbage_log_path(namespace_dir.as_ref(), &state.path);
+            let existing = if committed == 0 {
+                Vec::new()
+            } else {
+                read_segment_garbage(&path, committed)?
+            };
+            let mut overlay = fold_segment_garbage(
+                existing,
+                summaries
+                    .remove(&segment_id)
+                    .expect("summaries were resolved above"),
+            )?;
+            overlay.apply_merge_ops(records.iter().map(garbage_merge_op));
+            let mut file = SegmentGarbageLog::open(path, committed)?;
+            let position = file.append(&records)?;
+            batch.put(self.segment_garbage_log_positions(), &segment_id, &position)?;
+            batch.put(self.segment_gc_summaries(), &segment_id, &overlay.summary)?;
+        }
+        batch.put(self.garbage_log_positions(), &cursor_name, &next_cursor)?;
+        batch.write_with_sync(true)?;
+        GarbageLog::reclaim_before(global_log_dir, next_cursor)?;
+        Ok(true)
+    }
+}
+
+fn garbage_merge_op(record: &GarbageRecord) -> SegmentGcOverlayMergeOp {
+    let range = SegmentGcRecordRange::from(record.event.record());
+    match record.event {
+        GarbageEvent::Retired { .. } => SegmentGcOverlayMergeOp::RetireBatch {
+            ranges: vec![range],
+        },
+        GarbageEvent::Expired { .. } => SegmentGcOverlayMergeOp::ExpireBatch {
+            ranges: vec![range],
+        },
+        GarbageEvent::SetLifecycle { lifecycle, .. } => SegmentGcOverlayMergeOp::LifetimeBatch {
+            updates: vec![SegmentGcLifetimeUpdate { range, lifecycle }],
+        },
+    }
+}
+
+fn segment_garbage_log_path(namespace_dir: &Path, segment_path: &str) -> PathBuf {
+    let path = PathBuf::from(segment_path);
+    let mut path = if path.is_absolute() {
+        path
+    } else {
+        namespace_dir.join(path)
+    };
+    path.set_extension("glog");
+    path
+}

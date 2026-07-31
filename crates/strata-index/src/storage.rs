@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use strata_core::{
-    BlobKey, BlobVersionState, Epoch, GcRelocation, RecordRef, SegmentGcOverlay, SegmentId,
-    SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardId, ShardInfo, StoreStateKey,
-    StrataLsn,
+    Epoch, SegmentGcSummary, SegmentId, SegmentState, ShardCleanupJob, ShardId, ShardInfo,
+    ShardKey, StoreStateKey, StrataLsn,
 };
+use strata_lsm::{GarbageLogPosition, Manifest};
 use typed_store::rocks::{DBBatch, DBMap, RocksDB};
 
 use crate::{Error, Result};
 
-use super::{AccountingIndexKey, AccountingIndexValue, StrataIndex, StrataIndexCfNames};
+use super::{StrataIndex, StrataIndexCfNames};
 
 impl StrataIndex {
     pub fn db(&self) -> &Arc<RocksDB> {
@@ -21,27 +21,19 @@ impl StrataIndex {
     }
 
     pub fn batch(&self) -> DBBatch {
-        self.blob_versions.batch()
-    }
-
-    pub fn blob_versions(&self) -> &DBMap<BlobKey, BlobVersionState> {
-        &self.blob_versions
+        self.store_state.batch()
     }
 
     pub fn segment_states(&self) -> &DBMap<SegmentId, SegmentState> {
         &self.segment_states
     }
 
-    pub fn segment_ref_events(&self) -> &DBMap<SegmentRefEventKey, SegmentRefEvent> {
-        &self.segment_ref_events
+    pub fn segment_publication_lsns(&self) -> &DBMap<SegmentId, StrataLsn> {
+        &self.segment_publication_lsns
     }
 
-    pub fn segment_gc_overlay(&self) -> &DBMap<SegmentId, SegmentGcOverlay> {
-        &self.segment_gc_overlay
-    }
-
-    pub fn gc_relocations(&self) -> &DBMap<RecordRef, GcRelocation> {
-        &self.gc_relocations
+    pub fn segment_gc_summaries(&self) -> &DBMap<SegmentId, SegmentGcSummary> {
+        &self.segment_gc_summaries
     }
 
     pub fn gc_reclaim_pending(&self) -> &DBMap<(SegmentId, StrataLsn), u64> {
@@ -52,6 +44,10 @@ impl StrataIndex {
         &self.shards
     }
 
+    pub fn shard_cleanup_jobs(&self) -> &DBMap<ShardKey, ShardCleanupJob> {
+        &self.shard_cleanup_jobs
+    }
+
     pub fn store_state(&self) -> &DBMap<StoreStateKey, StrataLsn> {
         &self.store_state
     }
@@ -60,12 +56,16 @@ impl StrataIndex {
         &self.epoch_changes
     }
 
-    pub fn unaccounted_lsn_ops(&self) -> &DBMap<StrataLsn, BlobKey> {
-        &self.unaccounted_lsn_ops
+    pub fn lsm_manifests(&self) -> &DBMap<String, Manifest> {
+        &self.lsm_manifests
     }
 
-    pub fn accounting_index(&self) -> &DBMap<AccountingIndexKey, AccountingIndexValue> {
-        &self.accounting_index
+    pub fn garbage_log_positions(&self) -> &DBMap<String, GarbageLogPosition> {
+        &self.garbage_log_positions
+    }
+
+    pub fn segment_garbage_log_positions(&self) -> &DBMap<SegmentId, u64> {
+        &self.segment_garbage_log_positions
     }
 
     pub fn flush_wal(&self, sync: bool) -> Result<()> {

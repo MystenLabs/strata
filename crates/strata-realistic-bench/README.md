@@ -80,7 +80,6 @@ sudo env \
   --delete-timely-percent 99 \
   --control-interval 5s \
   --sync-interval 0 \
-  --strata-accounting true \
   --strata-gc true \
   --metrics-listen 0.0.0.0:9184
 ```
@@ -159,7 +158,7 @@ strata_realistic_bench_space_amplification_ratio
 
 Strata exports direct net physical GC reclamation as
 `strata_store_gc_reclaimed_bytes_total`. BlobDB does not expose an equivalent counter. Its net
-physical reclaim rate can be derived from the blob-file accounting exposed by this harness:
+physical reclaim rate can be derived from the blob-file counters exposed by this harness:
 
 ```promql
 clamp_min(

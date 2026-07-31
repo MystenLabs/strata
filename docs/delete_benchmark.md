@@ -17,7 +17,7 @@ delete loop, and that durable boundary is `t=0` for reclamation samples.
 logical deletes without an observation window.
 
 `--delete-reclaim background` keeps the store open for `--reclaim-duration`. It never invokes a GC
-or compaction API. Strata's configured accounting/GC workers and RocksDB's configured automatic
+or compaction API. Strata's configured LSM/GC workers and RocksDB's configured automatic
 compactions continue naturally. Samples are recorded at `--reclaim-sample-at`; `0` and the final
 duration are always included.
 
@@ -106,7 +106,7 @@ foreground interference.
 - `--delete-verify-samples`: number of deleted and surviving initial keys checked at `t=0` and after
   the observation window.
 - `--delete-reclaim none|background`: immediate exit or fixed-duration native background behavior.
-- `--delete-setup-timeout`: bound Strata's pre-delete sealing/accounting wait.
+- `--delete-setup-timeout`: bound Strata's pre-delete sealing/LSM-materialization wait.
 - `--reclaim-duration`: total background observation time. Supported suffixes are `ms`, `s`, `m`,
   and `h`.
 - `--reclaim-sample-at`: comma-separated checkpoints. Times after the duration are rejected when
@@ -146,7 +146,7 @@ Important groups are:
 
 Strata also exports engine-level GC byte counters:
 
-- `strata_store_gc_output_bytes_total`: bytes installed in successfully published GC outputs.
+- `strata_store_gc_output_bytes_total`: bytes made visible in successfully published GC outputs.
 - `strata_store_gc_source_deleted_bytes_total`: gross bytes in source files successfully unlinked.
 - `strata_store_gc_reclaimed_bytes_total`: net bytes reclaimed after subtracting output bytes copied
   forward from deleted source bytes. This counter advances only after source unlink succeeds.

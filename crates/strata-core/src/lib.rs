@@ -23,7 +23,6 @@
 //!
 //! - `BlobKey` is non-empty and bounded by the record format limit.
 //! - `RecordRef` is a physical pointer into one segment and includes the encoded record length.
-//! - `BlobVersionKey` orders versions by logical LSN for one blob key.
 //! - `SegmentState` is durable metadata; segment bytes live outside this crate.
 
 mod checksum;
@@ -44,20 +43,19 @@ pub use ids::{
 pub use key::{BlobKey, BlobKeyError};
 pub use lifecycle::{
     BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp, BlobLifecycleOp,
-    BlobLifecycleState, BlobLifetimeHead, BlobVersionKey, BlobVersionState, ShardLsnKey,
-    ShardStoreStateKey, StoreStateKey, StrataStoreState,
+    BlobLifecycleState, BlobLifetimeHead, ShardLsnKey, ShardStoreStateKey, StoreStateKey,
 };
 pub use put::PutEntry;
-pub use put::{MapRefOp, PutHead, PutMergeOp, PutOp, PutState};
+pub use put::{PutHead, PutMergeOp, PutOp, PutState};
 pub use record::{
     DEFAULT_RECORD_SHARD, DecodedRecord, EncodedRecordParts, FIXED_RECORD_HEADER_LEN, RECORD_MAGIC,
     RECORD_VERSION, RecordHeader, RecordHeaderFields, encoded_record_len,
 };
 pub use segment::{
-    EpochBucket, GcRelocation, PlacementClass, SegmentFileState, SegmentGcLifetimeRange,
+    EpochBucket, GarbageEvent, PlacementClass, SegmentFileState, SegmentGcLifetimeRange,
     SegmentGcLifetimeUpdate, SegmentGcLiveRecord, SegmentGcOverlay, SegmentGcOverlayMergeOp,
-    SegmentGcRecordRange, SegmentGcSummary, SegmentId, SegmentOwner, SegmentRefEvent,
-    SegmentRefEventKey, SegmentState, VolumeId,
+    SegmentGcRecordRange, SegmentGcSummary, SegmentGcSummaryDelta, SegmentId, SegmentKey,
+    SegmentOwner, SegmentState, VolumeId,
 };
 
 #[cfg(test)]

@@ -13,9 +13,9 @@ test-utils = ["strata-core/test-utils"]
 bcs.workspace = true
 rocksdb.workspace = true
 serde.workspace = true
-strata-accounting.workspace = true
 strata-core.workspace = true
 strata-gc.workspace = true
+strata-lsm.workspace = true
 thiserror.workspace = true
 typed-store.workspace = true
 

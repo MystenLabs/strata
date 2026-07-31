@@ -2,10 +2,43 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BlobLifecycle, Epoch, ShardKey, StrataLsn};
+use crate::{BlobKey, BlobLifecycle, Epoch, RecordRef, ShardKey, StrataLsn};
 
 pub type SegmentId = u64;
 pub type VolumeId = u32;
+
+/// Sort key that keeps garbage for one physical segment together.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SegmentKey {
+    pub segment_id: SegmentId,
+    pub blob_key: BlobKey,
+}
+
+/// One physical transition used to classify a record during GC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GarbageEvent {
+    Retired {
+        record: RecordRef,
+    },
+    Expired {
+        record: RecordRef,
+    },
+    /// Sets the initial lifecycle, changes it, or explicitly clears it with `None`.
+    SetLifecycle {
+        record: RecordRef,
+        lifecycle: Option<BlobLifecycle>,
+    },
+}
+
+impl GarbageEvent {
+    pub fn record(&self) -> RecordRef {
+        match self {
+            Self::Retired { record }
+            | Self::Expired { record }
+            | Self::SetLifecycle { record, .. } => *record,
+        }
+    }
+}
 
 /// Physical owner of a segment file.
 ///
@@ -24,33 +57,6 @@ impl SegmentOwner {
             Self::Shard(shard) => Some(shard),
         }
     }
-}
-
-/// LSN-ordered accounting event for one physical record in an ingest segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SegmentRefEventKey {
-    pub segment_id: SegmentId,
-    pub lsn: StrataLsn,
-    pub offset: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SegmentRefEvent {
-    /// The physical record stopped protecting a key because of overwrite, tombstone, or GC mapping.
-    Retired,
-    /// The physical record stopped protecting a key because its lifecycle reached an epoch boundary.
-    Expired,
-    /// The physical record is still protected, but its routing lifecycle changed.
-    LifecycleChanged { lifecycle: Option<BlobLifecycle> },
-}
-
-/// Durable forwarding entry installed while accounting catches up to a GC publish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GcRelocation {
-    /// Publish LSN of the `MapRef` that makes this relocation part of the ordered accounting log.
-    pub publish_lsn: StrataLsn,
-    /// Replacement physical record that already received the copied bytes.
-    pub to: crate::RecordRef,
 }
 
 /// Segment-local byte range for one encoded record.
@@ -104,10 +110,10 @@ pub struct SegmentGcLiveRecord {
     pub lifecycle: Option<BlobLifecycle>,
 }
 
-/// Cheap accounting summary used by GC planning.
+/// Cheap segment summary used by GC planning.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SegmentGcSummary {
-    /// Total encoded bytes accounted for this segment by the GC overlay fold.
+    /// Total encoded bytes represented for this segment by the GC overlay fold.
     pub total_bytes: u64,
     /// Bytes currently protected by live refs.
     pub live_bytes: u64,
@@ -130,6 +136,24 @@ pub struct SegmentGcSummary {
     /// Extension counts of refs added live to this segment. Refs stay in their bucket after they
     /// expire: per-epoch extension counts are not tracked, so expiry sweeps cannot remove them.
     pub extension_count_histogram: BTreeMap<u32, u64>,
+}
+
+/// Additive RocksDB merge operand for one segment's GC summary.
+///
+/// LSM compaction resolves record lifecycles before producing this delta. Negative values move bytes or
+/// references out of their previous state; positive values move them into their new state.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SegmentGcSummaryDelta {
+    pub total_bytes: i128,
+    pub live_bytes: i128,
+    pub retired_bytes: i128,
+    pub expired_bytes: i128,
+    pub live_ref_count: i128,
+    pub unknown_lifetime_bytes: i128,
+    pub unknown_lifetime_ref_count: i128,
+    pub epoch_bytes: BTreeMap<Epoch, i128>,
+    pub epoch_refs: BTreeMap<Epoch, i128>,
+    pub extension_counts: BTreeMap<u32, i128>,
 }
 
 impl SegmentGcSummary {
@@ -411,7 +435,7 @@ pub enum SegmentGcOverlayMergeOp {
     /// Marks segment-local ranges as definitely not protecting live data. This is stronger than a
     /// lifetime hint and removes overlapping lifecycle overlay state when folded.
     RetireBatch { ranges: Vec<SegmentGcRecordRange> },
-    /// Installs or clears lifecycle routing for ranges that remain copy-eligible. A `None`
+    /// Sets or clears lifecycle routing for ranges that remain copy-eligible. A `None`
     /// lifecycle is an explicit clear, not the absence of an update.
     LifetimeBatch {
         updates: Vec<SegmentGcLifetimeUpdate>,
@@ -608,11 +632,11 @@ pub enum SegmentFileState {
     /// A segment that is no longer readable or eligible for planning. Its file has been removed or
     /// is scheduled for idempotent removal.
     Deleted,
-    /// A sealed GC output installed at its final path before its `MapRef`s are published. Recovery
+    /// A sealed GC output published at its final path before its relocation entries are written. Recovery
     /// deletes it if publication does not commit.
     PendingGcOutput,
     /// A sealed GC source whose replacement refs have been published. The source remains readable
-    /// and fenced from rewrites until accounting makes it eligible for final empty deletion.
+    /// and fenced from rewrites until reference processing makes it eligible for final deletion.
     GcRelocating,
 }
 

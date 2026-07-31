@@ -388,7 +388,7 @@ As today:
 2. Seal and checksum output files.
 3. Rename them to final paths.
 4. Sync files and parent directories.
-5. Install protective pending-output segment rows.
+5. Publish protective pending-output segment rows.
 
 No relocation mapping is visible yet.
 
@@ -429,7 +429,7 @@ different payload version.
 
 ### Phase 4: post-commit
 
-1. Install the new relocation-manifest generation in the in-memory lookup view.
+1. Make the new relocation-manifest generation visible to in-memory lookups.
 2. Make active run blocks available through the relocation cache.
 3. Wake accounting ingestion.
 4. Release the accounting publication lock.
@@ -666,7 +666,7 @@ range markers cannot be removed.
 A conservative compaction frontier is:
 
 ```text
-min(durable_lsn, accounted_lsn, minimum_pinned_consumer_lsn)
+min(published_lsn, accounted_lsn, minimum_pinned_consumer_lsn)
 ```
 
 Chain collapsing may occur for read lookup before full retirement, but original run files remain
@@ -1093,3 +1093,7 @@ careful comparison with NovKV-style lazy handle updating, not on the number of L
 
 This sequence tests the central hypothesis—moving `O(N)` physical relocation metadata out of the
 serialized writer—before committing to permanent forwarding or complex reachability-based cleanup.
+# Historical MapRef LSM Proposal
+
+> This proposal predates the implemented blob and relocation LSMs. References to the separate
+> accounting engine are historical. See [`lsm_gc.md`](lsm_gc.md).

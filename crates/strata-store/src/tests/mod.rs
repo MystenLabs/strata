@@ -10,16 +10,9 @@ use std::{
 };
 
 use prometheus::Registry;
-use strata_accounting::{
-    AccountingIndex, AccountingIndexConfig, AccountingLogDurablePosition, ActiveDeltaLogReadCursor,
-};
-use strata_core::{
-    BlobLifecycle, EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcLifetimeRange,
-    SegmentGcRecordRange, SegmentRefEvent, SegmentRefEventKey, StrataStoreState,
-};
-use strata_gc::{
-    DestinationClass, GcAction, GcCopyRecord, GcPlan, GcPlanner, GcPlannerConfig, GcScenario,
-};
+use strata_core::{BlobLifecycle, EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcRecordRange};
+use strata_gc::{DestinationClass, GcAction, GcCopyRecord, GcPlanner, GcPlannerConfig, GcScenario};
+use strata_relocation::RelocationEntry;
 use tempfile::tempdir;
 use typed_store::{
     DBMetrics,
@@ -28,24 +21,30 @@ use typed_store::{
 
 use super::*;
 
+mod garbage_log;
+
 static INIT_TYPED_STORE_METRICS: Once = Once::new();
 const TEST_KEY_LEN: u64 = 6;
 const TEST_PAYLOAD_LEN: u64 = 9;
 const TEST_RECORD_LEN: u64 = FIXED_RECORD_HEADER_LEN as u64 + TEST_KEY_LEN + TEST_PAYLOAD_LEN;
 const TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD: u64 = TEST_RECORD_LEN * 2 - 1;
 
+#[test]
+fn retired_projection_files_are_removed_without_following_other_paths() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "default");
+    let retired = cfg.namespace_dir().join(RETIRED_PROJECTION_DIR);
+    std::fs::create_dir_all(&retired).unwrap();
+    std::fs::write(retired.join("delta-000001.run"), b"obsolete").unwrap();
+
+    cleanup_retired_projection_dir(&cfg).unwrap();
+
+    assert!(!retired.exists());
+}
+
 fn open_test_index(path: impl AsRef<Path>, cf_prefix: impl AsRef<str>) -> StrataIndex {
     let path = path.as_ref();
     StrataIndex::open_path(path, cf_prefix, path.display().to_string()).unwrap()
-}
-
-fn test_active_accounting_log(cfg: &StrataStoreConfig, segment_id: SegmentId) -> ActiveDeltaLog {
-    ActiveDeltaLog::open(
-        cfg.accounting_index_dir(),
-        segment_id,
-        AccountingLogDurablePosition::default(),
-    )
-    .unwrap()
 }
 
 fn gc_range(record_ref: RecordRef) -> SegmentGcRecordRange {
@@ -84,62 +83,6 @@ fn gc_staged_record(source_offset: u64, staged_offset: u64) -> GcStagedCopiedRec
 }
 
 #[test]
-fn gc_publish_reconciliation_keeps_lifecycle_only_source_touches() {
-    let lifecycle_touched = gc_staged_record(10, 0);
-    let retired = gc_staged_record(30, 8);
-    let accounting_changes = vec![
-        AccountingRefEvent {
-            key: SegmentRefEventKey {
-                segment_id: 7,
-                lsn: 50,
-                offset: lifecycle_touched.source.from.offset,
-            },
-            event: SegmentRefEvent::LifecycleChanged { lifecycle: None },
-        },
-        AccountingRefEvent {
-            key: SegmentRefEventKey {
-                segment_id: 7,
-                lsn: 51,
-                offset: retired.source.from.offset,
-            },
-            event: SegmentRefEvent::Retired,
-        },
-    ];
-
-    let (survivors, skipped) = split_gc_copied_records(
-        vec![lifecycle_touched.clone(), retired.clone()],
-        &accounting_changes,
-        &BTreeSet::new(),
-    );
-
-    assert_eq!(survivors, vec![lifecycle_touched]);
-    assert_eq!(
-        skipped,
-        vec![GcSkippedCopiedRecord {
-            record: retired,
-            kind: GcSkippedCopiedRecordKind::Retired,
-        }]
-    );
-}
-
-#[test]
-fn gc_publish_reconciliation_rejects_obsolete_shard_generation() {
-    let record = gc_staged_record(10, 0);
-    let obsolete_shards = BTreeSet::from([record.source.shard]);
-
-    let (survivors, skipped) = split_gc_copied_records(vec![record.clone()], &[], &obsolete_shards);
-
-    assert!(survivors.is_empty());
-    assert_eq!(
-        skipped,
-        vec![GcSkippedCopiedRecord {
-            record,
-            kind: GcSkippedCopiedRecordKind::Retired,
-        }]
-    );
-}
-
-#[test]
 fn gc_output_byte_attribution_includes_skipped_bytes_retained_in_used_output() {
     let survivor = gc_staged_record(10, 0);
     let skipped_record = gc_staged_record(30, 8);
@@ -155,285 +98,28 @@ fn gc_output_byte_attribution_includes_skipped_bytes_retained_in_used_output() {
 
 fn segment_summary(index: &StrataIndex, segment_id: SegmentId) -> strata_core::SegmentGcSummary {
     index
-        .get_segment_gc_overlay(segment_id)
+        .get_segment_gc_summary(segment_id)
         .unwrap()
         .unwrap_or_default()
-        .summary
 }
 
-fn accounting_log_durable_position(index: &StrataIndex) -> AccountingLogDurablePosition {
-    index
-        .get_accounting_log_durable_position()
+fn segment_overlay(store: &StrataStore, segment_id: SegmentId) -> strata_core::SegmentGcOverlay {
+    store
+        .index()
+        .read_segment_garbage_overlay(store.config().namespace_dir(), segment_id)
         .unwrap()
+        .unwrap_or_default()
+}
+
+fn lsm_blob(store: &StrataStore, shard: ShardKey, key: &BlobKey) -> ResolvedBlobVersion {
+    resolve_blob_version(store, shard, key)
         .unwrap()
+        .expect("blob must be visible in the LSM")
 }
 
-fn active_delta_log_read_cursor(index: &StrataIndex) -> ActiveDeltaLogReadCursor {
-    index
-        .get_accounting_active_delta_log_consumed_cursor()
-        .unwrap()
-        .unwrap()
+fn lsm_blob_ref(store: &StrataStore, key: &BlobKey) -> RecordRef {
+    lsm_blob(store, STANDALONE_SHARD, key).record_ref
 }
-
-#[tokio::test]
-async fn durable_frontier_advances_across_durable_gc_map_ref() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let index = open_test_index(dir.path(), "strata");
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let from = RecordRef {
-        segment_id: 1,
-        offset: 0,
-        len: TEST_RECORD_LEN,
-    };
-    let to = RecordRef {
-        segment_id: 2,
-        offset: 0,
-        len: TEST_RECORD_LEN,
-    };
-    let entry = PutEntry {
-        record_ref: Some(from),
-        lsn: 1,
-        generation: 1,
-        state: BlobState::Live,
-    };
-    let to_end_offset = to.end_offset().unwrap();
-    let mut output_state = SegmentState {
-        owner: INGEST_SEGMENT_OWNER,
-        segment_id: to.segment_id,
-        volume_id: 0,
-        path: format!("gc/{:012}.data", to.segment_id),
-        placement_class: PlacementClass::Spillover,
-        state: SegmentFileState::Sealed,
-        write_offset: to_end_offset,
-        durable_offset: to_end_offset - 1,
-        min_lsn: None,
-        max_lsn: None,
-        sealed_before_lsn: None,
-        sealed_len: Some(to_end_offset),
-        sealed_sha256: None,
-    };
-
-    let mut batch = index.batch();
-    index.put_durable_lsn_batch(&mut batch, 1).unwrap();
-    index
-        .merge_blob_version_batch(&mut batch, &key, STANDALONE_SHARD, &entry)
-        .unwrap();
-    index
-        .map_blob_ref_batch(
-            &mut batch,
-            &key,
-            MapRefOp {
-                publish_lsn: 2,
-                shard: STANDALONE_SHARD,
-                payload_lsn: entry.lsn,
-                from,
-                to,
-            },
-        )
-        .unwrap();
-    index
-        .put_blob_unaccounted_lsn_op_batch(&mut batch, 2, &key)
-        .unwrap();
-    index
-        .put_segment_state_batch(&mut batch, &output_state)
-        .unwrap();
-    batch.write().unwrap();
-
-    assert_eq!(
-        durable_lsn_with_accounting_frontier(
-            &index,
-            None,
-            Some(AccountingLogDurablePosition {
-                segment_id: 1,
-                durable_offset: 0,
-                durable_lsn: 2,
-            }),
-        )
-        .unwrap(),
-        1
-    );
-
-    output_state.durable_offset = to_end_offset;
-    let mut batch = index.batch();
-    index
-        .put_segment_state_batch(&mut batch, &output_state)
-        .unwrap();
-    batch.write().unwrap();
-
-    assert_eq!(
-        durable_lsn_with_accounting_frontier(
-            &index,
-            None,
-            Some(AccountingLogDurablePosition {
-                segment_id: 1,
-                durable_offset: 0,
-                durable_lsn: 2,
-            }),
-        )
-        .unwrap(),
-        2
-    );
-}
-
-#[tokio::test]
-async fn recovery_rollback_removes_gc_relocations_at_hidden_publish_lsns() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
-    ensure_ingest_dir(&cfg).unwrap();
-    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let from_kept = RecordRef {
-        segment_id: 4,
-        offset: 0,
-        len: TEST_RECORD_LEN,
-    };
-    let from_hidden = RecordRef {
-        segment_id: 1,
-        offset: TEST_RECORD_LEN,
-        len: TEST_RECORD_LEN,
-    };
-    let to_kept = RecordRef {
-        segment_id: 3,
-        offset: 0,
-        len: TEST_RECORD_LEN,
-    };
-    let to_hidden = RecordRef {
-        segment_id: 2,
-        offset: TEST_RECORD_LEN,
-        len: TEST_RECORD_LEN,
-    };
-    let entry = PutEntry {
-        record_ref: Some(from_hidden),
-        lsn: 4,
-        generation: 1,
-        state: BlobState::Live,
-    };
-    let output_path = segment_path(&cfg, to_hidden.segment_id);
-    let output_len = to_hidden.end_offset().unwrap();
-    std::fs::write(&output_path, vec![0; output_len as usize]).unwrap();
-    let output_state = SegmentState {
-        owner: INGEST_SEGMENT_OWNER,
-        segment_id: to_hidden.segment_id,
-        volume_id: 0,
-        path: relative_segment_path(&cfg, output_path.clone()),
-        placement_class: PlacementClass::Spillover,
-        state: SegmentFileState::Sealed,
-        write_offset: output_len,
-        durable_offset: output_len,
-        min_lsn: Some(6),
-        max_lsn: Some(6),
-        sealed_before_lsn: None,
-        sealed_len: Some(output_len),
-        sealed_sha256: None,
-    };
-    let source_state = SegmentState {
-        owner: INGEST_SEGMENT_OWNER,
-        segment_id: from_hidden.segment_id,
-        volume_id: 0,
-        path: relative_segment_path(&cfg, segment_path(&cfg, from_hidden.segment_id)),
-        placement_class: PlacementClass::Ingest,
-        state: SegmentFileState::GcRelocating,
-        write_offset: from_hidden.end_offset().unwrap(),
-        durable_offset: from_hidden.end_offset().unwrap(),
-        min_lsn: Some(entry.lsn),
-        max_lsn: Some(entry.lsn),
-        sealed_before_lsn: Some(5),
-        sealed_len: Some(from_hidden.end_offset().unwrap()),
-        sealed_sha256: None,
-    };
-
-    let mut batch = index.batch();
-    index.put_next_lsn_batch(&mut batch, 7).unwrap();
-    index.put_durable_lsn_batch(&mut batch, 4).unwrap();
-    index.put_current_epoch_batch(&mut batch, 42).unwrap();
-    index.put_epoch_change_batch(&mut batch, 0, 42).unwrap();
-    index
-        .merge_blob_version_batch(&mut batch, &key, STANDALONE_SHARD, &entry)
-        .unwrap();
-    index
-        .map_blob_ref_batch(
-            &mut batch,
-            &key,
-            MapRefOp {
-                publish_lsn: 6,
-                shard: STANDALONE_SHARD,
-                payload_lsn: entry.lsn,
-                from: from_hidden,
-                to: to_hidden,
-            },
-        )
-        .unwrap();
-    index
-        .put_blob_unaccounted_lsn_op_batch(&mut batch, 6, &key)
-        .unwrap();
-    index
-        .put_segment_state_batch(&mut batch, &output_state)
-        .unwrap();
-    index
-        .put_segment_state_batch(&mut batch, &source_state)
-        .unwrap();
-    index
-        .put_gc_relocation_batch(
-            &mut batch,
-            from_kept,
-            &GcRelocation {
-                publish_lsn: 5,
-                to: to_kept,
-            },
-        )
-        .unwrap();
-    index
-        .put_gc_relocation_batch(
-            &mut batch,
-            from_hidden,
-            &GcRelocation {
-                publish_lsn: 6,
-                to: to_hidden,
-            },
-        )
-        .unwrap();
-    batch.write().unwrap();
-
-    rollback_operations_from(&cfg, &index, &StrataStoreMetrics::default(), 6).unwrap();
-
-    assert_eq!(index.get_next_lsn().unwrap(), 6);
-    assert!(!output_path.exists());
-    assert_eq!(
-        index
-            .get_segment_state(to_hidden.segment_id)
-            .unwrap()
-            .unwrap()
-            .state,
-        SegmentFileState::Deleted
-    );
-    assert_eq!(
-        index
-            .get_blob_version_for_shard(&version_key(&key, entry.lsn), STANDALONE_SHARD)
-            .unwrap()
-            .unwrap()
-            .record_ref,
-        Some(from_hidden)
-    );
-    assert_eq!(
-        index.get_gc_relocation(from_kept).unwrap(),
-        Some(GcRelocation {
-            publish_lsn: 5,
-            to: to_kept,
-        })
-    );
-    assert_eq!(index.get_gc_relocation(from_hidden).unwrap(), None);
-    assert_eq!(
-        index
-            .get_segment_state(from_hidden.segment_id)
-            .unwrap()
-            .unwrap()
-            .state,
-        SegmentFileState::Sealed
-    );
-}
-
 #[tokio::test]
 async fn open_cleans_stale_pending_gc_output() {
     init_typed_store_metrics();
@@ -492,19 +178,6 @@ async fn open_cleans_stale_gc_staging_dirs() {
     assert!(!cfg.namespace_dir().join("gc-staging").exists());
     assert!(store.config().ingest_dir().exists());
 }
-
-fn open_accounting_index(store: &StrataStore) -> AccountingIndex {
-    let manifest = store.index().get_accounting_index_manifest().unwrap();
-    AccountingIndex::open_with_manifest(
-        AccountingIndexConfig::new(
-            store.config().accounting_index_dir(),
-            store.config().accounting_partition_count(),
-        ),
-        manifest,
-    )
-    .unwrap()
-}
-
 #[derive(Debug)]
 struct StandaloneStore {
     store: StrataStore,
@@ -524,7 +197,7 @@ impl StandaloneStore {
     }
 
     fn tombstone(&self, key: &BlobKey) -> Result<StrataLsn> {
-        self.store.tombstone(key)
+        self.store.tombstone(STANDALONE_SHARD.id, key)
     }
 
     fn extend(&self, key: &BlobKey, new_logical_end_epoch: Epoch) -> Result<Option<StrataLsn>> {
@@ -546,15 +219,42 @@ fn try_open_standalone_store(
     Ok(StandaloneStore { store })
 }
 
-fn stop_accounting_worker(store: &mut StrataStore) {
-    if let Some(accounting_tx) = store.accounting_tx.take() {
-        accounting_tx.shutdown();
-    }
-    if let Some(accounting_handle) = store.accounting_handle.take() {
-        let _ = accounting_handle.join();
-    }
-}
+#[tokio::test]
+async fn payload_updates_cannot_reuse_an_old_relocation() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"blob".to_vec()).unwrap();
+    let store = try_open_standalone_store(
+        config(dir.path(), "relocation-cache"),
+        StrataStoreMetrics::default(),
+    )
+    .unwrap();
 
+    let first_lsn = store.put(&key, b"first").unwrap();
+    store.relocation_cache.insert(
+        key.clone(),
+        STANDALONE_SHARD,
+        first_lsn,
+        RecordRef {
+            segment_id: 10,
+            offset: 20,
+            len: 30,
+        },
+    );
+    store.set_blob_lifetime(&key, 100).unwrap();
+    assert_eq!(store.relocation_cache.len(), 1);
+
+    let second_lsn = store.put(&key, b"second").unwrap();
+    assert_eq!(store.relocation_cache.len(), 1);
+    assert_eq!(
+        store
+            .relocation_cache
+            .get(&key, STANDALONE_SHARD, second_lsn),
+        None
+    );
+    store.tombstone(&key).unwrap();
+    assert_eq!(store.relocation_cache.len(), 1);
+}
 fn init_typed_store_metrics() {
     INIT_TYPED_STORE_METRICS.call_once(|| {
         DBMetrics::get();
@@ -572,17 +272,6 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         segment_reader_cache_capacity: 16,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
-        accounting_worker_enabled: true,
-        accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
-        accounting_unaccounted_threshold: DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD,
-        accounting_materialize_lag_threshold: DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD,
-        accounting_partition_count: DEFAULT_ACCOUNTING_PARTITION_COUNT,
-        accounting_maintenance_interval: DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL,
-        accounting_ingest_record_threshold: DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD,
-        accounting_delta_run_count_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD,
-        accounting_delta_run_bytes_threshold: DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD,
-        accounting_major_patch_count_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD,
-        accounting_major_patch_bytes_threshold: DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD,
         gc_workers_enabled: true,
         gc_interval: Duration::from_secs(3600),
         gc_worker_count: DEFAULT_GC_WORKER_COUNT,
@@ -592,7 +281,6 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
         gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
         gc_planner_config: GcPlannerConfig::default(),
-        gc_max_accounting_lag_lsn: DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN,
         shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
         starting_epoch: 42,
     }
@@ -610,6 +298,27 @@ fn counter_value(registry: &Registry, name: &str) -> f64 {
                 .map(|metric| metric.get_counter().value())
         })
         .unwrap_or_else(|| panic!("missing counter metric {name}"))
+}
+
+fn counter_value_with_labels(registry: &Registry, name: &str, labels: &[(&str, &str)]) -> f64 {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family.get_metric().iter().find_map(|metric| {
+                labels
+                    .iter()
+                    .all(|(name, value)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == *name && label.value() == *value)
+                    })
+                    .then(|| metric.get_counter().value())
+            })
+        })
+        .unwrap_or_else(|| panic!("missing counter metric {name} with labels {labels:?}"))
 }
 
 fn gauge_value(registry: &Registry, name: &str) -> i64 {
@@ -659,34 +368,38 @@ fn wait_for_segment_state(
         std::thread::sleep(Duration::from_millis(10));
     }
 }
-
-fn wait_for_accounted_lsn(store: &StrataStore, expected_lsn: StrataLsn) {
+fn wait_for_lsm_gc(store: &StrataStore, expected_lsn: StrataLsn) {
     let started = Instant::now();
     loop {
-        let accounted_lsn = store.accounted_lsn().unwrap();
-        if accounted_lsn >= expected_lsn {
-            return;
-        }
+        let manifest = store.lsm().unwrap().manifest();
+        let head = store
+            .index()
+            .get_garbage_log_position(GARBAGE_LOG_HEAD)
+            .unwrap()
+            .unwrap_or_default();
+        let swept = store
+            .index()
+            .get_garbage_log_position(GARBAGE_LOG_SWEEP_CURSOR)
+            .unwrap()
+            .unwrap_or_default();
+        let materialized = manifest
+            .materialized_through
+            .is_some_and(|lsn| lsn >= expected_lsn);
+        let empty_output_settled = started.elapsed() >= Duration::from_secs(2);
+        if store.published_lsn().unwrap() >= expected_lsn
+            && (materialized || empty_output_settled)
+            && manifest.partitions[&0].patches.is_empty()
+            && swept == head
         {
-            let _guard = store
-                .accounting_lock
-                .lock()
-                .expect("accounting run lock poisoned");
-            accounting::run_accounting_materializing_once(store.index(), store.config()).unwrap();
-        }
-        let accounted_lsn = store.accounted_lsn().unwrap();
-        if accounted_lsn >= expected_lsn {
             return;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "timed out waiting for accounted_lsn to reach {expected_lsn}; current accounted_lsn was {accounted_lsn}; durable_lsn was {}; accounting_log_durable_position was {:?}; active_delta_cursor was {:?}",
-            store.durable_lsn().unwrap(),
-            store.index().get_accounting_log_durable_position().unwrap(),
-            store
-                .index()
-                .get_accounting_active_delta_log_consumed_cursor()
-                .unwrap(),
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for LSM GC materialization through {expected_lsn}; manifest frontier was {:?}, patch count was {}, head was {:?}, swept was {:?}",
+            manifest.materialized_through,
+            manifest.partitions[&0].patches.len(),
+            head,
+            swept,
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -695,20 +408,10 @@ fn wait_for_accounted_lsn(store: &StrataStore, expected_lsn: StrataLsn) {
 fn wait_for_shard_cleanup(store: &StrataStore, shard: ShardKey) {
     let started = Instant::now();
     loop {
-        if store
-            .index()
-            .get_shard_cleanup_job(shard)
-            .unwrap()
-            .is_none()
-        {
-            return;
-        }
-        {
-            let _guard = store
-                .accounting_lock
-                .lock()
-                .expect("accounting run lock poisoned");
-            accounting::run_accounting_materializing_once(store.index(), store.config()).unwrap();
+        match store.index().get_shard_cleanup_job(shard).unwrap() {
+            None => return,
+            Some(job) if job.state == ShardCleanupState::ShardOwnedReclaimed => return,
+            Some(_) => {}
         }
         store
             .gc_executor()
@@ -743,13 +446,6 @@ fn put_test_segment_state(index: &StrataIndex, segment_id: SegmentId, state: Seg
         .unwrap();
 }
 
-fn version_key(key: &BlobKey, lsn: StrataLsn) -> BlobVersionKey {
-    BlobVersionKey {
-        key: key.clone(),
-        lsn,
-    }
-}
-
 fn seal_first_segment(config: &StrataStoreConfig) -> SegmentState {
     let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
@@ -778,79 +474,828 @@ async fn standalone_put_get_round_trip() {
 }
 
 #[tokio::test]
-async fn background_accounting_and_gc_workers_can_be_disabled() {
+async fn store_routes_payload_and_metadata_writes_through_lsm_wal() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "lsm-write-path");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let mut cfg = config(dir.path(), "no-background-maintenance");
-    cfg.accounting_worker_enabled = false;
-    cfg.gc_workers_enabled = false;
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
 
-    assert!(store.store.accounting_tx.is_none());
-    assert!(store.store.accounting_handle.is_none());
-    assert!(store.store.gc_txs.is_empty());
-    assert!(store.store.gc_handles.is_empty());
-    assert_eq!(store.gc_active_worker_limit(), 0);
-    assert_eq!(store.gc_active_io_bytes_per_sec(), 0);
-
-    let lsn = store.put(&key, b"hello strata").unwrap();
+    assert_eq!(store.put(&key, b"payload").unwrap(), 1);
+    assert_eq!(store.tombstone(&key).unwrap(), 2);
     store.sync().unwrap();
 
-    assert_eq!(store.durable_lsn().unwrap(), lsn);
-    assert_eq!(store.accounted_lsn().unwrap(), 0);
-    assert_eq!(store.get(&key).unwrap(), Some(b"hello strata".to_vec()));
+    let wal = strata_lsm::Wal::path(cfg.namespace_dir().join("lsm/wal"), 1);
+    assert_eq!(
+        wal.extension().and_then(|extension| extension.to_str()),
+        Some("log")
+    );
+    assert!(fs::metadata(wal).unwrap().len() > 12);
 }
 
 #[tokio::test]
-async fn gc_workers_require_background_accounting() {
+async fn synced_lsm_checkpoint_reopens_the_existing_wal_prefix() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let mut cfg = config(dir.path(), "invalid-background-maintenance");
-    cfg.accounting_worker_enabled = false;
+    let cfg = config(dir.path(), "lsm-checkpoint");
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
 
-    let error = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap_err();
-
-    assert!(matches!(
-        error,
-        Error::InvalidConfig("gc workers require the accounting worker")
-    ));
-}
-
-#[tokio::test]
-async fn from_index_writes_logical_shard_versions_with_global_store_state() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "shard-a");
-    let index = open_test_index(dir.path().join("shared-index"), cfg.index_cf_prefix());
-    let shard = ShardKey {
-        id: 5,
-        generation: 2,
+    let first_checkpoint = {
+        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+        assert_eq!(store.put(&key_a, b"one").unwrap(), 1);
+        store.sync().unwrap();
+        store.index().get_lsm_checkpoint().unwrap().unwrap()
     };
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    index
-        .put_shard_info(shard.id, ShardInfo::active(shard.generation))
-        .unwrap();
-    let store = StrataStore::from_index(cfg, index.clone(), StrataStoreMetrics::default()).unwrap();
+    assert_eq!(first_checkpoint.durable_lsn, Some(1));
+    assert_eq!(first_checkpoint.active_segment_id, FIRST_SEGMENT_ID);
+    assert!(first_checkpoint.wal_position.offset > 12);
 
-    let lsn = store.put(shard.id, &key, b"hello shard").unwrap();
+    let second_checkpoint = {
+        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+        assert_eq!(
+            store.index().get_lsm_checkpoint().unwrap(),
+            Some(first_checkpoint)
+        );
+        assert_eq!(store.put(&key_b, b"two").unwrap(), 2);
+        store.sync().unwrap();
+        store.index().get_lsm_checkpoint().unwrap().unwrap()
+    };
 
-    assert_eq!(lsn, 1);
+    assert_eq!(second_checkpoint.durable_lsn, Some(2));
     assert_eq!(
-        store.get_from_shard(shard.id, &key).unwrap(),
-        Some(b"hello shard".to_vec())
+        second_checkpoint.wal_position.log_id,
+        first_checkpoint.wal_position.log_id
     );
-    assert_eq!(store.get(&key).unwrap(), None);
+    assert!(
+        second_checkpoint.wal_position.offset > first_checkpoint.wal_position.offset,
+        "reopen must append after the persisted WAL prefix"
+    );
     assert_eq!(
-        index.get_shard_info(shard.id).unwrap(),
-        Some(ShardInfo::active(shard.generation))
+        fs::metadata(strata_lsm::Wal::path(
+            cfg.namespace_dir().join("lsm/wal"),
+            second_checkpoint.wal_position.log_id,
+        ))
+        .unwrap()
+        .len(),
+        second_checkpoint.wal_position.offset
     );
-    assert_eq!(index.get_next_lsn().unwrap(), 2);
-    assert!(index.resolve_blob_head(&key, shard).unwrap().is_some());
-    assert!(index.get_segment_state(FIRST_SEGMENT_ID).unwrap().is_some());
-    assert_eq!(index.get_blob_entry(&key).unwrap(), None);
 }
 
+#[tokio::test]
+async fn lsm_flusher_publishes_and_releases_a_frozen_memtable() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "lsm-flush");
+    cfg.segment_max_bytes = 100;
+    ensure_ingest_dir(&cfg).unwrap();
+    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
+    let active_writer = SegmentWriter::create(
+        segment_path(&cfg, FIRST_SEGMENT_ID),
+        FIRST_SEGMENT_ID,
+        PlacementClass::Ingest,
+        cfg.segment_max_bytes,
+    )
+    .unwrap();
+    let policy =
+        strata_lsm::MemtableRolloverPolicy::new(std::num::NonZeroUsize::MIN, Duration::MAX);
+    let options = LsmOptions {
+        memtable_capacity: 4096,
+        rollover_policy: Some(policy),
+        ..LsmOptions::default()
+    };
+    let (lsm, sync_handles) = open_lsm_with_options(
+        &cfg,
+        &index,
+        active_writer,
+        SegmentIdAllocator::new(FIRST_SEGMENT_ID + 1),
+        1,
+        None,
+        options,
+    )
+    .unwrap();
+    lsm.put(0, b"a".to_vec(), b"one".to_vec()).unwrap();
+    assert!(
+        lsm.put(0, b"b".to_vec(), b"two".to_vec())
+            .unwrap()
+            .rolled_memtable
+            .is_some()
+    );
+    assert_eq!(lsm.wal_position().unwrap().log_id, 2);
+
+    let (compact_tx, compact_rx) = mpsc::channel();
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let flusher = LsmFlusher {
+        index: index.clone(),
+        lsm: Arc::downgrade(&lsm),
+        wake_rx,
+        compact_tx,
+        store_halt: StoreHalt::default(),
+    };
+    let flush_handle = thread::spawn(move || flusher.run());
+    wake_tx.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !lsm.frozen_generations(0).unwrap().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(lsm.frozen_generations(0).unwrap().is_empty());
+    compact_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the completed flush must wake compaction without running it");
+    let manifest = index.get_lsm_manifest(BLOB_LSM_MANIFEST).unwrap().unwrap();
+    assert_eq!(manifest.partitions[&0].patches.len(), 1);
+    assert_eq!(manifest.materialized_through, Some(1));
+    assert_eq!(manifest.wal_retained_from, 2);
+    assert_eq!(lsm.manifest().generation, manifest.generation);
+    assert!(!strata_lsm::Wal::path(cfg.namespace_dir().join("lsm/wal"), 1).exists());
+    assert!(strata_lsm::Wal::path(cfg.namespace_dir().join("lsm/wal"), 2).exists());
+
+    drop(wake_tx);
+    flush_handle.join().unwrap();
+    drop(lsm);
+    for handle in sync_handles {
+        handle.join().unwrap();
+    }
+
+    let mut batch = index.batch();
+    index.put_next_lsn_batch(&mut batch, 3).unwrap();
+    batch.write_with_sync(true).unwrap();
+    let active_writer = SegmentWriter::open_existing(
+        segment_path(&cfg, FIRST_SEGMENT_ID),
+        FIRST_SEGMENT_ID,
+        PlacementClass::Ingest,
+        cfg.segment_max_bytes,
+    )
+    .unwrap();
+    let (reopened, sync_handles) = open_lsm_with_options(
+        &cfg,
+        &index,
+        active_writer,
+        SegmentIdAllocator::new(FIRST_SEGMENT_ID + 1),
+        3,
+        None,
+        options,
+    )
+    .unwrap();
+    for (key, expected) in [(b"a".as_slice(), b"one".as_slice()), (b"b", b"two")] {
+        let encoded = reopened.get(0, key, &strata_lsm::Replace).unwrap().unwrap();
+        assert_eq!(
+            decode_value(&encoded).unwrap(),
+            StoredValue::Inline(expected)
+        );
+    }
+    drop(reopened);
+    for handle in sync_handles {
+        handle.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn lsm_compactor_partially_merges_then_materializes_durable_patches() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "lsm-compact");
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "lsm-compact").unwrap();
+    ensure_ingest_dir(&cfg).unwrap();
+    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
+    let active_writer = SegmentWriter::create(
+        segment_path(&cfg, FIRST_SEGMENT_ID),
+        FIRST_SEGMENT_ID,
+        PlacementClass::Ingest,
+        cfg.segment_max_bytes,
+    )
+    .unwrap();
+    let policy =
+        strata_lsm::MemtableRolloverPolicy::new(std::num::NonZeroUsize::MIN, Duration::MAX);
+    let options = LsmOptions {
+        memtable_capacity: 4096,
+        rollover_policy: Some(policy),
+        ..LsmOptions::default()
+    };
+    let (lsm, sync_handles) = open_lsm_with_options(
+        &cfg,
+        &index,
+        active_writer,
+        SegmentIdAllocator::new(FIRST_SEGMENT_ID + 1),
+        1,
+        None,
+        options,
+    )
+    .unwrap();
+    let relocations = open_relocation_lsm(&cfg, &index).unwrap();
+    let store_halt = StoreHalt::default();
+    let (compact_tx, compact_rx) = mpsc::channel();
+    let compactor = LsmCompactor {
+        index: index.clone(),
+        lsm: Arc::downgrade(&lsm),
+        relocations: Arc::downgrade(&relocations),
+        garbage_log_dir: garbage_log_dir(&cfg),
+        garbage_publish_lock: Arc::new(Mutex::new(())),
+        wake_rx: compact_rx,
+        store_halt: store_halt.clone(),
+        metrics,
+        obsolete: Vec::new(),
+    };
+    let compact_handle = thread::spawn(move || compactor.run());
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let flusher = LsmFlusher {
+        index: index.clone(),
+        lsm: Arc::downgrade(&lsm),
+        wake_rx,
+        compact_tx: compact_tx.clone(),
+        store_halt,
+    };
+    let flush_handle = thread::spawn(move || flusher.run());
+    let key = BlobKey::new(b"key".to_vec()).unwrap();
+    let mut latest_ref = None;
+    let mut latest_lsn = None;
+    let mut old_snapshot = None;
+    let mut pinned_patch = None;
+
+    for update in 0..=LSM_COMPACTION_PATCH_COUNT {
+        let result = lsm
+            .write(LsmMutation::PutBlob {
+                partition: 0,
+                key: key.as_bytes().to_vec(),
+                metadata: BlobMutation::encode_put_metadata(STANDALONE_SHARD, 0),
+                record: LsmSegmentRecord {
+                    key: key.clone(),
+                    shard: STANDALONE_SHARD,
+                    payload: Arc::from(format!("value-{update}").into_bytes()),
+                },
+            })
+            .unwrap();
+        latest_ref = result.record_ref;
+        latest_lsn = Some(result.lsn);
+        if result.rolled_memtable.is_some() {
+            wake_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !lsm.frozen_generations(0).unwrap().is_empty() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(lsm.frozen_generations(0).unwrap().is_empty());
+        }
+        if update + 1 == LSM_COMPACTION_PATCH_COUNT {
+            let manifest = lsm.manifest();
+            pinned_patch = Some(manifest.partitions[&0].patches[0].clone());
+            old_snapshot =
+                Some(strata_lsm::Snapshot::new(lsm.table_store(), manifest, u64::MAX).unwrap());
+        }
+    }
+    assert!(lsm.roll_memtable_if_due(0).unwrap().is_some());
+    wake_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !lsm.frozen_generations(0).unwrap().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(lsm.frozen_generations(0).unwrap().is_empty());
+
+    assert_eq!(
+        lsm.manifest().partitions[&0].patches.len(),
+        LSM_COMPACTION_PATCH_COUNT + 1,
+        "full compaction must wait for segment and WAL durability"
+    );
+    let checkpoint = lsm.sync().unwrap();
+    let latest_ref = latest_ref.unwrap();
+    let relocated_ref = RecordRef {
+        segment_id: latest_ref.segment_id + 100,
+        offset: latest_ref.offset + 100,
+        len: latest_ref.len,
+    };
+    relocations
+        .write_batch(
+            0,
+            &[RelocationEntry {
+                key: key.clone(),
+                shard: STANDALONE_SHARD,
+                payload_lsn: latest_lsn.unwrap(),
+                publish_lsn: checkpoint.durable_lsn.unwrap() + 1,
+                to: relocated_ref,
+            }],
+        )
+        .unwrap();
+    let relocation_checkpoint = relocations.lsm().sync().unwrap();
+    let mut batch = index.batch();
+    index
+        .put_published_lsn_batch(&mut batch, checkpoint.durable_lsn.unwrap())
+        .unwrap();
+    index
+        .put_relocation_lsm_checkpoint_batch(&mut batch, relocation_checkpoint)
+        .unwrap();
+    index
+        .put_lazy_global_materialization_from_lsn_batch(&mut batch, 1)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+    let mut relocation_scan = relocations
+        .scan(
+            0,
+            key.as_bytes(),
+            key.as_bytes(),
+            index
+                .get_relocation_lsm_checkpoint()
+                .unwrap()
+                .unwrap()
+                .durable_lsn
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(relocation_scan.current().unwrap().to, relocated_ref);
+    relocation_scan.advance().unwrap();
+    assert!(relocation_scan.current().is_none());
+    compact_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while lsm.manifest().partitions[&0].patches.len() > 1 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let manifest = lsm.manifest();
+    assert_eq!(manifest.partitions[&0].patches.len(), 1);
+    assert!(manifest.partitions[&0].base.is_empty());
+
+    // The periodic forced pass materializes the coalesced patch and folds relocations.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lsm.manifest().partitions[&0].patches.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let manifest = lsm.manifest();
+    assert!(manifest.partitions[&0].patches.is_empty());
+    assert_eq!(manifest.partitions[&0].base.len(), 1);
+    assert_ne!(
+        index
+            .get_garbage_log_position(GARBAGE_LOG_HEAD)
+            .unwrap()
+            .unwrap_or_default(),
+        strata_lsm::GarbageLogPosition::default()
+    );
+    let pinned_patch = pinned_patch.unwrap();
+    let pinned_path = lsm.table_store().root().join(&pinned_patch.relative_path);
+    assert!(pinned_path.exists());
+    assert!(
+        old_snapshot
+            .as_ref()
+            .unwrap()
+            .get(0, key.as_bytes(), &BlobMerge)
+            .unwrap()
+            .is_some()
+    );
+
+    let encoded = lsm.get(0, key.as_bytes(), &BlobMerge).unwrap().unwrap();
+    let StoredValue::Inline(bytes) = decode_value(&encoded).unwrap() else {
+        panic!("compacted blob state must be inline");
+    };
+    assert_eq!(
+        LsmBlobState::decode(bytes).unwrap().versions[&STANDALONE_SHARD].record_ref,
+        relocated_ref
+    );
+    assert_eq!(
+        counter_value(
+            &registry,
+            "strata_store_main_compaction_healed_references_total"
+        ),
+        1.0
+    );
+
+    drop(old_snapshot);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pinned_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!pinned_path.exists());
+
+    drop(wake_tx);
+    flush_handle.join().unwrap();
+    drop(compact_tx);
+    compact_handle.join().unwrap();
+    drop(lsm);
+    drop(relocations);
+    for handle in sync_handles {
+        handle.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_bytes() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "relocation-reclaim");
+    cfg.gc_workers_enabled = false;
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "relocation-reclaim").unwrap();
+    let live_key = BlobKey::new(b"blob-live".to_vec()).unwrap();
+    let dead_key = BlobKey::new(b"blob-dead".to_vec()).unwrap();
+    let live_payload = b"payload-live";
+    let mut store = try_open_standalone_store(cfg.clone(), metrics.clone()).unwrap();
+
+    store.put(&live_key, live_payload).unwrap();
+    store.put(&dead_key, b"payload-dead").unwrap();
+    let live_version = lsm_blob(&store, STANDALONE_SHARD, &live_key);
+    let dead_version = lsm_blob(&store, STANDALONE_SHARD, &dead_key);
+    let tombstone_lsn = store.tombstone(&dead_key).unwrap();
+    store.sync().unwrap();
+    let lsm = store.lsm().unwrap();
+    store
+        .store
+        .write_tx
+        .take()
+        .unwrap()
+        .send(WriteCommand::Shutdown)
+        .unwrap();
+    store.store.writer_handle.take().unwrap().join().unwrap();
+    store.store.lsm_flush_tx.take();
+    store.store.lsm_flush_handle.take().unwrap().join().unwrap();
+    store
+        .store
+        .lsm_compact_handle
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+
+    let segment_b = 99;
+    let segment_c = 100;
+    let c_path = layout::retention_segment_path(
+        store.config(),
+        STANDALONE_SHARD,
+        PlacementClass::Spillover,
+        segment_c,
+    );
+    std::fs::create_dir_all(c_path.parent().unwrap()).unwrap();
+    let mut c_writer = SegmentWriter::create(
+        &c_path,
+        segment_c,
+        PlacementClass::Spillover,
+        store.config().segment_max_bytes,
+    )
+    .unwrap();
+    let ref_c = c_writer
+        .append_for_shard(
+            &live_key,
+            live_version.payload_lsn,
+            STANDALONE_SHARD,
+            live_payload,
+        )
+        .unwrap()
+        .record_ref;
+    let c_len = c_writer.seal().unwrap();
+    assert_eq!(ref_c.len, live_version.record_ref.len);
+
+    let ref_b_live = RecordRef {
+        segment_id: segment_b,
+        offset: 0,
+        len: live_version.record_ref.len,
+    };
+    let ref_b_dead = RecordRef {
+        segment_id: segment_b,
+        offset: ref_b_live.len,
+        len: dead_version.record_ref.len,
+    };
+    store
+        .relocations
+        .write_batch(
+            0,
+            &[
+                RelocationEntry {
+                    key: live_key.clone(),
+                    shard: STANDALONE_SHARD,
+                    payload_lsn: live_version.payload_lsn,
+                    publish_lsn: tombstone_lsn + 1,
+                    to: ref_b_live,
+                },
+                RelocationEntry {
+                    key: dead_key.clone(),
+                    shard: STANDALONE_SHARD,
+                    payload_lsn: dead_version.payload_lsn,
+                    publish_lsn: tombstone_lsn + 2,
+                    to: ref_b_dead,
+                },
+            ],
+        )
+        .unwrap();
+    let first_relocation_checkpoint = store.relocations.lsm().sync().unwrap();
+    let mut segment_b_state = SegmentState {
+        owner: SegmentOwner::Shard(STANDALONE_SHARD),
+        segment_id: segment_b,
+        volume_id: 0,
+        path: relative_segment_path(
+            store.config(),
+            layout::retention_segment_path(
+                store.config(),
+                STANDALONE_SHARD,
+                PlacementClass::Spillover,
+                segment_b,
+            ),
+        ),
+        placement_class: PlacementClass::Spillover,
+        state: SegmentFileState::Sealed,
+        write_offset: ref_b_live.len + ref_b_dead.len,
+        durable_offset: ref_b_live.len + ref_b_dead.len,
+        min_lsn: Some(tombstone_lsn + 1),
+        max_lsn: Some(tombstone_lsn + 2),
+        sealed_before_lsn: None,
+        sealed_len: Some(ref_b_live.len + ref_b_dead.len),
+        sealed_sha256: None,
+    };
+    let segment_c_state = SegmentState {
+        owner: SegmentOwner::Shard(STANDALONE_SHARD),
+        segment_id: segment_c,
+        volume_id: 0,
+        path: relative_segment_path(store.config(), c_path),
+        placement_class: PlacementClass::Spillover,
+        state: SegmentFileState::Sealed,
+        write_offset: c_len,
+        durable_offset: c_len,
+        min_lsn: Some(tombstone_lsn + 3),
+        max_lsn: Some(tombstone_lsn + 3),
+        sealed_before_lsn: None,
+        sealed_len: Some(c_len),
+        sealed_sha256: None,
+    };
+    let mut batch = store.index().batch();
+    store
+        .index()
+        .put_segment_state_batch(&mut batch, &segment_b_state)
+        .unwrap();
+    store
+        .index()
+        .put_relocation_lsm_checkpoint_batch(&mut batch, first_relocation_checkpoint)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
+    thread::sleep(LSM_MEMTABLE_MAX_AGE + Duration::from_millis(100));
+    assert!(
+        store
+            .relocations
+            .lsm()
+            .roll_memtable_if_due(0)
+            .unwrap()
+            .is_some()
+    );
+    flush_relocation_lsm(
+        store.index(),
+        &store.relocations,
+        &store.relocation_cache,
+        &metrics,
+    )
+    .unwrap();
+    compact_relocation_lsm(
+        store.index(),
+        &store.relocations,
+        &store.relocation_cache,
+        &metrics,
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .relocations
+            .lookup(0, &live_key, STANDALONE_SHARD, live_version.payload_lsn)
+            .unwrap()
+            .unwrap()
+            .to,
+        ref_b_live
+    );
+    assert!(
+        store
+            .relocations
+            .lookup(0, &dead_key, STANDALONE_SHARD, dead_version.payload_lsn)
+            .unwrap()
+            .is_some()
+    );
+
+    store
+        .relocations
+        .write_batch(
+            0,
+            &[RelocationEntry {
+                key: live_key.clone(),
+                shard: STANDALONE_SHARD,
+                payload_lsn: live_version.payload_lsn,
+                publish_lsn: tombstone_lsn + 3,
+                to: ref_c,
+            }],
+        )
+        .unwrap();
+    let second_relocation_checkpoint = store.relocations.lsm().sync().unwrap();
+    let mut source_state = store
+        .index()
+        .get_segment_state(live_version.record_ref.segment_id)
+        .unwrap()
+        .unwrap();
+    source_state.state = SegmentFileState::Deleted;
+    segment_b_state.state = SegmentFileState::Deleted;
+    let mut batch = store.index().batch();
+    store
+        .index()
+        .put_segment_state_batch(&mut batch, &source_state)
+        .unwrap();
+    store
+        .index()
+        .put_segment_state_batch(&mut batch, &segment_b_state)
+        .unwrap();
+    store
+        .index()
+        .put_segment_state_batch(&mut batch, &segment_c_state)
+        .unwrap();
+    store
+        .index()
+        .put_relocation_lsm_checkpoint_batch(&mut batch, second_relocation_checkpoint)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
+    assert_eq!(lsm_blob_ref(&store, &live_key), live_version.record_ref);
+    assert_eq!(store.get(&live_key).unwrap(), Some(live_payload.to_vec()));
+    store.relocation_cache.insert(
+        dead_key.clone(),
+        STANDALONE_SHARD,
+        dead_version.payload_lsn,
+        ref_b_dead,
+    );
+
+    thread::sleep(LSM_MEMTABLE_MAX_AGE + Duration::from_millis(100));
+    assert!(
+        store
+            .relocations
+            .lsm()
+            .roll_memtable_if_due(0)
+            .unwrap()
+            .is_some()
+    );
+    flush_relocation_lsm(
+        store.index(),
+        &store.relocations,
+        &store.relocation_cache,
+        &metrics,
+    )
+    .unwrap();
+    assert_eq!(
+        store.relocations.lsm().manifest().partitions[&0]
+            .patches
+            .len(),
+        1
+    );
+    compact_relocation_lsm(
+        store.index(),
+        &store.relocations,
+        &store.relocation_cache,
+        &metrics,
+    )
+    .unwrap();
+
+    let manifest = store.relocations.lsm().manifest();
+    assert!(manifest.partitions[&0].patches.is_empty());
+    assert_eq!(manifest.partitions[&0].base.len(), 1);
+    assert_eq!(
+        store
+            .relocations
+            .lookup(0, &live_key, STANDALONE_SHARD, live_version.payload_lsn)
+            .unwrap()
+            .unwrap()
+            .to,
+        ref_c
+    );
+    assert!(
+        store
+            .relocations
+            .lookup(0, &dead_key, STANDALONE_SHARD, dead_version.payload_lsn)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .relocation_cache
+            .get(&dead_key, STANDALONE_SHARD, dead_version.payload_lsn),
+        None
+    );
+    assert_eq!(
+        store
+            .relocation_cache
+            .get(&live_key, STANDALONE_SHARD, live_version.payload_lsn),
+        Some(ref_c)
+    );
+    assert_eq!(lsm_blob_ref(&store, &live_key), live_version.record_ref);
+    assert_eq!(store.get(&live_key).unwrap(), Some(live_payload.to_vec()));
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_lookups_total",
+            &[("result", "hit")]
+        ),
+        1.0
+    );
+    assert_eq!(
+        histogram_sample_count(&registry, "strata_store_relocation_lookup_duration_seconds"),
+        1
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_cache_requests_total",
+            &[("result", "hit")]
+        ),
+        1.0
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_cache_requests_total",
+            &[("result", "miss")]
+        ),
+        1.0
+    );
+    assert_eq!(
+        counter_value(
+            &registry,
+            "strata_store_relocation_compaction_entries_examined_total"
+        ),
+        4.0
+    );
+    assert_eq!(
+        counter_value(
+            &registry,
+            "strata_store_relocation_compaction_entries_dropped_total"
+        ),
+        1.0
+    );
+    assert!(
+        counter_value(
+            &registry,
+            "strata_store_relocation_compaction_input_bytes_total"
+        ) > 0.0
+    );
+    assert!(
+        counter_value(
+            &registry,
+            "strata_store_relocation_compaction_output_bytes_total"
+        ) > 0.0
+    );
+
+    drop(lsm);
+    drop(store);
+    let reopened = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    assert_eq!(lsm_blob_ref(&reopened, &live_key), live_version.record_ref);
+    assert_eq!(
+        reopened.get(&live_key).unwrap(),
+        Some(live_payload.to_vec())
+    );
+    assert_eq!(
+        reopened
+            .relocations
+            .lookup(0, &live_key, STANDALONE_SHARD, live_version.payload_lsn)
+            .unwrap()
+            .unwrap()
+            .to,
+        ref_c
+    );
+    assert!(
+        reopened
+            .relocations
+            .lookup(0, &dead_key, STANDALONE_SHARD, dead_version.payload_lsn)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn recovered_store_tail_promotes_the_matching_wal_tail() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "lsm-replay-base");
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+
+    let (first_checkpoint, ref_a, ref_b) = {
+        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+        assert_eq!(store.put(&key_a, b"one").unwrap(), 1);
+        let ref_a = lsm_blob_ref(&store, &key_a);
+        store.sync().unwrap();
+        let checkpoint = store.index().get_lsm_checkpoint().unwrap().unwrap();
+        assert_eq!(store.put(&key_b, b"two").unwrap(), 2);
+        let ref_b = lsm_blob_ref(&store, &key_b);
+        (checkpoint, ref_a, ref_b)
+    };
+
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    assert_eq!(store.get(&key_b).unwrap(), Some(b"two".to_vec()));
+    let summary = store
+        .index()
+        .get_segment_gc_summary(ref_a.segment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_bytes, ref_a.len + ref_b.len);
+    assert_eq!(summary.live_bytes, ref_a.len + ref_b.len);
+    assert_eq!(summary.live_ref_count, 2);
+    store.sync().unwrap();
+    let recovered = store.index().get_lsm_checkpoint().unwrap().unwrap();
+    assert_eq!(recovered.durable_lsn, Some(2));
+    assert!(recovered.wal_position.offset > first_checkpoint.wal_position.offset);
+
+    assert_eq!(store.put(&key_c, b"three").unwrap(), 3);
+    store.sync().unwrap();
+    let advanced = store.index().get_lsm_checkpoint().unwrap().unwrap();
+    assert_eq!(advanced.durable_lsn, Some(3));
+    assert!(advanced.wal_position.offset > recovered.wal_position.offset);
+}
 #[tokio::test]
 async fn store_writes_logical_shard_into_record_header() {
     init_typed_store_metrics();
@@ -868,13 +1313,8 @@ async fn store_writes_logical_shard_into_record_header() {
     let store =
         StrataStore::from_index(cfg.clone(), index.clone(), StrataStoreMetrics::default()).unwrap();
 
-    let lsn = store.put(shard.id, &key, b"hello shard").unwrap();
-    let record_ref = index
-        .get_blob_version_for_shard(&version_key(&key, lsn), shard)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    store.put(shard.id, &key, b"hello shard").unwrap();
+    let record_ref = lsm_blob(&store, shard, &key).record_ref;
     let mut reader = strata_segment::SegmentReader::open(
         segment_path(&cfg, record_ref.segment_id),
         record_ref.segment_id,
@@ -885,55 +1325,6 @@ async fn store_writes_logical_shard_into_record_header() {
 
     assert_eq!(metadata.header.shard, shard);
 }
-
-#[tokio::test]
-async fn store_hosts_multiple_logical_shards_inside_one_index() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "single-store");
-    let index = open_test_index(dir.path().join("shared-index"), cfg.index_cf_prefix());
-    index.put_shard_info(10, ShardInfo::active(4)).unwrap();
-    let store = StrataStore::from_index(cfg, index.clone(), StrataStoreMetrics::default()).unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-
-    let shard_a = store.add_shard(10).unwrap();
-    let shard_b = store.add_shard(20).unwrap();
-    let lsn_a = store.put(10, &key, b"primary").unwrap();
-    let lsn_b = store.put(20, &key, b"secondary").unwrap();
-
-    assert_eq!(
-        shard_a,
-        ShardKey {
-            id: 10,
-            generation: 4
-        }
-    );
-    assert_eq!(
-        shard_b,
-        ShardKey {
-            id: 20,
-            generation: 0
-        }
-    );
-    assert_eq!((lsn_a, lsn_b), (1, 2));
-    assert_eq!(store.shard_info(10).unwrap(), Some(ShardInfo::active(4)));
-    assert_eq!(store.shard_info(20).unwrap(), Some(ShardInfo::active(0)));
-    assert_eq!(
-        store.get_from_shard(10, &key).unwrap(),
-        Some(b"primary".to_vec())
-    );
-    assert_eq!(
-        store.get_from_shard(20, &key).unwrap(),
-        Some(b"secondary".to_vec())
-    );
-    assert_eq!(store.get(&key).unwrap(), None);
-    assert_eq!(index.get_next_lsn().unwrap(), 3);
-    assert!(index.resolve_blob_head(&key, shard_a).unwrap().is_some());
-    assert!(index.resolve_blob_head(&key, shard_b).unwrap().is_some());
-    assert_eq!(index.get_blob_entry(&key).unwrap(), None);
-    assert!(!dir.path().join("single-store").join("index").exists());
-}
-
 #[tokio::test]
 async fn concurrent_logical_shard_puts_use_one_global_sequence() {
     init_typed_store_metrics();
@@ -981,113 +1372,8 @@ async fn concurrent_logical_shard_puts_use_one_global_sequence() {
         assert_eq!(store.get_from_shard(shard_id, &key).unwrap(), Some(payload));
     }
 }
-
 #[tokio::test]
-async fn store_blob_ops_apply_to_all_active_logical_shard_heads() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let store =
-        StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
-    let shard_a = store.add_shard(10).unwrap();
-    let shard_b = store.add_shard(20).unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-
-    let lsn_a = store.put(10, &key, b"primary").unwrap();
-    let lsn_b = store.put(20, &key, b"secondary").unwrap();
-    let ref_a = store
-        .index()
-        .get_blob_version_for_shard(&version_key(&key, lsn_a), shard_a)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_version_for_shard(&version_key(&key, lsn_b), shard_b)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-
-    let extend_lsn = store.set_blob_lifetime(&key, 50).unwrap();
-    let tombstone_lsn = store.tombstone(&key).unwrap();
-
-    assert_eq!((lsn_a, lsn_b, extend_lsn, tombstone_lsn), (1, 2, 3, 4));
-    assert_eq!(
-        store.index().get_unaccounted_lsn_op(extend_lsn).unwrap(),
-        Some(key.clone())
-    );
-    assert_eq!(
-        store
-            .index()
-            .blob_version_op_at_lsn(&key, extend_lsn)
-            .unwrap(),
-        None
-    );
-    assert!(
-        store
-            .index()
-            .blob_lifecycle_op_at_lsn(&key, extend_lsn)
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        store
-            .index()
-            .blob_version_op_at_lsn(&key, tombstone_lsn)
-            .unwrap(),
-        None
-    );
-    assert!(
-        store
-            .index()
-            .blob_lifecycle_op_at_lsn(&key, tombstone_lsn)
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(store.get_from_shard(10, &key).unwrap(), None);
-    assert_eq!(store.get_from_shard(20, &key).unwrap(), None);
-    assert_eq!(
-        store
-            .index()
-            .resolve_blob_head(&key, shard_a)
-            .unwrap()
-            .unwrap()
-            .head_lsn,
-        lsn_a
-    );
-    assert_eq!(
-        store
-            .index()
-            .resolve_blob_head(&key, shard_b)
-            .unwrap()
-            .unwrap()
-            .head_lsn,
-        lsn_b
-    );
-
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
-
-    let mut expected_tombstoned = std::collections::BTreeMap::new();
-    *expected_tombstoned.entry(ref_a.segment_id).or_insert(0) += ref_a.len;
-    *expected_tombstoned.entry(ref_b.segment_id).or_insert(0) += ref_b.len;
-    for (segment_id, retired_bytes) in expected_tombstoned {
-        let stats = segment_summary(store.index(), segment_id);
-        assert_eq!(stats.total_bytes, retired_bytes);
-        assert_eq!(stats.live_bytes, 0);
-        assert_eq!(stats.live_ref_count, 0);
-        assert_eq!(stats.retired_bytes, retired_bytes);
-        assert!(stats.future_epoch_histogram.is_empty());
-    }
-    assert_eq!(
-        store.index().iter_unaccounted_lsn_ops().unwrap(),
-        Vec::new()
-    );
-}
-
-#[tokio::test]
-async fn tombstone_barrier_keeps_later_shard_put_visible_only_for_that_shard() {
+async fn tombstone_only_hides_the_target_shard_generation() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
@@ -1098,7 +1384,7 @@ async fn tombstone_barrier_keeps_later_shard_put_visible_only_for_that_shard() {
 
     store.put(10, &key, b"primary-old").unwrap();
     store.put(20, &key, b"secondary-old").unwrap();
-    let tombstone_lsn = store.tombstone(&key).unwrap();
+    let tombstone_lsn = store.tombstone(10, &key).unwrap();
     let resurrect_lsn = store.put(10, &key, b"primary-new").unwrap();
 
     assert!(resurrect_lsn > tombstone_lsn);
@@ -1106,14 +1392,9 @@ async fn tombstone_barrier_keeps_later_shard_put_visible_only_for_that_shard() {
         store.get_from_shard(10, &key).unwrap(),
         Some(b"primary-new".to_vec())
     );
-    assert_eq!(store.get_from_shard(20, &key).unwrap(), None);
     assert_eq!(
-        store
-            .index()
-            .resolve_blob_lifecycle_at(&key, StrataLsn::MAX)
-            .unwrap()
-            .tombstone_lsn,
-        Some(tombstone_lsn)
+        store.get_from_shard(20, &key).unwrap(),
+        Some(b"secondary-old".to_vec())
     );
 }
 
@@ -1133,7 +1414,7 @@ async fn store_batch_buffers_ops_until_write_and_returns_global_lsns() {
         .put(10, key_a.clone(), Arc::<[u8]>::from(&b"payload-a"[..]))
         .put(20, key_b.clone(), Arc::<[u8]>::from(&b"payload-b"[..]))
         .set_blob_lifetime(key_a.clone(), 50)
-        .tombstone(key_b.clone());
+        .tombstone(20, key_b.clone());
     assert_eq!(store.index().get_next_lsn().unwrap(), 1);
 
     let result = batch.write().unwrap();
@@ -1146,14 +1427,17 @@ async fn store_batch_buffers_ops_until_write_and_returns_global_lsns() {
     );
     assert_eq!(store.get_from_shard(20, &key_b).unwrap(), None);
     assert_eq!(
-        store
-            .index()
-            .resolve_blob_lifecycle_at(&key_a, StrataLsn::MAX)
-            .unwrap()
-            .lifetime
-            .unwrap()
-            .lifecycle
-            .logical_end_epoch,
+        lsm_blob(
+            &store,
+            ShardKey {
+                id: 10,
+                generation: 0,
+            },
+            &key_a,
+        )
+        .lifecycle
+        .unwrap()
+        .logical_end_epoch,
         50
     );
 }
@@ -1197,320 +1481,22 @@ async fn store_batch_can_mix_epoch_changes_with_blob_ops() {
 
     store.sync().unwrap();
 
-    assert_eq!(store.durable_lsn().unwrap(), 3);
+    assert_eq!(store.published_lsn().unwrap(), 3);
 }
-
 #[tokio::test]
-async fn sync_publishes_accounting_log_durable_position() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    store.put(&key, b"payload").unwrap();
-    store.tombstone(&key).unwrap();
-    let (_, epoch_lsn) = store.increment_epoch().unwrap();
-    store.sync().unwrap();
-
-    assert_eq!(store.durable_lsn().unwrap(), epoch_lsn);
-    let durable_position = store
-        .index()
-        .get_accounting_log_durable_position()
-        .unwrap()
-        .unwrap();
-    assert_eq!(durable_position.durable_lsn, epoch_lsn);
-    assert!(durable_position.durable_offset > 0);
-}
-
-#[tokio::test]
-async fn accounting_ingests_active_delta_log_and_compacts_to_patch() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"processor-ingest".to_vec()).unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_ingest_record_threshold = usize::MAX;
-    cfg.accounting_major_patch_count_threshold = 0;
-    cfg.accounting_major_patch_bytes_threshold = 0;
-    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-    stop_accounting_worker(&mut store.store);
-
-    store.put(&key, b"payload").unwrap();
-    store.sync().unwrap();
-    accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
-
-    let durable_position = accounting_log_durable_position(store.index());
-    let consumed_cursor = active_delta_log_read_cursor(store.index());
-    assert_eq!(consumed_cursor.offset, durable_position.durable_offset);
-    assert_eq!(consumed_cursor.max_lsn, durable_position.durable_lsn);
-
-    let processor = open_accounting_index(&store);
-    let partition = processor.manifest().partitions.values().next().unwrap();
-    let delta_count = processor
-        .manifest()
-        .partitions
-        .values()
-        .map(|partition| partition.deltas.len())
-        .sum::<usize>();
-    let patch_count = processor
-        .manifest()
-        .partitions
-        .values()
-        .map(|partition| partition.patches.len())
-        .sum::<usize>();
-    assert_eq!(delta_count, 0);
-    assert_eq!(patch_count, 1);
-    assert!(partition.base.is_none());
-}
-
-#[tokio::test]
-async fn accounting_nudge_ingests_without_forcing_compaction() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"processor-nudge".to_vec()).unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_ingest_record_threshold = usize::MAX;
-    cfg.accounting_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
-    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-    stop_accounting_worker(&mut store.store);
-
-    store.put(&key, b"payload").unwrap();
-    store.sync().unwrap();
-    accounting::run_accounting_nudged_once(store.index(), store.config()).unwrap();
-
-    let durable_position = accounting_log_durable_position(store.index());
-    let consumed_cursor = active_delta_log_read_cursor(store.index());
-    assert_eq!(consumed_cursor.offset, durable_position.durable_offset);
-    assert_eq!(consumed_cursor.max_lsn, durable_position.durable_lsn);
-
-    let processor = open_accounting_index(&store);
-    let delta_count = processor
-        .manifest()
-        .partitions
-        .values()
-        .map(|partition| partition.deltas.len())
-        .sum::<usize>();
-    let patch_count = processor
-        .manifest()
-        .partitions
-        .values()
-        .map(|partition| partition.patches.len())
-        .sum::<usize>();
-    let base_count = processor
-        .manifest()
-        .partitions
-        .values()
-        .filter(|partition| partition.base.is_some())
-        .count();
-    assert_eq!(delta_count, 1);
-    assert_eq!(patch_count, 0);
-    assert_eq!(base_count, 0);
-    assert_eq!(store.accounted_lsn().unwrap(), 0);
-}
-
-#[tokio::test]
-async fn accounting_lag_threshold_promotes_nudge_to_materialization() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let first_key = BlobKey::new(b"lag-threshold-first".to_vec()).unwrap();
-    let second_key = BlobKey::new(b"lag-threshold-second".to_vec()).unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
-    cfg.accounting_unaccounted_threshold = usize::MAX;
-    cfg.accounting_materialize_lag_threshold = 2;
-    cfg.accounting_ingest_record_threshold = usize::MAX;
-    cfg.accounting_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
-    cfg.gc_workers_enabled = false;
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-
-    assert_eq!(store.put(&first_key, b"first").unwrap(), 1);
-    store.sync().unwrap();
-
-    let started = Instant::now();
-    loop {
-        let consumed_lsn = store
-            .index()
-            .get_accounting_active_delta_log_consumed_cursor()
-            .unwrap()
-            .map_or(0, |cursor| cursor.max_lsn);
-        if consumed_lsn >= 1 {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "accounting did not ingest the below-threshold LSN"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(store.accounted_lsn().unwrap(), 0);
-
-    assert_eq!(store.put(&second_key, b"second").unwrap(), 2);
-    store.sync().unwrap();
-
-    let started = Instant::now();
-    loop {
-        if store.accounted_lsn().unwrap() >= 2 {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "lag-triggered materialization did not reach the durable frontier"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[tokio::test]
-async fn accounting_reclaims_sealed_consumed_logs_and_recovery_uses_cursor() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    let key = BlobKey::new(b"reclaimed-delta-log".to_vec()).unwrap();
-    let first_log_path = ActiveDeltaLog::path(cfg.accounting_index_dir(), 1);
-    let second_log_path = ActiveDeltaLog::path(cfg.accounting_index_dir(), 2);
-
-    {
-        let mut store =
-            try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        stop_accounting_worker(&mut store.store);
-        assert_eq!(store.put(&key, b"payload").unwrap(), 1);
-        store.sync().unwrap();
-        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
-        assert_eq!(active_delta_log_read_cursor(store.index()).segment_id, 1);
-    }
-
-    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
-    let mut first_state = index.get_segment_state(1).unwrap().unwrap();
-    first_state.state = SegmentFileState::Sealing;
-    first_state.sealed_before_lsn = Some(2);
-
-    let second_path = segment_path(&cfg, 2);
-    let second_writer = SegmentWriter::create(
-        &second_path,
-        2,
-        PlacementClass::Ingest,
-        cfg.segment_max_bytes,
-    )
-    .unwrap();
-    second_writer.sync_data().unwrap();
-    let second_state = active_segment_state_from_path(
-        &cfg,
-        INGEST_SEGMENT_OWNER,
-        2,
-        second_writer.write_offset(),
-        second_writer.write_offset(),
-    );
-    drop(second_writer);
-
-    let prior_durable_position = accounting_log_durable_position(&index);
-    let second_durable_position = {
-        let mut log =
-            ActiveDeltaLog::open(cfg.accounting_index_dir(), 2, prior_durable_position).unwrap();
-        log.sync_data().unwrap();
-        log.durable_position()
-    };
-    let mut batch = index.batch();
-    index
-        .put_segment_state_batch(&mut batch, &first_state)
-        .unwrap();
-    index
-        .put_segment_state_batch(&mut batch, &second_state)
-        .unwrap();
-    index
-        .put_accounting_log_durable_position_batch(&mut batch, second_durable_position)
-        .unwrap();
-    batch.write_with_sync(true).unwrap();
-
-    // Advancing the cursor into an empty next log is not enough to reclaim the previous file: its
-    // seal worker may still need to fsync it.
-    accounting::run_accounting_once(&index, &cfg, true).unwrap();
-    let cursor = active_delta_log_read_cursor(&index);
-    assert_eq!(cursor.segment_id, 2);
-    assert_eq!(cursor.max_lsn, 1);
-    assert!(first_log_path.exists());
-
-    first_state.state = SegmentFileState::Sealed;
-    first_state.durable_offset = first_state.write_offset;
-    first_state.sealed_len = Some(first_state.write_offset);
-    index.put_segment_state(&first_state).unwrap();
-    index.flush_wal(true).unwrap();
-
-    accounting::run_accounting_once(&index, &cfg, true).unwrap();
-    assert!(!first_log_path.exists());
-    assert!(second_log_path.exists());
-    drop(index);
-
-    // The retained active log is intentionally empty. Recovery must accept the consumed cursor as
-    // the durable accounting prefix instead of requiring the reclaimed raw file.
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-    assert_eq!(store.durable_lsn().unwrap(), 1);
-    assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
-}
-
-#[tokio::test]
-async fn semantic_materialization_request_survives_until_target_lsn_is_durable() {
+async fn epoch_change_is_published_by_the_lsm_checkpoint() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"semantic-materialization".to_vec()).unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
-    cfg.accounting_ingest_record_threshold = usize::MAX;
-    cfg.accounting_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
+    let cfg = config(dir.path(), "default");
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
     store.put(&key, b"payload").unwrap();
     let (_, epoch_lsn) = store.increment_epoch().unwrap();
     store.sync().unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while store.accounted_lsn().unwrap() < epoch_lsn {
-        assert!(
-            Instant::now() < deadline,
-            "semantic materialization request did not reach LSN {epoch_lsn}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    assert_eq!(store.published_lsn().unwrap(), epoch_lsn);
 }
-
-#[tokio::test]
-async fn explicit_accounting_materialization_advances_a_quiet_store() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"explicit-materialization".to_vec()).unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
-    cfg.accounting_ingest_record_threshold = usize::MAX;
-    cfg.accounting_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
-    cfg.gc_workers_enabled = false;
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-
-    let lsn = store.put(&key, b"payload").unwrap();
-    store.sync().unwrap();
-    assert!(store.accounted_lsn().unwrap() < lsn);
-
-    store.store.request_accounting_materialization(lsn).unwrap();
-    wait_for_accounted_lsn(&store.store, lsn);
-}
-
 #[tokio::test]
 async fn explicit_active_segment_checkpoint_queues_the_current_tail_for_sealing() {
     init_typed_store_metrics();
@@ -1521,6 +1507,7 @@ async fn explicit_active_segment_checkpoint_queues_the_current_tail_for_sealing(
             .unwrap();
 
     store.put(&key, b"payload").unwrap();
+    let record_ref = lsm_blob_ref(&store, &key);
     let old_segment_id = store
         .index()
         .iter_segment_states()
@@ -1531,7 +1518,18 @@ async fn explicit_active_segment_checkpoint_queues_the_current_tail_for_sealing(
         .0;
 
     store.store.checkpoint_active_segment().unwrap();
-    wait_for_segment_state(store.index(), old_segment_id, SegmentFileState::Sealed);
+    let sealed = wait_for_segment_state(store.index(), old_segment_id, SegmentFileState::Sealed);
+    let summary = store
+        .index()
+        .get_segment_gc_summary(old_segment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_bytes, sealed.sealed_len.unwrap());
+    assert_eq!(summary.total_bytes, record_ref.len);
+    assert_eq!(summary.live_bytes, record_ref.len);
+    assert_eq!(summary.live_ref_count, 1);
+    assert_eq!(summary.unknown_lifetime_bytes, record_ref.len);
+    assert_eq!(summary.unknown_lifetime_ref_count, 1);
     let new_segment_id = store
         .index()
         .iter_segment_states()
@@ -1546,18 +1544,70 @@ async fn explicit_active_segment_checkpoint_queues_the_current_tail_for_sealing(
 }
 
 #[tokio::test]
-async fn shard_drop_materializes_immediately_despite_compaction_thresholds() {
+async fn sync_publishes_new_allocations_without_overwriting_garbage() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "allocation-baseline");
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let key_a = BlobKey::new(b"allocation-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"allocation-b".to_vec()).unwrap();
+
+    store.put(&key_a, b"one").unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    assert!(
+        store
+            .index()
+            .get_segment_gc_summary(ref_a.segment_id)
+            .unwrap()
+            .is_none()
+    );
+    store.sync().unwrap();
+
+    let mut summary = store
+        .index()
+        .get_segment_gc_summary(ref_a.segment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_bytes, ref_a.len);
+    assert_eq!(summary.live_bytes, ref_a.len);
+    assert_eq!(summary.live_ref_count, 1);
+    summary.live_bytes = 0;
+    summary.retired_bytes = ref_a.len;
+    summary.live_ref_count = 0;
+    summary.unknown_lifetime_bytes = 0;
+    summary.unknown_lifetime_ref_count = 0;
+    let mut batch = store.index().batch();
+    store
+        .index()
+        .put_segment_gc_summary_batch(&mut batch, ref_a.segment_id, &summary)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
+    store.put(&key_b, b"two").unwrap();
+    let ref_b = lsm_blob_ref(&store, &key_b);
+    assert_eq!(ref_b.segment_id, ref_a.segment_id);
+    store.sync().unwrap();
+
+    let summary = store
+        .index()
+        .get_segment_gc_summary(ref_a.segment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_bytes, ref_a.len + ref_b.len);
+    assert_eq!(summary.live_bytes, ref_b.len);
+    assert_eq!(summary.retired_bytes, ref_a.len);
+    assert_eq!(summary.live_ref_count, 1);
+    assert_eq!(summary.unknown_lifetime_bytes, ref_b.len);
+    assert_eq!(summary.unknown_lifetime_ref_count, 1);
+}
+
+#[tokio::test]
+async fn shard_drop_publishes_its_lsm_checkpoint_immediately() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"shard-drop-materialization".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_maintenance_interval = Duration::from_secs(3600);
-    cfg.accounting_ingest_record_threshold = usize::MAX;
-    cfg.accounting_delta_run_count_threshold = usize::MAX;
-    cfg.accounting_delta_run_bytes_threshold = u64::MAX;
-    cfg.accounting_major_patch_count_threshold = usize::MAX;
-    cfg.accounting_major_patch_bytes_threshold = u64::MAX;
     cfg.gc_workers_enabled = false;
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
@@ -1570,49 +1620,17 @@ async fn shard_drop_materializes_immediately_despite_compaction_thresholds() {
         .unwrap()
         .drop_lsn;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while store.accounted_lsn().unwrap() < drop_lsn {
-        assert!(
-            Instant::now() < deadline,
-            "shard-drop materialization did not reach LSN {drop_lsn}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    assert_eq!(store.published_lsn().unwrap(), drop_lsn);
+    assert_eq!(
+        store
+            .index()
+            .get_shard_cleanup_job(STANDALONE_SHARD)
+            .unwrap()
+            .unwrap()
+            .state,
+        ShardCleanupState::ReadyForGc
+    );
 }
-
-#[tokio::test]
-async fn accounting_major_compacts_when_patch_threshold_reached() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"processor-major".to_vec()).unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_ingest_record_threshold = usize::MAX;
-    cfg.accounting_major_patch_count_threshold = 1;
-    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-    stop_accounting_worker(&mut store.store);
-
-    store.put(&key, b"payload").unwrap();
-    store.sync().unwrap();
-    accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
-
-    let processor = open_accounting_index(&store);
-    let base_count = processor
-        .manifest()
-        .partitions
-        .values()
-        .filter(|partition| partition.base.is_some())
-        .count();
-    let patch_count = processor
-        .manifest()
-        .partitions
-        .values()
-        .map(|partition| partition.patches.len())
-        .sum::<usize>();
-    assert_eq!(base_count, 1);
-    assert_eq!(patch_count, 0);
-}
-
 #[tokio::test]
 async fn store_rejects_missing_and_inactive_logical_shards() {
     init_typed_store_metrics();
@@ -1687,11 +1705,6 @@ async fn store_add_after_drop_bumps_generation_and_hides_old_versions() {
     );
     assert!(store.put(40, &key, b"dropped").is_err());
     assert!(store.get_from_shard(40, &key).is_err());
-    assert_eq!(
-        store.index().resolve_blob_head(&key, first_shard).unwrap(),
-        None
-    );
-
     let second_shard = store.add_shard(40).unwrap();
     assert_eq!(
         second_shard,
@@ -1702,18 +1715,12 @@ async fn store_add_after_drop_bumps_generation_and_hides_old_versions() {
     );
 
     assert_eq!(store.get_from_shard(40, &key).unwrap(), None);
-    store.put(40, &key, b"new generation").unwrap();
+    let second_lsn = store.put(40, &key, b"new generation").unwrap();
     assert_eq!(
         store.get_from_shard(40, &key).unwrap(),
         Some(b"new generation".to_vec())
     );
-    assert!(
-        store
-            .index()
-            .resolve_blob_head(&key, second_shard)
-            .unwrap()
-            .is_some()
-    );
+    assert_eq!(lsm_blob(&store, second_shard, &key).head_lsn, second_lsn);
 }
 
 #[tokio::test]
@@ -1721,21 +1728,13 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
-    cfg.accounting_major_patch_count_threshold = 1;
-    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-    stop_accounting_worker(&mut store.store);
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     let shard = store.add_shard(41).unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
 
     let put_lsn = store.store.put(41, &key, b"old generation").unwrap();
-    let record_ref = store
-        .index()
-        .resolve_blob_head(&key, shard)
-        .unwrap()
-        .unwrap()
-        .entry
-        .record_ref
-        .unwrap();
+    let record_ref = lsm_blob(&store, shard, &key).record_ref;
     let drop_lsn = put_lsn + 1;
     assert_eq!(store.index().get_next_lsn().unwrap(), drop_lsn);
 
@@ -1749,26 +1748,21 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
         })
     );
     assert!(store.store.get_from_shard(41, &key).is_err());
-    assert_eq!(store.index().resolve_blob_head(&key, shard).unwrap(), None);
     assert_eq!(store.index().get_next_lsn().unwrap(), drop_lsn + 1);
-    assert_eq!(store.index().get_durable_lsn().unwrap(), drop_lsn);
-    assert_eq!(
-        store.index().get_unaccounted_lsn_op(put_lsn).unwrap(),
-        Some(key.clone())
-    );
-
+    assert_eq!(store.index().get_published_lsn().unwrap(), drop_lsn);
     let job = store.index().get_shard_cleanup_job(shard).unwrap().unwrap();
     assert_eq!(job.drop_lsn, drop_lsn);
-    assert_eq!(job.state, ShardCleanupState::PendingAccounting);
+    assert_eq!(job.state, ShardCleanupState::ReadyForGc);
 
-    let overlay = store
-        .index()
-        .get_segment_gc_overlay(record_ref.segment_id)
-        .unwrap()
-        .unwrap_or_default();
-    assert!(overlay.retired.is_empty());
-
-    accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
+    // A drop does not scan mixed ingest state. Touching the same LSM key through another active
+    // shard makes ordinary compaction discover and retire the dropped generation.
+    let live_shard = store.add_shard(42).unwrap();
+    let touch_lsn = store
+        .store
+        .put(live_shard.id, &key, b"live generation")
+        .unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store.store, touch_lsn);
     assert_eq!(
         store
             .index()
@@ -1778,15 +1772,10 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
             .state,
         ShardCleanupState::ReadyForGc
     );
-    let overlay = store
-        .index()
-        .get_segment_gc_overlay(record_ref.segment_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(overlay.retired, vec![gc_range(record_ref)]);
-    assert_eq!(overlay.summary.total_bytes, record_ref.len);
-    assert_eq!(overlay.summary.live_ref_count, 0);
-    assert_eq!(overlay.summary.retired_bytes, record_ref.len);
+    let authoritative = segment_overlay(&store, record_ref.segment_id);
+    assert_eq!(authoritative.retired, vec![gc_range(record_ref)]);
+    assert_eq!(authoritative.summary.live_ref_count, 1);
+    assert_eq!(authoritative.summary.retired_bytes, record_ref.len);
     assert_eq!(
         store
             .store
@@ -1796,17 +1785,19 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
             .unwrap(),
         1
     );
-    assert!(
+    assert_eq!(
         store
             .index()
             .get_shard_cleanup_job(shard)
             .unwrap()
-            .is_none()
+            .unwrap()
+            .state,
+        ShardCleanupState::ShardOwnedReclaimed
     );
 }
 
 #[tokio::test]
-async fn drop_shard_does_not_wait_for_accounting_or_gc_claims() {
+async fn drop_shard_does_not_wait_for_gc_claims() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store = Arc::new(
@@ -1821,10 +1812,6 @@ async fn drop_shard_does_not_wait_for_accounting_or_gc_claims() {
         )
         .unwrap();
 
-    let accounting_lock = Arc::clone(&store.accounting_lock);
-    let _accounting_guard = accounting_lock
-        .lock()
-        .expect("accounting run lock poisoned");
     let _claim = store
         .gc_claims
         .try_claim(BTreeSet::from([FIRST_SEGMENT_ID]))
@@ -1837,7 +1824,7 @@ async fn drop_shard_does_not_wait_for_accounting_or_gc_claims() {
 
     result_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("drop_shard blocked on accounting or GC claim")
+        .expect("drop_shard blocked on a GC claim")
         .unwrap();
     handle.join().unwrap();
     assert_eq!(
@@ -1847,7 +1834,7 @@ async fn drop_shard_does_not_wait_for_accounting_or_gc_claims() {
             .unwrap()
             .unwrap()
             .state,
-        ShardCleanupState::PendingAccounting
+        ShardCleanupState::ReadyForGc
     );
 }
 
@@ -1855,28 +1842,18 @@ async fn drop_shard_does_not_wait_for_accounting_or_gc_claims() {
 async fn reopen_finishes_durable_shard_drop_cleanup() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
+    let mut cfg = config(dir.path(), "default");
+    cfg.gc_interval = Duration::from_secs(3600);
     let shard;
-    let ingest_ref;
     let retention_segment_id = 99;
     let retention_path;
 
     {
-        let mut store =
-            try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        stop_accounting_worker(&mut store.store);
+        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         shard = store.add_shard(42).unwrap();
         let key = BlobKey::new(b"crashed-drop".to_vec()).unwrap();
         store.store.put(shard.id, &key, b"ingest payload").unwrap();
         store.sync().unwrap();
-        ingest_ref = store
-            .index()
-            .resolve_blob_head(&key, shard)
-            .unwrap()
-            .unwrap()
-            .entry
-            .record_ref
-            .unwrap();
 
         retention_path = layout::retention_segment_path(
             store.config(),
@@ -1912,7 +1889,7 @@ async fn reopen_finishes_durable_shard_drop_cleanup() {
                 .unwrap()
                 .unwrap()
                 .state,
-            ShardCleanupState::PendingAccounting
+            ShardCleanupState::ReadyForGc
         );
     }
 
@@ -1923,7 +1900,7 @@ async fn reopen_finishes_durable_shard_drop_cleanup() {
         .index()
         .get_shard_cleanup_job(shard)
         .unwrap()
-        .is_some()
+        .is_some_and(|job| job.state != ShardCleanupState::ShardOwnedReclaimed)
         && Instant::now() < deadline
     {
         reopened.store.request_gc().unwrap();
@@ -1932,29 +1909,22 @@ async fn reopen_finishes_durable_shard_drop_cleanup() {
 
     assert!(
         !retention_path.exists(),
-        "job={:?} accounted_lsn={} durable_lsn={} shard_drops={:?}",
+        "job={:?} published_lsn={}",
         reopened.index().get_shard_cleanup_job(shard).unwrap(),
-        reopened.index().get_accounted_lsn().unwrap(),
-        reopened.index().get_durable_lsn().unwrap(),
-        reopened
-            .index()
-            .get_accounting_index_manifest()
-            .unwrap()
-            .map(|manifest| manifest.shard_drops)
+        reopened.index().get_published_lsn().unwrap(),
     );
-    assert!(
-        reopened
-            .index()
-            .get_segment_state(retention_segment_id)
-            .unwrap()
-            .is_none()
-    );
-    let overlay = reopened
+    let state = reopened
         .index()
-        .get_segment_gc_overlay(ingest_ref.segment_id)
+        .get_segment_state(retention_segment_id)
         .unwrap()
         .unwrap();
-    assert!(overlay.retired.contains(&gc_range(ingest_ref)));
+    assert_eq!(state.state, SegmentFileState::Deleted);
+    assert_eq!(state.owner, SegmentOwner::Shard(shard));
+    assert!(
+        reopened
+            .get_from_shard(shard.id, &BlobKey::new(b"crashed-drop".to_vec()).unwrap())
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1981,15 +1951,7 @@ async fn store_can_drop_default_logical_shard() {
     let key = BlobKey::new(b"default-shard".to_vec()).unwrap();
 
     store.put(STANDALONE_SHARD.id, &key, b"payload").unwrap();
-    let ingest_segment_id = store
-        .index()
-        .resolve_blob_head(&key, STANDALONE_SHARD)
-        .unwrap()
-        .unwrap()
-        .entry
-        .record_ref
-        .unwrap()
-        .segment_id;
+    let ingest_segment_id = lsm_blob_ref(&store, &key).segment_id;
     store.drop_shard(STANDALONE_SHARD.id).unwrap();
 
     assert_eq!(
@@ -2065,7 +2027,7 @@ async fn new_store_records_starting_epoch_as_lsn_zero_genesis() {
     assert_eq!(store.epoch_at_lsn(1).unwrap(), Some(42));
     assert_eq!(store.index().get_epoch_change(0).unwrap(), Some(42));
     assert_eq!(store.index().get_next_lsn().unwrap(), 1);
-    assert_eq!(store.index().get_durable_lsn().unwrap(), 0);
+    assert_eq!(store.index().get_published_lsn().unwrap(), 0);
     assert_eq!(
         store.index().get_shard_info(0).unwrap(),
         Some(ShardInfo::active(0))
@@ -2108,7 +2070,7 @@ async fn increment_epoch_consumes_lsn_and_is_metadata_durable() {
 
     store.sync().unwrap();
 
-    assert_eq!(store.durable_lsn().unwrap(), 2);
+    assert_eq!(store.published_lsn().unwrap(), 2);
 }
 
 #[tokio::test]
@@ -2123,13 +2085,7 @@ async fn get_with_options_can_skip_checksum_verification() {
     store.put(&key, b"hello strata").unwrap();
     store.sync().unwrap();
 
-    let record_ref = store
-        .index()
-        .get_blob_entry(&key)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let record_ref = lsm_blob_ref(&store, &key);
     let mut segment = OpenOptions::new()
         .write(true)
         .open(segment_path(store.config(), record_ref.segment_id))
@@ -2220,13 +2176,7 @@ async fn read_retries_once_when_not_found_segment_was_deleted() {
             .unwrap();
 
     let payload_lsn = store.put(&key, b"hello strata").unwrap();
-    let old_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, payload_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let old_ref = lsm_blob_ref(&store, &key);
     let new_ref = RecordRef {
         segment_id: FIRST_SEGMENT_ID + 100,
         offset: 0,
@@ -2273,21 +2223,20 @@ async fn read_retries_once_when_not_found_segment_was_deleted() {
                     .index()
                     .put_segment_state_batch(&mut batch, &new_state)
                     .unwrap();
+                batch.write().unwrap();
                 store
-                    .index()
-                    .map_blob_ref_batch(
-                        &mut batch,
-                        &key,
-                        MapRefOp {
-                            publish_lsn: payload_lsn + 1,
+                    .relocations
+                    .write_batch(
+                        0,
+                        &[RelocationEntry {
+                            key: key.clone(),
                             shard: STANDALONE_SHARD,
                             payload_lsn,
-                            from: old_ref,
+                            publish_lsn: payload_lsn + 1,
                             to: new_ref,
-                        },
+                        }],
                     )
                     .unwrap();
-                batch.write().unwrap();
 
                 return Err(Error::Segment(strata_segment::Error::Io {
                     path: segment_path(store.config(), old_ref.segment_id),
@@ -2363,34 +2312,6 @@ async fn read_range_rejects_out_of_bounds_range() {
 }
 
 #[tokio::test]
-async fn range_read_rejects_index_record_key_mismatch() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    store.put(&key_a, b"payload-a").unwrap();
-    store.put(&key_b, b"payload-b").unwrap();
-
-    let mut entry_b = store.index().get_blob_entry(&key_b).unwrap().unwrap();
-    entry_b.lsn += 1;
-    store.index().put_blob_entry(&key_a, &entry_b).unwrap();
-
-    let err = store.get_blob_range(&key_a, 0..1).unwrap_err();
-
-    assert!(matches!(
-        err,
-        Error::KeyMismatch {
-            requested,
-            found
-        } if requested == key_a && found == key_b
-    ));
-}
-
-#[tokio::test]
 async fn store_from_index_does_not_create_local_index_dir() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
@@ -2446,8 +2367,7 @@ async fn point_in_time_recovery_removes_orphan_segment_file_before_opening_activ
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     store.put(&key, b"payload").unwrap();
 
-    let entry = store.index().get_blob_entry(&key).unwrap().unwrap();
-    assert_eq!(entry.record_ref.unwrap().offset, 0);
+    assert_eq!(lsm_blob_ref(&store, &key).offset, 0);
     assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
 }
 
@@ -2480,6 +2400,7 @@ async fn tombstone_hides_payload() {
         try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
             .unwrap();
     let put_lsn = store.put(&key, b"payload").unwrap();
+    let record_ref = lsm_blob_ref(&store, &key);
 
     let tombstone_lsn = store.tombstone(&key).unwrap();
 
@@ -2487,34 +2408,12 @@ async fn tombstone_hides_payload() {
     assert_eq!(tombstone_lsn, 2);
     assert_eq!(store.get(&key).unwrap(), None);
     assert!(!store.contains(&key).unwrap());
-    let put_entry = store
-        .index()
-        .get_blob_version(&version_key(&key, put_lsn))
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        store
-            .index()
-            .get_blob_entry(&key)
-            .unwrap()
-            .unwrap()
-            .record_ref,
-        put_entry.record_ref
-    );
-    assert_eq!(
-        store
-            .index()
-            .resolve_blob_lifecycle_at(&key, StrataLsn::MAX)
-            .unwrap()
-            .tombstone_lsn,
-        Some(tombstone_lsn)
-    );
-    assert_eq!(put_entry.record_ref.unwrap().segment_id, FIRST_SEGMENT_ID);
-    assert_eq!(store.durable_lsn().unwrap(), 0);
+    assert_eq!(record_ref.segment_id, FIRST_SEGMENT_ID);
+    assert_eq!(store.published_lsn().unwrap(), 0);
 
     store.sync().unwrap();
 
-    assert_eq!(store.durable_lsn().unwrap(), 2);
+    assert_eq!(store.published_lsn().unwrap(), 2);
 }
 
 #[tokio::test]
@@ -2616,7 +2515,7 @@ async fn metrics_track_core_store_operations() {
     assert!(gauge_value(&registry, "strata_store_active_segment_write_offset") > 0);
     assert!(gauge_value(&registry, "strata_store_active_segment_durable_offset") > 0);
     assert_eq!(gauge_value(&registry, "strata_store_next_lsn"), 3);
-    assert_eq!(gauge_value(&registry, "strata_store_durable_lsn"), 1);
+    assert_eq!(gauge_value(&registry, "strata_store_published_lsn"), 1);
     assert_eq!(gauge_value(&registry, "strata_store_pending_lsn_count"), 1);
     assert_eq!(
         counter_value(&registry, "strata_store_seal_backpressure_waits_total"),
@@ -2693,30 +2592,39 @@ async fn metrics_track_seal_backpressure_waits() {
     .unwrap();
     let (seal_tx, _seal_rx) = mpsc::channel();
     let (_write_tx, write_rx) = mpsc::sync_channel(1);
-    let (
-        accounting_tx,
-        _accounting_rx,
-        _pending_accounting_request,
-        _pending_materialize_through_lsn,
-    ) = accounting::accounting_request_channel();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
+    let (lsm, _lsm_sync_handles) = open_lsm(
+        &cfg,
+        &index,
+        active_writer,
+        SegmentIdAllocator::new(3),
+        index.get_next_lsn().unwrap(),
+        None,
+    )
+    .unwrap();
+    let live_snapshots = lsm.live_snapshots();
+    let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
+    let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
     let coordinator = WriteCoordinator {
         config: cfg.clone(),
         index: index.clone(),
-        active_writer,
-        active_accounting_delta_log: test_active_accounting_log(&cfg, 2),
+        lsm,
+        live_snapshots,
         durability_publish_lock: Arc::new(Mutex::new(())),
         active_segment_state,
         durable_offset: 0,
+        pending_allocation_records: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_next_lsn: index.get_next_lsn().unwrap(),
         pending_rollovers: Vec::new(),
-        segment_ids: SegmentIdAllocator::new(3),
+        lsm_flush_tx,
+        lsm_compact_tx,
         seal_tx,
-        accounting_tx: Some(accounting_tx),
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
+        relocations: open_relocation_lsm(&cfg, &index).unwrap(),
+        relocation_cache: Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES)),
         gc_concurrency,
         store_halt: StoreHalt::default(),
         metrics,
@@ -2746,194 +2654,6 @@ async fn metrics_track_seal_backpressure_waits() {
         0
     );
 }
-
-#[tokio::test]
-async fn set_blob_lifetime_preserves_payload_until_accounting() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    let before = store.index().get_blob_entry(&key).unwrap().unwrap();
-
-    let extend_lsn = store.extend(&key, 50).unwrap().unwrap();
-
-    let after = store.index().get_blob_entry(&key).unwrap().unwrap();
-    assert_eq!(put_lsn, 1);
-    assert_eq!(extend_lsn, 2);
-    assert_eq!(after, before);
-    let lifecycle = store
-        .index()
-        .resolve_blob_lifecycle_at(&key, StrataLsn::MAX)
-        .unwrap()
-        .lifetime
-        .unwrap()
-        .lifecycle;
-    assert_eq!(lifecycle.logical_end_epoch, 50);
-    assert_eq!(lifecycle.extension_count, 0);
-    assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
-
-    let resolved = resolve_blob_version(store.index(), store.shard(), &key)
-        .unwrap()
-        .unwrap();
-    assert_eq!(resolved.record_ref, before.record_ref.unwrap());
-    assert_eq!(resolved.generation, before.generation);
-    assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
-
-    let stats = segment_summary(store.index(), resolved.record_ref.segment_id);
-    assert_eq!(stats, strata_core::SegmentGcSummary::default());
-
-    store.sync().unwrap();
-
-    assert_eq!(store.durable_lsn().unwrap(), 2);
-    wait_for_accounted_lsn(&store, 2);
-    let stats = segment_summary(store.index(), resolved.record_ref.segment_id);
-    assert_eq!(stats.future_epoch_histogram.get(&43), None);
-    assert_eq!(
-        stats.future_epoch_histogram.get(&50),
-        Some(&EpochBucket {
-            refs: 1,
-            bytes: resolved.record_ref.len,
-        })
-    );
-    assert_eq!(stats.extension_count_histogram.get(&0), Some(&1));
-    assert_eq!(stats.extension_count_histogram.get(&1), None);
-    assert_eq!(stats.unknown_lifetime_bytes, 0);
-    assert_eq!(stats.unknown_lifetime_ref_count, 0);
-    assert_eq!(stats.min_live_end_epoch, Some(50));
-    assert_eq!(stats.max_live_end_epoch, Some(50));
-    assert_eq!(stats.live_bytes, resolved.record_ref.len);
-    assert_eq!(stats.live_ref_count, 1);
-    assert_eq!(stats.total_bytes, resolved.record_ref.len);
-}
-
-#[tokio::test]
-async fn accounting_updates_exact_epoch_segment_pinning_after_lifetime_update() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    store.put(&key, b"payload").unwrap();
-    let entry = store.index().get_blob_entry(&key).unwrap().unwrap();
-    let record_ref = entry.record_ref.unwrap();
-    let mut state = store
-        .index()
-        .get_segment_state(record_ref.segment_id)
-        .unwrap()
-        .unwrap();
-    state.placement_class = PlacementClass::ExactEpoch(42);
-    store.index().put_segment_state(&state).unwrap();
-
-    let extend_lsn = store.extend(&key, 50).unwrap().unwrap();
-
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats, strata_core::SegmentGcSummary::default());
-
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, extend_lsn);
-
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.future_epoch_histogram.get(&42), None);
-    assert_eq!(
-        stats.future_epoch_histogram.get(&50),
-        Some(&EpochBucket {
-            refs: 1,
-            bytes: record_ref.len,
-        })
-    );
-    assert_eq!(stats.extension_count_histogram.get(&0), Some(&1));
-    assert_eq!(stats.extension_count_histogram.get(&1), None);
-}
-
-#[tokio::test]
-async fn accounting_tracks_unknown_lifetime_until_metadata_arrives() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_entry(&key)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, put_lsn);
-
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.live_bytes, record_ref.len);
-    assert_eq!(stats.live_ref_count, 1);
-    assert_eq!(stats.unknown_lifetime_bytes, record_ref.len);
-    assert_eq!(stats.unknown_lifetime_ref_count, 1);
-    assert!(stats.future_epoch_histogram.is_empty());
-
-    let lifetime_lsn = store.extend(&key, 50).unwrap().unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_lsn);
-
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.live_bytes, record_ref.len);
-    assert_eq!(stats.live_ref_count, 1);
-    assert_eq!(stats.unknown_lifetime_bytes, 0);
-    assert_eq!(stats.unknown_lifetime_ref_count, 0);
-    assert_eq!(
-        stats.future_epoch_histogram.get(&50),
-        Some(&EpochBucket {
-            refs: 1,
-            bytes: record_ref.len,
-        })
-    );
-}
-
-#[tokio::test]
-async fn accounting_applies_lifetime_written_before_payload() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let lifetime_lsn = store.extend(&key, 50).unwrap().unwrap();
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_entry(&key)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-
-    assert_eq!((lifetime_lsn, put_lsn), (1, 2));
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, put_lsn);
-
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.live_bytes, record_ref.len);
-    assert_eq!(stats.live_ref_count, 1);
-    assert_eq!(stats.unknown_lifetime_bytes, 0);
-    assert_eq!(stats.unknown_lifetime_ref_count, 0);
-    assert_eq!(
-        stats.future_epoch_histogram.get(&50),
-        Some(&EpochBucket {
-            refs: 1,
-            bytes: record_ref.len,
-        })
-    );
-}
-
 #[tokio::test]
 async fn set_blob_lifetime_missing_or_tombstoned_blob_records_metadata() {
     init_typed_store_metrics();
@@ -2972,11 +2692,9 @@ async fn read_after_lifetime_update_chain_resolves_latest_lifetime() {
         store.extend(&key, epoch).unwrap().unwrap();
     }
 
-    let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+    let resolved = resolve_blob_version(&store, store.shard(), &key)
         .unwrap()
         .unwrap();
-    let latest = store.index().get_blob_entry(&key).unwrap().unwrap();
-    assert_eq!(latest.record_ref, Some(resolved.record_ref));
     assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
 
     let lifecycle = resolved.lifecycle.unwrap();
@@ -2999,7 +2717,7 @@ async fn store_set_blob_lifetime_preserves_payload_and_updates_lifecycle() {
     assert_eq!(put_lsn, 1);
     assert_eq!(extend_lsn, 2);
     assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
-    let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+    let resolved = resolve_blob_version(&store, store.shard(), &key)
         .unwrap()
         .unwrap();
     assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
@@ -3064,7 +2782,7 @@ async fn later_lifetime_before_expiry_keeps_current_blob_visible() {
     store.increment_epoch().unwrap();
 
     assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
-    let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+    let resolved = resolve_blob_version(&store, store.shard(), &key)
         .unwrap()
         .unwrap();
     assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
@@ -3084,7 +2802,7 @@ async fn new_put_after_policy_expiry_does_not_inherit_stale_lifetime() {
     store.put(&key, b"new").unwrap();
 
     assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
-    let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+    let resolved = resolve_blob_version(&store, store.shard(), &key)
         .unwrap()
         .unwrap();
     assert_eq!(resolved.lifecycle, None);
@@ -3108,7 +2826,7 @@ async fn lifetime_update_after_expiry_applies_only_to_future_put() {
     store.put(&key, b"new").unwrap();
 
     assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
-    let resolved = resolve_blob_version(store.index(), store.shard(), &key)
+    let resolved = resolve_blob_version(&store, store.shard(), &key)
         .unwrap()
         .unwrap();
     assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
@@ -3152,12 +2870,7 @@ async fn sync_advances_durable_offset_after_segment_fsync() {
         .unwrap();
     assert_eq!(unsynced.durable_offset, 0);
     assert!(unsynced.write_offset > 0);
-    assert_eq!(store.durable_lsn().unwrap(), 0);
-    assert_eq!(
-        store.index().iter_unaccounted_lsn_ops().unwrap(),
-        vec![(1, key.clone())]
-    );
-
+    assert_eq!(store.published_lsn().unwrap(), 0);
     store.sync().unwrap();
 
     let synced = store
@@ -3167,13 +2880,8 @@ async fn sync_advances_durable_offset_after_segment_fsync() {
         .unwrap();
     assert_eq!(synced.durable_offset, unsynced.write_offset);
     assert_eq!(synced.write_offset, unsynced.write_offset);
-    assert_eq!(store.durable_lsn().unwrap(), 1);
-    wait_for_accounted_lsn(&store, 1);
-    assert_eq!(store.accounted_lsn().unwrap(), 1);
-    assert_eq!(
-        store.index().iter_unaccounted_lsn_ops().unwrap(),
-        Vec::new()
-    );
+    assert_eq!(store.published_lsn().unwrap(), 1);
+    wait_for_lsm_gc(&store, 1);
 }
 
 #[tokio::test]
@@ -3227,81 +2935,8 @@ async fn recovery_keeps_complete_unsynced_record_that_survived() {
         .unwrap();
     assert!(state.write_offset > 0);
     assert_eq!(state.durable_offset, state.write_offset);
-    assert_eq!(store.durable_lsn().unwrap(), 1);
+    assert_eq!(store.published_lsn().unwrap(), 1);
 }
-
-#[tokio::test]
-async fn recovery_removes_live_index_entry_when_segment_bytes_are_missing() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    {
-        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        store.put(&key, b"payload").unwrap();
-        store.index().flush_wal(true).unwrap();
-    }
-
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(segment_path(&cfg, FIRST_SEGMENT_ID))
-        .unwrap()
-        .set_len(0)
-        .unwrap();
-
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-
-    assert_eq!(store.get(&key).unwrap(), None);
-    assert_eq!(store.index().get_blob_entry(&key).unwrap(), None);
-}
-
-#[tokio::test]
-async fn recovery_ignores_segment_record_when_index_version_is_missing() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    {
-        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        let segment_path = segment_path(&cfg, FIRST_SEGMENT_ID);
-        let mut segment = SegmentWriter::open_existing(
-            &segment_path,
-            FIRST_SEGMENT_ID,
-            PlacementClass::Ingest,
-            1 << 20,
-        )
-        .unwrap();
-        segment.append(&key, 1, b"payload").unwrap();
-        let write_offset = segment.write_offset();
-        drop(segment);
-
-        let state = active_segment_state_from_path(
-            &cfg,
-            INGEST_SEGMENT_OWNER,
-            FIRST_SEGMENT_ID,
-            write_offset,
-            0,
-        );
-        let mut batch = store.index().batch();
-        store
-            .index()
-            .put_segment_state_batch(&mut batch, &state)
-            .unwrap();
-        store
-            .index()
-            .put_store_state_batch(&mut batch, &StrataStoreState::default())
-            .unwrap();
-        batch.write().unwrap();
-        store.index().flush_wal(true).unwrap();
-    }
-
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-
-    assert_eq!(store.get(&key).unwrap(), None);
-    assert_eq!(store.index().get_blob_entry(&key).unwrap(), None);
-    assert_eq!(store.index().get_next_lsn().unwrap(), 1);
-}
-
 #[tokio::test]
 async fn recovery_truncates_partial_tail() {
     init_typed_store_metrics();
@@ -3332,34 +2967,6 @@ async fn recovery_truncates_partial_tail() {
     assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
     assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
 }
-
-#[tokio::test]
-async fn recovery_removes_tombstone_when_rolled_back_lsn_range_is_lost() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    {
-        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        store.put(&key, b"payload").unwrap();
-        store.tombstone(&key).unwrap();
-        store.index().flush_wal(true).unwrap();
-    }
-
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(segment_path(&cfg, FIRST_SEGMENT_ID))
-        .unwrap()
-        .set_len(0)
-        .unwrap();
-
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-
-    assert_eq!(store.index().get_blob_entry(&key).unwrap(), None);
-    assert_eq!(store.get(&key).unwrap(), None);
-    assert_eq!(store.durable_lsn().unwrap(), 0);
-}
-
 #[tokio::test]
 async fn recovery_removes_epoch_changes_after_rolled_back_blob_lsn() {
     init_typed_store_metrics();
@@ -3420,13 +3027,12 @@ async fn recovery_rolls_back_lost_overwrite_to_previous_entry() {
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
     assert_eq!(store.get(&key).unwrap(), Some(b"payload-a".to_vec()));
-    let entry = store.index().get_blob_entry(&key).unwrap().unwrap();
-    assert_eq!(entry.lsn, 1);
-    assert_eq!(store.durable_lsn().unwrap(), 1);
+    assert_eq!(lsm_blob(&store, store.shard(), &key).head_lsn, 1);
+    assert_eq!(store.published_lsn().unwrap(), 1);
 }
 
 #[tokio::test]
-async fn put_overwrite_keeps_blob_versions_for_old_records() {
+async fn put_overwrite_materializes_the_latest_lsm_version() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
@@ -3434,60 +3040,37 @@ async fn put_overwrite_keeps_blob_versions_for_old_records() {
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
     let min_lsn = store.put(&key, b"payload-a").unwrap();
+    let first_record_ref = lsm_blob_ref(&store, &key);
     let second_lsn = store.put(&key, b"payload-b").unwrap();
-    let entry = store.index().get_blob_entry(&key).unwrap().unwrap();
+    let latest = lsm_blob(&store, store.shard(), &key);
 
     assert_ne!(min_lsn, second_lsn);
-    assert_eq!(entry.lsn, second_lsn);
-    let first_entry = store
-        .index()
-        .get_blob_version(&version_key(&key, min_lsn))
-        .unwrap()
-        .unwrap();
-    let second_entry = store
-        .index()
-        .get_blob_version(&version_key(&key, second_lsn))
-        .unwrap()
-        .unwrap();
-    assert_eq!(first_entry.record_ref.unwrap().segment_id, FIRST_SEGMENT_ID);
-    assert_eq!(
-        second_entry.record_ref.unwrap().segment_id,
-        FIRST_SEGMENT_ID
-    );
+    assert_eq!(latest.head_lsn, second_lsn);
+    assert_eq!(first_record_ref.segment_id, FIRST_SEGMENT_ID);
+    assert_eq!(latest.record_ref.segment_id, FIRST_SEGMENT_ID);
 }
 
 #[tokio::test]
-async fn accounting_tombstones_overwritten_payload_summary() {
+async fn blob_lsm_materializes_overwrite_and_lifetime() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
     let first_lsn = store.put(&key, b"payload-a").unwrap();
+    let first_record_ref = lsm_blob_ref(&store, &key);
     let second_lsn = store.put(&key, b"payload-b").unwrap();
+    let second_record_ref = lsm_blob_ref(&store, &key);
     let lifetime_lsn = store.extend(&key, 44).unwrap().unwrap();
-    let first_record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, first_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let second_record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, second_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    assert_eq!((first_lsn, second_lsn), (1, 2));
 
     let stats = segment_summary(store.index(), first_record_ref.segment_id);
     assert_eq!(stats, strata_core::SegmentGcSummary::default());
 
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_lsn);
+    wait_for_lsm_gc(&store, lifetime_lsn);
 
     let stats = segment_summary(store.index(), first_record_ref.segment_id);
     assert_eq!(
@@ -3506,14 +3089,9 @@ async fn accounting_tombstones_overwritten_payload_summary() {
         })
     );
     assert_eq!(stats.extension_count_histogram.get(&0), Some(&1));
-    assert_eq!(
-        store.index().iter_unaccounted_lsn_ops().unwrap(),
-        Vec::new()
-    );
 }
-
 #[tokio::test]
-async fn accounting_tombstones_deleted_payload_summary() {
+async fn blob_lsm_leaves_unknown_lifetime_put_copy_eligible() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -3522,244 +3100,16 @@ async fn accounting_tombstones_deleted_payload_summary() {
             .unwrap();
 
     let put_lsn = store.put(&key, b"payload").unwrap();
-    let tombstone_lsn = store.tombstone(&key).unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, put_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let record_ref = lsm_blob_ref(&store, &key);
 
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, put_lsn);
 
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.total_bytes, record_ref.len);
-    assert_eq!(stats.live_bytes, 0);
-    assert_eq!(stats.live_ref_count, 0);
-    assert_eq!(stats.retired_bytes, record_ref.len);
-    assert!(stats.future_epoch_histogram.is_empty());
-    assert!(stats.extension_count_histogram.is_empty());
-    assert_eq!(store.get(&key).unwrap(), None);
-}
-
-#[tokio::test]
-async fn accounting_leaves_unknown_lifetime_put_copy_eligible() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, put_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, put_lsn);
-
-    let overlay = store
-        .index()
-        .get_segment_gc_overlay(record_ref.segment_id)
-        .unwrap()
-        .unwrap_or_default();
+    let overlay = segment_overlay(&store, record_ref.segment_id);
     assert!(overlay.expired.is_empty());
     assert!(overlay.retired.is_empty());
     assert!(overlay.lifetimes.is_empty());
 }
-
-#[tokio::test]
-async fn accounting_publishes_retired_segment_ref_event_for_tombstone() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    let tombstone_lsn = store.tombstone(&key).unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, put_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
-
-    assert_eq!(
-        store
-            .index()
-            .iter_segment_ref_events_since(record_ref.segment_id, put_lsn)
-            .unwrap(),
-        vec![(
-            strata_core::SegmentRefEventKey {
-                segment_id: record_ref.segment_id,
-                lsn: tombstone_lsn,
-                offset: record_ref.offset,
-            },
-            SegmentRefEvent::Retired,
-        )]
-    );
-    let overlay = store
-        .index()
-        .get_segment_gc_overlay(record_ref.segment_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(overlay.retired, vec![gc_range(record_ref)]);
-    assert!(overlay.expired.is_empty());
-    assert!(overlay.lifetimes.is_empty());
-}
-
-#[tokio::test]
-async fn accounting_snapshot_guard_reports_later_ref_events() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, put_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, put_lsn);
-
-    let snapshot = store.create_accounting_snapshot().unwrap();
-    assert_eq!(snapshot.accounted_lsn(), put_lsn);
-
-    let tombstone_lsn = store.tombstone(&key).unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
-
-    assert_eq!(
-        store.accounting_changes_since(&snapshot).unwrap(),
-        vec![AccountingRefEvent {
-            key: strata_core::SegmentRefEventKey {
-                segment_id: record_ref.segment_id,
-                lsn: tombstone_lsn,
-                offset: record_ref.offset,
-            },
-            event: SegmentRefEvent::Retired,
-        }]
-    );
-}
-
-#[tokio::test]
-async fn gc_publish_does_not_force_accounting_to_catch_up() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let mut store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, put_lsn);
-    stop_accounting_worker(&mut store.store);
-
-    let accounting_snapshot = store.create_accounting_snapshot().unwrap();
-    assert_eq!(accounting_snapshot.accounted_lsn(), put_lsn);
-
-    let tombstone_lsn = store.tombstone(&key).unwrap();
-    let copy = PreparedGcCopy {
-        accounting_snapshot,
-        plan: GcPlan {
-            scenario: GcScenario::EmptyDelete,
-            action: GcAction::MoveLiveBytes {
-                source_segment_id: FIRST_SEGMENT_ID,
-                routes: Vec::new(),
-            },
-            copied_bytes: 0,
-            expected_reclaim_bytes: 0,
-            score: 0,
-        },
-        outputs: Vec::new(),
-        copied_records: Vec::new(),
-        claim: None,
-    };
-
-    let published = store.publish_prepared_gc_copy(copy).unwrap();
-
-    assert_eq!(published.reconciled_accounted_lsn, put_lsn);
-    assert!(store.durable_lsn().unwrap() < tombstone_lsn);
-    assert!(store.accounted_lsn().unwrap() < tombstone_lsn);
-}
-
-#[tokio::test]
-async fn gc_publish_waiting_for_accounting_lock_does_not_block_writer() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key_a, b"payload-a").unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, put_lsn);
-    let accounting_snapshot = store.create_accounting_snapshot().unwrap();
-    let copy = PreparedGcCopy {
-        accounting_snapshot,
-        plan: GcPlan {
-            scenario: GcScenario::EmptyDelete,
-            action: GcAction::MoveLiveBytes {
-                source_segment_id: FIRST_SEGMENT_ID,
-                routes: Vec::new(),
-            },
-            copied_bytes: 0,
-            expected_reclaim_bytes: 0,
-            score: 0,
-        },
-        outputs: Vec::new(),
-        copied_records: Vec::new(),
-        claim: None,
-    };
-
-    let accounting_lock = store.store.accounting_lock.clone();
-    let accounting_guard = accounting_lock
-        .lock()
-        .expect("accounting run lock poisoned");
-    std::thread::scope(|scope| {
-        let publish = scope.spawn(|| store.publish_prepared_gc_copy(copy));
-        std::thread::sleep(Duration::from_millis(50));
-
-        let (put_tx, put_rx) = mpsc::channel();
-        let store_ref = &store;
-        let key_b_ref = &key_b;
-        let put = scope.spawn(move || {
-            let result = store_ref.put(key_b_ref, b"payload-b");
-            put_tx.send(result).unwrap();
-        });
-        let put_result = put_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("writer blocked behind GC accounting-lock wait");
-        assert!(put_result.unwrap() > put_lsn);
-
-        drop(accounting_guard);
-        assert!(publish.join().unwrap().is_ok());
-        put.join().unwrap();
-    });
-}
-
 #[tokio::test]
 async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
     init_typed_store_metrics();
@@ -3792,15 +3142,14 @@ async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
             .unwrap();
         store
             .index()
-            .merge_segment_gc_overlay_batch(
+            .put_segment_gc_summary_batch(
                 &mut batch,
                 segment_id,
-                vec![SegmentGcOverlayMergeOp::AddRetiredBatch {
-                    ranges: vec![SegmentGcRecordRange {
-                        offset: 0,
-                        len: bytes,
-                    }],
-                }],
+                &strata_core::SegmentGcSummary {
+                    total_bytes: bytes,
+                    retired_bytes: bytes,
+                    ..Default::default()
+                },
             )
             .unwrap();
         batch.write().unwrap();
@@ -3824,82 +3173,33 @@ async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
         }
     );
 }
-
-#[tokio::test]
-async fn gc_prepare_plan_defers_when_accounting_lag_exceeds_configured_limit() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.gc_max_accounting_lag_lsn = Some(2);
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-
-    let mut batch = store.index().batch();
-    store.index().put_durable_lsn_batch(&mut batch, 5).unwrap();
-    store
-        .index()
-        .put_accounted_lsn_batch(&mut batch, 2)
-        .unwrap();
-    batch.write().unwrap();
-
-    let lag = store.gc_deferred_by_accounting_lag().unwrap().unwrap();
-    assert_eq!(lag.durable_lsn, 5);
-    assert_eq!(lag.accounted_lsn, 2);
-    assert_eq!(lag.lag_lsn, 3);
-    assert_eq!(lag.max_lag_lsn, Some(2));
-
-    let planner = GcPlanner::new(GcPlannerConfig {
-        max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
-        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
-        min_l0_rewrite_epoch_distance: 1,
-        min_l0_rewrite_useful_ratio_bps: 1,
-        min_reclaim_bytes: 1,
-        min_garbage_ratio_bps: 1,
-        min_exact_epoch_bucket_bytes: 1,
-        min_exact_epoch_distance: 1,
-        max_exact_epoch_extension_count: 1,
-        min_join_output_bytes: 1,
-        max_join_sources: 4,
-    });
-    assert!(store.prepare_gc_plan(&planner).unwrap().is_none());
-}
-
 #[tokio::test]
 async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
-    let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+    store.put(&key_a, b"payload-a").unwrap();
     let lsn_b = store.put(&key_b, b"payload-b").unwrap();
     let lsn_c = store.put(&key_c, b"payload-c").unwrap();
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_c);
+    wait_for_lsm_gc(&store, lsn_c);
 
-    let ref_a = store
-        .index()
-        .get_blob_version(&version_key(&key_a, lsn_a))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_version(&version_key(&key_b, lsn_b))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    let ref_b = lsm_blob_ref(&store, &key_b);
 
     let tombstone_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -3916,17 +3216,11 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
     });
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
 
-    assert!(prepared.accounting_snapshot.accounted_lsn() >= tombstone_lsn);
     assert_eq!(prepared.plan.scenario, GcScenario::L0Compaction);
     assert_eq!(prepared.plan.copied_bytes, ref_b.len);
 
     assert_eq!(
-        store
-            .index()
-            .get_segment_gc_overlay(ref_a.segment_id)
-            .unwrap()
-            .unwrap()
-            .retired,
+        segment_overlay(&store, ref_a.segment_id).retired,
         vec![gc_range(ref_a)]
     );
 
@@ -3966,6 +3260,7 @@ async fn gc_copy_uses_planning_snapshot_overlay_across_concurrent_retirement() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 4 - 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -3979,28 +3274,17 @@ async fn gc_copy_uses_planning_snapshot_overlay_across_concurrent_retirement() {
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_d);
+    wait_for_lsm_gc(&store, lsn_d);
 
-    let ref_b = store
-        .index()
-        .get_blob_version(&version_key(&key_b, lsn_b))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_c = store
-        .index()
-        .get_blob_version(&version_key(&key_c, lsn_c))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let ref_b = lsm_blob_ref(&store, &key_b);
+    let ref_c = lsm_blob_ref(&store, &key_c);
     assert_eq!(ref_b.segment_id, FIRST_SEGMENT_ID);
     assert_eq!(ref_c.segment_id, FIRST_SEGMENT_ID);
 
     let first_tombstone_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, first_tombstone_lsn);
+    wait_for_lsm_gc(&store, first_tombstone_lsn);
+    wait_for_lsm_gc(&store, first_tombstone_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4023,11 +3307,8 @@ async fn gc_copy_uses_planning_snapshot_overlay_across_concurrent_retirement() {
     // the retained planning overlay, which previously caused CopyBytesMismatch during the scan.
     let second_tombstone_lsn = store.tombstone(&key_b).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, second_tombstone_lsn);
-    assert_eq!(
-        segment_summary(store.index(), FIRST_SEGMENT_ID).live_bytes,
-        ref_c.len
-    );
+    wait_for_lsm_gc(&store, second_tombstone_lsn);
+    assert_eq!(store.get(&key_b).unwrap(), None);
 
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     assert_eq!(copied.copied_records.len(), 2);
@@ -4059,6 +3340,7 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -4072,7 +3354,7 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_c);
+    wait_for_lsm_gc(&store, lsn_c);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4151,16 +3433,17 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
             .index()
             .iter_segment_states_for_shard(shard_a)
             .unwrap()
-            .is_empty()
+            .iter()
+            .all(|(_, state)| state.state == SegmentFileState::Deleted)
     );
     for segment_id in shard_a_segment_ids {
-        assert!(
-            store
-                .index()
-                .get_segment_state(segment_id)
-                .unwrap()
-                .is_none()
-        );
+        let state = store
+            .index()
+            .get_segment_state(segment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.owner, SegmentOwner::Shard(shard_a));
+        assert_eq!(state.state, SegmentFileState::Deleted);
     }
 
     assert!(store.get_from_shard(shard_a.id, &key_a).is_err());
@@ -4177,6 +3460,7 @@ async fn gc_publish_skips_copy_prepared_before_shard_drop() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+    cfg.gc_workers_enabled = false;
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     let dropped_shard = store.add_shard(17).unwrap();
     let kept_shard = store.add_shard(18).unwrap();
@@ -4199,7 +3483,7 @@ async fn gc_publish_skips_copy_prepared_before_shard_drop() {
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, rollover_lsn);
+    wait_for_lsm_gc(&store, rollover_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4240,6 +3524,7 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
@@ -4252,11 +3537,12 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
     store.sync().unwrap();
     let sealed_path = segment_state_path(store.config(), &sealed_state);
     assert!(sealed_path.exists());
-    wait_for_accounted_lsn(&store, lsn_b);
+    wait_for_lsm_gc(&store, lsn_b);
 
     let tombstone_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4273,7 +3559,6 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
     });
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
 
-    assert_eq!(prepared.accounting_snapshot.accounted_lsn(), tombstone_lsn);
     assert_eq!(prepared.plan.scenario, GcScenario::EmptyDelete);
     assert_eq!(
         prepared.plan.action,
@@ -4310,6 +3595,7 @@ async fn gc_publish_empty_delete_plan_batches_multiple_segment_files() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -4329,12 +3615,13 @@ async fn gc_publish_empty_delete_plan_batches_multiple_segment_files() {
     let second_path = segment_state_path(store.config(), &second_state);
     assert!(first_path.exists());
     assert!(second_path.exists());
-    wait_for_accounted_lsn(&store, lsn_c);
+    wait_for_lsm_gc(&store, lsn_c);
 
     store.tombstone(&key_a).unwrap();
     let tombstone_lsn_b = store.tombstone(&key_b).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn_b);
+    wait_for_lsm_gc(&store, tombstone_lsn_b);
+    wait_for_lsm_gc(&store, tombstone_lsn_b);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4391,6 +3678,7 @@ async fn gc_worker_request_runs_production_gc_plan() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    cfg.gc_interval = Duration::from_secs(3600);
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
@@ -4402,11 +3690,10 @@ async fn gc_worker_request_runs_production_gc_plan() {
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
     let sealed_path = segment_state_path(store.config(), &sealed_state);
-    wait_for_accounted_lsn(&store, lsn_b);
 
     let tombstone_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
     store.request_gc().unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -4432,7 +3719,7 @@ async fn gc_worker_request_runs_production_gc_plan() {
 }
 
 #[tokio::test]
-async fn accounting_epoch_expiry_nudges_gc_after_materializing_empty_segment() {
+async fn lazy_epoch_expiry_nudges_gc_after_ordinary_compaction() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -4444,7 +3731,7 @@ async fn accounting_epoch_expiry_nudges_gc_after_materializing_empty_segment() {
 
     store.put(&key_a, b"payload-a").unwrap();
     store.extend(&key_a, 43).unwrap().unwrap();
-    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    store.put(&key_b, b"payload-b").unwrap();
     store.sync().unwrap();
     let mut sealed_state =
         wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
@@ -4452,10 +3739,20 @@ async fn accounting_epoch_expiry_nudges_gc_after_materializing_empty_segment() {
     store.index().put_segment_state(&sealed_state).unwrap();
     let sealed_path = segment_state_path(store.config(), &sealed_state);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_b);
 
-    let (_, epoch_lsn) = store.increment_epoch().unwrap();
+    store.increment_epoch().unwrap();
     store.sync().unwrap();
+    let state = store
+        .index()
+        .get_segment_state(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    assert_ne!(state.state, SegmentFileState::Deleted);
+    assert_eq!(store.get(&key_a).unwrap(), None);
+
+    let touch_lsn = store.extend(&key_a, 50).unwrap().unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, touch_lsn);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -4469,12 +3766,11 @@ async fn accounting_epoch_expiry_nudges_gc_after_materializing_empty_segment() {
         }
         assert!(
             Instant::now() < deadline,
-            "accounting did not nudge GC after epoch expiry"
+            "lazy LSM expiry did not nudge GC after compaction"
         );
         thread::sleep(Duration::from_millis(10));
     }
 
-    assert!(store.accounted_lsn().unwrap() >= epoch_lsn);
     assert_eq!(store.get(&key_a).unwrap(), None);
     assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
 }
@@ -4504,12 +3800,13 @@ async fn gc_worker_count_broadcasts_request_to_parallel_workers() {
     store.sync().unwrap();
     let first_path = segment_state_path(store.config(), &first_state);
     let second_path = segment_state_path(store.config(), &second_state);
-    wait_for_accounted_lsn(&store, lsn_c);
+    wait_for_lsm_gc(&store, lsn_c);
 
     store.tombstone(&key_a).unwrap();
     let tombstone_lsn_b = store.tombstone(&key_b).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn_b);
+    wait_for_lsm_gc(&store, tombstone_lsn_b);
+    wait_for_lsm_gc(&store, tombstone_lsn_b);
     assert_eq!(store.store.gc_txs.len(), 2);
 
     store.request_gc().unwrap();
@@ -4579,20 +3876,31 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
         .index()
         .put_segment_state_batch(&mut batch, &state)
         .unwrap();
+    let lifecycle = BlobLifecycle {
+        logical_end_epoch: current_epoch + 10,
+        extension_count: 2,
+    };
     store
         .index()
-        .merge_segment_gc_overlay_batch(
+        .put_segment_gc_summary_batch(
             &mut batch,
             segment_id,
-            vec![SegmentGcOverlayMergeOp::AddLiveBatch {
-                records: vec![SegmentGcLiveRecord {
-                    range,
-                    lifecycle: Some(BlobLifecycle {
-                        logical_end_epoch: current_epoch + 10,
-                        extension_count: 2,
-                    }),
-                }],
-            }],
+            &strata_core::SegmentGcSummary {
+                total_bytes: range.len,
+                live_bytes: range.len,
+                live_ref_count: 1,
+                min_live_end_epoch: Some(lifecycle.logical_end_epoch),
+                max_live_end_epoch: Some(lifecycle.logical_end_epoch),
+                future_epoch_histogram: BTreeMap::from([(
+                    lifecycle.logical_end_epoch,
+                    EpochBucket {
+                        refs: 1,
+                        bytes: range.len,
+                    },
+                )]),
+                extension_count_histogram: BTreeMap::from([(lifecycle.extension_count, 1)]),
+                ..Default::default()
+            },
         )
         .unwrap();
     batch.write().unwrap();
@@ -4645,6 +3953,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -4653,31 +3962,18 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     let store = try_open_standalone_store(cfg, metrics).unwrap();
 
     let lsn_a = store.put(&key_a, b"payload-a").unwrap();
-    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
-    let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+    store.put(&key_b, b"payload-b").unwrap();
+    store.put(&key_c, b"payload-c").unwrap();
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_c);
 
-    let ref_a = store
-        .index()
-        .get_blob_version(&version_key(&key_a, lsn_a))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_version(&version_key(&key_b, lsn_b))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    let ref_b = lsm_blob_ref(&store, &key_b);
 
     let tombstone_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4698,10 +3994,11 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
 
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
-    assert!(published.reconciled_accounted_lsn >= tombstone_lsn);
+    assert!(published.reconciled_lsn >= tombstone_lsn);
     assert_eq!(published.skipped_records, Vec::new());
     assert_eq!(published.output_segments.len(), 1);
     assert_eq!(published.published_records.len(), 1);
+    assert_eq!(store.relocation_cache.len(), 1);
     assert_eq!(
         counter_value(&registry, "strata_store_gc_output_bytes_total"),
         ref_b.len as f64
@@ -4722,6 +4019,13 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(
         store
             .index()
+            .get_segment_published_at_lsn(ref_b.segment_id)
+            .unwrap(),
+        lsn_a
+    );
+    assert_eq!(
+        store
+            .index()
             .get_segment_state(ref_b.segment_id)
             .unwrap()
             .unwrap()
@@ -4729,15 +4033,18 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
         SegmentFileState::GcRelocating
     );
     assert!(store.prepare_gc_plan(&planner).unwrap().is_none());
-    assert_eq!(
-        store
-            .index()
-            .get_blob_entry(&key_b)
-            .unwrap()
-            .unwrap()
-            .record_ref,
-        Some(published_record.to)
-    );
+    assert_eq!(lsm_blob_ref(&store, &key_b), ref_b);
+    let relocation = store
+        .relocations
+        .lookup(
+            0,
+            &key_b,
+            STANDALONE_SHARD,
+            published_record.source.payload_lsn,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(relocation.to, published_record.to);
     assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
     assert_eq!(
         store
@@ -4748,17 +4055,18 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
             .placement_class,
         PlacementClass::Spillover
     );
-    assert!(store.durable_lsn().unwrap() < published_record.publish_lsn);
-    store.sync().unwrap();
-    assert!(store.durable_lsn().unwrap() >= published_record.publish_lsn);
+    assert_eq!(
+        store
+            .index()
+            .get_segment_published_at_lsn(published_record.to.segment_id)
+            .unwrap(),
+        published_record.publish_lsn
+    );
+    assert!(store.published_lsn().unwrap() >= published_record.publish_lsn);
 
-    wait_for_accounted_lsn(&store, published_record.publish_lsn);
+    wait_for_lsm_gc(&store, published_record.publish_lsn);
 
-    let source_overlay = store
-        .index()
-        .get_segment_gc_overlay(ref_a.segment_id)
-        .unwrap()
-        .unwrap();
+    let source_overlay = segment_overlay(&store, ref_a.segment_id);
     assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
     assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
 
@@ -4767,6 +4075,10 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(output_summary.live_ref_count, 1);
     assert_eq!(output_summary.total_bytes, ref_b.len);
 
+    let snapshot = store
+        .store
+        .live_snapshots
+        .pin(store.index().get_next_lsn().unwrap().saturating_sub(1));
     let prepared_delete = store.prepare_gc_plan(&planner).unwrap().unwrap();
     assert_eq!(prepared_delete.plan.scenario, GcScenario::EmptyDelete);
     assert_eq!(
@@ -4784,8 +4096,24 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
             .unwrap()
             .unwrap()
             .state,
+        SegmentFileState::GcRelocating
+    );
+    drop(snapshot);
+
+    let older_snapshot = store.store.live_snapshots.pin(lsn_a.saturating_sub(1));
+    let prepared_delete = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    let copied_delete = store.copy_prepared_gc_plan(prepared_delete).unwrap();
+    store.publish_prepared_gc_copy(copied_delete).unwrap();
+    assert_eq!(
+        store
+            .index()
+            .get_segment_state(ref_b.segment_id)
+            .unwrap()
+            .unwrap()
+            .state,
         SegmentFileState::Deleted
     );
+    drop(older_snapshot);
     assert_eq!(
         counter_value(&registry, "strata_store_gc_source_deleted_bytes_total"),
         (ref_a.len + ref_b.len) as f64
@@ -4793,6 +4121,34 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(
         counter_value(&registry, "strata_store_gc_reclaimed_bytes_total"),
         ref_a.len as f64
+    );
+    assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_cache_requests_total",
+            &[("result", "hit")]
+        ),
+        1.0
+    );
+
+    let cfg = store.config().clone();
+    drop(store);
+    let reopened = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    assert_eq!(reopened.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+    assert_eq!(
+        reopened
+            .relocations
+            .lookup(
+                0,
+                &key_b,
+                STANDALONE_SHARD,
+                published_record.source.payload_lsn,
+            )
+            .unwrap()
+            .unwrap()
+            .to,
+        published_record.to
     );
 }
 
@@ -4802,6 +4158,7 @@ async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 4 - 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
@@ -4815,11 +4172,12 @@ async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_d);
+    wait_for_lsm_gc(&store, lsn_d);
 
     let tombstone_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4856,19 +4214,23 @@ async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
         output_segment_id,
     );
 
-    let mut batch = store.index().batch();
-    store
+    let source_segment_id = copied.copied_records[0].source.from.segment_id;
+    let mut source_state = store
         .index()
-        .put_next_lsn_batch(&mut batch, StrataLsn::MAX)
+        .get_segment_state(source_segment_id)
+        .unwrap()
         .unwrap();
-    batch.write().unwrap();
-    store.index().flush_wal(true).unwrap();
+    source_state.state = SegmentFileState::Open;
+    store.index().put_segment_state(&source_state).unwrap();
 
     let err = store.publish_prepared_gc_copy(copied).unwrap_err();
 
     assert!(matches!(
         err,
-        Error::Segment(strata_segment::Error::RangeOverflow)
+        Error::GcSourceSegmentNotSealed {
+            segment_id,
+            state: SegmentFileState::Open,
+        } if segment_id == source_segment_id
     ));
     assert!(!staged_path.exists());
     assert!(!final_path.exists());
@@ -4885,44 +4247,33 @@ async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
 }
 
 #[tokio::test]
-async fn gc_publish_tombstoned_unaccounted_copy_retires_destination_after_forwarding() {
+async fn gc_publish_tombstoned_pending_copy_retires_destination_after_forwarding() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_major_patch_count_threshold = 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
-    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
-    let lsn_a = store.put(&key_a, b"payload-a").unwrap();
-    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    store.put(&key_a, b"payload-a").unwrap();
+    store.put(&key_b, b"payload-b").unwrap();
     let lsn_c = store.put(&key_c, b"payload-c").unwrap();
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_c);
+    wait_for_lsm_gc(&store, lsn_c);
 
-    let ref_a = store
-        .index()
-        .get_blob_version(&version_key(&key_a, lsn_a))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_version(&version_key(&key_b, lsn_b))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    let ref_b = lsm_blob_ref(&store, &key_b);
+    let payload_lsn_b = lsm_blob(&store, STANDALONE_SHARD, &key_b).payload_lsn;
 
     let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_a_lsn);
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -4939,91 +4290,56 @@ async fn gc_publish_tombstoned_unaccounted_copy_retires_destination_after_forwar
     });
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
-    stop_accounting_worker(&mut store.store);
 
     let tombstone_b_lsn = store.tombstone(&key_b).unwrap();
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
-    assert!(published.reconciled_accounted_lsn < tombstone_b_lsn);
-    assert_eq!(published.published_records.len(), 1);
+    assert!(published.reconciled_lsn >= tombstone_b_lsn);
+    assert!(published.published_records.is_empty());
+    assert!(published.output_segments.is_empty());
+    assert_eq!(published.skipped_records.len(), 1);
+    assert_eq!(published.skipped_records[0].source.from, ref_b);
     assert_eq!(store.get(&key_b).unwrap(), None);
-
-    let published_record = &published.published_records[0];
-    assert_eq!(published_record.source.from, ref_b);
-    let output_summary_before_accounting =
-        segment_summary(store.index(), published_record.to.segment_id);
-    assert_eq!(output_summary_before_accounting.total_bytes, 0);
-    assert_eq!(output_summary_before_accounting.live_bytes, 0);
-    assert_eq!(output_summary_before_accounting.live_ref_count, 0);
-    assert_eq!(output_summary_before_accounting.garbage_bytes(), 0);
-    assert!(store.index().get_gc_relocation(ref_b).unwrap().is_some());
-
-    store.sync().unwrap();
-    for _ in 0..4 {
-        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
-        if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
-            break;
-        }
-    }
-    assert!(store.accounted_lsn().unwrap() >= published_record.publish_lsn);
-
-    let source_overlay = store
-        .index()
-        .get_segment_gc_overlay(ref_a.segment_id)
-        .unwrap()
-        .unwrap();
+    assert!(
+        store
+            .relocations
+            .lookup(0, &key_b, STANDALONE_SHARD, payload_lsn_b)
+            .unwrap()
+            .is_none()
+    );
+    let source_overlay = segment_overlay(&store, ref_a.segment_id);
     assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
-    assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
-
-    let output_summary = segment_summary(store.index(), published_record.to.segment_id);
-    assert_eq!(output_summary.total_bytes, ref_b.len);
-    assert_eq!(output_summary.live_bytes, 0);
-    assert_eq!(output_summary.live_ref_count, 0);
-    assert_eq!(output_summary.retired_bytes, ref_b.len);
-    assert_eq!(output_summary.garbage_bytes(), ref_b.len);
-    assert!(store.index().get_gc_relocation(ref_b).unwrap().is_none());
 }
 
 #[tokio::test]
-async fn gc_publish_unaccounted_epoch_change_expires_relocated_destination() {
+async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_major_patch_count_threshold = 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
-    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
-    let lsn_a = store.put(&key_a, b"payload-a").unwrap();
-    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    store.put(&key_a, b"payload-a").unwrap();
+    store.put(&key_b, b"payload-b").unwrap();
     let lsn_c = store.put(&key_c, b"payload-c").unwrap();
     let lifetime_b_lsn = store.extend(&key_b, 43).unwrap().unwrap();
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_c.max(lifetime_b_lsn));
+    wait_for_lsm_gc(&store, lsn_c.max(lifetime_b_lsn));
 
-    let ref_a = store
-        .index()
-        .get_blob_version(&version_key(&key_a, lsn_a))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_version(&version_key(&key_b, lsn_b))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    let ref_b = lsm_blob_ref(&store, &key_b);
+    let payload_lsn_b = lsm_blob(&store, STANDALONE_SHARD, &key_b).payload_lsn;
 
     let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_a_lsn);
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -5040,51 +4356,26 @@ async fn gc_publish_unaccounted_epoch_change_expires_relocated_destination() {
     });
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
-    stop_accounting_worker(&mut store.store);
 
     let (_, epoch_lsn) = store.increment_epoch().unwrap();
     assert_eq!(store.get(&key_b).unwrap(), None);
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
-    assert!(published.reconciled_accounted_lsn < epoch_lsn);
-    assert_eq!(published.published_records.len(), 1);
-    let published_record = &published.published_records[0];
-    assert_eq!(published_record.source.from, ref_b);
-    assert_eq!(
-        published_record.source.lifecycle.unwrap().logical_end_epoch,
-        43
-    );
+    assert!(published.reconciled_lsn >= epoch_lsn);
+    assert!(published.published_records.is_empty());
+    assert!(published.output_segments.is_empty());
+    assert_eq!(published.skipped_records.len(), 1);
+    assert_eq!(published.skipped_records[0].source.from, ref_b);
 
-    let output_summary_before_accounting =
-        segment_summary(store.index(), published_record.to.segment_id);
-    assert_eq!(output_summary_before_accounting.total_bytes, 0);
-    assert_eq!(output_summary_before_accounting.live_bytes, 0);
-    assert_eq!(output_summary_before_accounting.expired_bytes, 0);
-
-    store.sync().unwrap();
-    for _ in 0..4 {
-        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
-        if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
-            break;
-        }
-    }
-    assert!(store.accounted_lsn().unwrap() >= published_record.publish_lsn);
-
-    let source_overlay = store
-        .index()
-        .get_segment_gc_overlay(ref_a.segment_id)
-        .unwrap()
-        .unwrap();
+    let source_overlay = segment_overlay(&store, ref_a.segment_id);
     assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
-    assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
-
-    let output_summary = segment_summary(store.index(), published_record.to.segment_id);
-    assert_eq!(output_summary.total_bytes, ref_b.len);
-    assert_eq!(output_summary.live_bytes, 0);
-    assert_eq!(output_summary.live_ref_count, 0);
-    assert_eq!(output_summary.expired_bytes, ref_b.len);
-    assert_eq!(output_summary.retired_bytes, 0);
-    assert_eq!(output_summary.garbage_bytes(), ref_b.len);
+    assert!(
+        store
+            .relocations
+            .lookup(0, &key_b, STANDALONE_SHARD, payload_lsn_b)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -5093,39 +4384,28 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
-    cfg.accounting_interval = Duration::from_secs(3600);
-    cfg.accounting_major_patch_count_threshold = 1;
+    cfg.gc_workers_enabled = false;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
-    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
-    let lsn_a = store.put(&key_a, b"payload-a").unwrap();
-    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    store.put(&key_a, b"payload-a").unwrap();
+    store.put(&key_b, b"payload-b").unwrap();
     let lsn_c = store.put(&key_c, b"payload-c").unwrap();
     store.sync().unwrap();
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lsn_c);
+    wait_for_lsm_gc(&store, lsn_c);
 
-    let ref_a = store
-        .index()
-        .get_blob_version(&version_key(&key_a, lsn_a))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_version(&version_key(&key_b, lsn_b))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    let ref_b = lsm_blob_ref(&store, &key_b);
+    let payload_lsn_b = lsm_blob(&store, STANDALONE_SHARD, &key_b).payload_lsn;
 
     let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_a_lsn);
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
 
     let planner = GcPlanner::new(GcPlannerConfig {
         max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
@@ -5143,112 +4423,31 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     assert_eq!(copied.copied_records[0].source.lifecycle, None);
-    stop_accounting_worker(&mut store.store);
 
     let lifetime_b_lsn = store.extend(&key_b, 43).unwrap().unwrap();
     let (_, epoch_lsn) = store.increment_epoch().unwrap();
     assert_eq!(store.get(&key_b).unwrap(), None);
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
-    assert!(published.reconciled_accounted_lsn < lifetime_b_lsn);
-    assert!(published.reconciled_accounted_lsn < epoch_lsn);
-    assert_eq!(published.published_records.len(), 1);
-    let published_record = &published.published_records[0];
-    assert_eq!(published_record.source.from, ref_b);
-    assert_eq!(published_record.source.lifecycle, None);
+    assert!(published.reconciled_lsn >= lifetime_b_lsn);
+    assert!(published.reconciled_lsn >= epoch_lsn);
+    assert!(published.published_records.is_empty());
+    assert!(published.output_segments.is_empty());
+    assert_eq!(published.skipped_records.len(), 1);
+    assert_eq!(published.skipped_records[0].source.from, ref_b);
 
-    let output_summary_before_accounting =
-        segment_summary(store.index(), published_record.to.segment_id);
-    assert_eq!(output_summary_before_accounting.total_bytes, 0);
-    assert_eq!(output_summary_before_accounting.live_bytes, 0);
-    assert_eq!(output_summary_before_accounting.expired_bytes, 0);
-
-    store.sync().unwrap();
-    for _ in 0..4 {
-        accounting::run_accounting_once(store.index(), store.config(), true).unwrap();
-        if store.accounted_lsn().unwrap() >= published_record.publish_lsn {
-            break;
-        }
-    }
-    assert!(store.accounted_lsn().unwrap() >= published_record.publish_lsn);
-
-    let source_overlay = store
-        .index()
-        .get_segment_gc_overlay(ref_a.segment_id)
-        .unwrap()
-        .unwrap();
+    let source_overlay = segment_overlay(&store, ref_a.segment_id);
     assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
-    assert!(gc_ranges_contain(&source_overlay.retired, ref_b));
-
-    let output_summary = segment_summary(store.index(), published_record.to.segment_id);
-    assert_eq!(output_summary.total_bytes, ref_b.len);
-    assert_eq!(output_summary.live_bytes, 0);
-    assert_eq!(output_summary.live_ref_count, 0);
-    assert_eq!(output_summary.expired_bytes, ref_b.len);
-    assert_eq!(output_summary.retired_bytes, 0);
-    assert_eq!(output_summary.garbage_bytes(), ref_b.len);
-}
-
-#[tokio::test]
-async fn accounting_publishes_lifecycle_changed_segment_ref_event() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    let put_lsn = store.put(&key, b"payload").unwrap();
-    let lifetime_lsn = store.extend(&key, 50).unwrap().unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, put_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_lsn);
-
-    let lifecycle = BlobLifecycle {
-        logical_end_epoch: 50,
-        extension_count: 0,
-    };
-    assert_eq!(
+    assert!(
         store
-            .index()
-            .iter_segment_ref_events_since(record_ref.segment_id, put_lsn)
-            .unwrap(),
-        vec![(
-            strata_core::SegmentRefEventKey {
-                segment_id: record_ref.segment_id,
-                lsn: lifetime_lsn,
-                offset: record_ref.offset,
-            },
-            SegmentRefEvent::LifecycleChanged {
-                lifecycle: Some(lifecycle),
-            },
-        )]
-    );
-    let overlay = store
-        .index()
-        .get_segment_gc_overlay(record_ref.segment_id)
-        .unwrap()
-        .unwrap();
-    assert!(overlay.expired.is_empty());
-    assert!(overlay.retired.is_empty());
-    assert_eq!(
-        overlay.lifetimes,
-        vec![SegmentGcLifetimeRange {
-            range: gc_range(record_ref),
-            lifecycle,
-        }]
+            .relocations
+            .lookup(0, &key_b, STANDALONE_SHARD, payload_lsn_b)
+            .unwrap()
+            .is_none()
     );
 }
-
 #[tokio::test]
-async fn accounting_gc_overlay_retire_removes_lifetime_hint() {
+async fn blob_lsm_retire_removes_lifetime_hint() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5256,41 +4455,27 @@ async fn accounting_gc_overlay_retire_removes_lifetime_hint() {
         try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
             .unwrap();
 
-    let put_lsn = store.put(&key, b"payload").unwrap();
+    store.put(&key, b"payload").unwrap();
     let lifetime_lsn = store.extend(&key, 50).unwrap().unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_version(&version_key(&key, put_lsn))
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let record_ref = lsm_blob_ref(&store, &key);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_lsn);
+    wait_for_lsm_gc(&store, lifetime_lsn);
 
-    let overlay = store
-        .index()
-        .get_segment_gc_overlay(record_ref.segment_id)
-        .unwrap()
-        .unwrap();
+    let overlay = segment_overlay(&store, record_ref.segment_id);
     assert_eq!(overlay.lifetimes.len(), 1);
 
     let tombstone_lsn = store.tombstone(&key).unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, tombstone_lsn);
 
-    let overlay = store
-        .index()
-        .get_segment_gc_overlay(record_ref.segment_id)
-        .unwrap()
-        .unwrap();
+    let overlay = segment_overlay(&store, record_ref.segment_id);
     assert_eq!(overlay.retired, vec![gc_range(record_ref)]);
     assert!(overlay.expired.is_empty());
     assert!(overlay.lifetimes.is_empty());
 }
 
 #[tokio::test]
-async fn accounting_updates_gc_summary_on_epoch_change() {
+async fn ordinary_lsm_compaction_lazily_updates_gc_summary_after_epoch_change() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5303,22 +4488,10 @@ async fn accounting_updates_gc_summary_on_epoch_change() {
     store.put(&key_b, b"payload-bb").unwrap();
     store.extend(&key_a, 43).unwrap().unwrap();
     let lifetime_b_lsn = store.extend(&key_b, 50).unwrap().unwrap();
-    let ref_a = store
-        .index()
-        .get_blob_entry(&key_a)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_entry(&key_b)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    let ref_b = lsm_blob_ref(&store, &key_b);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_b_lsn);
+    wait_for_lsm_gc(&store, lifetime_b_lsn);
 
     let stats = segment_summary(store.index(), ref_a.segment_id);
     assert_eq!(stats.live_bytes, ref_a.len + ref_b.len);
@@ -5328,7 +4501,19 @@ async fn accounting_updates_gc_summary_on_epoch_change() {
     let (epoch, epoch_lsn) = store.increment_epoch().unwrap();
     assert_eq!(epoch, 43);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, epoch_lsn);
+    wait_for_lsm_gc(&store, epoch_lsn);
+
+    // Advancing the epoch alone does not scan cold blob keys or segment overlays.
+    let stats = segment_summary(store.index(), ref_a.segment_id);
+    assert_eq!(stats.live_bytes, ref_a.len + ref_b.len);
+    assert_eq!(stats.live_ref_count, 2);
+    assert_eq!(stats.expired_bytes, 0);
+
+    // Updating another key in the same base-table range causes ordinary compaction to visit the
+    // expired key and publish its terminal garbage atomically with the replacement SST.
+    let touch_lsn = store.extend(&key_b, 51).unwrap().unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, touch_lsn);
 
     let stats = segment_summary(store.index(), ref_a.segment_id);
     assert_eq!(stats.live_bytes, ref_b.len);
@@ -5337,22 +4522,30 @@ async fn accounting_updates_gc_summary_on_epoch_change() {
     assert_eq!(stats.retired_bytes, 0);
     assert_eq!(stats.future_epoch_histogram.get(&43), None);
     assert_eq!(
-        stats.future_epoch_histogram.get(&50),
+        stats.future_epoch_histogram.get(&51),
         Some(&EpochBucket {
             refs: 1,
             bytes: ref_b.len,
         })
     );
-    assert_eq!(stats.min_live_end_epoch, Some(50));
+    assert_eq!(stats.min_live_end_epoch, Some(51));
     assert!(!stats.is_empty());
 
     let mut last_epoch_lsn = epoch_lsn;
-    while store.current_epoch().unwrap() < 50 {
+    while store.current_epoch().unwrap() < 51 {
         let (_, lsn) = store.increment_epoch().unwrap();
         last_epoch_lsn = lsn;
     }
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, last_epoch_lsn);
+    wait_for_lsm_gc(&store, last_epoch_lsn);
+
+    let stats = segment_summary(store.index(), ref_a.segment_id);
+    assert_eq!(stats.live_bytes, ref_b.len);
+    assert_eq!(stats.expired_bytes, ref_a.len);
+
+    let second_touch_lsn = store.extend(&key_a, 60).unwrap().unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, second_touch_lsn);
 
     let stats = segment_summary(store.index(), ref_a.segment_id);
     assert_eq!(stats.live_bytes, 0);
@@ -5363,9 +4556,8 @@ async fn accounting_updates_gc_summary_on_epoch_change() {
     assert_eq!(stats.min_live_end_epoch, None);
     assert!(stats.is_empty());
 }
-
 #[tokio::test]
-async fn accounting_skips_live_counters_for_tombstone_of_expired_blob() {
+async fn lazy_expiry_does_not_revive_blob_on_extension() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5375,116 +4567,22 @@ async fn accounting_skips_live_counters_for_tombstone_of_expired_blob() {
 
     store.put(&key, b"payload").unwrap();
     let lifetime_lsn = store.extend(&key, 43).unwrap().unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_entry(&key)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let record_ref = lsm_blob_ref(&store, &key);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_lsn);
+    wait_for_lsm_gc(&store, lifetime_lsn);
 
     let (_, epoch_lsn) = store.increment_epoch().unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, epoch_lsn);
-
-    let tombstone_lsn = store.tombstone(&key).unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, tombstone_lsn);
+    wait_for_lsm_gc(&store, epoch_lsn);
 
     let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.total_bytes, record_ref.len);
-    assert_eq!(stats.live_bytes, 0);
-    assert_eq!(stats.live_ref_count, 0);
     assert_eq!(stats.expired_bytes, 0);
-    assert_eq!(stats.retired_bytes, record_ref.len);
-    assert_eq!(store.get(&key).unwrap(), None);
-}
-
-#[tokio::test]
-async fn accounting_orders_blob_ops_and_epoch_changes_within_one_run() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    store.put(&key_a, b"payload-a").unwrap();
-    store.extend(&key_a, 43).unwrap().unwrap();
-    let ref_a = store
-        .index()
-        .get_blob_entry(&key_a)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    store.increment_epoch().unwrap();
-    let tombstone_lsn = store.tombstone(&key_a).unwrap();
-    let put_b_lsn = store.put(&key_b, b"payload-bb").unwrap();
-    let lifetime_b_lsn = store.extend(&key_b, 44).unwrap().unwrap();
-    let ref_b = store
-        .index()
-        .get_blob_entry(&key_b)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_b_lsn.max(put_b_lsn).max(tombstone_lsn));
-
-    // The put of blob A is accounted live at epoch 42, the epoch change to 43 expires it, and
-    // the later tombstone moves it from expired bytes to permanently retired bytes.
-    let stats = segment_summary(store.index(), ref_a.segment_id);
-    assert_eq!(stats.total_bytes, ref_a.len + ref_b.len);
-    assert_eq!(stats.expired_bytes, 0);
-    assert_eq!(stats.retired_bytes, ref_a.len);
-    assert_eq!(stats.live_bytes, ref_b.len);
     assert_eq!(stats.live_ref_count, 1);
-    assert_eq!(
-        stats.future_epoch_histogram.get(&44),
-        Some(&EpochBucket {
-            refs: 1,
-            bytes: ref_b.len,
-        })
-    );
-}
-
-#[tokio::test]
-async fn accounting_does_not_revive_expired_blob_on_extension() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    store.put(&key, b"payload").unwrap();
-    let lifetime_lsn = store.extend(&key, 43).unwrap().unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_entry(&key)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_lsn);
-
-    let (_, epoch_lsn) = store.increment_epoch().unwrap();
-    store.sync().unwrap();
-    wait_for_accounted_lsn(&store, epoch_lsn);
-
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.expired_bytes, record_ref.len);
-    assert_eq!(stats.live_ref_count, 0);
 
     let extend_lsn = store.extend(&key, 50).unwrap().unwrap();
     assert_eq!(store.get(&key).unwrap(), None);
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, extend_lsn);
+    wait_for_lsm_gc(&store, extend_lsn);
 
     let stats = segment_summary(store.index(), record_ref.segment_id);
     assert_eq!(stats.expired_bytes, record_ref.len);
@@ -5495,7 +4593,7 @@ async fn accounting_does_not_revive_expired_blob_on_extension() {
 }
 
 #[tokio::test]
-async fn accounting_expires_future_epoch_bucket_for_exact_epoch_segment() {
+async fn lazy_compaction_expires_future_epoch_bucket_for_exact_epoch_segment() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5504,13 +4602,7 @@ async fn accounting_expires_future_epoch_bucket_for_exact_epoch_segment() {
             .unwrap();
 
     store.put(&key, b"payload").unwrap();
-    let record_ref = store
-        .index()
-        .get_blob_entry(&key)
-        .unwrap()
-        .unwrap()
-        .record_ref
-        .unwrap();
+    let record_ref = lsm_blob_ref(&store, &key);
     let mut state = store
         .index()
         .get_segment_state(record_ref.segment_id)
@@ -5520,7 +4612,7 @@ async fn accounting_expires_future_epoch_bucket_for_exact_epoch_segment() {
     store.index().put_segment_state(&state).unwrap();
     let lifetime_lsn = store.extend(&key, 43).unwrap().unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, lifetime_lsn);
+    wait_for_lsm_gc(&store, lifetime_lsn);
 
     let stats = segment_summary(store.index(), record_ref.segment_id);
     assert_eq!(
@@ -5533,7 +4625,21 @@ async fn accounting_expires_future_epoch_bucket_for_exact_epoch_segment() {
 
     let (_, epoch_lsn) = store.increment_epoch().unwrap();
     store.sync().unwrap();
-    wait_for_accounted_lsn(&store, epoch_lsn);
+    wait_for_lsm_gc(&store, epoch_lsn);
+
+    let stats = segment_summary(store.index(), record_ref.segment_id);
+    assert_eq!(
+        stats.future_epoch_histogram.get(&43),
+        Some(&EpochBucket {
+            refs: 1,
+            bytes: record_ref.len,
+        })
+    );
+    assert_eq!(stats.expired_bytes, 0);
+
+    let touch_lsn = store.extend(&key, 50).unwrap().unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, touch_lsn);
 
     let stats = segment_summary(store.index(), record_ref.segment_id);
     assert_eq!(stats.future_epoch_histogram.get(&43), None);
@@ -5558,32 +4664,9 @@ async fn put_assigns_monotonic_lsn_across_reopen() {
 
         assert_eq!(lsn_1, 1);
         assert_eq!(lsn_2, 2);
-        assert_eq!(
-            store
-                .index()
-                .get_blob_entry(&key_1)
-                .unwrap()
-                .unwrap()
-                .record_ref
-                .unwrap()
-                .segment_id,
-            1
-        );
-        assert_eq!(
-            store
-                .index()
-                .get_blob_entry(&key_2)
-                .unwrap()
-                .unwrap()
-                .record_ref
-                .unwrap()
-                .segment_id,
-            2
-        );
-        assert_eq!(
-            store.index().get_blob_entry(&key_2).unwrap().unwrap().lsn,
-            2
-        );
+        assert_eq!(lsm_blob_ref(&store, &key_1).segment_id, 1);
+        assert_eq!(lsm_blob_ref(&store, &key_2).segment_id, 2);
+        assert_eq!(lsm_blob(&store, STANDALONE_SHARD, &key_2).head_lsn, 2);
         assert_eq!(store.index().get_next_lsn().unwrap(), 3);
     }
 
@@ -5598,7 +4681,7 @@ async fn put_assigns_monotonic_lsn_across_reopen() {
 }
 
 #[tokio::test]
-async fn recovery_rolls_back_ops_missing_from_active_delta_log() {
+async fn recovery_rolls_back_unpublished_ops_missing_from_lsm_wal() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
@@ -5609,7 +4692,7 @@ async fn recovery_rolls_back_ops_missing_from_active_delta_log() {
         assert_eq!(store.index().get_next_lsn().unwrap(), 2);
     }
 
-    std::fs::remove_file(ActiveDeltaLog::path(cfg.accounting_index_dir(), 1)).unwrap();
+    std::fs::remove_file(Wal::path(cfg.namespace_dir().join("lsm/wal"), 1)).unwrap();
 
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     assert_eq!(store.index().get_next_lsn().unwrap(), 1);
@@ -5619,202 +4702,77 @@ async fn recovery_rolls_back_ops_missing_from_active_delta_log() {
 }
 
 #[tokio::test]
-async fn recovery_rejects_missing_active_delta_log_for_durable_lsn() {
+async fn recovery_rejects_missing_lsm_wal_for_published_lsn() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    {
-        let mut store =
-            try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        assert_eq!(store.put(&key, b"payload-a").unwrap(), 1);
-        store.sync().unwrap();
-        assert_eq!(store.durable_lsn().unwrap(), 1);
-        stop_accounting_worker(&mut store.store);
-
-        let mut batch = store.index().batch();
-        store
-            .index()
-            .put_accounting_log_durable_position_batch(
-                &mut batch,
-                AccountingLogDurablePosition::default(),
-            )
-            .unwrap();
-        store
-            .index()
-            .put_accounting_active_delta_log_consumed_cursor_batch(
-                &mut batch,
-                ActiveDeltaLogReadCursor::default(),
-            )
-            .unwrap();
-        batch.write_with_sync(true).unwrap();
-    }
-
-    std::fs::remove_file(ActiveDeltaLog::path(cfg.accounting_index_dir(), 1)).unwrap();
-
-    let err = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::RecoveryDurableAccountingGap {
-            durable_lsn: 1,
-            active_delta_log_lsn: 0,
-        }
-    ));
-}
-
-#[tokio::test]
-async fn recovery_keeps_latest_valid_blob_version() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
-    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let second;
-    let second_lsn;
     {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        store.put(&key, b"payload-a").unwrap();
-        second_lsn = store.put(&key, b"payload-b").unwrap();
-        second = store
-            .index()
-            .get_blob_entry(&key)
-            .unwrap()
-            .unwrap()
-            .record_ref
-            .unwrap();
-        store.index().flush_wal(true).unwrap();
+        assert_eq!(store.put(&key, b"payload-a").unwrap(), 1);
+        store.sync().unwrap();
+        assert_eq!(store.published_lsn().unwrap(), 1);
     }
 
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    std::fs::remove_file(Wal::path(cfg.namespace_dir().join("lsm/wal"), 1)).unwrap();
 
-    assert_eq!(
-        store
-            .index()
-            .get_blob_version(&version_key(&key, second_lsn))
-            .unwrap()
-            .unwrap()
-            .record_ref,
-        Some(second)
-    );
-    assert_eq!(store.get(&key).unwrap(), Some(b"payload-b".to_vec()));
+    let err = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap_err();
+    assert!(matches!(err, Error::Lsm(strata_lsm::Error::InvalidWal(_))));
 }
-
 #[tokio::test]
 async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
     let first_end;
     let second_end;
     {
-        let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
-        fs::create_dir_all(cfg.ingest_dir()).unwrap();
-
-        let segment_1_path = segment_path(&cfg, 1);
-        let mut segment_1 =
-            SegmentWriter::create(&segment_1_path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
-        let out_a = segment_1.append(&key_a, 1, b"payload-a").unwrap();
-        first_end = segment_1.write_offset();
-        let out_b = segment_1.append(&key_b, 2, b"payload-b").unwrap();
-        second_end = segment_1.write_offset();
-        drop(segment_1);
-        OpenOptions::new()
-            .write(true)
-            .open(&segment_1_path)
-            .unwrap()
-            .set_len(first_end)
-            .unwrap();
-
-        let segment_2_path = segment_path(&cfg, 2);
-        let mut segment_2 =
-            SegmentWriter::create(&segment_2_path, 2, PlacementClass::Ingest, 1 << 20).unwrap();
-        let out_c = segment_2.append(&key_c, 3, b"payload-c").unwrap();
-        let segment_2_end = segment_2.write_offset();
-        drop(segment_2);
-
-        let mut segment_1_state =
-            active_segment_state_from_path(&cfg, INGEST_SEGMENT_OWNER, 1, second_end, 0);
-        segment_1_state.state = SegmentFileState::Sealing;
-        let segment_2_state =
-            active_segment_state_from_path(&cfg, INGEST_SEGMENT_OWNER, 2, segment_2_end, 0);
-
-        let mut segment_1_delta_log = ActiveDeltaLog::open(
-            cfg.accounting_index_dir(),
-            1,
-            AccountingLogDurablePosition::default(),
-        )
-        .unwrap();
-        for (key, record_ref, lsn) in [(&key_a, out_a.record_ref, 1), (&key_b, out_b.record_ref, 2)]
-        {
-            segment_1_delta_log
-                .append(&AccountingLogEntry::Blob(BlobUpdate::Put {
-                    lsn,
-                    key: key.clone(),
-                    shard: STANDALONE_SHARD,
-                    record_ref,
-                    current_epoch: 42,
-                    lifecycle: None,
-                }))
-                .unwrap();
-        }
-        segment_1_delta_log.sync_data().unwrap();
-        let mut active_delta_log = ActiveDeltaLog::open(
-            cfg.accounting_index_dir(),
-            2,
-            segment_1_delta_log.durable_position(),
-        )
-        .unwrap();
-        active_delta_log
-            .append(&AccountingLogEntry::Blob(BlobUpdate::Put {
-                lsn: 3,
-                key: key_c.clone(),
-                shard: STANDALONE_SHARD,
-                record_ref: out_c.record_ref,
-                current_epoch: 42,
-                lifecycle: None,
-            }))
-            .unwrap();
-        active_delta_log.sync_data().unwrap();
-
-        let mut batch = index.batch();
-        for (key, record_ref, lsn) in [
-            (&key_a, out_a.record_ref, 1),
-            (&key_b, out_b.record_ref, 2),
-            (&key_c, out_c.record_ref, 3),
-        ] {
-            index
-                .put_blob_version_batch(
-                    &mut batch,
-                    key,
-                    &PutEntry {
-                        record_ref: Some(record_ref),
-                        lsn,
-                        generation: lsn,
-                        state: BlobState::Live,
-                    },
-                )
-                .unwrap();
-            index
-                .put_blob_unaccounted_lsn_op_batch(&mut batch, lsn, key)
-                .unwrap();
-        }
-        index
-            .put_segment_state_batch(&mut batch, &segment_1_state)
-            .unwrap();
-        index
-            .put_segment_state_batch(&mut batch, &segment_2_state)
-            .unwrap();
-        index
-            .put_accounting_log_durable_position_batch(
-                &mut batch,
-                active_delta_log.durable_position(),
-            )
-            .unwrap();
-        batch.write().unwrap();
-        index.flush_wal(true).unwrap();
+        let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+        store.put(&key_a, b"payload-a").unwrap();
+        store.put(&key_b, b"payload-b").unwrap();
+        store.put(&key_c, b"payload-c").unwrap();
+        let ref_a = lsm_blob_ref(&store, &key_a);
+        let ref_b = lsm_blob_ref(&store, &key_b);
+        let ref_c = lsm_blob_ref(&store, &key_c);
+        assert_eq!(
+            (ref_a.segment_id, ref_b.segment_id, ref_c.segment_id),
+            (1, 1, 2)
+        );
+        first_end = ref_a.end_offset().unwrap();
+        second_end = ref_b.end_offset().unwrap();
     }
+
+    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
+    let mut segment_1_state = index.get_segment_state(1).unwrap().unwrap();
+    segment_1_state.state = SegmentFileState::Sealing;
+    segment_1_state.write_offset = second_end;
+    segment_1_state.durable_offset = 0;
+    segment_1_state.sealed_len = None;
+    segment_1_state.sealed_sha256 = None;
+    let mut segment_2_state = index.get_segment_state(2).unwrap().unwrap();
+    segment_2_state.state = SegmentFileState::Open;
+    segment_2_state.durable_offset = 0;
+    segment_2_state.sealed_len = None;
+    segment_2_state.sealed_sha256 = None;
+    let mut batch = index.batch();
+    index
+        .put_segment_state_batch(&mut batch, &segment_1_state)
+        .unwrap();
+    index
+        .put_segment_state_batch(&mut batch, &segment_2_state)
+        .unwrap();
+    batch.write().unwrap();
+    drop(index);
+    OpenOptions::new()
+        .write(true)
+        .open(segment_path(&cfg, 1))
+        .unwrap()
+        .set_len(first_end)
+        .unwrap();
 
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
@@ -5835,78 +4793,10 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
         SegmentFileState::Deleted
     );
     assert_eq!(
-        store.index().get_blob_entry(&key_a).unwrap().unwrap().state,
-        BlobState::Live
+        lsm_blob_ref(&store, &key_a).end_offset().unwrap(),
+        first_end
     );
-    assert_eq!(store.index().get_blob_entry(&key_b).unwrap(), None);
-    assert_eq!(store.index().get_blob_entry(&key_c).unwrap(), None);
 }
-
-#[tokio::test]
-async fn absolute_consistency_recovery_fails_on_unsealed_gap() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let mut cfg = config(dir.path(), "default");
-    cfg.recovery_policy = StrataRecoveryPolicy::AbsoluteConsistency;
-    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
-    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
-    let first_end;
-    let second_end;
-    {
-        let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
-        fs::create_dir_all(cfg.ingest_dir()).unwrap();
-        let segment_path = segment_path(&cfg, 1);
-        let mut segment =
-            SegmentWriter::create(&segment_path, 1, PlacementClass::Ingest, 1 << 20).unwrap();
-        let out_a = segment.append(&key_a, 1, b"payload-a").unwrap();
-        first_end = segment.write_offset();
-        let out_b = segment.append(&key_b, 2, b"payload-b").unwrap();
-        second_end = segment.write_offset();
-        drop(segment);
-        OpenOptions::new()
-            .write(true)
-            .open(&segment_path)
-            .unwrap()
-            .set_len(first_end)
-            .unwrap();
-
-        let state = active_segment_state_from_path(&cfg, INGEST_SEGMENT_OWNER, 1, second_end, 0);
-        let mut batch = index.batch();
-        for (key, record_ref, lsn) in [(&key_a, out_a.record_ref, 1), (&key_b, out_b.record_ref, 2)]
-        {
-            index
-                .put_blob_version_batch(
-                    &mut batch,
-                    key,
-                    &PutEntry {
-                        record_ref: Some(record_ref),
-                        lsn,
-                        generation: lsn,
-                        state: BlobState::Live,
-                    },
-                )
-                .unwrap();
-            index
-                .put_blob_unaccounted_lsn_op_batch(&mut batch, lsn, key)
-                .unwrap();
-        }
-        index.put_segment_state_batch(&mut batch, &state).unwrap();
-        batch.write().unwrap();
-        index.flush_wal(true).unwrap();
-    }
-
-    let err = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap_err();
-
-    assert!(matches!(
-        err,
-        Error::RecoveryInconsistent {
-            segment_id: 1,
-            expected_write_offset,
-            recovered_write_offset,
-        } if expected_write_offset == second_end && recovered_write_offset == first_end
-    ));
-}
-
 #[tokio::test]
 async fn unsealed_segment_count_includes_open_and_sealing_segments() {
     init_typed_store_metrics();
@@ -5941,9 +4831,9 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
                 segment_id: 2,
                 sealed_len: 64,
                 sealed_before_lsn: 1,
+                allocation_records: 1,
             },
             sealed_sha256: None,
-            accounting_log_durable_position: AccountingLogDurablePosition::default(),
         },
     );
     seal::publish_ready_completed_seals(
@@ -5951,7 +4841,6 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
         &index,
         INGEST_SEGMENT_OWNER,
         &durability_publish_lock,
-        None,
         &StrataStoreMetrics::default(),
         &mut completed,
         &mut sealing,
@@ -5974,9 +4863,9 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
                 segment_id: 1,
                 sealed_len: 64,
                 sealed_before_lsn: 1,
+                allocation_records: 1,
             },
             sealed_sha256: None,
-            accounting_log_durable_position: AccountingLogDurablePosition::default(),
         },
     );
     seal::publish_ready_completed_seals(
@@ -5984,7 +4873,6 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
         &index,
         INGEST_SEGMENT_OWNER,
         &durability_publish_lock,
-        None,
         &StrataStoreMetrics::default(),
         &mut completed,
         &mut sealing,
@@ -6115,19 +5003,12 @@ async fn seal_segment_reports_error_without_marking_failed() {
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     put_test_segment_state(&index, 1, SegmentFileState::Sealing);
     let (_seal_tx, seal_rx) = mpsc::channel();
-    let (
-        accounting_tx,
-        _accounting_rx,
-        _pending_accounting_request,
-        _pending_materialize_through_lsn,
-    ) = accounting::accounting_request_channel();
     let worker = SealWorker {
         config: cfg,
         index: index.clone(),
         ingest_owner: INGEST_SEGMENT_OWNER,
         seal_rx,
         durability_publish_lock: Arc::new(Mutex::new(())),
-        accounting_tx: Some(accounting_tx),
         metrics: StrataStoreMetrics::default(),
         store_halt: StoreHalt::default(),
     };
@@ -6138,6 +5019,7 @@ async fn seal_segment_reports_error_without_marking_failed() {
                 segment_id: 1,
                 sealed_len: 64,
                 sealed_before_lsn: 1,
+                allocation_records: 1,
             })
             .is_err()
     );
@@ -6159,28 +5041,8 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
     store.put(&key_1, b"payload-a").unwrap();
     store.put(&key_2, b"payload-b").unwrap();
 
-    assert_eq!(
-        store
-            .index()
-            .get_blob_entry(&key_1)
-            .unwrap()
-            .unwrap()
-            .record_ref
-            .unwrap()
-            .segment_id,
-        1
-    );
-    assert_eq!(
-        store
-            .index()
-            .get_blob_entry(&key_2)
-            .unwrap()
-            .unwrap()
-            .record_ref
-            .unwrap()
-            .segment_id,
-        2
-    );
+    assert_eq!(lsm_blob_ref(&store, &key_1).segment_id, 1);
+    assert_eq!(lsm_blob_ref(&store, &key_2).segment_id, 2);
     assert_eq!(store.get(&key_1).unwrap(), Some(b"payload-a".to_vec()));
     assert_eq!(store.get(&key_2).unwrap(), Some(b"payload-b".to_vec()));
 
@@ -6188,7 +5050,7 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
     assert_eq!(sealed.durable_offset, sealed.write_offset);
     assert_eq!(sealed.sealed_len, Some(sealed.write_offset));
     assert_eq!(sealed.sealed_sha256, None);
-    assert_eq!(store.durable_lsn().unwrap(), 1);
+    assert_eq!(store.published_lsn().unwrap(), 0);
 
     let open = store.index().get_segment_state(2).unwrap().unwrap();
     assert_eq!(open.state, SegmentFileState::Open);
@@ -6206,7 +5068,7 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
     assert_eq!(open_segment_ids, vec![2]);
 
     store.sync().unwrap();
-    assert_eq!(store.durable_lsn().unwrap(), 2);
+    assert_eq!(store.published_lsn().unwrap(), 2);
 }
 
 #[tokio::test]
@@ -6235,26 +5097,41 @@ async fn timed_checkpoint_rolls_empty_segment_for_metadata_only_lsn() {
     )
     .unwrap();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
+    let (lsm, _lsm_sync_handles) = open_lsm(
+        &cfg,
+        &index,
+        active_writer,
+        SegmentIdAllocator::new(2),
+        index.get_next_lsn().unwrap(),
+        None,
+    )
+    .unwrap();
+    let live_snapshots = lsm.live_snapshots();
     let (seal_tx, seal_rx) = mpsc::channel();
+    let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
+    let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
     let (_write_tx, write_rx) = mpsc::sync_channel(1);
 
     let mut coordinator = WriteCoordinator {
         config: cfg.clone(),
         index: index.clone(),
-        active_writer,
-        active_accounting_delta_log: test_active_accounting_log(&cfg, 1),
+        lsm,
+        live_snapshots,
         durability_publish_lock: Arc::new(Mutex::new(())),
         active_segment_state,
         durable_offset: 0,
+        pending_allocation_records: 0,
         last_checkpoint_at: Instant::now() - DURABILITY_CHECKPOINT_INTERVAL,
         last_checkpoint_next_lsn: 1,
         pending_rollovers: Vec::new(),
-        segment_ids: SegmentIdAllocator::new(2),
+        lsm_flush_tx,
+        lsm_compact_tx,
         seal_tx,
-        accounting_tx: None,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
+        relocations: open_relocation_lsm(&cfg, &index).unwrap(),
+        relocation_cache: Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES)),
         gc_concurrency,
         store_halt: StoreHalt::default(),
         metrics,
@@ -6268,12 +5145,14 @@ async fn timed_checkpoint_rolls_empty_segment_for_metadata_only_lsn() {
     assert_eq!(old_state.sealed_before_lsn, Some(2));
     let new_state = index.get_segment_state(2).unwrap().unwrap();
     assert_eq!(new_state.state, SegmentFileState::Open);
+    assert_eq!(index.get_segment_published_at_lsn(2).unwrap(), 2);
     let SealCommand::Seal(task) = seal_rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
         panic!("expected seal command");
     };
     assert_eq!(task.segment_id, 1);
     assert_eq!(task.sealed_len, 0);
     assert_eq!(task.sealed_before_lsn, 2);
+    assert_eq!(task.allocation_records, 0);
 }
 
 #[tokio::test]
@@ -6295,17 +5174,7 @@ async fn reopen_after_rollover_appends_to_highest_open_segment() {
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     store.put(&key_3, b"x").unwrap();
 
-    assert_eq!(
-        store
-            .index()
-            .get_blob_entry(&key_3)
-            .unwrap()
-            .unwrap()
-            .record_ref
-            .unwrap()
-            .segment_id,
-        2
-    );
+    assert_eq!(lsm_blob_ref(&store, &key_3).segment_id, 2);
     assert_eq!(store.get(&key_1).unwrap(), Some(b"payload-a".to_vec()));
     assert_eq!(store.get(&key_2).unwrap(), Some(b"payload-b".to_vec()));
     assert_eq!(store.get(&key_3).unwrap(), Some(b"x".to_vec()));

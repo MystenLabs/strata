@@ -19,7 +19,7 @@ pub struct GcSourceRecord {
     pub shard: ShardKey,
     /// LSN of the payload write that created this physical record.
     ///
-    /// `VersionMergeOp::MapRef` must target this exact payload LSN so a GC move cannot rewrite a
+    /// A relocation entry must target this exact payload LSN so a GC move cannot rewrite a
     /// later blob version that happens to reference the same key.
     pub payload_lsn: StrataLsn,
     /// Physical range of the complete encoded source record.
@@ -31,7 +31,7 @@ pub struct GcSourceRecord {
 /// One exact record that should be copied by the executor.
 ///
 /// This is the bridge from aggregate planning to physical execution. The executor will read `from`,
-/// append the payload to the selected destination class, then publish a `MapRef` using `key`,
+/// append the payload to the selected destination class, then publish a relocation using `key`,
 /// `shard`, `payload_lsn`, and the newly allocated destination `RecordRef`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcCopyRecord {
@@ -39,11 +39,11 @@ pub struct GcCopyRecord {
     pub key: BlobKey,
     /// Shard generation owning the payload version.
     pub shard: ShardKey,
-    /// Exact payload LSN to rewrite during `MapRef` publication.
+    /// Exact payload LSN to rewrite during relocation publication.
     pub payload_lsn: StrataLsn,
     /// Source physical record range.
     pub from: RecordRef,
-    /// Current lifecycle used for destination routing and later accounting publication.
+    /// Current lifecycle used for destination routing and later garbage materialization.
     pub lifecycle: Option<BlobLifecycle>,
     /// Destination class chosen by the planner for this record's bucket.
     pub destination_class: DestinationClass,
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_live_records_and_preserves_map_ref_identity() {
+    fn selects_live_records_and_preserves_relocation_identity() {
         let from = record_ref(1, 10, 100);
         let plan = move_plan(vec![route(1, Some(50), 100)]);
         let records = vec![source_record("blob-a", 42, from, Some(lifecycle(50)))];

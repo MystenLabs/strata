@@ -96,7 +96,7 @@ impl Default for GcPlannerConfig {
 ///
 /// The planner is intentionally snapshot-based. It does not hold locks, mutate metadata, or assume
 /// that this view remains current after planning. The executor must revalidate the selected plan
-/// before publishing any `MapRef` operations or deleting source files.
+/// before publishing any relocation entries or deleting source files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcSnapshot {
     /// Store epoch at the time the snapshot was built.
@@ -104,26 +104,25 @@ pub struct GcSnapshot {
     /// This is used for expiry-sensitive routing and for detecting exact-epoch segments whose
     /// physical epoch has already passed.
     pub current_epoch: Epoch,
-    /// Highest LSN for which accounting-derived segment state is known to be materialized.
+    /// Highest contiguous LSN whose segment allocations are durable and published.
     ///
     /// A source segment whose `max_lsn` is above this frontier may contain refs that are still
-    /// unknown to `SegmentGcSummary` or `SegmentGcOverlay`, so the pure planner skips full-source
-    /// plans for that segment.
-    pub accounted_lsn: StrataLsn,
-    /// Candidate source segments and their accounting summaries.
+    /// unknown to `SegmentGcSummary`, so the pure planner skips full-source plans for that segment.
+    pub published_lsn: StrataLsn,
+    /// Candidate source segments and their GC summaries.
     pub segments: Vec<SegmentSnapshot>,
 }
 
 /// Per-source segment facts used by the planner.
 ///
-/// `SegmentState` says what the file is and where it is placed; `SegmentGcSummary` says what the
-/// accounting view currently knows about the bytes inside it. Keeping both together makes tests
+/// `SegmentState` says what the file is and where it is placed; `SegmentGcSummary` describes the
+/// published liveness of the bytes inside it. Keeping both together makes tests
 /// and future schedulers explicit about the view they are planning from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentSnapshot {
     /// Durable segment metadata, including placement class, state, path, and LSN bounds.
     pub state: SegmentState,
-    /// GC-facing byte/ref accounting for this segment.
+    /// GC-facing byte/ref summary for this segment.
     ///
     /// The planner treats these counters as a conservative planning view. It does not use them as
     /// proof that a copy is still valid at publish time.
@@ -150,23 +149,23 @@ impl SegmentSnapshot {
         )
     }
 
-    fn liveness_complete(&self, accounted_lsn: StrataLsn) -> bool {
+    fn liveness_complete(&self, published_lsn: StrataLsn) -> bool {
         self.state
             .max_lsn
-            .is_none_or(|max_lsn| accounted_lsn >= max_lsn)
+            .is_none_or(|max_lsn| published_lsn >= max_lsn)
     }
 
-    fn eligible_source(&self, accounted_lsn: StrataLsn) -> bool {
+    fn eligible_source(&self, published_lsn: StrataLsn) -> bool {
         self.is_sealed()
             && !self.claimed
-            && self.liveness_complete(accounted_lsn)
+            && self.liveness_complete(published_lsn)
             && self.summary.total_bytes > 0
     }
 
-    fn eligible_empty_delete_source(&self, accounted_lsn: StrataLsn) -> bool {
+    fn eligible_empty_delete_source(&self, published_lsn: StrataLsn) -> bool {
         self.is_empty_delete_source()
             && !self.claimed
-            && self.liveness_complete(accounted_lsn)
+            && self.liveness_complete(published_lsn)
             && self.summary.total_bytes > 0
     }
 }
@@ -209,7 +208,7 @@ pub struct RouteEstimate {
 /// list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcScenario {
-    /// Delete a sealed segment whose accounting view shows no live refs.
+    /// Delete a sealed segment whose published summary shows no live refs.
     EmptyDelete,
     /// Move live records from sealed ingest layout into retention layout.
     L0Compaction,
@@ -343,7 +342,7 @@ impl GcPlanner {
         let mut candidates = snapshot
             .segments
             .iter()
-            .filter(|segment| segment.eligible_empty_delete_source(snapshot.accounted_lsn))
+            .filter(|segment| segment.eligible_empty_delete_source(snapshot.published_lsn))
             .filter(|segment| segment.summary.live_ref_count == 0)
             .map(|segment| {
                 (
@@ -381,7 +380,7 @@ impl GcPlanner {
         snapshot
             .segments
             .iter()
-            .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
+            .filter(|segment| segment.eligible_source(snapshot.published_lsn))
             .filter(|segment| segment.state.placement_class == PlacementClass::Ingest)
             .filter_map(|segment| {
                 let copied_bytes = segment.summary.live_bytes;
@@ -414,7 +413,7 @@ impl GcPlanner {
         snapshot
             .segments
             .iter()
-            .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
+            .filter(|segment| segment.eligible_source(snapshot.published_lsn))
             .filter(|segment| segment.state.placement_class != PlacementClass::Ingest)
             .filter(|segment| segment.summary.garbage_bytes() >= self.config.min_reclaim_bytes)
             .filter(|segment| {
@@ -445,7 +444,7 @@ impl GcPlanner {
         for segment in snapshot
             .segments
             .iter()
-            .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
+            .filter(|segment| segment.eligible_source(snapshot.published_lsn))
             .filter(|segment| segment.state.placement_class != PlacementClass::Ingest)
         {
             if !self.segment_lifetimes_stable(&segment.summary) {
@@ -498,7 +497,7 @@ impl GcPlanner {
         snapshot
             .segments
             .iter()
-            .filter(|segment| segment.eligible_source(snapshot.accounted_lsn))
+            .filter(|segment| segment.eligible_source(snapshot.published_lsn))
             .filter(|segment| {
                 matches!(
                     segment.state.placement_class,
@@ -731,7 +730,7 @@ mod tests {
     fn snapshot(segments: Vec<SegmentSnapshot>) -> GcSnapshot {
         GcSnapshot {
             current_epoch: 10,
-            accounted_lsn: 10,
+            published_lsn: 10,
             segments,
         }
     }
@@ -1022,12 +1021,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_accounting_blocks_full_source_planning() {
+    fn unpublished_liveness_blocks_full_source_planning() {
         let mut segment = sealed_segment(1, PlacementClass::ExactEpoch(20), summary(500, 0, 500));
         segment.state.max_lsn = Some(11);
         let snapshot = GcSnapshot {
             current_epoch: 10,
-            accounted_lsn: 10,
+            published_lsn: 10,
             segments: vec![segment],
         };
 

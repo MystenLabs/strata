@@ -7985,18 +7985,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "strata-accounting"
-version = "0.1.0"
-dependencies = [
- "bcs",
- "serde",
- "strata-core",
- "tempfile",
- "thiserror 2.0.18",
- "xxhash-rust",
-]
-
-[[package]]
 name = "strata-bench"
 version = "0.1.0"
 dependencies = [
@@ -8035,13 +8023,27 @@ dependencies = [
  "bcs",
  "rocksdb",
  "serde",
- "strata-accounting",
  "strata-core",
  "strata-gc",
+ "strata-lsm",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "typed-store",
+]
+
+[[package]]
+name = "strata-lsm"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "serde",
+ "sha2 0.10.9",
+ "strata-core",
+ "strata-segment",
+ "tempfile",
+ "thiserror 2.0.18",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -8060,6 +8062,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-relocation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "strata-core",
+ "strata-lsm",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "strata-segment"
 version = "0.1.0"
 dependencies = [
@@ -8075,10 +8088,11 @@ version = "0.1.0"
 dependencies = [
  "prometheus",
  "sha2 0.10.9",
- "strata-accounting",
  "strata-core",
  "strata-gc",
  "strata-index",
+ "strata-lsm",
+ "strata-relocation",
  "strata-segment",
  "tempfile",
  "thiserror 2.0.18",

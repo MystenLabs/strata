@@ -823,10 +823,10 @@ Strata will return a logical sequence number for every payload write:
 
 ```rust
 put_sliver(...) -> strata_lsn // lsn of this write
-durable_lsn() -> strata_lsn // latest durable lsn
+published_lsn() -> strata_lsn // latest durable lsn
 ```
 
-The `strata_lsn` is a global Strata sequence number. All Strata writes with `lsn <= durable_lsn()` are known to be durable. Walrus then uses this rule:
+The `strata_lsn` is a global Strata sequence number. All Strata writes with `lsn <= published_lsn()` are known to be durable. Walrus then uses this rule:
 
 ```rust
 after processing event E:
@@ -834,7 +834,7 @@ after processing event E:
     pending_event_durability.insert(strata_lsn_E, event_cursor_for_E)
 
 background:
-    durable = strata.durable_lsn()
+    durable = strata.published_lsn()
     mark all pending events with lsn <= durable as complete
 
 ```
@@ -1710,3 +1710,8 @@ or a materialized-through watermark proves a view covers a segment.
 ```
 
 As long as unknown refs are never mistaken for retired refs, GC can run on older views and L0 can remain a mostly sequential byte mover.
+# Historical Design Record
+
+> This document preserves earlier RocksDB and projection-engine designs for context. Those sections
+> are not the current implementation. See [`lsm_gc.md`](lsm_gc.md) for the blob-LSM garbage and
+> durability path.

@@ -1,23 +1,13 @@
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
-use strata_core::{Epoch, StrataLsn};
+use strata_core::Epoch;
 use strata_gc::GcPlannerConfig;
 
 const INGEST_DIR: &str = "ingest";
 const INDEX_DIR: &str = "index";
-const ACCOUNTING_INDEX_DIR: &str = "accounting-index";
+const RELOCATION_DIR: &str = "relocations";
 
 pub const DEFAULT_SEGMENT_READER_CACHE_CAPACITY: usize = 64_000;
-pub const DEFAULT_ACCOUNTING_INTERVAL: Duration = Duration::from_secs(1);
-pub const DEFAULT_ACCOUNTING_UNACCOUNTED_THRESHOLD: usize = 1024;
-pub const DEFAULT_ACCOUNTING_MATERIALIZE_LAG_THRESHOLD: StrataLsn = 64 * 1024;
-pub const DEFAULT_ACCOUNTING_PARTITION_COUNT: u32 = 64;
-pub const DEFAULT_ACCOUNTING_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(20 * 60);
-pub const DEFAULT_ACCOUNTING_INGEST_RECORD_THRESHOLD: usize = 4096;
-pub const DEFAULT_ACCOUNTING_DELTA_RUN_COUNT_THRESHOLD: usize = 8;
-pub const DEFAULT_ACCOUNTING_DELTA_RUN_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_ACCOUNTING_MAJOR_PATCH_COUNT_THRESHOLD: usize = 8;
-pub const DEFAULT_ACCOUNTING_MAJOR_PATCH_BYTES_THRESHOLD: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_GC_WORKER_COUNT: usize = 1;
 pub const DEFAULT_GC_INITIAL_WORKER_COUNT: usize = 1;
@@ -25,7 +15,6 @@ pub const DEFAULT_GC_TUNING_WINDOW_CYCLES: u64 = 8;
 pub const DEFAULT_GC_SYNC_IMPACT_THRESHOLD: Duration = Duration::from_millis(250);
 pub const DEFAULT_GC_IO_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_GC_MIN_IO_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
-pub const DEFAULT_GC_MAX_ACCOUNTING_LAG_LSN: Option<StrataLsn> = None;
 pub const DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_SEAL_WORKER_COUNT: usize = 1;
@@ -42,25 +31,6 @@ pub struct StrataStoreConfig {
     pub segment_reader_cache_capacity: usize,
     pub recovery_policy: StrataRecoveryPolicy,
     pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
-    /// Whether the background accounting materialization worker is started.
-    ///
-    /// The foreground active delta log remains enabled because it is part of the store's
-    /// durability and recovery contract.
-    pub accounting_worker_enabled: bool,
-    pub accounting_interval: Duration,
-    pub accounting_unaccounted_threshold: usize,
-    /// Durable/accounted LSN gap that promotes the next ingest nudge to a full materialization.
-    ///
-    /// Zero disables lag-triggered materialization. A non-zero threshold bounds accounting lag
-    /// without forcing delta and major compaction on every foreground nudge.
-    pub accounting_materialize_lag_threshold: StrataLsn,
-    pub accounting_partition_count: u32,
-    pub accounting_maintenance_interval: Duration,
-    pub accounting_ingest_record_threshold: usize,
-    pub accounting_delta_run_count_threshold: usize,
-    pub accounting_delta_run_bytes_threshold: u64,
-    pub accounting_major_patch_count_threshold: usize,
-    pub accounting_major_patch_bytes_threshold: u64,
     /// Whether background GC workers are started.
     pub gc_workers_enabled: bool,
     /// Background GC cadence for one planning/copy/publish attempt.
@@ -86,13 +56,6 @@ pub struct StrataStoreConfig {
     pub gc_min_io_bytes_per_sec: u64,
     /// Policy knobs used by the background GC planner.
     pub gc_planner_config: GcPlannerConfig,
-    /// Optional GC admission limit measured as `durable_lsn - accounted_lsn`.
-    ///
-    /// This is an efficiency gate, not a correctness barrier. If set, new GC planning/copy work is
-    /// skipped while accounting is too far behind because the planner's liveness view is likely
-    /// stale. GC publish still uses relocation forwarding and does not require accounting to catch
-    /// all the way up to the durable LSN.
-    pub gc_max_accounting_lag_lsn: Option<StrataLsn>,
     /// Maximum time one background shard-cleanup attempt waits for retention-segment GC readers.
     ///
     /// New overlapping claims are fenced immediately. A timeout leaves the persisted cleanup job
@@ -133,13 +96,8 @@ impl StrataStoreConfig {
         self.namespace_dir().join(INDEX_DIR)
     }
 
-    pub fn accounting_index_dir(&self) -> PathBuf {
-        self.namespace_dir().join(ACCOUNTING_INDEX_DIR)
-    }
-
-    pub(crate) fn accounting_partition_count(&self) -> NonZeroU32 {
-        NonZeroU32::new(self.accounting_partition_count)
-            .expect("accounting processor partition count is validated before use")
+    pub fn relocation_dir(&self) -> PathBuf {
+        self.namespace_dir().join(RELOCATION_DIR)
     }
 
     pub fn index_cf_prefix(&self) -> String {

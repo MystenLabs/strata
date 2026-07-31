@@ -1,8 +1,6 @@
-pub(crate) mod gc_overlay;
+pub(crate) mod gc_summary;
 
-use strata_core::{
-    SegmentId, SegmentOwner, SegmentRefEvent, SegmentRefEventKey, SegmentState, ShardKey,
-};
+use strata_core::{SegmentId, SegmentOwner, SegmentState, ShardKey};
 use typed_store::{Map, rocks::DBBatch};
 
 use crate::{Error, Result};
@@ -38,40 +36,30 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn put_segment_ref_event_batch(
-        &self,
-        batch: &mut DBBatch,
-        key: SegmentRefEventKey,
-        event: &SegmentRefEvent,
-    ) -> Result<()> {
-        // Ref events are keyed by segment, LSN, and offset so a copied record can be reconciled
-        // against exactly the physical range it came from. They are the ordered evidence of
-        // transitions that happened while GC may have been running.
-        batch
-            .insert_batch(self.segment_ref_events(), [(&key, event)])
-            .map_err(Error::from)?;
-        Ok(())
-    }
-
-    pub fn iter_segment_ref_events_since(
+    /// Returns when a physical segment first became visible.
+    ///
+    /// Older stores have no row in this column family; zero keeps their segments conservatively
+    /// protected by every live snapshot.
+    pub fn get_segment_published_at_lsn(
         &self,
         segment_id: SegmentId,
-        since_lsn: strata_core::StrataLsn,
-    ) -> Result<Vec<(SegmentRefEventKey, SegmentRefEvent)>> {
-        let mut events = self
-            .segment_ref_events
-            .safe_iter()?
-            .filter_map(|result| match result {
-                Ok((key, event)) if key.segment_id == segment_id && key.lsn > since_lsn => {
-                    Some(Ok((key, event)))
-                }
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
+    ) -> Result<strata_core::StrataLsn> {
+        Ok(self.segment_publication_lsns.get(&segment_id)?.unwrap_or(0))
+    }
+
+    pub fn put_segment_published_at_lsn_batch(
+        &self,
+        batch: &mut DBBatch,
+        segment_id: SegmentId,
+        published_at_lsn: strata_core::StrataLsn,
+    ) -> Result<()> {
+        batch
+            .insert_batch(
+                self.segment_publication_lsns(),
+                [(&segment_id, &published_at_lsn)],
+            )
             .map_err(Error::from)?;
-        events.sort_by_key(|(key, _)| (key.lsn, key.offset));
-        Ok(events)
+        Ok(())
     }
 
     pub fn iter_segment_states(&self) -> Result<Vec<(SegmentId, SegmentState)>> {

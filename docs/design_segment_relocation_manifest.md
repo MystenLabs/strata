@@ -194,7 +194,7 @@ Useful signals already exist or are adjacent to existing GC tuning:
 - foreground sync latency
 - seal backlog pressure
 - current GC worker/concurrency pressure
-- `durable_lsn - accounted_lsn`
+- `published_lsn - accounted_lsn`
 - metadata-index write latency for recent small metadata batches
 
 Scheduling policy:
@@ -359,3 +359,7 @@ These approaches are compatible. Even with relocation manifests, the healer shou
 ## Local Code Pointer
 
 Current Strata GC publish TODO: `crates/strata-store/src/lib.rs`, `submit_gc_publish`.
+# Historical Segment Relocation Manifest Proposal
+
+> This proposal predates the implemented relocation LSM. References to the separate accounting
+> engine are historical. See [`lsm_gc.md`](lsm_gc.md).

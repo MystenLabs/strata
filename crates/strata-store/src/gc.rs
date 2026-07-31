@@ -15,7 +15,7 @@ use strata_core::{
 use strata_gc::{
     DestinationClass, GcAction, GcCopyRecord, GcCopySelector, GcPlan, GcPlanner, GcSnapshot,
 };
-use strata_index::{AccountingSnapshotGuard, StrataIndex};
+use strata_index::StrataIndex;
 use strata_segment::SegmentWriter;
 
 use crate::{
@@ -26,21 +26,18 @@ use crate::{
     prune_empty_retention_dirs,
     reader_cache::SegmentReaderCache,
     seal::sha256_file_prefix,
+    segment_garbage_log_path,
     shard_gc::{remove_shard_retention_generation, shard_generation_is_obsolete},
     sync_parent_dir,
 };
 
 /// Store-local preparation for one GC attempt.
 ///
-/// This object intentionally keeps the accounting snapshot guard alive. Later copy/publish work must
-/// use the same guard when it asks accounting for changes that happened during the copy phase.
 #[derive(Debug)]
 pub struct PreparedGcPlan {
-    /// In-memory accounting frontier pin used for both planning and later reconciliation.
-    pub accounting_snapshot: AccountingSnapshotGuard,
     /// Aggregate pure-planner recommendation.
     pub plan: GcPlan,
-    /// Source overlays captured from the same RocksDB snapshot as the aggregate plan.
+    /// Source classifications folded from the selected segments' committed local garbage logs.
     source_overlays: BTreeMap<SegmentId, SegmentGcOverlay>,
     /// In-memory source segment claim held until this plan is copied or dropped.
     #[doc(hidden)]
@@ -51,16 +48,14 @@ pub struct PreparedGcPlan {
 ///
 /// The output files are not yet durable segment rows and the staged `RecordRef.segment_id` values
 /// are local to this object. Publishing first preprotects those files as pending output segment
-/// rows, then the writer translates staged offsets into final `MapRef` destinations atomically.
+/// rows, then GC translates staged offsets into final relocation destinations.
 #[derive(Debug)]
 pub struct PreparedGcCopy {
-    /// In-memory accounting frontier pin used for publish reconciliation.
-    pub accounting_snapshot: AccountingSnapshotGuard,
     /// Aggregate plan whose selected bytes were copied.
     pub plan: GcPlan,
     /// Sealed staging files containing copied records.
     pub outputs: Vec<GcStagedOutputSegment>,
-    /// Source-to-staged-record mapping for later `MapRef` publication.
+    /// Source-to-staged-record mapping for later relocation publication.
     pub copied_records: Vec<GcStagedCopiedRecord>,
     /// In-memory source segment claim held until publish completes or this copy is dropped.
     #[doc(hidden)]
@@ -70,13 +65,11 @@ pub struct PreparedGcCopy {
 /// GC copy bundle after output files have durable segment ids and protected segment rows.
 #[derive(Debug)]
 pub(crate) struct GcPrepublishedCopy {
-    /// In-memory accounting frontier pin used for publish reconciliation.
-    pub(crate) accounting_snapshot: AccountingSnapshotGuard,
     /// Aggregate plan whose selected bytes were copied.
     pub(crate) plan: GcPlan,
-    /// Protected output segments already installed as pending GC output rows.
+    /// Protected output segments already published as pending GC output rows.
     pub(crate) outputs: Vec<GcPrepublishedOutputSegment>,
-    /// Source-to-staged-record mapping for later `MapRef` publication.
+    /// Reconciled source-to-staged-record mappings.
     pub(crate) copied_records: Vec<GcStagedCopiedRecord>,
     /// In-memory source segment claim held until publish completes or this copy is dropped.
     pub(crate) _claim: Option<GcSourceClaimGuard>,
@@ -85,13 +78,13 @@ pub(crate) struct GcPrepublishedCopy {
 /// Result of publishing staged GC copies into durable Strata metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcPublishResult {
-    /// Accounted frontier observed while accounting was paused for publish reconciliation.
-    pub reconciled_accounted_lsn: StrataLsn,
+    /// Published frontier observed by the writer immediately before relocation LSN assignment.
+    pub reconciled_lsn: StrataLsn,
     /// Output segment files finalized by this publish.
     pub output_segments: Vec<GcPublishedOutputSegment>,
     /// Source refs that were mapped to replacement refs.
     pub published_records: Vec<GcPublishedRecord>,
-    /// Staged copies not mapped because their source changed after the GC accounting snapshot.
+    /// Staged copies not mapped because their source changed while bytes were copied.
     pub skipped_records: Vec<GcStagedCopiedRecord>,
 }
 
@@ -106,7 +99,7 @@ pub struct GcPublishedOutputSegment {
     pub shard: ShardKey,
     /// Final on-disk path.
     pub path: PathBuf,
-    /// Placement class installed in segment state.
+    /// Placement class recorded in segment state.
     pub placement_class: PlacementClass,
     /// Number of sealed bytes in the file.
     pub sealed_len: u64,
@@ -119,7 +112,7 @@ pub struct GcPublishedRecord {
     pub source: GcCopyRecord,
     /// Final replacement ref. This is the staged offset with the real segment id substituted.
     pub to: RecordRef,
-    /// Publish LSN assigned to the MapRef/accounting delta.
+    /// LSN assigned to the relocation mutation during publication.
     pub publish_lsn: StrataLsn,
 }
 
@@ -153,7 +146,7 @@ pub(crate) struct GcPrepublishedOutputSegment {
     pub(crate) shard: ShardKey,
     /// Final on-disk path.
     pub(crate) path: PathBuf,
-    /// Placement class to install when the output becomes sealed.
+    /// Placement class to record when the output becomes sealed.
     pub(crate) placement_class: PlacementClass,
     /// Number of sealed bytes in the file.
     pub(crate) sealed_len: u64,
@@ -215,36 +208,6 @@ pub struct GcStagedCopiedRecord {
     pub source: GcCopyRecord,
     /// Staged record location. `segment_id` is local to `PreparedGcCopy.outputs`.
     pub staged: RecordRef,
-}
-
-/// Current accounting lag observed by GC admission.
-///
-/// `lag_lsn` is `durable_lsn - accounted_lsn` with saturating arithmetic. A non-zero value is not a
-/// correctness problem: GC publish can still use relocation forwarding to reconcile accounting
-/// events that were durable before publish but not yet materialized. The lag matters for efficiency,
-/// because a stale accounting view can make GC copy bytes that accounting will later discover are
-/// dead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GcAccountingLag {
-    /// Highest contiguous LSN whose payload and metadata are crash-safe.
-    pub durable_lsn: StrataLsn,
-    /// Highest contiguous LSN already materialized into accounting/GC overlays.
-    pub accounted_lsn: StrataLsn,
-    /// `durable_lsn - accounted_lsn`, clamped at zero for defensive accounting.
-    pub lag_lsn: StrataLsn,
-    /// Optional configured limit used to decide whether a new GC run should be admitted.
-    pub max_lag_lsn: Option<StrataLsn>,
-}
-
-impl GcAccountingLag {
-    /// Returns true when this lag should defer new GC planning/copy work.
-    ///
-    /// The check is strict: a lag equal to the limit is still admitted, while a lag above the limit
-    /// is deferred. `None` disables the gate.
-    pub fn exceeds_configured_limit(&self) -> bool {
-        self.max_lag_lsn
-            .is_some_and(|max_lag_lsn| self.lag_lsn > max_lag_lsn)
-    }
 }
 
 /// Metric value meaning the GC tuner currently sees no foreground pressure.
@@ -991,10 +954,10 @@ pub(crate) struct GcExecutor {
     pub(crate) index: StrataIndex,
     /// Writer queue used to serialize GC publish with foreground writes.
     pub(crate) write_tx: mpsc::SyncSender<WriteCommand>,
-    /// Accounting run lock used to pause accounting during publish reconciliation.
-    pub(crate) accounting_lock: Arc<Mutex<()>>,
     /// Serializes GC output publication with shard-generation directory cleanup.
     pub(crate) publish_cleanup_lock: Arc<Mutex<()>>,
+    /// Serializes whole-shard metadata removal with garbage-log publication and sweeping.
+    pub(crate) durability_publish_lock: Arc<Mutex<()>>,
     /// In-process source segment ownership table.
     pub(crate) claims: Arc<GcSourceClaims>,
     /// Runtime GC admission controller shared with foreground paths.
@@ -1023,8 +986,8 @@ impl StrataStore {
                 .as_ref()
                 .ok_or(Error::WriteQueueClosed)?
                 .clone(),
-            accounting_lock: Arc::clone(&self.accounting_lock),
             publish_cleanup_lock: Arc::clone(&self.gc_publish_cleanup_lock),
+            durability_publish_lock: Arc::clone(&self.durability_publish_lock),
             claims: Arc::clone(&self.gc_claims),
             gc_concurrency: Arc::clone(&self.gc_concurrency),
             gc_io_limiter: Arc::clone(&self.gc_io_limiter),
@@ -1055,42 +1018,25 @@ impl StrataStore {
         self.gc_executor()?.run_once(&planner)
     }
 
-    /// Reports the accounting lag GC would use for admission control.
-    pub fn gc_accounting_lag(&self) -> Result<GcAccountingLag> {
-        self.gc_executor()?.gc_accounting_lag()
-    }
-
-    /// Returns a lag snapshot when the configured GC accounting-lag gate would defer a new run.
-    pub fn gc_deferred_by_accounting_lag(&self) -> Result<Option<GcAccountingLag>> {
-        self.gc_executor()?.gc_deferred_by_accounting_lag()
-    }
-
-    /// Prepares one GC plan from the segment GC overlay.
+    /// Prepares one GC plan from RocksDB summaries and segment-local garbage logs.
     ///
-    /// This is the bridge from pure planning to execution. It creates an accounting snapshot guard,
-    /// builds the GC planning view from that guard, asks the planner for one plan, and claims the
-    /// source segments named by that plan. It does not read source segment files, copy bytes, or
-    /// publish metadata.
+    /// This builds one published GC view, asks the planner for a plan, and claims its sources.
     pub fn prepare_gc_plan(&self, planner: &GcPlanner) -> Result<Option<PreparedGcPlan>> {
         self.gc_executor()?.prepare_gc_plan(planner)
     }
 
     /// Copies selected GC records into sealed staging files.
     ///
-    /// This consumes a `PreparedGcPlan` so the accounting snapshot guard moves forward with the
-    /// copied bytes. The method does not publish `MapRef` operations or create durable segment
-    /// metadata for the outputs; that is the next step, after reconciling accounting changes since
-    /// `accounting_snapshot`.
+    /// This consumes a `PreparedGcPlan`. It does not publish relocations or create durable segment
+    /// metadata for the outputs.
     pub fn copy_prepared_gc_plan(&self, prepared: PreparedGcPlan) -> Result<PreparedGcCopy> {
         self.gc_executor()?.copy_prepared_gc_plan(prepared)
     }
 
     /// Publishes staged GC copies through the serialized writer path.
     ///
-    /// This method pauses accounting before it enters the writer queue, so the writer thread never
-    /// blocks waiting for a long-running processor pass. The writer still assigns the final LSN range
-    /// and commits metadata in order with user writes; any user writes that were already ahead of
-    /// this command in the queue have lower LSNs and are handled later by relocation forwarding.
+    /// The writer revalidates copied records against the current LSM, assigns the final LSN range,
+    /// and commits metadata in order with user writes.
     pub fn publish_prepared_gc_copy(&self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
         self.gc_executor()?.publish_prepared_gc_copy(copy)
     }
@@ -1112,6 +1058,17 @@ impl GcExecutor {
     }
 
     pub(crate) fn cleanup_ready_shard_generations(&self) -> Result<usize> {
+        let garbage_head = self
+            .index
+            .get_garbage_log_position(crate::GARBAGE_LOG_HEAD)?
+            .unwrap_or_default();
+        let garbage_swept = self
+            .index
+            .get_garbage_log_position(crate::GARBAGE_LOG_SWEEP_CURSOR)?
+            .unwrap_or_default();
+        if garbage_head != garbage_swept {
+            return Ok(0);
+        }
         let jobs = self.index.iter_shard_cleanup_jobs()?;
         let mut cleaned = 0;
         for job in jobs
@@ -1134,6 +1091,10 @@ impl GcExecutor {
                 .publish_cleanup_lock
                 .lock()
                 .expect("gc publish/cleanup lock poisoned");
+            let _durability_publish_guard = self
+                .durability_publish_lock
+                .lock()
+                .expect("durability publication lock poisoned");
             let Some(current_job) = self.index.get_shard_cleanup_job(job.shard)? else {
                 continue;
             };
@@ -1150,22 +1111,22 @@ impl GcExecutor {
                 {
                     removed_relocating_segments += 1;
                 }
-                if let Some(overlay) = self.index.get_segment_gc_overlay(*segment_id)? {
+                if let Some(summary) = self.index.get_segment_gc_summary(*segment_id)? {
                     removed_summary.total_bytes = removed_summary
                         .total_bytes
-                        .saturating_add(overlay.summary.total_bytes);
+                        .saturating_add(summary.total_bytes);
                     removed_summary.live_bytes = removed_summary
                         .live_bytes
-                        .saturating_add(overlay.summary.live_bytes);
+                        .saturating_add(summary.live_bytes);
                     removed_summary.retired_bytes = removed_summary
                         .retired_bytes
-                        .saturating_add(overlay.summary.retired_bytes);
+                        .saturating_add(summary.retired_bytes);
                     removed_summary.expired_bytes = removed_summary
                         .expired_bytes
-                        .saturating_add(overlay.summary.expired_bytes);
+                        .saturating_add(summary.expired_bytes);
                     removed_summary.live_ref_count = removed_summary
                         .live_ref_count
-                        .saturating_add(overlay.summary.live_ref_count);
+                        .saturating_add(summary.live_ref_count);
                 }
                 self.reader_cache.evict(*segment_id);
                 self.metrics.record_reader_cache_eviction();
@@ -1175,8 +1136,10 @@ impl GcExecutor {
             self.metrics
                 .remove_gc_relocating_segments(removed_relocating_segments);
             let mut batch = self.index.batch();
+            let mut completed = current_job;
+            completed.state = ShardCleanupState::ShardOwnedReclaimed;
             self.index
-                .delete_shard_cleanup_job_batch(&mut batch, job.shard)?;
+                .put_shard_cleanup_job_batch(&mut batch, completed)?;
             batch
                 .write_with_sync(true)
                 .map_err(strata_index::Error::from)?;
@@ -1185,40 +1148,9 @@ impl GcExecutor {
         Ok(cleaned)
     }
 
-    /// Reports the accounting lag GC would use for admission control.
-    pub(crate) fn gc_accounting_lag(&self) -> Result<GcAccountingLag> {
-        let durable_lsn = self.index.get_durable_lsn()?;
-        let accounted_lsn = self.index.get_accounted_lsn()?;
-        Ok(GcAccountingLag {
-            durable_lsn,
-            accounted_lsn,
-            lag_lsn: durable_lsn.saturating_sub(accounted_lsn),
-            max_lag_lsn: self.config.gc_max_accounting_lag_lsn,
-        })
-    }
-
-    /// Returns a lag snapshot when the configured GC accounting-lag gate would defer a new run.
-    pub(crate) fn gc_deferred_by_accounting_lag(&self) -> Result<Option<GcAccountingLag>> {
-        let lag = self.gc_accounting_lag()?;
-        Ok(lag.exceeds_configured_limit().then_some(lag))
-    }
-
-    /// Prepares one GC plan from the segment GC overlay.
-    ///
-    /// This is the bridge from pure planning to execution. It creates an accounting snapshot guard,
-    /// builds the GC planning view from that guard, asks the planner for one plan, and claims the
-    /// source segments named by that plan. It does not read source segment files, copy bytes, or
-    /// publish metadata.
+    /// Prepares one GC plan from published summaries and segment-local garbage logs.
     pub(crate) fn prepare_gc_plan(&self, planner: &GcPlanner) -> Result<Option<PreparedGcPlan>> {
-        if self.gc_deferred_by_accounting_lag()?.is_some() {
-            return Ok(None);
-        }
-
-        let accounting_snapshot = self.index.create_accounting_snapshot()?;
-        let Some((mut snapshot, snapshot_overlays)) = self
-            .index
-            .build_gc_snapshot_with_overlays(&accounting_snapshot)?
-        else {
+        let Some(mut snapshot) = self.index.build_gc_snapshot()? else {
             return Ok(None);
         };
         self.claims.mark_snapshot(&mut snapshot);
@@ -1230,20 +1162,16 @@ impl GcExecutor {
             let source_overlays = copy_source_segment_ids(&plan)
                 .into_iter()
                 .map(|segment_id| {
-                    snapshot_overlays
-                        .get(&segment_id)
-                        .cloned()
+                    self.index
+                        .read_segment_garbage_overlay(self.config.namespace_dir(), segment_id)?
                         .map(|overlay| (segment_id, overlay))
                         .ok_or_else(|| Error::InvariantViolation {
-                            reason: format!(
-                                "GC planning snapshot omitted overlay for selected source segment {segment_id}"
-                            ),
+                            reason: format!("GC selected missing source segment {segment_id}"),
                         })
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?;
 
             return Ok(Some(PreparedGcPlan {
-                accounting_snapshot,
                 plan,
                 source_overlays,
                 claim: Some(claim),
@@ -1254,20 +1182,15 @@ impl GcExecutor {
 
     /// Copies selected GC records into sealed staging files.
     ///
-    /// This consumes a `PreparedGcPlan` so the accounting snapshot guard moves forward with the
-    /// copied bytes. The method does not publish `MapRef` operations or create durable segment
-    /// metadata for the outputs; that is the next step, after reconciling accounting changes since
-    /// `accounting_snapshot`.
+    /// This consumes a `PreparedGcPlan` and preserves its source claims through publication.
     pub fn copy_prepared_gc_plan(&self, prepared: PreparedGcPlan) -> Result<PreparedGcCopy> {
         let PreparedGcPlan {
-            accounting_snapshot,
             plan,
             source_overlays,
             claim,
         } = prepared;
         if !plan_has_copy_action(&plan) {
             return Ok(PreparedGcCopy {
-                accounting_snapshot,
                 plan,
                 outputs: Vec::new(),
                 copied_records: Vec::new(),
@@ -1286,7 +1209,6 @@ impl GcExecutor {
         };
 
         Ok(PreparedGcCopy {
-            accounting_snapshot,
             plan,
             outputs,
             copied_records,
@@ -1297,8 +1219,7 @@ impl GcExecutor {
     /// Publishes staged GC copies through the serialized writer path.
     ///
     /// Output files are first renamed into final segment paths and protected by pending segment
-    /// rows outside the writer queue. Accounting is paused only while the writer reconciles the
-    /// snapshot and publishes MapRefs.
+    /// rows outside the writer queue. The writer then reconciles copied refs against the current LSM.
     pub fn publish_prepared_gc_copy(&self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
         // Keep shard cleanup ordered with every phase that can create or remove a retention path.
         // The writer may fence a shard while this guard is held; drop cleanup waits until publish
@@ -1309,13 +1230,7 @@ impl GcExecutor {
             .expect("gc publish/cleanup lock poisoned");
         let copy = self.prepublish_gc_outputs(copy)?;
         let prepublished_outputs = copy.outputs.clone();
-        let result = {
-            let _accounting_guard = self
-                .accounting_lock
-                .lock()
-                .expect("accounting run lock poisoned");
-            self.publish_prepublished_gc_copy(copy)
-        };
+        let result = self.publish_prepublished_gc_copy(copy);
 
         match result {
             Ok(result) => {
@@ -1339,12 +1254,15 @@ impl GcExecutor {
         }
     }
 
-    fn publish_prepublished_gc_copy(&self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
+    fn publish_prepublished_gc_copy(&self, publish: GcPrepublishedCopy) -> Result<GcPublishResult> {
         self.store_halt.check()?;
         let started = Instant::now();
         self.metrics.enqueue_write_command();
         let (response_tx, response_rx) = mpsc::channel();
-        let command = WriteCommand::GcPublish(GcPublishRequest { copy, response_tx });
+        let command = WriteCommand::GcPublish(GcPublishRequest {
+            publish,
+            response_tx,
+        });
         if let Err(error) = self.write_tx.send(command) {
             self.metrics.dequeue_write_command();
             self.metrics
@@ -1354,7 +1272,7 @@ impl GcExecutor {
                     let _ = abandon_prepublished_outputs(
                         &self.config,
                         &self.index,
-                        &request.copy.outputs,
+                        &request.publish.outputs,
                     );
                     Err(Error::WriteQueueClosed)
                 }
@@ -1372,7 +1290,6 @@ impl GcExecutor {
 
     fn prepublish_gc_outputs(&self, copy: PreparedGcCopy) -> Result<GcPrepublishedCopy> {
         let PreparedGcCopy {
-            accounting_snapshot,
             plan,
             outputs,
             copied_records,
@@ -1400,7 +1317,6 @@ impl GcExecutor {
             }
         };
         Ok(GcPrepublishedCopy {
-            accounting_snapshot,
             plan,
             outputs,
             copied_records,
@@ -1758,7 +1674,7 @@ struct OpenStagedOutput {
     writer: SegmentWriter,
     /// Logical shard and destination class this output accepts.
     destination: DestinationPlacement,
-    /// Final placement class to install if this output is published.
+    /// Final placement class to record if this output is published.
     placement_class: PlacementClass,
     /// Next local staging id to allocate after this output.
     next_staged_segment_id: SegmentId,
@@ -1936,13 +1852,21 @@ fn remove_gc_prepublished_output_files(
 }
 
 fn remove_gc_output_file(path: &std::path::Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => sync_parent_dir(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(Error::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
+    let mut removed = false;
+    for path in [
+        path.to_path_buf(),
+        segment_garbage_log_path(path.to_path_buf()),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(Error::Io { path, source }),
+        }
+    }
+    if removed {
+        sync_parent_dir(path)
+    } else {
+        Ok(())
     }
 }
 

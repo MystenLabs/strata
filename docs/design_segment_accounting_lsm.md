@@ -1,5 +1,8 @@
 # Segment Accounting LSM Design
 
+> Historical proposal: the separate accounting engine described here has been removed. See
+> [`lsm_gc.md`](lsm_gc.md) for the implemented blob-LSM garbage path.
+
 Status: proposed
 
 ## Summary
@@ -416,7 +419,7 @@ published manifest is an orphan and must not affect reads.
 
 After RocksDB publication succeeds:
 
-1. Install the published manifest in the in-memory blob and segment indexes.
+1. Make the published manifest visible to the in-memory blob and segment indexes.
 2. Make the new generation available to readers.
 3. Mark superseded runs as cleanup candidates.
 4. Delete obsolete files only after all manifest and GC snapshot pins release them.
@@ -691,6 +694,10 @@ writing the RocksDB representations for rollback and comparison.
 Stop writing `segment_ref_events` and `segment_gc_overlay`. Continue publishing the combined
 accounting manifest and frontier in RocksDB. Keep old column families read-only for an upgrade
 window.
+
+**Status: implemented.** GC reads the blob-LSM-owned segment summaries and local garbage logs, and
+publish-time reconciliation reads the current blob LSM. The legacy accounting worker continues to
+publish only its manifest, consumed cursor, and compatibility frontier.
 
 ### Phase 4: remove legacy state
 
