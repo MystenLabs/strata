@@ -42,9 +42,6 @@ pub enum Error {
     #[error("serialization failed: {0}")]
     Serialization(String),
 
-    #[error("file sync queue is closed")]
-    FileSyncQueueClosed,
-
     #[error("LSM is halted: {reason}")]
     LsmHalted { reason: String },
 
@@ -62,32 +59,6 @@ pub enum Error {
 
     #[error("replacement segment {next} must follow active segment {current}")]
     SegmentOutOfOrder { current: u64, next: u64 },
-
-    #[error("WAL sync failed: {0}")]
-    WalSyncFailed(String),
-
-    #[error("invalid WAL: {0}")]
-    InvalidWal(String),
-
-    #[error("corrupt WAL at {path}: {reason}")]
-    CorruptWal { path: PathBuf, reason: String },
-
-    #[error(
-        "WAL append rollback failed for {path} at offset {offset} after write error: {write_error}; rollback error: {rollback_error}"
-    )]
-    WalAppendRollbackFailed {
-        path: PathBuf,
-        offset: u64,
-        write_error: io::Error,
-        #[source]
-        rollback_error: io::Error,
-    },
-
-    #[error("WAL lsns must increase: previous {previous:?}, next {next:?}")]
-    WalLsnOutOfOrder {
-        previous: crate::StrataLsn,
-        next: crate::StrataLsn,
-    },
 
     #[error(
         "memtable generation {generation} is full: capacity {capacity} bytes, used {used} bytes, entry requires {required} bytes"
@@ -118,12 +89,4 @@ pub enum Error {
 
     #[error("replacement memtable generation {generation} is not empty")]
     MemtableReplacementNotEmpty { generation: u64 },
-
-    #[error(
-        "memtable cursor belongs to generation {cursor_generation}, not generation {generation}"
-    )]
-    MemtableCursorGeneration {
-        generation: u64,
-        cursor_generation: u64,
-    },
 }

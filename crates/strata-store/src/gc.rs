@@ -1069,12 +1069,12 @@ impl GcExecutor {
         if garbage_head != garbage_swept {
             return Ok(0);
         }
+        let published_lsn = self.index.get_published_lsn()?;
         let jobs = self.index.iter_shard_cleanup_jobs()?;
         let mut cleaned = 0;
-        for job in jobs
-            .into_iter()
-            .filter(|job| job.state == ShardCleanupState::ReadyForGc)
-        {
+        for job in jobs.into_iter().filter(|job| {
+            job.state == ShardCleanupState::ReadyForGc && job.drop_lsn <= published_lsn
+        }) {
             let owned_segments = self
                 .index
                 .iter_segment_states_for_shard(job.shard)?

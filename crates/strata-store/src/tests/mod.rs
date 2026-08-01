@@ -474,18 +474,33 @@ async fn standalone_put_get_round_trip() {
 }
 
 #[tokio::test]
-async fn store_routes_payload_and_metadata_writes_through_lsm_wal() {
+async fn store_wal_routes_payload_and_metadata_without_fake_lsm_rows() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "lsm-write-path");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+    let lsm = store.lsm.upgrade().unwrap();
 
     assert_eq!(store.put(&key, b"payload").unwrap(), 1);
-    assert_eq!(store.tombstone(&key).unwrap(), 2);
+    assert_eq!(lsm.last_lsn().unwrap(), Some(1));
+
+    // Epoch LSN 2 belongs in the store WAL and RocksDB, not in the blob LSM. The gap is
+    // intentional: the next blob mutation keeps its global store LSN instead of being renumbered.
+    assert_eq!(store.increment_epoch().unwrap(), (43, 2));
+    assert_eq!(lsm.last_lsn().unwrap(), Some(1));
+
+    assert_eq!(store.tombstone(&key).unwrap(), 3);
+    assert_eq!(lsm.last_lsn().unwrap(), Some(3));
+
+    // A shard drop is the same kind of RocksDB-only projection: it consumes global LSN 4 and is
+    // recoverable from the store WAL, but it does not manufacture a blob key.
+    store.drop_shard(STANDALONE_SHARD.id).unwrap();
+    assert_eq!(store.index().get_next_lsn().unwrap(), 5);
+    assert_eq!(lsm.last_lsn().unwrap(), Some(3));
     store.sync().unwrap();
 
-    let wal = strata_lsm::Wal::path(cfg.namespace_dir().join("lsm/wal"), 1);
+    let wal = Wal::path(cfg.namespace_dir().join("wal"), 1);
     assert_eq!(
         wal.extension().and_then(|extension| extension.to_str()),
         Some("log")
@@ -494,7 +509,51 @@ async fn store_routes_payload_and_metadata_writes_through_lsm_wal() {
 }
 
 #[tokio::test]
-async fn synced_lsm_checkpoint_reopens_the_existing_wal_prefix() {
+async fn store_wal_recovery_uses_the_slower_projection_frontier() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "store-wal-frontier");
+    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
+    load_blob_lsm_manifest(&index).unwrap();
+    load_relocation_lsm_manifest(&index).unwrap();
+
+    let mut batch = index.batch();
+    index
+        .merge_lsm_manifest_batch(
+            &mut batch,
+            BLOB_LSM_MANIFEST,
+            &ManifestEdit {
+                remove: Vec::new(),
+                add_base: Vec::new(),
+                add_patches: Vec::new(),
+                materialized_through: Some(100),
+                wal_retained_from: None,
+            },
+        )
+        .unwrap();
+    index
+        .merge_lsm_manifest_batch(
+            &mut batch,
+            RELOCATION_LSM_MANIFEST,
+            &ManifestEdit {
+                remove: Vec::new(),
+                add_base: Vec::new(),
+                add_patches: Vec::new(),
+                materialized_through: Some(80),
+                wal_retained_from: None,
+            },
+        )
+        .unwrap();
+    index
+        .put_store_wal_retained_from_batch(&mut batch, 3)
+        .unwrap();
+    batch.write().unwrap();
+
+    assert_eq!(store_wal_recovery_state(&index).unwrap(), (Some(80), 3));
+}
+
+#[tokio::test]
+async fn synced_store_checkpoint_reopens_the_existing_wal_prefix() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "lsm-checkpoint");
@@ -505,24 +564,24 @@ async fn synced_lsm_checkpoint_reopens_the_existing_wal_prefix() {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         assert_eq!(store.put(&key_a, b"one").unwrap(), 1);
         store.sync().unwrap();
-        store.index().get_lsm_checkpoint().unwrap().unwrap()
+        assert_eq!(store.index().get_published_lsn().unwrap(), 1);
+        store.index().get_store_checkpoint().unwrap().unwrap()
     };
-    assert_eq!(first_checkpoint.durable_lsn, Some(1));
     assert_eq!(first_checkpoint.active_segment_id, FIRST_SEGMENT_ID);
     assert!(first_checkpoint.wal_position.offset > 12);
 
     let second_checkpoint = {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         assert_eq!(
-            store.index().get_lsm_checkpoint().unwrap(),
+            store.index().get_store_checkpoint().unwrap(),
             Some(first_checkpoint)
         );
         assert_eq!(store.put(&key_b, b"two").unwrap(), 2);
         store.sync().unwrap();
-        store.index().get_lsm_checkpoint().unwrap().unwrap()
+        assert_eq!(store.index().get_published_lsn().unwrap(), 2);
+        store.index().get_store_checkpoint().unwrap().unwrap()
     };
 
-    assert_eq!(second_checkpoint.durable_lsn, Some(2));
     assert_eq!(
         second_checkpoint.wal_position.log_id,
         first_checkpoint.wal_position.log_id
@@ -532,346 +591,14 @@ async fn synced_lsm_checkpoint_reopens_the_existing_wal_prefix() {
         "reopen must append after the persisted WAL prefix"
     );
     assert_eq!(
-        fs::metadata(strata_lsm::Wal::path(
-            cfg.namespace_dir().join("lsm/wal"),
+        fs::metadata(Wal::path(
+            cfg.namespace_dir().join("wal"),
             second_checkpoint.wal_position.log_id,
         ))
         .unwrap()
         .len(),
         second_checkpoint.wal_position.offset
     );
-}
-
-#[tokio::test]
-async fn lsm_flusher_publishes_and_releases_a_frozen_memtable() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let mut cfg = config(dir.path(), "lsm-flush");
-    cfg.segment_max_bytes = 100;
-    ensure_ingest_dir(&cfg).unwrap();
-    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
-    let active_writer = SegmentWriter::create(
-        segment_path(&cfg, FIRST_SEGMENT_ID),
-        FIRST_SEGMENT_ID,
-        PlacementClass::Ingest,
-        cfg.segment_max_bytes,
-    )
-    .unwrap();
-    let policy =
-        strata_lsm::MemtableRolloverPolicy::new(std::num::NonZeroUsize::MIN, Duration::MAX);
-    let options = LsmOptions {
-        memtable_capacity: 4096,
-        rollover_policy: Some(policy),
-        ..LsmOptions::default()
-    };
-    let (lsm, sync_handles) = open_lsm_with_options(
-        &cfg,
-        &index,
-        active_writer,
-        SegmentIdAllocator::new(FIRST_SEGMENT_ID + 1),
-        1,
-        None,
-        options,
-    )
-    .unwrap();
-    lsm.put(0, b"a".to_vec(), b"one".to_vec()).unwrap();
-    assert!(
-        lsm.put(0, b"b".to_vec(), b"two".to_vec())
-            .unwrap()
-            .rolled_memtable
-            .is_some()
-    );
-    assert_eq!(lsm.wal_position().unwrap().log_id, 2);
-
-    let (compact_tx, compact_rx) = mpsc::channel();
-    let (wake_tx, wake_rx) = mpsc::channel();
-    let flusher = LsmFlusher {
-        index: index.clone(),
-        lsm: Arc::downgrade(&lsm),
-        wake_rx,
-        compact_tx,
-        store_halt: StoreHalt::default(),
-    };
-    let flush_handle = thread::spawn(move || flusher.run());
-    wake_tx.send(()).unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while !lsm.frozen_generations(0).unwrap().is_empty() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(lsm.frozen_generations(0).unwrap().is_empty());
-    compact_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("the completed flush must wake compaction without running it");
-    let manifest = index.get_lsm_manifest(BLOB_LSM_MANIFEST).unwrap().unwrap();
-    assert_eq!(manifest.partitions[&0].patches.len(), 1);
-    assert_eq!(manifest.materialized_through, Some(1));
-    assert_eq!(manifest.wal_retained_from, 2);
-    assert_eq!(lsm.manifest().generation, manifest.generation);
-    assert!(!strata_lsm::Wal::path(cfg.namespace_dir().join("lsm/wal"), 1).exists());
-    assert!(strata_lsm::Wal::path(cfg.namespace_dir().join("lsm/wal"), 2).exists());
-
-    drop(wake_tx);
-    flush_handle.join().unwrap();
-    drop(lsm);
-    for handle in sync_handles {
-        handle.join().unwrap();
-    }
-
-    let mut batch = index.batch();
-    index.put_next_lsn_batch(&mut batch, 3).unwrap();
-    batch.write_with_sync(true).unwrap();
-    let active_writer = SegmentWriter::open_existing(
-        segment_path(&cfg, FIRST_SEGMENT_ID),
-        FIRST_SEGMENT_ID,
-        PlacementClass::Ingest,
-        cfg.segment_max_bytes,
-    )
-    .unwrap();
-    let (reopened, sync_handles) = open_lsm_with_options(
-        &cfg,
-        &index,
-        active_writer,
-        SegmentIdAllocator::new(FIRST_SEGMENT_ID + 1),
-        3,
-        None,
-        options,
-    )
-    .unwrap();
-    for (key, expected) in [(b"a".as_slice(), b"one".as_slice()), (b"b", b"two")] {
-        let encoded = reopened.get(0, key, &strata_lsm::Replace).unwrap().unwrap();
-        assert_eq!(
-            decode_value(&encoded).unwrap(),
-            StoredValue::Inline(expected)
-        );
-    }
-    drop(reopened);
-    for handle in sync_handles {
-        handle.join().unwrap();
-    }
-}
-
-#[tokio::test]
-async fn lsm_compactor_partially_merges_then_materializes_durable_patches() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "lsm-compact");
-    let registry = Registry::new();
-    let metrics = StrataStoreMetrics::new(&registry, "lsm-compact").unwrap();
-    ensure_ingest_dir(&cfg).unwrap();
-    let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
-    let active_writer = SegmentWriter::create(
-        segment_path(&cfg, FIRST_SEGMENT_ID),
-        FIRST_SEGMENT_ID,
-        PlacementClass::Ingest,
-        cfg.segment_max_bytes,
-    )
-    .unwrap();
-    let policy =
-        strata_lsm::MemtableRolloverPolicy::new(std::num::NonZeroUsize::MIN, Duration::MAX);
-    let options = LsmOptions {
-        memtable_capacity: 4096,
-        rollover_policy: Some(policy),
-        ..LsmOptions::default()
-    };
-    let (lsm, sync_handles) = open_lsm_with_options(
-        &cfg,
-        &index,
-        active_writer,
-        SegmentIdAllocator::new(FIRST_SEGMENT_ID + 1),
-        1,
-        None,
-        options,
-    )
-    .unwrap();
-    let relocations = open_relocation_lsm(&cfg, &index).unwrap();
-    let store_halt = StoreHalt::default();
-    let (compact_tx, compact_rx) = mpsc::channel();
-    let compactor = LsmCompactor {
-        index: index.clone(),
-        lsm: Arc::downgrade(&lsm),
-        relocations: Arc::downgrade(&relocations),
-        garbage_log_dir: garbage_log_dir(&cfg),
-        garbage_publish_lock: Arc::new(Mutex::new(())),
-        wake_rx: compact_rx,
-        store_halt: store_halt.clone(),
-        metrics,
-        obsolete: Vec::new(),
-    };
-    let compact_handle = thread::spawn(move || compactor.run());
-    let (wake_tx, wake_rx) = mpsc::channel();
-    let flusher = LsmFlusher {
-        index: index.clone(),
-        lsm: Arc::downgrade(&lsm),
-        wake_rx,
-        compact_tx: compact_tx.clone(),
-        store_halt,
-    };
-    let flush_handle = thread::spawn(move || flusher.run());
-    let key = BlobKey::new(b"key".to_vec()).unwrap();
-    let mut latest_ref = None;
-    let mut latest_lsn = None;
-    let mut old_snapshot = None;
-    let mut pinned_patch = None;
-
-    for update in 0..=LSM_COMPACTION_PATCH_COUNT {
-        let result = lsm
-            .write(LsmMutation::PutBlob {
-                partition: 0,
-                key: key.as_bytes().to_vec(),
-                metadata: BlobMutation::encode_put_metadata(STANDALONE_SHARD, 0),
-                record: LsmSegmentRecord {
-                    key: key.clone(),
-                    shard: STANDALONE_SHARD,
-                    payload: Arc::from(format!("value-{update}").into_bytes()),
-                },
-            })
-            .unwrap();
-        latest_ref = result.record_ref;
-        latest_lsn = Some(result.lsn);
-        if result.rolled_memtable.is_some() {
-            wake_tx.send(()).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while !lsm.frozen_generations(0).unwrap().is_empty() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
-            assert!(lsm.frozen_generations(0).unwrap().is_empty());
-        }
-        if update + 1 == LSM_COMPACTION_PATCH_COUNT {
-            let manifest = lsm.manifest();
-            pinned_patch = Some(manifest.partitions[&0].patches[0].clone());
-            old_snapshot =
-                Some(strata_lsm::Snapshot::new(lsm.table_store(), manifest, u64::MAX).unwrap());
-        }
-    }
-    assert!(lsm.roll_memtable_if_due(0).unwrap().is_some());
-    wake_tx.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while !lsm.frozen_generations(0).unwrap().is_empty() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(lsm.frozen_generations(0).unwrap().is_empty());
-
-    assert_eq!(
-        lsm.manifest().partitions[&0].patches.len(),
-        LSM_COMPACTION_PATCH_COUNT + 1,
-        "full compaction must wait for segment and WAL durability"
-    );
-    let checkpoint = lsm.sync().unwrap();
-    let latest_ref = latest_ref.unwrap();
-    let relocated_ref = RecordRef {
-        segment_id: latest_ref.segment_id + 100,
-        offset: latest_ref.offset + 100,
-        len: latest_ref.len,
-    };
-    relocations
-        .write_batch(
-            0,
-            &[RelocationEntry {
-                key: key.clone(),
-                shard: STANDALONE_SHARD,
-                payload_lsn: latest_lsn.unwrap(),
-                publish_lsn: checkpoint.durable_lsn.unwrap() + 1,
-                to: relocated_ref,
-            }],
-        )
-        .unwrap();
-    let relocation_checkpoint = relocations.lsm().sync().unwrap();
-    let mut batch = index.batch();
-    index
-        .put_published_lsn_batch(&mut batch, checkpoint.durable_lsn.unwrap())
-        .unwrap();
-    index
-        .put_relocation_lsm_checkpoint_batch(&mut batch, relocation_checkpoint)
-        .unwrap();
-    index
-        .put_lazy_global_materialization_from_lsn_batch(&mut batch, 1)
-        .unwrap();
-    batch.write_with_sync(true).unwrap();
-    let mut relocation_scan = relocations
-        .scan(
-            0,
-            key.as_bytes(),
-            key.as_bytes(),
-            index
-                .get_relocation_lsm_checkpoint()
-                .unwrap()
-                .unwrap()
-                .durable_lsn
-                .unwrap(),
-        )
-        .unwrap();
-    assert_eq!(relocation_scan.current().unwrap().to, relocated_ref);
-    relocation_scan.advance().unwrap();
-    assert!(relocation_scan.current().is_none());
-    compact_tx.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while lsm.manifest().partitions[&0].patches.len() > 1 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let manifest = lsm.manifest();
-    assert_eq!(manifest.partitions[&0].patches.len(), 1);
-    assert!(manifest.partitions[&0].base.is_empty());
-
-    // The periodic forced pass materializes the coalesced patch and folds relocations.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !lsm.manifest().partitions[&0].patches.is_empty() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let manifest = lsm.manifest();
-    assert!(manifest.partitions[&0].patches.is_empty());
-    assert_eq!(manifest.partitions[&0].base.len(), 1);
-    assert_ne!(
-        index
-            .get_garbage_log_position(GARBAGE_LOG_HEAD)
-            .unwrap()
-            .unwrap_or_default(),
-        strata_lsm::GarbageLogPosition::default()
-    );
-    let pinned_patch = pinned_patch.unwrap();
-    let pinned_path = lsm.table_store().root().join(&pinned_patch.relative_path);
-    assert!(pinned_path.exists());
-    assert!(
-        old_snapshot
-            .as_ref()
-            .unwrap()
-            .get(0, key.as_bytes(), &BlobMerge)
-            .unwrap()
-            .is_some()
-    );
-
-    let encoded = lsm.get(0, key.as_bytes(), &BlobMerge).unwrap().unwrap();
-    let StoredValue::Inline(bytes) = decode_value(&encoded).unwrap() else {
-        panic!("compacted blob state must be inline");
-    };
-    assert_eq!(
-        LsmBlobState::decode(bytes).unwrap().versions[&STANDALONE_SHARD].record_ref,
-        relocated_ref
-    );
-    assert_eq!(
-        counter_value(
-            &registry,
-            "strata_store_main_compaction_healed_references_total"
-        ),
-        1.0
-    );
-
-    drop(old_snapshot);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while pinned_path.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!pinned_path.exists());
-
-    drop(wake_tx);
-    flush_handle.join().unwrap();
-    drop(compact_tx);
-    compact_handle.join().unwrap();
-    drop(lsm);
-    drop(relocations);
-    for handle in sync_handles {
-        handle.join().unwrap();
-    }
 }
 
 #[tokio::test]
@@ -911,6 +638,17 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .unwrap()
         .join()
         .unwrap();
+    // The production GC path writes these relocation records through WriteCoordinator. This test
+    // drives compaction directly, so keep a store WAL open and mirror that one production step.
+    // It is deliberately the *store* WAL; the relocation LSM has no private log.
+    let checkpoint = store.index().get_store_checkpoint().unwrap();
+    let (mut store_wal, _, _, store_wal_sync_handles) = open_store_wal(
+        store.config(),
+        store.index(),
+        store.index().get_next_lsn().unwrap(),
+        checkpoint,
+    )
+    .unwrap();
 
     let segment_b = 99;
     let segment_c = 100;
@@ -950,29 +688,43 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         offset: ref_b_live.len,
         len: dead_version.record_ref.len,
     };
-    store
-        .relocations
-        .write_batch(
-            0,
-            &[
-                RelocationEntry {
-                    key: live_key.clone(),
-                    shard: STANDALONE_SHARD,
-                    payload_lsn: live_version.payload_lsn,
-                    publish_lsn: tombstone_lsn + 1,
-                    to: ref_b_live,
-                },
-                RelocationEntry {
-                    key: dead_key.clone(),
-                    shard: STANDALONE_SHARD,
-                    payload_lsn: dead_version.payload_lsn,
-                    publish_lsn: tombstone_lsn + 2,
-                    to: ref_b_dead,
-                },
-            ],
+    let first_relocations = [
+        RelocationEntry {
+            key: live_key.clone(),
+            shard: STANDALONE_SHARD,
+            payload_lsn: live_version.payload_lsn,
+            publish_lsn: tombstone_lsn + 1,
+            to: ref_b_live,
+        },
+        RelocationEntry {
+            key: dead_key.clone(),
+            shard: STANDALONE_SHARD,
+            payload_lsn: dead_version.payload_lsn,
+            publish_lsn: tombstone_lsn + 2,
+            to: ref_b_dead,
+        },
+    ];
+    store_wal
+        .append(
+            &first_relocations
+                .iter()
+                .map(|entry| WalEntry {
+                    lsn: entry.publish_lsn,
+                    payload: StoreWalMutation::Relocation(entry.clone())
+                        .encode()
+                        .unwrap(),
+                })
+                .collect::<Vec<_>>(),
         )
         .unwrap();
-    let first_relocation_checkpoint = store.relocations.lsm().sync().unwrap();
+    store
+        .relocations
+        .write_batch(0, &first_relocations)
+        .unwrap();
+    let first_wal_position = store_wal.sync().unwrap();
+    store_wal.wait_for_sync(first_wal_position).unwrap();
+    let mut first_store_checkpoint = store.index().get_store_checkpoint().unwrap().unwrap();
+    first_store_checkpoint.wal_position = first_wal_position;
     let mut segment_b_state = SegmentState {
         owner: SegmentOwner::Shard(STANDALONE_SHARD),
         segment_id: segment_b,
@@ -1018,7 +770,15 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .unwrap();
     store
         .index()
-        .put_relocation_lsm_checkpoint_batch(&mut batch, first_relocation_checkpoint)
+        .put_published_lsn_batch(&mut batch, tombstone_lsn + 2)
+        .unwrap();
+    store
+        .index()
+        .put_store_checkpoint_batch(&mut batch, first_store_checkpoint)
+        .unwrap();
+    store
+        .index()
+        .put_next_lsn_batch(&mut batch, tombstone_lsn + 3)
         .unwrap();
     batch.write_with_sync(true).unwrap();
 
@@ -1062,20 +822,29 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
             .is_some()
     );
 
+    let final_relocation = RelocationEntry {
+        key: live_key.clone(),
+        shard: STANDALONE_SHARD,
+        payload_lsn: live_version.payload_lsn,
+        publish_lsn: tombstone_lsn + 3,
+        to: ref_c,
+    };
+    store_wal
+        .append(&[WalEntry {
+            lsn: final_relocation.publish_lsn,
+            payload: StoreWalMutation::Relocation(final_relocation.clone())
+                .encode()
+                .unwrap(),
+        }])
+        .unwrap();
     store
         .relocations
-        .write_batch(
-            0,
-            &[RelocationEntry {
-                key: live_key.clone(),
-                shard: STANDALONE_SHARD,
-                payload_lsn: live_version.payload_lsn,
-                publish_lsn: tombstone_lsn + 3,
-                to: ref_c,
-            }],
-        )
+        .write_batch(0, &[final_relocation])
         .unwrap();
-    let second_relocation_checkpoint = store.relocations.lsm().sync().unwrap();
+    let final_wal_position = store_wal.sync().unwrap();
+    store_wal.wait_for_sync(final_wal_position).unwrap();
+    let mut final_store_checkpoint = store.index().get_store_checkpoint().unwrap().unwrap();
+    final_store_checkpoint.wal_position = final_wal_position;
     let mut source_state = store
         .index()
         .get_segment_state(live_version.record_ref.segment_id)
@@ -1098,7 +867,15 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .unwrap();
     store
         .index()
-        .put_relocation_lsm_checkpoint_batch(&mut batch, second_relocation_checkpoint)
+        .put_published_lsn_batch(&mut batch, tombstone_lsn + 3)
+        .unwrap();
+    store
+        .index()
+        .put_store_checkpoint_batch(&mut batch, final_store_checkpoint)
+        .unwrap();
+    store
+        .index()
+        .put_next_lsn_batch(&mut batch, tombstone_lsn + 4)
         .unwrap();
     batch.write_with_sync(true).unwrap();
 
@@ -1229,6 +1006,12 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         ) > 0.0
     );
 
+    let wal_position = store_wal.sync().unwrap();
+    store_wal.wait_for_sync(wal_position).unwrap();
+    drop(store_wal);
+    for handle in store_wal_sync_handles {
+        handle.join().unwrap();
+    }
     drop(lsm);
     drop(store);
     let reopened = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
@@ -1269,7 +1052,7 @@ async fn recovered_store_tail_promotes_the_matching_wal_tail() {
         assert_eq!(store.put(&key_a, b"one").unwrap(), 1);
         let ref_a = lsm_blob_ref(&store, &key_a);
         store.sync().unwrap();
-        let checkpoint = store.index().get_lsm_checkpoint().unwrap().unwrap();
+        let checkpoint = store.index().get_store_checkpoint().unwrap().unwrap();
         assert_eq!(store.put(&key_b, b"two").unwrap(), 2);
         let ref_b = lsm_blob_ref(&store, &key_b);
         (checkpoint, ref_a, ref_b)
@@ -1286,14 +1069,14 @@ async fn recovered_store_tail_promotes_the_matching_wal_tail() {
     assert_eq!(summary.live_bytes, ref_a.len + ref_b.len);
     assert_eq!(summary.live_ref_count, 2);
     store.sync().unwrap();
-    let recovered = store.index().get_lsm_checkpoint().unwrap().unwrap();
-    assert_eq!(recovered.durable_lsn, Some(2));
+    let recovered = store.index().get_store_checkpoint().unwrap().unwrap();
+    assert_eq!(store.index().get_published_lsn().unwrap(), 2);
     assert!(recovered.wal_position.offset > first_checkpoint.wal_position.offset);
 
     assert_eq!(store.put(&key_c, b"three").unwrap(), 3);
     store.sync().unwrap();
-    let advanced = store.index().get_lsm_checkpoint().unwrap().unwrap();
-    assert_eq!(advanced.durable_lsn, Some(3));
+    let advanced = store.index().get_store_checkpoint().unwrap().unwrap();
+    assert_eq!(store.index().get_published_lsn().unwrap(), 3);
     assert!(advanced.wal_position.offset > recovered.wal_position.offset);
 }
 #[tokio::test]
@@ -1484,7 +1267,7 @@ async fn store_batch_can_mix_epoch_changes_with_blob_ops() {
     assert_eq!(store.published_lsn().unwrap(), 3);
 }
 #[tokio::test]
-async fn epoch_change_is_published_by_the_lsm_checkpoint() {
+async fn epoch_change_is_published_by_the_store_checkpoint() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"semantic-materialization".to_vec()).unwrap();
@@ -1498,7 +1281,7 @@ async fn epoch_change_is_published_by_the_lsm_checkpoint() {
     assert_eq!(store.published_lsn().unwrap(), epoch_lsn);
 }
 #[tokio::test]
-async fn explicit_active_segment_checkpoint_queues_the_current_tail_for_sealing() {
+async fn explicit_active_segment_rollover_queues_the_current_tail_for_sealing() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"explicit-checkpoint".to_vec()).unwrap();
@@ -1517,7 +1300,7 @@ async fn explicit_active_segment_checkpoint_queues_the_current_tail_for_sealing(
         .unwrap()
         .0;
 
-    store.store.checkpoint_active_segment().unwrap();
+    store.store.rollover_active_segment_for_sealing().unwrap();
     let sealed = wait_for_segment_state(store.index(), old_segment_id, SegmentFileState::Sealed);
     let summary = store
         .index()
@@ -1603,7 +1386,7 @@ async fn sync_publishes_new_allocations_without_overwriting_garbage() {
 }
 
 #[tokio::test]
-async fn shard_drop_publishes_its_lsm_checkpoint_immediately() {
+async fn shard_drop_is_visible_immediately_and_durable_after_sync() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"shard-drop-materialization".to_vec()).unwrap();
@@ -1611,6 +1394,7 @@ async fn shard_drop_publishes_its_lsm_checkpoint_immediately() {
     cfg.gc_workers_enabled = false;
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
+    let previous_published = store.published_lsn().unwrap();
     store.put(&key, b"payload").unwrap();
     store.drop_shard(STANDALONE_SHARD.id).unwrap();
     let drop_lsn = store
@@ -1620,6 +1404,8 @@ async fn shard_drop_publishes_its_lsm_checkpoint_immediately() {
         .unwrap()
         .drop_lsn;
 
+    assert_eq!(store.published_lsn().unwrap(), previous_published);
+    store.sync().unwrap();
     assert_eq!(store.published_lsn().unwrap(), drop_lsn);
     assert_eq!(
         store
@@ -1749,6 +1535,8 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
     );
     assert!(store.store.get_from_shard(41, &key).is_err());
     assert_eq!(store.index().get_next_lsn().unwrap(), drop_lsn + 1);
+    assert!(store.index().get_published_lsn().unwrap() < drop_lsn);
+    store.sync().unwrap();
     assert_eq!(store.index().get_published_lsn().unwrap(), drop_lsn);
     let job = store.index().get_shard_cleanup_job(shard).unwrap().unwrap();
     assert_eq!(job.drop_lsn, drop_lsn);
@@ -2593,15 +2381,9 @@ async fn metrics_track_seal_backpressure_waits() {
     let (seal_tx, _seal_rx) = mpsc::channel();
     let (_write_tx, write_rx) = mpsc::sync_channel(1);
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
-    let (lsm, _lsm_sync_handles) = open_lsm(
-        &cfg,
-        &index,
-        active_writer,
-        SegmentIdAllocator::new(3),
-        index.get_next_lsn().unwrap(),
-        None,
-    )
-    .unwrap();
+    let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
+        open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
+    let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
     let live_snapshots = lsm.live_snapshots();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
@@ -2609,13 +2391,22 @@ async fn metrics_track_seal_backpressure_waits() {
         config: cfg.clone(),
         index: index.clone(),
         lsm,
+        wal,
+        segment: active_writer,
+        segment_factory: SegmentFactory::new(
+            cfg.ingest_dir(),
+            SegmentIdAllocator::new(3),
+            PlacementClass::Ingest,
+            cfg.segment_max_bytes,
+        ),
         live_snapshots,
         durability_publish_lock: Arc::new(Mutex::new(())),
         active_segment_state,
         durable_offset: 0,
         pending_allocation_records: 0,
-        last_checkpoint_at: Instant::now(),
-        last_checkpoint_next_lsn: index.get_next_lsn().unwrap(),
+        last_durability_publish_at: Instant::now(),
+        last_segment_rollover_at: Instant::now(),
+        last_segment_rollover_next_lsn: index.get_next_lsn().unwrap(),
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
@@ -2623,7 +2414,13 @@ async fn metrics_track_seal_backpressure_waits() {
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
-        relocations: open_relocation_lsm(&cfg, &index).unwrap(),
+        relocations: open_relocation_lsm(
+            &cfg,
+            &index,
+            index.get_next_lsn().unwrap(),
+            relocation_recovery,
+        )
+        .unwrap(),
         relocation_cache: Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES)),
         gc_concurrency,
         store_halt: StoreHalt::default(),
@@ -3424,6 +3221,7 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
     assert!(shard_b_dir.exists());
 
     store.store.drop_shard(shard_a.id).unwrap();
+    store.sync().unwrap();
     wait_for_shard_cleanup(&store.store, shard_a);
 
     assert!(!shard_a_dir.exists());
@@ -3719,7 +3517,7 @@ async fn gc_worker_request_runs_production_gc_plan() {
 }
 
 #[tokio::test]
-async fn lazy_epoch_expiry_nudges_gc_after_ordinary_compaction() {
+async fn snapshot_compaction_epoch_expiry_nudges_gc() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -3766,7 +3564,7 @@ async fn lazy_epoch_expiry_nudges_gc_after_ordinary_compaction() {
         }
         assert!(
             Instant::now() < deadline,
-            "lazy LSM expiry did not nudge GC after compaction"
+            "blob-LSM compaction expiry did not nudge GC"
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -4475,7 +4273,7 @@ async fn blob_lsm_retire_removes_lifetime_hint() {
 }
 
 #[tokio::test]
-async fn ordinary_lsm_compaction_lazily_updates_gc_summary_after_epoch_change() {
+async fn ordinary_lsm_compaction_updates_gc_summary_from_epoch_snapshot() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -4557,7 +4355,7 @@ async fn ordinary_lsm_compaction_lazily_updates_gc_summary_after_epoch_change() 
     assert!(stats.is_empty());
 }
 #[tokio::test]
-async fn lazy_expiry_does_not_revive_blob_on_extension() {
+async fn compaction_expiry_does_not_revive_blob_on_extension() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -4593,7 +4391,7 @@ async fn lazy_expiry_does_not_revive_blob_on_extension() {
 }
 
 #[tokio::test]
-async fn lazy_compaction_expires_future_epoch_bucket_for_exact_epoch_segment() {
+async fn snapshot_compaction_expires_future_epoch_bucket_for_exact_epoch_segment() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -4681,7 +4479,7 @@ async fn put_assigns_monotonic_lsn_across_reopen() {
 }
 
 #[tokio::test]
-async fn recovery_rolls_back_unpublished_ops_missing_from_lsm_wal() {
+async fn recovery_rolls_back_unpublished_ops_missing_from_store_wal() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
@@ -4692,7 +4490,7 @@ async fn recovery_rolls_back_unpublished_ops_missing_from_lsm_wal() {
         assert_eq!(store.index().get_next_lsn().unwrap(), 2);
     }
 
-    std::fs::remove_file(Wal::path(cfg.namespace_dir().join("lsm/wal"), 1)).unwrap();
+    std::fs::remove_file(Wal::path(cfg.namespace_dir().join("wal"), 1)).unwrap();
 
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     assert_eq!(store.index().get_next_lsn().unwrap(), 1);
@@ -4702,7 +4500,7 @@ async fn recovery_rolls_back_unpublished_ops_missing_from_lsm_wal() {
 }
 
 #[tokio::test]
-async fn recovery_rejects_missing_lsm_wal_for_published_lsn() {
+async fn recovery_rejects_missing_store_wal_for_published_lsn() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
@@ -4714,10 +4512,10 @@ async fn recovery_rejects_missing_lsm_wal_for_published_lsn() {
         assert_eq!(store.published_lsn().unwrap(), 1);
     }
 
-    std::fs::remove_file(Wal::path(cfg.namespace_dir().join("lsm/wal"), 1)).unwrap();
+    std::fs::remove_file(Wal::path(cfg.namespace_dir().join("wal"), 1)).unwrap();
 
     let err = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap_err();
-    assert!(matches!(err, Error::Lsm(strata_lsm::Error::InvalidWal(_))));
+    assert!(matches!(err, Error::InvalidWal(_)));
 }
 #[tokio::test]
 async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
@@ -5072,7 +4870,7 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
 }
 
 #[tokio::test]
-async fn timed_checkpoint_rolls_empty_segment_for_metadata_only_lsn() {
+async fn scheduled_rollover_rolls_empty_segment_for_metadata_only_lsn() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
@@ -5097,15 +4895,9 @@ async fn timed_checkpoint_rolls_empty_segment_for_metadata_only_lsn() {
     )
     .unwrap();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
-    let (lsm, _lsm_sync_handles) = open_lsm(
-        &cfg,
-        &index,
-        active_writer,
-        SegmentIdAllocator::new(2),
-        index.get_next_lsn().unwrap(),
-        None,
-    )
-    .unwrap();
+    let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
+        open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
+    let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
     let live_snapshots = lsm.live_snapshots();
     let (seal_tx, seal_rx) = mpsc::channel();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
@@ -5116,13 +4908,22 @@ async fn timed_checkpoint_rolls_empty_segment_for_metadata_only_lsn() {
         config: cfg.clone(),
         index: index.clone(),
         lsm,
+        wal,
+        segment: active_writer,
+        segment_factory: SegmentFactory::new(
+            cfg.ingest_dir(),
+            SegmentIdAllocator::new(2),
+            PlacementClass::Ingest,
+            cfg.segment_max_bytes,
+        ),
         live_snapshots,
         durability_publish_lock: Arc::new(Mutex::new(())),
         active_segment_state,
         durable_offset: 0,
         pending_allocation_records: 0,
-        last_checkpoint_at: Instant::now() - DURABILITY_CHECKPOINT_INTERVAL,
-        last_checkpoint_next_lsn: 1,
+        last_durability_publish_at: Instant::now(),
+        last_segment_rollover_at: Instant::now() - SEGMENT_ROLLOVER_INTERVAL,
+        last_segment_rollover_next_lsn: 1,
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
@@ -5130,14 +4931,20 @@ async fn timed_checkpoint_rolls_empty_segment_for_metadata_only_lsn() {
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
-        relocations: open_relocation_lsm(&cfg, &index).unwrap(),
+        relocations: open_relocation_lsm(
+            &cfg,
+            &index,
+            index.get_next_lsn().unwrap(),
+            relocation_recovery,
+        )
+        .unwrap(),
         relocation_cache: Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES)),
         gc_concurrency,
         store_halt: StoreHalt::default(),
         metrics,
     };
 
-    coordinator.process_timed_checkpoint().unwrap();
+    coordinator.process_segment_rollover().unwrap();
 
     let old_state = index.get_segment_state(1).unwrap().unwrap();
     assert_eq!(old_state.state, SegmentFileState::Sealing);

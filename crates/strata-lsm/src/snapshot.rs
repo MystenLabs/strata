@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -8,9 +8,7 @@ use std::{
 
 use crate::{
     BlockCacheStats, Error, Manifest, MergeOperator, Result, StrataLsn, TableMeta, TableReader,
-    table::{
-        BlockCache, DEFAULT_BLOCK_CACHE_BYTES, TableCursor, sync_parent, validate_relative_path,
-    },
+    table::{BlockCache, DEFAULT_BLOCK_CACHE_BYTES, sync_parent, validate_relative_path},
 };
 
 type ReadParts = (Option<Vec<u8>>, Vec<(StrataLsn, Vec<u8>)>);
@@ -279,9 +277,11 @@ impl Drop for TablePinGuard {
     }
 }
 
-struct PartitionReaders {
-    base: Vec<TableReader>,
-    patches: Vec<TableReader>,
+// Shared so iterator cursors can reuse these open, cache-enabled readers without reopening
+// the files or re-decoding their footers, Bloom filters, and sparse indexes.
+pub(crate) struct PartitionReaders {
+    pub(crate) base: Vec<Arc<TableReader>>,
+    pub(crate) patches: Vec<Arc<TableReader>>,
 }
 
 // Why pin a physical file set instead of remembering only a lsn number?
@@ -303,165 +303,11 @@ struct PartitionReaders {
 /// captured manifest. Patch records with a lsn greater than `max_lsn` are ignored.
 /// Creating the snapshot pins every SST in the manifest; dropping it releases those pins.
 pub struct Snapshot {
-    full_manifest: Arc<Manifest>,
+    pub(crate) full_manifest: Arc<Manifest>,
     max_lsn: u64,
-    readers: BTreeMap<u32, PartitionReaders>,
+    pub(crate) readers: BTreeMap<u32, PartitionReaders>,
     _table_pin: TablePinGuard,
     _lsn_pin: Option<SnapshotPin>,
-}
-
-/// A pinned, sorted scan over one LSM partition.
-pub struct LsmScan {
-    base: Vec<TableCursor>,
-    patches: Vec<TableCursor>,
-    memory: VecDeque<(Vec<u8>, StrataLsn, Vec<u8>)>,
-    max_lsn: StrataLsn,
-    end: Option<Vec<u8>>,
-    _snapshot: Arc<Snapshot>,
-}
-
-impl LsmScan {
-    pub(crate) fn new(
-        snapshot: Arc<Snapshot>,
-        tables: &TableStore,
-        partition: u32,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        memory: Vec<(Vec<u8>, StrataLsn, Vec<u8>)>,
-        max_lsn: StrataLsn,
-    ) -> Result<Self> {
-        let partition_manifest =
-            snapshot
-                .full_manifest
-                .partitions
-                .get(&partition)
-                .ok_or(Error::InvalidPartition {
-                    partition,
-                    partition_count: snapshot.full_manifest.partition_count,
-                })?;
-        let overlaps = |table: &&TableMeta| {
-            start.is_none_or(|start| table.last_key.as_slice() >= start)
-                && end.is_none_or(|end| table.first_key.as_slice() < end)
-        };
-        let base = partition_manifest
-            .base
-            .iter()
-            .filter(overlaps)
-            .map(|table| {
-                TableReader::open_base(tables.root(), table, &snapshot.full_manifest.schema_id)?
-                    .into_cursor_from(start)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let patches = partition_manifest
-            .patches
-            .iter()
-            .filter(overlaps)
-            .filter(|table| table.min_lsn.is_none_or(|lsn| lsn <= max_lsn))
-            .map(|table| {
-                TableReader::open_patch(
-                    tables.root(),
-                    table,
-                    &snapshot.full_manifest.patch_format_id,
-                )?
-                .into_cursor_from(start)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            base,
-            patches,
-            memory: memory.into(),
-            max_lsn,
-            end: end.map(<[u8]>::to_vec),
-            _snapshot: snapshot,
-        })
-    }
-
-    /// Returns the next materialized key/value pair in unsigned lexicographic key order.
-    pub fn next(&mut self, merge: &dyn MergeOperator) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        loop {
-            let Some(key) = self
-                .base
-                .iter()
-                .chain(&self.patches)
-                .filter_map(TableCursor::current)
-                .map(|row| row.key.as_slice())
-                .chain(self.memory.front().map(|(key, _, _)| key.as_slice()))
-                .min()
-                .map(<[u8]>::to_vec)
-            else {
-                return Ok(None);
-            };
-            if self.end.as_deref().is_some_and(|end| key.as_slice() >= end) {
-                return Ok(None);
-            }
-
-            let mut base_value = None;
-            for cursor in &mut self.base {
-                while cursor
-                    .current()
-                    .is_some_and(|row| row.key.as_slice() == key)
-                {
-                    if base_value.is_some() {
-                        return Err(Error::InvalidManifest {
-                            reason: "scan found multiple base values for one key".to_owned(),
-                        });
-                    }
-                    base_value = Some(cursor.current().expect("checked current row").value.clone());
-                    cursor.advance()?;
-                }
-            }
-
-            let mut patches = Vec::new();
-            for cursor in &mut self.patches {
-                while cursor
-                    .current()
-                    .is_some_and(|row| row.key.as_slice() == key)
-                {
-                    let row = cursor.current().expect("checked current row");
-                    let lsn = row.lsn.expect("patch cursor has lsned rows");
-                    if lsn <= self.max_lsn {
-                        patches.push((lsn, row.value.clone()));
-                    }
-                    cursor.advance()?;
-                }
-            }
-            while self
-                .memory
-                .front()
-                .is_some_and(|(memory_key, _, _)| memory_key == &key)
-            {
-                let (_, lsn, value) = self.memory.pop_front().expect("checked memory row");
-                patches.push((lsn, value));
-            }
-
-            if patches.is_empty() {
-                if let Some(value) = base_value {
-                    return Ok(Some((key, value)));
-                }
-                continue;
-            }
-            patches.sort_unstable_by_key(|(lsn, _)| *lsn);
-            if let Some(lsn) = patches
-                .windows(2)
-                .find_map(|pair| (pair[0].0 == pair[1].0).then_some(pair[0].0))
-            {
-                return Err(Error::InvalidManifest {
-                    reason: format!("scan found duplicate patch lsn {lsn:?} for one key"),
-                });
-            }
-            let patch_refs = patches
-                .iter()
-                .map(|(lsn, value)| (*lsn, value.as_slice()))
-                .collect::<Vec<_>>();
-            let mut discard = |_| Ok(());
-            if let Some(value) =
-                merge.merge(&key, base_value.as_deref(), &patch_refs, &mut discard)?
-            {
-                return Ok(Some((key, value)));
-            }
-        }
-    }
 }
 
 impl Snapshot {
@@ -508,6 +354,7 @@ impl Snapshot {
                         &manifest.schema_id,
                         Arc::clone(&tables.block_cache),
                     )
+                    .map(Arc::new)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let patches = partition_tables
@@ -520,6 +367,7 @@ impl Snapshot {
                         &manifest.patch_format_id,
                         Arc::clone(&tables.block_cache),
                     )
+                    .map(Arc::new)
                 })
                 .collect::<Result<Vec<_>>>()?;
             readers.insert(partition, PartitionReaders { base, patches });

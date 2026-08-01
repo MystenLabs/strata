@@ -54,8 +54,12 @@ struct BlockCacheKey {
     offset: u64,
 }
 
+/// One complete encoded data block — header, rows, and trailing checksum, exactly as stored
+/// on disk — shared between a reader and the block cache without copying.
+type EncodedBlock = Arc<[u8]>;
+
 struct CachedBlock {
-    bytes: Arc<[u8]>,
+    bytes: EncodedBlock,
     referenced: bool,
 }
 
@@ -87,7 +91,7 @@ impl BlockCache {
         }
     }
 
-    fn get(&self, key: BlockCacheKey) -> Option<Arc<[u8]>> {
+    fn get(&self, key: BlockCacheKey) -> Option<EncodedBlock> {
         let mut state = self
             .state
             .lock()
@@ -101,7 +105,7 @@ impl BlockCache {
         None
     }
 
-    fn insert(&self, key: BlockCacheKey, bytes: Arc<[u8]>) {
+    fn insert(&self, key: BlockCacheKey, bytes: EncodedBlock) {
         if self.capacity == 0 || bytes.len() > self.capacity {
             return;
         }
@@ -318,7 +322,7 @@ pub struct TableWriter {
     current_layout: Option<BlockLayout>,
     block: Option<PendingBlock>,
     blocks: Vec<BlockMeta>,
-    full_key_hashes: Vec<(u64, u64)>,
+    full_key_hashes: Vec<BloomHashPair>,
     first_key: Option<Vec<u8>>,
     last_key: Option<Vec<u8>>,
     min_lsn: Option<StrataLsn>,
@@ -768,9 +772,14 @@ pub(crate) struct TableRow {
     pub value: Vec<u8>,
 }
 
-/// A compaction cursor that keeps at most one decoded block in memory.
+/// A sorted cursor over one SST that keeps at most one decoded block in memory.
+///
+/// The reader is shared so many cursors can reuse one open table: iterators clone the
+/// cache-enabled readers their snapshot already holds, while compaction wraps its own
+/// uncached reader via [`TableReader::into_cursor`] because it reads every block exactly
+/// once and must not evict hot blocks.
 pub(crate) struct TableCursor {
-    reader: TableReader,
+    reader: Arc<TableReader>,
     block: usize,
     buffered: VecDeque<TableRow>,
     current: Option<TableRow>,
@@ -820,28 +829,7 @@ impl TableReader {
     }
 
     pub(crate) fn into_cursor(self) -> Result<TableCursor> {
-        self.into_cursor_from(None)
-    }
-
-    pub(crate) fn into_cursor_from(self, start: Option<&[u8]>) -> Result<TableCursor> {
-        let block = start.map_or(0, |start| {
-            self.blocks
-                .partition_point(|block| block.last_key.as_slice() < start)
-        });
-        let mut cursor = TableCursor {
-            reader: self,
-            block,
-            buffered: VecDeque::new(),
-            current: None,
-        };
-        cursor.advance()?;
-        while cursor
-            .current()
-            .is_some_and(|row| start.is_some_and(|start| row.key.as_slice() < start))
-        {
-            cursor.advance()?;
-        }
-        Ok(cursor)
+        TableCursor::new(Arc::new(self), None)
     }
 
     fn open(
@@ -1134,7 +1122,7 @@ impl TableReader {
             .as_ref()
             .and_then(|cache| cache.get(cache_key));
         let was_cached = cached.is_some();
-        let encoded: Arc<[u8]> = match cached {
+        let encoded: EncodedBlock = match cached {
             Some(encoded) => encoded,
             None => read_exact_at(&self.file, block.offset, len, &self.path)?.into(),
         };
@@ -1221,8 +1209,43 @@ impl TableReader {
 }
 
 impl TableCursor {
+    /// Opens a cursor on the first row with key >= `start` (the table's first row for `None`).
+    pub(crate) fn new(reader: Arc<TableReader>, start: Option<&[u8]>) -> Result<Self> {
+        let mut cursor = Self {
+            reader,
+            block: 0,
+            buffered: VecDeque::new(),
+            current: None,
+        };
+        cursor.seek(start)?;
+        Ok(cursor)
+    }
+
     pub(crate) fn current(&self) -> Option<&TableRow> {
         self.current.as_ref()
+    }
+
+    /// Repositions `current` to the first row with key >= `target`, in either direction.
+    ///
+    /// The sparse index stores each block's last key, so `partition_point` names the only
+    /// block that could contain `target` and at most that one block is decoded. With blocks
+    /// `[a..c] [d..f] [g..i]`, seeking `"e"` decodes the middle block and skips its `"d"`
+    /// row; seeking `"z"` exhausts the cursor without reading any block at all.
+    pub(crate) fn seek(&mut self, target: Option<&[u8]>) -> Result<()> {
+        self.block = target.map_or(0, |target| {
+            self.reader
+                .blocks
+                .partition_point(|block| block.last_key.as_slice() < target)
+        });
+        self.buffered.clear();
+        self.advance()?;
+        while self
+            .current()
+            .is_some_and(|row| target.is_some_and(|target| row.key.as_slice() < target))
+        {
+            self.advance()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn advance(&mut self) -> Result<()> {
@@ -1705,7 +1728,12 @@ fn validate_prefix_metadata(
     Ok(())
 }
 
-fn build_bloom(hashes: &[(u64, u64)]) -> Result<BloomFilter> {
+/// The two independent hashes of one key that derive every Bloom probe: probe `i` tests bit
+/// `first + i * second` (classic double hashing), so a filter with any `hash_count` needs
+/// only this pair per key.
+type BloomHashPair = (u64, u64);
+
+fn build_bloom(hashes: &[BloomHashPair]) -> Result<BloomFilter> {
     let key_count = u64::try_from(hashes.len())
         .map_err(|_| Error::InvalidTable("too many Bloom filter keys".to_owned()))?;
     let raw_bit_count = key_count
@@ -1752,15 +1780,15 @@ fn bloom_may_contain_with_seed(
     })
 }
 
-fn bloom_hashes(key: &[u8]) -> (u64, u64) {
+fn bloom_hashes(key: &[u8]) -> BloomHashPair {
     hashes_with_seed(key, BLOOM_SEED)
 }
 
-fn prefix_bloom_hashes(key: &[u8]) -> (u64, u64) {
+fn prefix_bloom_hashes(key: &[u8]) -> BloomHashPair {
     hashes_with_seed(key, PREFIX_BLOOM_SEED)
 }
 
-fn hashes_with_seed(key: &[u8], seed: u64) -> (u64, u64) {
+fn hashes_with_seed(key: &[u8], seed: u64) -> BloomHashPair {
     let first = xxh3_64_with_seed(key, seed);
     let second = xxh3_64_with_seed(key, seed ^ 0x9e37_79b9_7f4a_7c15) | 1;
     (first, second)

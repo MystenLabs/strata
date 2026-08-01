@@ -43,7 +43,8 @@ pub use ids::{
 pub use key::{BlobKey, BlobKeyError};
 pub use lifecycle::{
     BlobLifecycle, BlobLifecycleAction, BlobLifecycleHead, BlobLifecycleMergeOp, BlobLifecycleOp,
-    BlobLifecycleState, BlobLifetimeHead, ShardLsnKey, ShardStoreStateKey, StoreStateKey,
+    BlobLifecycleState, BlobLifetimeHead, ShardLsnKey, ShardStoreStateKey, StoreCheckpoint,
+    StoreStateKey, WalPosition,
 };
 pub use put::PutEntry;
 pub use put::{PutHead, PutMergeOp, PutOp, PutState};

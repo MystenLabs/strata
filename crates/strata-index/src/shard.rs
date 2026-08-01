@@ -43,10 +43,10 @@ impl StrataIndex {
         batch: &mut DBBatch,
         shard: ShardKey,
     ) -> Result<()> {
-        // Keep a small Deleted state tombstone after removing the shard generation's files. Lazy
-        // blob-LSM compaction uses the owner on that row to distinguish bulk-reclaimed records from
-        // records in mixed ingest segments, and the garbage sweeper uses Deleted to discard any
-        // terminal event that raced with whole-file cleanup.
+        // Keep a small Deleted state tombstone after removing the shard generation's files.
+        // Snapshot-driven blob-LSM compaction uses the owner on that row to distinguish
+        // bulk-reclaimed records from records in mixed ingest segments, and the garbage sweeper
+        // uses Deleted to discard any terminal event that raced with whole-file cleanup.
         let mut segment_states = self
             .segment_states
             .safe_iter()?

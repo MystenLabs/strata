@@ -9,7 +9,7 @@ use std::{
 
 use strata_core::{BlobKey, RecordRef, SegmentId, ShardKey, StrataLsn};
 use strata_lsm::{
-    GarbageRecord, Lsm, LsmScan, MergeOperator, Mutation, Replace, StoredValue, WriteBatchResult,
+    GarbageRecord, Lsm, LsmIter, MergeOperator, Mutation, Replace, StoredValue, WriteBatchResult,
     decode_value,
 };
 
@@ -45,7 +45,7 @@ pub struct RelocationMerge {
 }
 
 pub struct RelocationScan {
-    scan: LsmScan,
+    iter: LsmIter,
     current: Option<RelocationEntry>,
 }
 
@@ -70,14 +70,20 @@ impl RelocationStore {
     ) -> Result<WriteBatchResult> {
         let mutations = entries
             .iter()
-            .map(|entry| Mutation::PutPrefix {
-                partition,
-                key_prefix: entry.key.as_bytes().to_vec(),
-                key_suffix: encode_suffix(entry.shard, entry.payload_lsn).to_vec(),
-                value: encode_value(entry.publish_lsn, entry.to).to_vec(),
-            })
+            .map(|entry| (entry.publish_lsn, Self::lsm_mutation(partition, entry)))
             .collect();
         Ok(self.lsm.write_batch(mutations)?)
+    }
+
+    /// Encodes the keyed projection stored in the relocation LSM. The store WAL calls this during
+    /// recovery so live writes and replay cannot drift into two formats.
+    pub fn lsm_mutation(partition: u32, entry: &RelocationEntry) -> Mutation {
+        Mutation::PutPrefix {
+            partition,
+            key_prefix: entry.key.as_bytes().to_vec(),
+            key_suffix: encode_suffix(entry.shard, entry.payload_lsn).to_vec(),
+            value: encode_value(entry.publish_lsn, entry.to).to_vec(),
+        }
     }
 
     pub fn lookup(
@@ -125,7 +131,7 @@ impl RelocationStore {
         };
         RelocationScan::new(
             self.lsm
-                .scan(partition, Some(first_key), end.as_deref(), max_lsn)?,
+                .iter(partition, Some(first_key), end.as_deref(), max_lsn)?,
         )
     }
 
@@ -205,9 +211,9 @@ impl MergeOperator for RelocationMerge {
 }
 
 impl RelocationScan {
-    fn new(scan: LsmScan) -> Result<Self> {
+    fn new(iter: LsmIter) -> Result<Self> {
         let mut scan = Self {
-            scan,
+            iter,
             current: None,
         };
         scan.advance()?;
@@ -219,7 +225,7 @@ impl RelocationScan {
     }
 
     pub fn advance(&mut self) -> Result<()> {
-        self.current = match self.scan.next(&Replace)? {
+        self.current = match self.iter.next(&Replace)? {
             Some((key, value)) => {
                 let (key, shard, payload_lsn) = decode_key(&key)?;
                 let StoredValue::Inline(value) = decode_value(&value)? else {

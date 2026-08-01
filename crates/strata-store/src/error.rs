@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use strata_core::{
-    BlobKey, Epoch, SegmentFileState, SegmentId, ShardGeneration, ShardId, ShardState,
+    BlobKey, Epoch, SegmentFileState, SegmentId, ShardGeneration, ShardId, ShardState, StrataLsn,
 };
 
 /// Result type used by `strata-store`.
@@ -40,6 +40,35 @@ pub enum Error {
 
     #[error("LSM error: {0}")]
     Lsm(#[from] strata_lsm::Error),
+
+    #[error("file sync queue is closed")]
+    FileSyncQueueClosed,
+
+    #[error("store WAL sync failed: {0}")]
+    WalSyncFailed(String),
+
+    #[error("invalid store WAL: {0}")]
+    InvalidWal(String),
+
+    #[error("corrupt store WAL at {path}: {reason}")]
+    CorruptWal { path: PathBuf, reason: String },
+
+    #[error(
+        "store WAL append rollback failed for {path} at offset {offset} after write error: {write_error}; rollback error: {rollback_error}"
+    )]
+    WalAppendRollbackFailed {
+        path: PathBuf,
+        offset: u64,
+        write_error: std::io::Error,
+        #[source]
+        rollback_error: std::io::Error,
+    },
+
+    #[error("store WAL LSNs must increase: previous {previous:?}, next {next:?}")]
+    WalLsnOutOfOrder {
+        previous: StrataLsn,
+        next: StrataLsn,
+    },
 
     #[error("relocation error: {0}")]
     Relocation(#[from] strata_relocation::Error),

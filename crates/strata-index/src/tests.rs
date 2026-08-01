@@ -4,7 +4,8 @@ use strata_core::{
     PlacementClass, SegmentFileState, SegmentGcSummary, SegmentOwner, ShardCleanupJob,
     ShardCleanupState, ShardInfo, ShardKey, ShardState,
 };
-use strata_lsm::{LsmCheckpoint, Manifest, ManifestEdit, TableMeta, WalPosition};
+use strata_core::{StoreCheckpoint, WalPosition};
+use strata_lsm::{Manifest, ManifestEdit, TableMeta};
 use tempfile::tempdir;
 use typed_store::rocks::open_cf;
 
@@ -245,15 +246,15 @@ async fn segment_state_and_publication_lsn_round_trip() {
 }
 
 #[tokio::test]
-async fn store_frontiers_and_lsm_checkpoint_round_trip() {
+async fn store_frontiers_and_checkpoint_round_trip() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     assert_eq!(index.get_next_lsn().unwrap(), 1);
     assert_eq!(index.get_published_lsn().unwrap(), 0);
+    assert_eq!(index.get_store_wal_retained_from().unwrap(), None);
 
-    let checkpoint = LsmCheckpoint {
-        durable_lsn: Some(41),
+    let checkpoint = StoreCheckpoint {
         wal_position: WalPosition {
             log_id: 3,
             offset: 8192,
@@ -265,13 +266,17 @@ async fn store_frontiers_and_lsm_checkpoint_round_trip() {
     index.put_next_lsn_batch(&mut batch, 42).unwrap();
     index.put_published_lsn_batch(&mut batch, 41).unwrap();
     index
-        .put_lsm_checkpoint_batch(&mut batch, checkpoint)
+        .put_store_wal_retained_from_batch(&mut batch, 3)
+        .unwrap();
+    index
+        .put_store_checkpoint_batch(&mut batch, checkpoint)
         .unwrap();
     batch.write().unwrap();
 
     assert_eq!(index.get_next_lsn().unwrap(), 42);
     assert_eq!(index.get_published_lsn().unwrap(), 41);
-    assert_eq!(index.get_lsm_checkpoint().unwrap(), Some(checkpoint));
+    assert_eq!(index.get_store_wal_retained_from().unwrap(), Some(3));
+    assert_eq!(index.get_store_checkpoint().unwrap(), Some(checkpoint));
 }
 
 #[tokio::test]

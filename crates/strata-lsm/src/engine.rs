@@ -3,30 +3,18 @@ use std::{
     fs, mem,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, Mutex, MutexGuard,
-        mpsc::{self, Receiver},
-    },
+    sync::{Arc, Condvar, Mutex, MutexGuard},
 };
 
-use strata_core::{BlobKey, RecordRef, SegmentId, ShardKey, encoded_record_len};
-use strata_segment::{SegmentFactory, SegmentWriter};
+use strata_core::RecordRef;
 
 use crate::{
-    BlockCacheStats, DEFAULT_BLOCK_CACHE_BYTES, Error, FileSyncSender, FileSyncTask,
-    FrozenMemtable, LsmScan, Manifest, ManifestEdit, Memtable, MemtableRolloverPolicy,
-    MergeOperator, Result, Snapshot, StrataLsn, TableMeta, TableStore, Wal, WalEntry, WalPosition,
-    memtable::{ENTRY_HEADER_BYTES, PREFIX_ENTRY_HEADER_BYTES},
-    table::sync_parent,
+    BlockCacheStats, DEFAULT_BLOCK_CACHE_BYTES, Error, FrozenMemtable, LsmIter, Manifest,
+    ManifestEdit, Memtable, MemtableRolloverPolicy, MergeOperator, Result, Snapshot, StrataLsn,
+    TableMeta, TableStore, memtable::VERSION_BYTES, table::sync_parent,
 };
 
-const PIPELINE_DEPTH: u64 = 2;
 const RECORD_REF_BYTES: usize = 3 * mem::size_of::<u64>();
-const WAL_PUT_BLOB: u8 = 0;
-const WAL_PUT_BLOB_PREFIX: u8 = 1;
-const WAL_METADATA: u8 = 2;
-const WAL_PUT: u8 = 3;
-const WAL_PUT_PREFIX: u8 = 4;
 const VALUE_INLINE: u8 = 0;
 const VALUE_BLOB: u8 = 1;
 
@@ -52,15 +40,17 @@ impl Default for LsmOptions {
     }
 }
 
-/// Value bytes and segment metadata for one put.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentRecord {
-    pub key: BlobKey,
-    pub shard: ShardKey,
-    pub payload: Arc<[u8]>,
-}
-
-/// One logical write. Sequence numbers, segment references, and WAL bytes are assigned internally.
+/// One keyed LSM write at an LSN assigned by the caller.
+///
+/// The LSM deliberately knows nothing about the store WAL or payload segment. For example, a blob
+/// write follows this order at the store boundary:
+///
+/// 1. append the payload to the active segment and obtain its [`RecordRef`];
+/// 2. append `PutBlob { record_ref, .. }` to the store WAL at LSN 42;
+/// 3. call `lsm.write(42, mutation)` to make the key visible.
+///
+/// Epoch changes and shard drops never become `Mutation`s because they have no LSM key; the store
+/// WAL routes those directly to RocksDB.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {
     Put {
@@ -78,17 +68,15 @@ pub enum Mutation {
         partition: u32,
         key: Vec<u8>,
         metadata: Vec<u8>,
-        record: SegmentRecord,
+        record_ref: RecordRef,
     },
     PutBlobPrefix {
         partition: u32,
         key_prefix: Vec<u8>,
         key_suffix: Vec<u8>,
         metadata: Vec<u8>,
-        record: SegmentRecord,
+        record_ref: RecordRef,
     },
-    /// Ordered caller-defined metadata with no segment value or memtable row.
-    Metadata { payload: Vec<u8> },
 }
 
 /// Memtable generation made immutable by one write.
@@ -98,42 +86,18 @@ pub struct RolledMemtable {
     pub generation: u64,
 }
 
-/// Segment replaced independently from WAL rollover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RolledSegment {
-    pub sealed_segment_id: u64,
-    pub sealed_length: u64,
-    pub active_segment_id: u64,
-    pub sealed_before_lsn: StrataLsn,
-}
-
-/// Exact segment and WAL prefix covered by one completed durability barrier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LsmCheckpoint {
-    pub durable_lsn: Option<StrataLsn>,
-    pub wal_position: WalPosition,
-    pub active_segment_id: SegmentId,
-    pub active_segment_offset: u64,
-}
-
 /// Result of one visible logical write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteResult {
     pub lsn: StrataLsn,
-    pub record_ref: Option<RecordRef>,
-    pub wal_position: WalPosition,
     pub rolled_memtable: Option<RolledMemtable>,
-    pub rolled_segment: Option<RolledSegment>,
 }
 
 /// Result of one ordered logical batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteBatchResult {
     pub lsns: Vec<StrataLsn>,
-    pub record_refs: Vec<Option<RecordRef>>,
-    pub wal_position: WalPosition,
     pub rolled_memtables: Vec<RolledMemtable>,
-    pub rolled_segment: Option<RolledSegment>,
 }
 
 struct PartitionState {
@@ -145,48 +109,29 @@ struct MemoryState {
     manifest: Arc<Manifest>,
     snapshot: Arc<Snapshot>,
     partitions: BTreeMap<u32, PartitionState>,
-    next_ticket: u64,
     last_visible_lsn: Option<StrataLsn>,
 }
 
-struct AppendState {
-    segment: SegmentWriter,
-    segment_factory: SegmentFactory,
-    wal: Wal,
-    file_sync_tx: FileSyncSender,
+struct WriteState {
     partition_count: u32,
     memtable_capacity: usize,
     last_lsn: Option<StrataLsn>,
-    durable_lsn: Option<StrataLsn>,
-    next_ticket: u64,
-    pending_segment_syncs: Vec<Receiver<Result<()>>>,
 }
 
 struct PendingBatch {
-    ticket: u64,
     mutations: Vec<Mutation>,
     lsns: Vec<StrataLsn>,
-    record_refs: Vec<Option<RecordRef>>,
-    wal_position: WalPosition,
-    rolled_segment: Option<RolledSegment>,
 }
 
-struct PreparedAppend {
-    lsns: Vec<StrataLsn>,
-    segment_bytes: u64,
-}
-
-/// Owning write façade over the active segment, WAL, memtables, and immutable tables.
+/// An unlogged LSM: memtables, immutable tables, and merge/compaction machinery.
 ///
-/// `from_parts` expects one coherent recovered segment, segment factory, WAL, manifest, and last
-/// lsn, then rebuilds the mutable view from WAL entries newer than its immutable patch tables.
+/// The caller owns sequencing and recovery. `from_parts` accepts decoded store-WAL mutations that
+/// are newer than the durable tables; normal writes use the same caller-assigned LSN API.
 pub struct Lsm {
     tables: Arc<TableStore>,
-    append: Mutex<AppendState>,
+    writes: Mutex<WriteState>,
     memory: Mutex<MemoryState>,
     memory_changed: Condvar,
-    visible_ticket: Mutex<u64>,
-    append_changed: Condvar,
     max_frozen_generations: usize,
     halted: Mutex<Option<String>>,
     flush_lock: Mutex<()>,
@@ -196,9 +141,7 @@ impl Lsm {
     pub fn from_parts(
         table_root: impl Into<PathBuf>,
         manifest: Arc<Manifest>,
-        segment: SegmentWriter,
-        segment_factory: SegmentFactory,
-        wal: Wal,
+        recovered: Vec<(StrataLsn, Mutation)>,
         last_lsn: Option<StrataLsn>,
         options: LsmOptions,
     ) -> Result<Self> {
@@ -237,12 +180,6 @@ impl Lsm {
             });
         }
         let last_lsn = last_lsn.or(manifest_lsn);
-        if wal.last_lsn() != last_lsn {
-            return Err(Error::InvalidWal(format!(
-                "WAL ends at {:?}, recovered store ends at {last_lsn:?}",
-                wal.last_lsn()
-            )));
-        }
         let tables = Arc::new(TableStore::with_block_cache_capacity(
             table_root,
             options.block_cache_capacity_bytes,
@@ -273,133 +210,96 @@ impl Lsm {
                 )
             })
             .collect();
-        replay_wal(
-            &wal,
+        replay_mutations(
+            recovered,
             manifest.materialized_through,
             &materialized_through,
             &mut partitions,
         )?;
-        let file_sync_tx = wal.file_sync_sender();
 
         Ok(Self {
             tables,
-            append: Mutex::new(AppendState {
-                segment,
-                segment_factory,
-                wal,
-                file_sync_tx,
+            writes: Mutex::new(WriteState {
                 partition_count: manifest.partition_count,
                 memtable_capacity: options.memtable_capacity,
                 last_lsn,
-                durable_lsn: last_lsn,
-                next_ticket: 0,
-                pending_segment_syncs: Vec::new(),
             }),
             memory: Mutex::new(MemoryState {
                 manifest,
                 snapshot,
                 partitions,
-                next_ticket: 0,
                 last_visible_lsn: last_lsn,
             }),
             memory_changed: Condvar::new(),
-            visible_ticket: Mutex::new(0),
-            append_changed: Condvar::new(),
             max_frozen_generations: options.max_frozen_generations.get(),
             halted: Mutex::new(None),
             flush_lock: Mutex::new(()),
         })
     }
 
-    /// Appends one operation to the ordered segment/WAL lane, then the ordered memtable lane.
-    pub fn write(&self, mutation: Mutation) -> Result<WriteResult> {
-        let result = self.write_batch(vec![mutation])?;
+    /// Applies one caller-sequenced mutation to the memtable.
+    pub fn write(&self, lsn: StrataLsn, mutation: Mutation) -> Result<WriteResult> {
+        let result = self.write_batch(vec![(lsn, mutation)])?;
         Ok(WriteResult {
             lsn: result.lsns[0],
-            record_ref: result.record_refs[0],
-            wal_position: result.wal_position,
             rolled_memtable: result.rolled_memtables.into_iter().next(),
-            rolled_segment: result.rolled_segment,
         })
     }
 
-    /// Stores a value directly in the WAL, memtable, and SSTs.
-    pub fn put(&self, partition: u32, key: Vec<u8>, value: Vec<u8>) -> Result<WriteResult> {
-        self.write(Mutation::Put {
-            partition,
-            key,
-            value,
-        })
-    }
-
-    /// Stores payload bytes in the segment and its reference in the LSM tree.
-    pub fn put_blob(
+    /// Stores a value in the memtable at a caller-assigned LSN.
+    pub fn put(
         &self,
+        lsn: StrataLsn,
         partition: u32,
         key: Vec<u8>,
-        record: SegmentRecord,
+        value: Vec<u8>,
     ) -> Result<WriteResult> {
-        self.write(Mutation::PutBlob {
-            partition,
-            key,
-            metadata: Vec::new(),
-            record,
-        })
+        self.write(
+            lsn,
+            Mutation::Put {
+                partition,
+                key,
+                value,
+            },
+        )
+    }
+
+    /// Stores a caller-created payload reference in the memtable.
+    pub fn put_blob(
+        &self,
+        lsn: StrataLsn,
+        partition: u32,
+        key: Vec<u8>,
+        record_ref: RecordRef,
+    ) -> Result<WriteResult> {
+        self.write(
+            lsn,
+            Mutation::PutBlob {
+                partition,
+                key,
+                metadata: Vec::new(),
+                record_ref,
+            },
+        )
     }
 
     /// Applies one batch atomically to the visible memtable view.
     ///
-    /// Concurrent callers pipeline segment/WAL work for the next batch with memtable work for the
-    /// previous batch. Both stages remain FIFO.
-    pub fn write_batch(&self, mutations: Vec<Mutation>) -> Result<WriteBatchResult> {
-        if mutations.is_empty() {
+    /// LSNs must be strictly increasing but need not be contiguous. Gaps represent store mutations
+    /// routed elsewhere. For example, `[10, 13]` is valid when LSNs 11 and 12 are RocksDB-only.
+    pub fn write_batch(&self, writes: Vec<(StrataLsn, Mutation)>) -> Result<WriteBatchResult> {
+        if writes.is_empty() {
             self.check_running()?;
             return Ok(WriteBatchResult {
                 lsns: Vec::new(),
-                record_refs: Vec::new(),
-                wal_position: lock(&self.append).wal.position(),
                 rolled_memtables: Vec::new(),
-                rolled_segment: None,
             });
         }
 
         let pending = {
-            let mut append = lock(&self.append);
+            let mut state = lock(&self.writes);
             self.check_running()?;
-
-            let mut visible_ticket = lock(&self.visible_ticket);
-            while append.next_ticket.saturating_sub(*visible_ticket) >= PIPELINE_DEPTH {
-                self.check_running()?;
-                visible_ticket = wait(&self.append_changed, visible_ticket);
-            }
-            drop(visible_ticket);
-
-            let prepared = prepare_batch(&append, &mutations)?;
-            if prepared.segment_bytes > append.segment.max_size() {
-                return Err(strata_segment::Error::SegmentFull {
-                    max_size: append.segment.max_size(),
-                    attempted_size: prepared.segment_bytes,
-                }
-                .into());
-            }
-            let rolled_segment = match ensure_segment_capacity(
-                &mut append,
-                prepared.segment_bytes,
-                prepared.lsns[0],
-            ) {
-                Ok(rolled) => rolled,
-                Err(error) => {
-                    self.halt(format!("segment rollover failed: {error}"));
-                    return Err(error);
-                }
-            };
-            match append_batch(&mut append, mutations, prepared.lsns, rolled_segment) {
-                Ok(batch) => batch,
-                Err(error) => {
-                    self.halt(format!("segment/WAL append failed: {error}"));
-                    return Err(error);
-                }
-            }
+            prepare_batch(&mut state, writes)?
         };
         self.apply_pending_batch(pending)
     }
@@ -451,104 +351,49 @@ impl Lsm {
         merge.merge(key, base.as_deref(), &patch_refs, &mut discard_event)
     }
 
-    /// Captures a pinned, sorted partition scan over `[start, end)`.
-    pub fn scan(
+    /// Captures a pinned, sorted iterator over `[start, end)` of one partition.
+    ///
+    /// The iterator must be created here rather than on [`Snapshot`] because a snapshot holds
+    /// only flushed SSTs: rows at or below `max_lsn` that still live in the memtables are
+    /// captured under the memory lock, atomically with the snapshot reference.
+    pub fn iter(
         &self,
         partition: u32,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         max_lsn: StrataLsn,
-    ) -> Result<LsmScan> {
+    ) -> Result<LsmIter> {
         self.check_running()?;
-        let (snapshot, mut memory) = {
+        let (snapshot, frozen, active) = {
             let state = lock(&self.memory);
             let partition_state = state.partition(partition)?;
             let in_range = |key: &[u8]| {
                 start.is_none_or(|start| key >= start) && end.is_none_or(|end| key < end)
             };
-            let mut memory = Vec::new();
-            for entry in partition_state
+            // Frozen generations are immutable, so the iterator pins them and reads their rows
+            // in place. Only the still-mutable active memtable is copied, and only its visible
+            // in-range rows, which also keeps this lock hold short.
+            let frozen = partition_state
                 .frozen
                 .iter()
-                .flat_map(|memtable| memtable.entries())
-                .chain(partition_state.active.entries())
-            {
+                .map(Arc::clone)
+                .collect::<Vec<_>>();
+            let mut active = Vec::new();
+            for entry in partition_state.active.entries() {
                 if entry.lsn <= max_lsn && in_range(entry.key) {
-                    memory.push((entry.key.to_vec(), entry.lsn, entry.value.to_vec()));
+                    active.push((entry.key.to_vec(), entry.lsn, entry.value.to_vec()));
                 }
             }
-            (Arc::clone(&state.snapshot), memory)
+            (Arc::clone(&state.snapshot), frozen, active)
         };
-        memory.sort_unstable_by(|left, right| {
-            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
-        });
-        LsmScan::new(
-            snapshot,
-            &self.tables,
-            partition,
-            start,
-            end,
-            memory,
-            max_lsn,
-        )
+        LsmIter::new(snapshot, partition, start, end, frozen, active, max_lsn)
     }
 
-    /// Syncs every segment and WAL append accepted before this call.
-    ///
-    /// Segment and WAL file syncs are queued together. The durable lsn advances only after both
-    /// complete and the matching memtable batch is visible.
-    pub fn sync(&self) -> Result<LsmCheckpoint> {
-        let result = (|| {
-            let mut append = lock(&self.append);
-            self.check_running()?;
-            let target_lsn = append.last_lsn;
-            let target_ticket = append.next_ticket;
-            let active_sync = queue_segment_sync(&append)?;
-            let wal_position = append.wal.sync()?;
-            let mut segment_syncs = mem::take(&mut append.pending_segment_syncs);
-            segment_syncs.push(active_sync);
-
-            for sync in segment_syncs {
-                sync.recv().map_err(|_| Error::FileSyncQueueClosed)??;
-            }
-            append.wal.wait_for_sync(wal_position)?;
-            self.wait_until_visible(target_ticket)?;
-            append.durable_lsn = target_lsn;
-            Ok(LsmCheckpoint {
-                durable_lsn: target_lsn,
-                wal_position,
-                active_segment_id: append.segment.segment_id(),
-                active_segment_offset: append.segment.write_offset(),
-            })
-        })();
-
-        if let Err(error) = &result {
-            self.halt(format!("durability barrier failed: {error}"));
-        }
-        result
-    }
-
-    /// Queues the active segment for sync and immediately installs a fresh one.
-    pub fn roll_segment(&self) -> Result<RolledSegment> {
-        let mut append = lock(&self.append);
+    /// Last caller-assigned LSN applied to this LSM. This is a visibility value, not a durability
+    /// frontier; durability belongs to the store WAL.
+    pub fn last_lsn(&self) -> Result<Option<StrataLsn>> {
         self.check_running()?;
-        let sealed_before_lsn = next_lsn(&append)?;
-        roll_segment(&mut append, sealed_before_lsn)
-    }
-
-    pub fn wal_position(&self) -> Result<WalPosition> {
-        self.check_running()?;
-        Ok(lock(&self.append).wal.position())
-    }
-
-    pub fn committed_wal_position(&self) -> Result<WalPosition> {
-        self.check_running()?;
-        lock(&self.append).wal.committed_position()
-    }
-
-    pub fn durable_lsn(&self) -> Result<Option<StrataLsn>> {
-        self.check_running()?;
-        Ok(lock(&self.append).durable_lsn)
+        Ok(lock(&self.writes).last_lsn)
     }
 
     pub fn manifest(&self) -> Arc<Manifest> {
@@ -598,7 +443,7 @@ impl Lsm {
     }
 
     /// Flushes the oldest frozen generation and asks the caller to durably publish its manifest
-    /// edit. A successful callback may make complete rolled WAL files immediately reclaimable.
+    /// edit. Store-WAL reclamation is deliberately outside this method.
     pub fn flush_one(
         &self,
         partition: u32,
@@ -626,21 +471,12 @@ impl Lsm {
             partition,
             &manifest.patch_format_id,
         )?;
-        let (materialized_through, wal_retained_from) = {
-            let append = lock(&self.append);
-            let materialized = next_materialized_frontier(&append.wal, &manifest, Some(&meta))?;
-            let retained_from = match materialized {
-                Some(materialized) => append.wal.retained_from_after(materialized)?,
-                None => manifest.wal_retained_from,
-            };
-            (materialized, retained_from)
-        };
         let edit = ManifestEdit {
             remove: Vec::new(),
             add_base: Vec::new(),
             add_patches: vec![meta.clone()],
-            materialized_through,
-            wal_retained_from: Some(wal_retained_from),
+            materialized_through: None,
+            wal_retained_from: None,
         };
         let published = publish(&edit)?;
         published.validate()?;
@@ -656,21 +492,6 @@ impl Lsm {
                     "published manifest does not contain flushed SST {}",
                     meta.relative_path
                 ),
-            });
-        }
-        if edit.materialized_through.is_some_and(|frontier| {
-            published
-                .materialized_through
-                .is_none_or(|published| published < frontier)
-        }) {
-            return Err(Error::InvalidManifest {
-                reason: "published manifest did not advance its materialized WAL frontier"
-                    .to_owned(),
-            });
-        }
-        if published.wal_retained_from < wal_retained_from {
-            return Err(Error::InvalidManifest {
-                reason: "published manifest did not advance its retained WAL file".to_owned(),
             });
         }
         let published = Arc::new(published);
@@ -696,47 +517,55 @@ impl Lsm {
         state.manifest = published;
         state.snapshot = snapshot;
         self.memory_changed.notify_all();
-        let materialized_through = state.manifest.materialized_through;
-        drop(state);
-        if let Some(materialized) = materialized_through {
-            lock(&self.append).wal.reclaim_through(materialized)?;
-        }
         Ok(Some(meta))
     }
 
-    /// Publishes a WAL frontier when the next unmaterialized entries are metadata-only.
-    pub fn materialize_metadata(
+    /// Advances the store-wide materialized frontier without inventing LSM metadata rows.
+    ///
+    /// The requested frontier is capped immediately before the first mutation still held only in a
+    /// memtable. Example: if the store has committed through LSN 20 and the oldest unflushed LSM
+    /// row is LSN 17, this publishes at most 16. RocksDB-only LSNs in that range need no SST row.
+    pub fn materialize_through(
         &self,
+        requested: StrataLsn,
         publish: impl FnOnce(&ManifestEdit) -> Result<Manifest>,
     ) -> Result<Option<StrataLsn>> {
         let _flush = lock(&self.flush_lock);
         self.check_running()?;
-        let (manifest, max_lsn) = {
+        let (manifest, max_lsn, first_unflushed) = {
             let state = lock(&self.memory);
             (
                 Arc::clone(&state.manifest),
                 state.last_visible_lsn.unwrap_or_default(),
+                state
+                    .partitions
+                    .values()
+                    .flat_map(|partition| {
+                        partition
+                            .frozen
+                            .iter()
+                            .flat_map(|memtable| memtable.entries())
+                            .chain(partition.active.entries())
+                    })
+                    .map(|entry| entry.lsn)
+                    .min(),
             )
         };
-        let (materialized_through, wal_retained_from) = {
-            let append = lock(&self.append);
-            let materialized = next_materialized_frontier(&append.wal, &manifest, None)?;
-            if materialized <= manifest.materialized_through {
-                return Ok(None);
-            }
-            (
-                materialized.expect("materialized frontier advanced"),
-                append
-                    .wal
-                    .retained_from_after(materialized.expect("frontier is present"))?,
-            )
-        };
+        let materialized_through = first_unflushed
+            .map(|lsn| requested.min(lsn.saturating_sub(1)))
+            .unwrap_or(requested);
+        if manifest
+            .materialized_through
+            .is_some_and(|published| published >= materialized_through)
+        {
+            return Ok(None);
+        }
         let edit = ManifestEdit {
             remove: Vec::new(),
             add_base: Vec::new(),
             add_patches: Vec::new(),
             materialized_through: Some(materialized_through),
-            wal_retained_from: Some(wal_retained_from),
+            wal_retained_from: None,
         };
         let published = publish(&edit)?;
         published.validate()?;
@@ -745,12 +574,7 @@ impl Lsm {
             .is_none_or(|frontier| frontier < materialized_through)
         {
             return Err(Error::InvalidManifest {
-                reason: "published manifest did not advance its metadata WAL frontier".to_owned(),
-            });
-        }
-        if published.wal_retained_from < wal_retained_from {
-            return Err(Error::InvalidManifest {
-                reason: "published manifest did not advance its retained WAL file".to_owned(),
+                reason: "published manifest did not advance its materialized frontier".to_owned(),
             });
         }
 
@@ -764,10 +588,6 @@ impl Lsm {
         self.check_running()?;
         state.manifest = published;
         state.snapshot = snapshot;
-        drop(state);
-        lock(&self.append)
-            .wal
-            .reclaim_through(materialized_through)?;
         Ok(Some(materialized_through))
     }
 
@@ -789,94 +609,87 @@ impl Lsm {
     }
 
     fn apply_pending_batch(&self, pending: PendingBatch) -> Result<WriteBatchResult> {
-        let PendingBatch {
-            ticket,
-            mutations,
-            lsns,
-            record_refs,
-            wal_position,
-            rolled_segment,
-        } = pending;
+        let PendingBatch { mutations, lsns } = pending;
         let result = (|| {
             let mut state = lock(&self.memory);
-            while state.next_ticket != ticket {
-                self.check_running()?;
-                state = wait(&self.memory_changed, state);
-            }
             self.check_running()?;
 
             let mut rolled = Vec::new();
-            for (index, mutation) in mutations.iter().enumerate() {
+            for (index, mutation) in mutations.into_iter().enumerate() {
                 let lsn = lsns[index];
                 match mutation {
                     Mutation::Put {
                         partition,
-                        key,
+                        mut key,
                         value,
                     } => {
-                        let value = encode_inline_value(value);
-                        state = self.insert_memtable(state, *partition, &mut rolled, |active| {
-                            active.insert_active(key, lsn, &value)
+                        let mut value = encode_inline_value_owned(value);
+                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
+                            active.insert_active_owned(&mut key, lsn, &mut value)
                         })?;
                     }
                     Mutation::PutPrefix {
                         partition,
-                        key_prefix,
+                        mut key_prefix,
                         key_suffix,
                         value,
                     } => {
-                        let value = encode_inline_value(value);
-                        state = self.insert_memtable(state, *partition, &mut rolled, |active| {
-                            active.insert_prefix_active(key_prefix, key_suffix, lsn, &value)
+                        let key_prefix_len = key_prefix.len();
+                        key_prefix.reserve(key_suffix.len());
+                        key_prefix.extend_from_slice(&key_suffix);
+                        let mut value = encode_inline_value_owned(value);
+                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
+                            active.insert_prefix_active_owned(
+                                &mut key_prefix,
+                                key_prefix_len,
+                                lsn,
+                                &mut value,
+                            )
                         })?;
                     }
                     Mutation::PutBlob {
                         partition,
-                        key,
+                        mut key,
                         metadata,
-                        ..
+                        record_ref,
                     } => {
-                        let value = encode_blob_value(
-                            metadata,
-                            record_refs[index].expect("put has a segment record reference"),
-                        );
-                        state = self.insert_memtable(state, *partition, &mut rolled, |active| {
-                            active.insert_active(key, lsn, &value)
+                        let mut value = encode_blob_value_owned(metadata, record_ref);
+                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
+                            active.insert_active_owned(&mut key, lsn, &mut value)
                         })?;
                     }
                     Mutation::PutBlobPrefix {
                         partition,
-                        key_prefix,
+                        mut key_prefix,
                         key_suffix,
                         metadata,
-                        ..
+                        record_ref,
                     } => {
-                        let record_ref =
-                            record_refs[index].expect("prefix put has a segment record reference");
-                        let value = encode_blob_value(metadata, record_ref);
-                        state = self.insert_memtable(state, *partition, &mut rolled, |active| {
-                            active.insert_prefix_active(key_prefix, key_suffix, lsn, &value)
+                        let key_prefix_len = key_prefix.len();
+                        key_prefix.reserve(key_suffix.len());
+                        key_prefix.extend_from_slice(&key_suffix);
+                        let mut value = encode_blob_value_owned(metadata, record_ref);
+                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
+                            active.insert_prefix_active_owned(
+                                &mut key_prefix,
+                                key_prefix_len,
+                                lsn,
+                                &mut value,
+                            )
                         })?;
                     }
-                    Mutation::Metadata { .. } => {}
                 }
             }
             state.last_visible_lsn = lsns.last().copied();
-            state.next_ticket = state.next_ticket.checked_add(1).ok_or(Error::LsnOverflow)?;
-            *lock(&self.visible_ticket) = state.next_ticket;
             self.memory_changed.notify_all();
-            self.append_changed.notify_all();
             Ok(WriteBatchResult {
                 lsns,
-                record_refs,
-                wal_position,
                 rolled_memtables: rolled,
-                rolled_segment,
             })
         })();
 
         if let Err(error) = &result {
-            self.halt(format!("memtable apply failed after WAL append: {error}"));
+            self.halt(format!("memtable apply failed: {error}"));
         }
         result
     }
@@ -926,16 +739,6 @@ impl Lsm {
             }
         }
     }
-
-    fn wait_until_visible(&self, target_ticket: u64) -> Result<()> {
-        let mut state = lock(&self.memory);
-        while state.next_ticket < target_ticket {
-            self.check_running()?;
-            state = wait(&self.memory_changed, state);
-        }
-        self.check_running()
-    }
-
     fn check_running(&self) -> Result<()> {
         match &*lock(&self.halted) {
             Some(reason) => Err(Error::LsmHalted {
@@ -947,10 +750,8 @@ impl Lsm {
 
     /// Stops writes and wakes callers blocked on pipeline or memtable backpressure.
     pub fn halt(&self, reason: String) {
-        let _visible_ticket = lock(&self.visible_ticket);
         lock(&self.halted).get_or_insert(reason);
         self.memory_changed.notify_all();
-        self.append_changed.notify_all();
     }
 }
 
@@ -992,175 +793,87 @@ fn roll_active(partition: u32, state: &mut PartitionState) -> Result<RolledMemta
     Ok(rolled)
 }
 
-fn next_materialized_frontier(
-    wal: &Wal,
-    manifest: &Manifest,
-    flushed: Option<&TableMeta>,
-) -> Result<Option<StrataLsn>> {
-    let mut covered = manifest
-        .partitions
-        .iter()
-        .map(|(&partition, tables)| {
-            (
-                partition,
-                tables
-                    .patches
-                    .iter()
-                    .filter_map(|table| table.max_lsn)
-                    .max(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    if let Some(flushed) = flushed {
-        let flushed_lsn = flushed.max_lsn.ok_or_else(|| {
-            Error::InvalidTable(format!(
-                "flushed patch SST {} has no maximum lsn",
-                flushed.relative_path
-            ))
-        })?;
-        covered
-            .entry(flushed.partition)
-            .and_modify(|lsn| *lsn = Some(lsn.map_or(flushed_lsn, |old| old.max(flushed_lsn))))
-            .or_insert(Some(flushed_lsn));
-    }
-
-    let mut frontier = manifest.materialized_through;
-    let mut blocked = false;
-    wal.replay(|entry| {
-        let partition = wal_entry_partition(entry)?;
-        if frontier.is_some_and(|frontier| entry.lsn <= frontier) || blocked {
-            return Ok(());
-        }
-        let materialized = partition.is_none_or(|partition| {
-            covered
-                .get(&partition)
-                .copied()
-                .flatten()
-                .is_some_and(|lsn| entry.lsn <= lsn)
-        });
-        if materialized {
-            frontier = Some(entry.lsn);
-        } else {
-            blocked = true;
-        }
-        Ok(())
-    })?;
-    Ok(frontier)
-}
-
-fn wal_entry_partition(entry: &WalEntry) -> Result<Option<u32>> {
-    let Some((&kind, payload)) = entry.payload.split_first() else {
-        return Err(Error::InvalidWal("empty mutation payload".to_owned()));
-    };
-    match kind {
-        WAL_PUT | WAL_PUT_PREFIX | WAL_PUT_BLOB | WAL_PUT_BLOB_PREFIX => {
-            Ok(Some(WalDecoder::new(payload).u32()?))
-        }
-        WAL_METADATA => Ok(None),
-        other => Err(Error::InvalidWal(format!(
-            "unknown mutation payload kind {other}"
-        ))),
-    }
-}
-
-fn replay_wal(
-    wal: &Wal,
+fn replay_mutations(
+    mutations: Vec<(StrataLsn, Mutation)>,
     manifest_frontier: Option<StrataLsn>,
     materialized_through: &BTreeMap<u32, Option<StrataLsn>>,
     partitions: &mut BTreeMap<u32, PartitionState>,
 ) -> Result<()> {
-    wal.replay(|entry| {
-        let Some((&kind, payload)) = entry.payload.split_first() else {
-            return Err(Error::InvalidWal("empty mutation payload".to_owned()));
-        };
-        let mut decoder = WalDecoder::new(payload);
-        match kind {
-            WAL_PUT => {
-                let partition = decoder.u32()?;
-                let key_len = decoder.u32()? as usize;
-                let value_len = decoder.u32()? as usize;
-                let key = decoder.take(key_len)?;
-                let value = encode_inline_value(decoder.take(value_len)?);
-                decoder.finish()?;
-                if is_materialized(
-                    manifest_frontier,
-                    materialized_through,
-                    partition,
-                    entry.lsn,
-                ) {
-                    return Ok(());
+    for (lsn, mutation) in mutations {
+        match mutation {
+            Mutation::Put {
+                partition,
+                key,
+                value,
+            } => {
+                if is_materialized(manifest_frontier, materialized_through, partition, lsn) {
+                    continue;
                 }
-                replay_plain(partitions, partition, key, entry.lsn, &value)
-            }
-            WAL_PUT_PREFIX => {
-                let partition = decoder.u32()?;
-                let key_prefix_len = decoder.u32()? as usize;
-                let key_suffix_len = decoder.u32()? as usize;
-                let value_len = decoder.u32()? as usize;
-                let key_prefix = decoder.take(key_prefix_len)?;
-                let key_suffix = decoder.take(key_suffix_len)?;
-                let value = encode_inline_value(decoder.take(value_len)?);
-                decoder.finish()?;
-                if is_materialized(
-                    manifest_frontier,
-                    materialized_through,
+                replay_plain(
+                    partitions,
                     partition,
-                    entry.lsn,
-                ) {
-                    return Ok(());
+                    &key,
+                    lsn,
+                    &encode_inline_value(&value),
+                )?;
+            }
+            Mutation::PutPrefix {
+                partition,
+                key_prefix,
+                key_suffix,
+                value,
+            } => {
+                if is_materialized(manifest_frontier, materialized_through, partition, lsn) {
+                    continue;
                 }
                 replay_prefix(
-                    partitions, partition, key_prefix, key_suffix, entry.lsn, &value,
-                )
-            }
-            WAL_PUT_BLOB => {
-                let partition = decoder.u32()?;
-                let key_len = decoder.u32()? as usize;
-                let metadata_len = decoder.u32()? as usize;
-                let key = decoder.take(key_len)?;
-                let metadata = decoder.take(metadata_len)?;
-                let value = encode_blob_value(metadata, decoder.record_ref()?);
-                decoder.finish()?;
-                if is_materialized(
-                    manifest_frontier,
-                    materialized_through,
+                    partitions,
                     partition,
-                    entry.lsn,
-                ) {
-                    return Ok(());
-                }
-                replay_plain(partitions, partition, key, entry.lsn, &value)
+                    &key_prefix,
+                    &key_suffix,
+                    lsn,
+                    &encode_inline_value(&value),
+                )?;
             }
-            WAL_PUT_BLOB_PREFIX => {
-                let partition = decoder.u32()?;
-                let key_prefix_len = decoder.u32()? as usize;
-                let key_suffix_len = decoder.u32()? as usize;
-                let metadata_len = decoder.u32()? as usize;
-                let key_prefix = decoder.take(key_prefix_len)?;
-                let key_suffix = decoder.take(key_suffix_len)?;
-                let metadata = decoder.take(metadata_len)?;
-                let record_ref = decoder.record_ref()?;
-                decoder.finish()?;
-                if is_materialized(
-                    manifest_frontier,
-                    materialized_through,
-                    partition,
-                    entry.lsn,
-                ) {
-                    return Ok(());
+            Mutation::PutBlob {
+                partition,
+                key,
+                metadata,
+                record_ref,
+            } => {
+                if is_materialized(manifest_frontier, materialized_through, partition, lsn) {
+                    continue;
                 }
-
-                let value = encode_blob_value(metadata, record_ref);
+                replay_plain(
+                    partitions,
+                    partition,
+                    &key,
+                    lsn,
+                    &encode_blob_value(&metadata, record_ref),
+                )?;
+            }
+            Mutation::PutBlobPrefix {
+                partition,
+                key_prefix,
+                key_suffix,
+                metadata,
+                record_ref,
+            } => {
+                if is_materialized(manifest_frontier, materialized_through, partition, lsn) {
+                    continue;
+                }
                 replay_prefix(
-                    partitions, partition, key_prefix, key_suffix, entry.lsn, &value,
-                )
+                    partitions,
+                    partition,
+                    &key_prefix,
+                    &key_suffix,
+                    lsn,
+                    &encode_blob_value(&metadata, record_ref),
+                )?;
             }
-            WAL_METADATA => Ok(()),
-            other => Err(Error::InvalidWal(format!(
-                "unknown mutation payload kind {other}"
-            ))),
         }
-    })
+    }
+    Ok(())
 }
 
 fn is_materialized(
@@ -1232,207 +945,27 @@ fn replay_partition(
         })
 }
 
-struct WalDecoder<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> WalDecoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or_else(|| Error::InvalidWal("mutation length overflow".to_owned()))?;
-        let bytes = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| Error::InvalidWal("truncated mutation payload".to_owned()))?;
-        self.offset = end;
-        Ok(bytes)
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn record_ref(&mut self) -> Result<RecordRef> {
-        decode_record_ref(self.take(RECORD_REF_BYTES)?)
-    }
-
-    fn finish(self) -> Result<()> {
-        if self.offset != self.bytes.len() {
-            return Err(Error::InvalidWal(
-                "mutation payload has trailing bytes".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn prepare_batch(state: &AppendState, mutations: &[Mutation]) -> Result<PreparedAppend> {
-    let count = u64::try_from(mutations.len()).map_err(|_| Error::LsnOverflow)?;
-    let first_lsn = next_lsn(state)?;
-    first_lsn.checked_add(count - 1).ok_or(Error::LsnOverflow)?;
-
-    let mut segment_bytes = 0_u64;
-    let mut lsns = Vec::with_capacity(mutations.len());
-    for (offset, mutation) in mutations.iter().enumerate() {
-        validate_mutation(mutation, state.partition_count, state.memtable_capacity)?;
-        if let Some(record) = mutation.record() {
-            segment_bytes = segment_bytes
-                .checked_add(encoded_record_len(&record.key, record.payload.len())?)
-                .ok_or(Error::LsnOverflow)?;
-        }
-        let lsn = first_lsn
-            .checked_add(u64::try_from(offset).map_err(|_| Error::LsnOverflow)?)
-            .ok_or(Error::LsnOverflow)?;
-        lsns.push(lsn);
-    }
-    Ok(PreparedAppend {
-        lsns,
-        segment_bytes,
-    })
-}
-
-fn append_batch(
-    state: &mut AppendState,
-    mutations: Vec<Mutation>,
-    lsns: Vec<StrataLsn>,
-    rolled_segment: Option<RolledSegment>,
+fn prepare_batch(
+    state: &mut WriteState,
+    writes: Vec<(StrataLsn, Mutation)>,
 ) -> Result<PendingBatch> {
-    let mut entries = Vec::with_capacity(mutations.len());
-    let mut record_refs = Vec::with_capacity(mutations.len());
-
-    for (mutation, lsn) in mutations.iter().zip(lsns.iter().copied()) {
-        let (record_ref, payload) = match mutation {
-            Mutation::Put {
-                partition,
-                key,
-                value,
-            } => (None, encode_put_wal(*partition, key, value)),
-            Mutation::PutPrefix {
-                partition,
-                key_prefix,
-                key_suffix,
-                value,
-            } => (
-                None,
-                encode_inline_prefix_wal(*partition, key_prefix, key_suffix, value),
-            ),
-            Mutation::PutBlob {
-                partition,
-                key,
-                metadata,
-                record,
-            } => {
-                let outcome = state.segment.append_for_shard(
-                    &record.key,
-                    lsn,
-                    record.shard,
-                    &record.payload,
-                )?;
-                let payload = encode_blob_wal(*partition, key, metadata, outcome.record_ref);
-                (Some(outcome.record_ref), payload)
-            }
-            Mutation::PutBlobPrefix {
-                partition,
-                key_prefix,
-                key_suffix,
-                metadata,
-                record,
-            } => {
-                let outcome = state.segment.append_for_shard(
-                    &record.key,
-                    lsn,
-                    record.shard,
-                    &record.payload,
-                )?;
-                let payload = encode_prefix_wal(
-                    *partition,
-                    key_prefix,
-                    key_suffix,
-                    metadata,
-                    outcome.record_ref,
-                );
-                (Some(outcome.record_ref), payload)
-            }
-            Mutation::Metadata { payload } => (None, encode_metadata_wal(payload)),
-        };
-        record_refs.push(record_ref);
-        entries.push(WalEntry { lsn, payload });
-    }
-
-    let wal_position = state.wal.append(&entries)?;
-    let ticket = state.next_ticket;
-    state.next_ticket = state.next_ticket.checked_add(1).ok_or(Error::LsnOverflow)?;
-    state.last_lsn = lsns.last().copied();
-    Ok(PendingBatch {
-        ticket,
-        mutations,
-        lsns,
-        record_refs,
-        wal_position,
-        rolled_segment,
-    })
-}
-
-fn next_lsn(state: &AppendState) -> Result<StrataLsn> {
-    state
-        .last_lsn
-        .map_or(Ok(1), |lsn| lsn.checked_add(1).ok_or(Error::LsnOverflow))
-}
-
-fn ensure_segment_capacity(
-    state: &mut AppendState,
-    additional_bytes: u64,
-    sealed_before_lsn: StrataLsn,
-) -> Result<Option<RolledSegment>> {
-    if additional_bytes == 0 {
-        return Ok(None);
-    }
-    match state.segment.ensure_capacity(additional_bytes) {
-        Ok(()) => Ok(None),
-        Err(strata_segment::Error::SegmentFull { .. }) => {
-            let rolled = roll_segment(state, sealed_before_lsn)?;
-            state.segment.ensure_capacity(additional_bytes)?;
-            Ok(Some(rolled))
+    let mut previous = state.last_lsn;
+    let mut lsns = Vec::with_capacity(writes.len());
+    let mut mutations = Vec::with_capacity(writes.len());
+    for (lsn, mutation) in writes {
+        if previous.is_some_and(|previous| lsn <= previous) {
+            return Err(Error::MemtableLsnOutOfOrder {
+                previous: previous.expect("checked above"),
+                next: lsn,
+            });
         }
-        Err(error) => Err(error.into()),
+        validate_mutation(&mutation, state.partition_count, state.memtable_capacity)?;
+        previous = Some(lsn);
+        lsns.push(lsn);
+        mutations.push(mutation);
     }
-}
-
-fn roll_segment(state: &mut AppendState, sealed_before_lsn: StrataLsn) -> Result<RolledSegment> {
-    let current_id = state.segment.segment_id();
-    let next = state.segment_factory.create()?;
-    if next.segment_id() <= current_id {
-        return Err(Error::SegmentOutOfOrder {
-            current: current_id,
-            next: next.segment_id(),
-        });
-    }
-    let sync = queue_segment_sync(state)?;
-    let rolled = RolledSegment {
-        sealed_segment_id: current_id,
-        sealed_length: state.segment.write_offset(),
-        active_segment_id: next.segment_id(),
-        sealed_before_lsn,
-    };
-    state.pending_segment_syncs.push(sync);
-    state.segment = next;
-    Ok(rolled)
-}
-
-impl Mutation {
-    fn record(&self) -> Option<&SegmentRecord> {
-        match self {
-            Self::PutBlob { record, .. } | Self::PutBlobPrefix { record, .. } => Some(record),
-            Self::Put { .. } | Self::PutPrefix { .. } | Self::Metadata { .. } => None,
-        }
-    }
+    state.last_lsn = previous;
+    Ok(PendingBatch { mutations, lsns })
 }
 
 fn validate_mutation(
@@ -1449,10 +982,9 @@ fn validate_mutation(
             validate_partition(*partition, partition_count)?;
             validate_u32_len("key", key.len())?;
             validate_u32_len("value", value.len())?;
-            validate_encoded_len("encoded WAL put", &[1, 4, 4, 4, key.len(), value.len()])?;
             validate_memtable_size(
                 memtable_capacity,
-                ENTRY_HEADER_BYTES,
+                VERSION_BYTES,
                 &[key.len(), 1, value.len()],
             )
         }
@@ -1466,22 +998,9 @@ fn validate_mutation(
             validate_u32_len("key prefix", key_prefix.len())?;
             validate_u32_len("key suffix", key_suffix.len())?;
             validate_u32_len("value", value.len())?;
-            validate_encoded_len(
-                "encoded WAL prefix put",
-                &[
-                    1,
-                    4,
-                    4,
-                    4,
-                    4,
-                    key_prefix.len(),
-                    key_suffix.len(),
-                    value.len(),
-                ],
-            )?;
             validate_memtable_size(
                 memtable_capacity,
-                PREFIX_ENTRY_HEADER_BYTES,
+                VERSION_BYTES,
                 &[key_prefix.len(), key_suffix.len(), 1, value.len()],
             )
         }
@@ -1489,23 +1008,14 @@ fn validate_mutation(
             partition,
             key,
             metadata,
-            record,
+            ..
         } => {
             validate_partition(*partition, partition_count)?;
             validate_u32_len("key", key.len())?;
             validate_u32_len("blob metadata", metadata.len())?;
-            if key.as_slice() != record.key.as_bytes() {
-                return Err(Error::Serialization(
-                    "LSM key and segment record key differ".to_owned(),
-                ));
-            }
-            validate_encoded_len(
-                "encoded WAL blob put",
-                &[1, 4, 4, 4, key.len(), metadata.len(), RECORD_REF_BYTES],
-            )?;
             validate_memtable_size(
                 memtable_capacity,
-                ENTRY_HEADER_BYTES,
+                VERSION_BYTES,
                 &[key.len(), 1, 4, metadata.len(), RECORD_REF_BYTES],
             )
         }
@@ -1514,37 +1024,15 @@ fn validate_mutation(
             key_prefix,
             key_suffix,
             metadata,
-            record,
+            ..
         } => {
             validate_partition(*partition, partition_count)?;
             validate_u32_len("key prefix", key_prefix.len())?;
             validate_u32_len("key suffix", key_suffix.len())?;
             validate_u32_len("blob metadata", metadata.len())?;
-            if record.key.len() != key_prefix.len() + key_suffix.len()
-                || !record.key.as_bytes().starts_with(key_prefix)
-                || !record.key.as_bytes().ends_with(key_suffix)
-            {
-                return Err(Error::Serialization(
-                    "LSM prefix key and segment record key differ".to_owned(),
-                ));
-            }
-            validate_encoded_len(
-                "encoded WAL prefix put",
-                &[
-                    1,
-                    4,
-                    4,
-                    4,
-                    4,
-                    key_prefix.len(),
-                    key_suffix.len(),
-                    metadata.len(),
-                    RECORD_REF_BYTES,
-                ],
-            )?;
             validate_memtable_size(
                 memtable_capacity,
-                PREFIX_ENTRY_HEADER_BYTES,
+                VERSION_BYTES,
                 &[
                     key_prefix.len(),
                     key_suffix.len(),
@@ -1554,10 +1042,6 @@ fn validate_mutation(
                     RECORD_REF_BYTES,
                 ],
             )
-        }
-        Mutation::Metadata { payload } => {
-            validate_u32_len("metadata payload", payload.len())?;
-            validate_encoded_len("encoded WAL metadata", &[1, payload.len()])
         }
     }
 }
@@ -1578,14 +1062,6 @@ fn validate_u32_len(name: &str, len: usize) -> Result<()> {
         .map_err(|_| Error::Serialization(format!("{name} exceeds u32::MAX bytes")))
 }
 
-fn validate_encoded_len(name: &str, fields: &[usize]) -> Result<()> {
-    let len = fields
-        .iter()
-        .try_fold(0usize, |len, field| len.checked_add(*field))
-        .ok_or_else(|| Error::Serialization(format!("{name} length overflow")))?;
-    validate_u32_len(name, len)
-}
-
 fn validate_memtable_size(capacity: usize, header: usize, fields: &[usize]) -> Result<()> {
     let required = fields
         .iter()
@@ -1597,81 +1073,18 @@ fn validate_memtable_size(capacity: usize, header: usize, fields: &[usize]) -> R
     Ok(())
 }
 
-fn encode_put_wal(partition: u32, key: &[u8], value: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(13 + key.len() + value.len());
-    payload.push(WAL_PUT);
-    payload.extend_from_slice(&partition.to_le_bytes());
-    payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    payload.extend_from_slice(key);
-    payload.extend_from_slice(value);
-    payload
-}
-
-fn encode_inline_prefix_wal(
-    partition: u32,
-    key_prefix: &[u8],
-    key_suffix: &[u8],
-    value: &[u8],
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(17 + key_prefix.len() + key_suffix.len() + value.len());
-    payload.push(WAL_PUT_PREFIX);
-    payload.extend_from_slice(&partition.to_le_bytes());
-    payload.extend_from_slice(&(key_prefix.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&(key_suffix.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    payload.extend_from_slice(key_prefix);
-    payload.extend_from_slice(key_suffix);
-    payload.extend_from_slice(value);
-    payload
-}
-
-fn encode_blob_wal(partition: u32, key: &[u8], metadata: &[u8], record_ref: RecordRef) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + 12 + key.len() + metadata.len() + RECORD_REF_BYTES);
-    payload.push(WAL_PUT_BLOB);
-    payload.extend_from_slice(&partition.to_le_bytes());
-    payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
-    payload.extend_from_slice(key);
-    payload.extend_from_slice(metadata);
-    payload.extend_from_slice(&encode_record_ref(record_ref));
-    payload
-}
-
-fn encode_prefix_wal(
-    partition: u32,
-    key_prefix: &[u8],
-    key_suffix: &[u8],
-    metadata: &[u8],
-    record_ref: RecordRef,
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(
-        1 + 16 + key_prefix.len() + key_suffix.len() + metadata.len() + RECORD_REF_BYTES,
-    );
-    payload.push(WAL_PUT_BLOB_PREFIX);
-    payload.extend_from_slice(&partition.to_le_bytes());
-    payload.extend_from_slice(&(key_prefix.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&(key_suffix.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
-    payload.extend_from_slice(key_prefix);
-    payload.extend_from_slice(key_suffix);
-    payload.extend_from_slice(metadata);
-    payload.extend_from_slice(&encode_record_ref(record_ref));
-    payload
-}
-
-fn encode_metadata_wal(metadata: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + metadata.len());
-    payload.push(WAL_METADATA);
-    payload.extend_from_slice(metadata);
-    payload
-}
-
 pub fn encode_inline_value(value: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(1 + value.len());
     encoded.push(VALUE_INLINE);
     encoded.extend_from_slice(value);
     encoded
+}
+
+fn encode_inline_value_owned(mut value: Vec<u8>) -> Vec<u8> {
+    value.reserve(1);
+    value.push(VALUE_INLINE);
+    value.rotate_right(1);
+    value
 }
 
 pub fn encode_blob_value(metadata: &[u8], record_ref: RecordRef) -> Vec<u8> {
@@ -1681,6 +1094,17 @@ pub fn encode_blob_value(metadata: &[u8], record_ref: RecordRef) -> Vec<u8> {
     encoded.extend_from_slice(metadata);
     encoded.extend_from_slice(&encode_record_ref(record_ref));
     encoded
+}
+
+fn encode_blob_value_owned(mut metadata: Vec<u8>, record_ref: RecordRef) -> Vec<u8> {
+    let metadata_len = metadata.len();
+    metadata.reserve(5 + RECORD_REF_BYTES);
+    metadata.resize(metadata_len + 5 + RECORD_REF_BYTES, 0);
+    metadata.copy_within(0..metadata_len, 5);
+    metadata[0] = VALUE_BLOB;
+    metadata[1..5].copy_from_slice(&(metadata_len as u32).to_le_bytes());
+    metadata[5 + metadata_len..].copy_from_slice(&encode_record_ref(record_ref));
+    metadata
 }
 
 /// One value stored directly in the tree or indirectly in a segment.
@@ -1753,19 +1177,6 @@ pub fn decode_record_ref(encoded: &[u8]) -> Result<RecordRef> {
     })
 }
 
-fn queue_segment_sync(state: &AppendState) -> Result<Receiver<Result<()>>> {
-    let path = state.segment.path().to_path_buf();
-    let file = state.segment.clone_file_for_sync()?;
-    let (completion_tx, completion_rx) = mpsc::sync_channel(1);
-    state
-        .file_sync_tx
-        .send(FileSyncTask::new(path, file, move |result| {
-            let _ = completion_tx.send(result);
-        }))
-        .map_err(|_| Error::FileSyncQueueClosed)?;
-    Ok(completion_rx)
-}
-
 fn remove_orphan_tables(root: &Path, manifest: &Manifest) -> Result<()> {
     let live = manifest
         .partitions
@@ -1821,583 +1232,128 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        num::{NonZeroU32, NonZeroUsize},
-        sync::{Arc, mpsc as test_mpsc},
-        thread,
-        time::Duration,
-    };
+    use std::{num::NonZeroU32, sync::Arc};
 
-    use strata_core::{PlacementClass, ShardKey};
+    use strata_core::RecordRef;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{GarbageRecord, TableWriter, file_sync_channel};
+    use crate::{Manifest, Replace};
 
-    struct LastWriteWins;
-
-    impl MergeOperator for LastWriteWins {
-        fn merge(
-            &self,
-            _key: &[u8],
-            base: Option<&[u8]>,
-            patches: &[(StrataLsn, &[u8])],
-            _emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
-        ) -> Result<Option<Vec<u8>>> {
-            Ok(patches
-                .last()
-                .map(|(_, value)| value.to_vec())
-                .or_else(|| base.map(<[u8]>::to_vec)))
-        }
-    }
-
-    fn lsn(sequence: u64) -> StrataLsn {
-        sequence
-    }
-
-    fn engine(
-        directory: &TempDir,
-        rollover_policy: Option<MemtableRolloverPolicy>,
-    ) -> (Arc<Lsm>, Vec<thread::JoinHandle<()>>) {
-        engine_with_segment_max(directory, rollover_policy, 1 << 20)
-    }
-
-    fn engine_with_segment_max(
-        directory: &TempDir,
-        rollover_policy: Option<MemtableRolloverPolicy>,
-        segment_max: u64,
-    ) -> (Arc<Lsm>, Vec<thread::JoinHandle<()>>) {
-        let table_root = directory.path().join("tables");
-        let segment_root = directory.path().join("segments");
-        fs::create_dir_all(&segment_root).unwrap();
-        let manifest = Arc::new(Manifest::empty(
-            "base-v1",
-            "patch-v1",
-            NonZeroU32::new(1).unwrap(),
-        ));
-        let (sync_tx, syncer) = file_sync_channel(8);
-        let workers = (0..2)
-            .map(|_| {
-                let syncer = syncer.clone();
-                thread::spawn(move || syncer.run())
-            })
-            .collect();
-        drop(syncer);
-        let wal = Wal::open(
-            directory.path().join("wal"),
-            1 << 20,
-            WalPosition::default(),
-            sync_tx,
+    fn open(directory: &TempDir, recovered: Vec<(StrataLsn, Mutation)>) -> Arc<Lsm> {
+        let last_lsn = recovered.last().map(|(lsn, _)| *lsn);
+        Arc::new(
+            Lsm::from_parts(
+                directory.path(),
+                Arc::new(Manifest::empty("test-base", "test-patch", NonZeroU32::MIN)),
+                recovered,
+                last_lsn,
+                LsmOptions::default(),
+            )
+            .unwrap(),
         )
-        .unwrap();
-        let segment = SegmentWriter::create(
-            strata_segment::segment_path(&segment_root, 1),
-            1,
-            PlacementClass::Ingest,
-            segment_max,
-        )
-        .unwrap();
-        let segment_factory = SegmentFactory::new(
-            &segment_root,
-            strata_segment::SegmentIdAllocator::new(2),
-            PlacementClass::Ingest,
-            segment_max,
-        );
-        let lsm = Lsm::from_parts(
-            table_root,
-            manifest,
-            segment,
-            segment_factory,
-            wal,
-            None,
-            LsmOptions {
-                memtable_capacity: 4096,
-                rollover_policy,
-                first_memtable_generation: 1,
-                max_frozen_generations: NonZeroUsize::MIN,
-                block_cache_capacity_bytes: DEFAULT_BLOCK_CACHE_BYTES,
-            },
-        )
-        .unwrap();
-        (Arc::new(lsm), workers)
     }
 
     fn put(key: &[u8], value: &[u8]) -> Mutation {
-        Mutation::PutBlob {
+        Mutation::Put {
             partition: 0,
             key: key.to_vec(),
-            metadata: Vec::new(),
-            record: SegmentRecord {
-                key: BlobKey::new(key.to_vec()).unwrap(),
-                shard: ShardKey {
-                    id: 1,
-                    generation: 1,
-                },
-                payload: Arc::from(value),
-            },
-        }
-    }
-
-    fn blob_ref(value: &[u8]) -> RecordRef {
-        match decode_value(value).unwrap() {
-            StoredValue::Blob { record_ref, .. } => record_ref,
-            StoredValue::Inline(_) => panic!("expected blob value"),
-        }
-    }
-
-    fn finish(lsm: Arc<Lsm>, workers: Vec<thread::JoinHandle<()>>) {
-        drop(lsm);
-        for worker in workers {
-            worker.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn writes_assign_lsns_and_log_record_refs() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-
-        let result = lsm.write(put(b"key", b"value")).unwrap();
-
-        assert_eq!(result.lsn, lsn(1));
-        assert_eq!(
-            blob_ref(&lsm.get(0, b"key", &LastWriteWins).unwrap().unwrap()),
-            result.record_ref.unwrap()
-        );
-        assert_eq!(result.wal_position, lsm.wal_position().unwrap());
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn lsm_encodes_the_wal_record_from_the_segment_outcome() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        let result = lsm.write(put(b"key", b"value")).unwrap();
-        let entries = {
-            let append = lock(&lsm.append);
-            let mut entries = Vec::new();
-            append
-                .wal
-                .replay(|entry| {
-                    entries.push(entry.clone());
-                    Ok(())
-                })
-                .unwrap();
-            entries
-        };
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].lsn, result.lsn);
-        assert_eq!(entries[0].payload[0], WAL_PUT_BLOB);
-        assert_eq!(
-            decode_record_ref(&entries[0].payload[entries[0].payload.len() - RECORD_REF_BYTES..])
-                .unwrap(),
-            result.record_ref.unwrap()
-        );
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn inline_put_stays_out_of_the_segment() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        let segment_offset = lock(&lsm.append).segment.write_offset();
-
-        let result = lsm.put(0, b"key".to_vec(), b"value".to_vec()).unwrap();
-
-        assert_eq!(result.lsn, lsn(1));
-        assert_eq!(result.record_ref, None);
-        assert_eq!(lock(&lsm.append).segment.write_offset(), segment_offset);
-        let value = lsm.get(0, b"key", &LastWriteWins).unwrap().unwrap();
-        assert_eq!(decode_value(&value).unwrap(), StoredValue::Inline(b"value"));
-
-        let mut entries = Vec::new();
-        lock(&lsm.append)
-            .wal
-            .replay(|entry| {
-                entries.push(entry.clone());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].payload[0], WAL_PUT);
-        assert!(entries[0].payload.ends_with(b"keyvalue"));
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn plain_prefix_and_metadata_mutations_share_one_order() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        let plain = lsm.write(put(b"A", b"plain")).unwrap();
-        let prefix = lsm
-            .write(Mutation::PutPrefix {
-                partition: 0,
-                key_prefix: b"K".to_vec(),
-                key_suffix: b"X".to_vec(),
-                value: b"prefix".to_vec(),
-            })
-            .unwrap();
-        let metadata = lsm
-            .write(Mutation::Metadata {
-                payload: b"metadata".to_vec(),
-            })
-            .unwrap();
-
-        assert_eq!(plain.lsn, lsn(1));
-        assert_eq!(prefix.lsn, lsn(2));
-        assert_eq!(prefix.record_ref, None);
-        assert_eq!(metadata.lsn, lsn(3));
-        assert_eq!(
-            decode_value(&lsm.get(0, b"KX", &LastWriteWins).unwrap().unwrap()).unwrap(),
-            StoredValue::Inline(b"prefix")
-        );
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn sorted_scan_merges_tables_and_memtables() {
-        let directory = TempDir::new().unwrap();
-        let policy = MemtableRolloverPolicy::new(NonZeroUsize::MIN, Duration::MAX);
-        let (lsm, workers) = engine(&directory, Some(policy));
-        let prefix = |suffix: &[u8], value: &[u8]| Mutation::PutPrefix {
-            partition: 0,
-            key_prefix: b"K".to_vec(),
-            key_suffix: suffix.to_vec(),
             value: value.to_vec(),
-        };
-        lsm.write(prefix(b"a", b"old")).unwrap();
-        lsm.write(prefix(b"b", b"second")).unwrap();
-        lsm.flush_one(0, 1, "patch-1.sst", |edit| {
-            let mut manifest = (*lsm.manifest()).clone();
-            manifest.apply(edit)?;
-            Ok(manifest)
-        })
-        .unwrap();
-        let latest = lsm.write(prefix(b"a", b"new")).unwrap();
-
-        let mut scan = lsm.scan(0, Some(b"K"), Some(b"L"), latest.lsn).unwrap();
-        let mut rows = Vec::new();
-        while let Some((key, value)) = scan.next(&crate::Replace).unwrap() {
-            let StoredValue::Inline(value) = decode_value(&value).unwrap() else {
-                panic!("inline writes must remain inline");
-            };
-            rows.push((key, value.to_vec()));
         }
-        assert_eq!(
-            rows,
-            [
-                (b"Ka".to_vec(), b"new".to_vec()),
-                (b"Kb".to_vec(), b"second".to_vec()),
-            ]
-        );
-        finish(lsm, workers);
     }
 
     #[test]
-    fn metadata_only_frontier_does_not_require_an_sst() {
+    fn caller_assigns_lsns_and_gaps_are_valid() {
         let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        let metadata = lsm
-            .write(Mutation::Metadata {
-                payload: b"metadata".to_vec(),
-            })
+        let lsm = open(&directory, Vec::new());
+
+        let written = lsm
+            .write_batch(vec![(10, put(b"a", b"one")), (13, put(b"b", b"two"))])
             .unwrap();
 
+        assert_eq!(written.lsns, vec![10, 13]);
+        assert_eq!(lsm.last_lsn().unwrap(), Some(13));
         assert_eq!(
-            lsm.materialize_metadata(|edit| {
+            lsm.get(0, b"b", &Replace).unwrap(),
+            Some(encode_inline_value(b"two"))
+        );
+    }
+
+    #[test]
+    fn lsn_must_increase_across_batches() {
+        let directory = TempDir::new().unwrap();
+        let lsm = open(&directory, Vec::new());
+        lsm.write(5, put(b"a", b"one")).unwrap();
+
+        assert!(matches!(
+            lsm.write(5, put(b"b", b"two")),
+            Err(Error::MemtableLsnOutOfOrder {
+                previous: 5,
+                next: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn blob_mutation_stores_the_callers_segment_reference() {
+        let directory = TempDir::new().unwrap();
+        let lsm = open(&directory, Vec::new());
+        let record_ref = RecordRef {
+            segment_id: 7,
+            offset: 100,
+            len: 25,
+        };
+        lsm.write(
+            9,
+            Mutation::PutBlob {
+                partition: 0,
+                key: b"blob".to_vec(),
+                metadata: b"epoch=3".to_vec(),
+                record_ref,
+            },
+        )
+        .unwrap();
+
+        let encoded = lsm.get(0, b"blob", &Replace).unwrap().unwrap();
+        assert_eq!(
+            decode_value(&encoded).unwrap(),
+            StoredValue::Blob {
+                metadata: b"epoch=3",
+                record_ref,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_uses_decoded_store_wal_mutations() {
+        let directory = TempDir::new().unwrap();
+        let lsm = open(
+            &directory,
+            vec![(2, put(b"a", b"old")), (8, put(b"a", b"new"))],
+        );
+
+        assert_eq!(
+            lsm.get(0, b"a", &Replace).unwrap(),
+            Some(encode_inline_value(b"new"))
+        );
+    }
+
+    #[test]
+    fn materialization_stops_before_an_unflushed_keyed_mutation() {
+        let directory = TempDir::new().unwrap();
+        let lsm = open(&directory, Vec::new());
+        lsm.write(17, put(b"a", b"one")).unwrap();
+
+        let advanced = lsm
+            .materialize_through(20, |edit| {
                 let mut manifest = (*lsm.manifest()).clone();
                 manifest.apply(edit)?;
                 Ok(manifest)
             })
-            .unwrap(),
-            Some(metadata.lsn)
-        );
-        assert_eq!(lsm.manifest().materialized_through, Some(metadata.lsn));
-
-        lsm.put(0, b"key".to_vec(), b"value".to_vec()).unwrap();
-        lsm.write(Mutation::Metadata {
-            payload: b"blocked".to_vec(),
-        })
-        .unwrap();
-        assert_eq!(
-            lsm.materialize_metadata(|_| unreachable!()).unwrap(),
-            None,
-            "an unflushed data row must block the following metadata"
-        );
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn batch_receives_consecutive_lsns_and_one_wal_frame() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-
-        let result = lsm
-            .write_batch(vec![
-                put(b"a", b"one"),
-                Mutation::Metadata {
-                    payload: b"metadata".to_vec(),
-                },
-                put(b"b", b"two"),
-            ])
             .unwrap();
 
-        assert_eq!(result.lsns, vec![lsn(1), lsn(2), lsn(3)]);
-        assert_eq!(result.wal_position, lsm.wal_position().unwrap());
-        assert_eq!(result.record_refs.len(), 3);
-        assert!(result.record_refs[1].is_none());
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn next_append_overlaps_the_previous_memtable_stage() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        let memory = lock(&lsm.memory);
-        let initial = lsm.wal_position().unwrap();
-
-        let first_lsm = Arc::clone(&lsm);
-        let first = thread::spawn(move || first_lsm.write(put(b"key", b"one")));
-        while lsm.wal_position().unwrap() == initial {
-            thread::yield_now();
-        }
-        let after_first = lsm.wal_position().unwrap();
-
-        let second_lsm = Arc::clone(&lsm);
-        let second = thread::spawn(move || second_lsm.write(put(b"key", b"two")));
-        while lsm.wal_position().unwrap() == after_first {
-            thread::yield_now();
-        }
-        drop(memory);
-
-        assert_eq!(first.join().unwrap().unwrap().lsn, lsn(1));
-        let second = second.join().unwrap().unwrap();
-        assert_eq!(second.lsn, lsn(2));
-        assert_eq!(
-            blob_ref(&lsm.get(0, b"key", &LastWriteWins).unwrap().unwrap()),
-            second.record_ref.unwrap()
-        );
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn sync_covers_segment_wal_and_visible_lsn() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        let result = lsm.write(put(b"key", b"value")).unwrap();
-
-        let checkpoint = lsm.sync().unwrap();
-        assert_eq!(checkpoint.durable_lsn, Some(result.lsn));
-        assert_eq!(checkpoint.wal_position, result.wal_position);
-        assert_eq!(checkpoint.active_segment_id, 1);
-        assert_eq!(
-            checkpoint.active_segment_offset,
-            result.record_ref.unwrap().len
-        );
-        assert_eq!(lsm.durable_lsn().unwrap(), Some(result.lsn));
-        assert_eq!(
-            lsm.committed_wal_position().unwrap(),
-            lsm.wal_position().unwrap()
-        );
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn segment_roll_is_independent_from_wal_roll() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        lsm.write(put(b"a", b"one")).unwrap();
-
-        let rolled = lsm.roll_segment().unwrap();
-        let second = lsm.write(put(b"b", b"two")).unwrap();
-
-        assert_eq!(rolled.sealed_segment_id, 1);
-        assert_eq!(rolled.active_segment_id, 2);
-        assert_eq!(rolled.sealed_before_lsn, lsn(2));
-        assert_eq!(second.record_ref.unwrap().segment_id, 2);
-        lsm.sync().unwrap();
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn capacity_roll_happens_inside_the_append_order() {
-        let directory = TempDir::new().unwrap();
-        let segment_max =
-            strata_core::encoded_record_len(&BlobKey::new(b"a".to_vec()).unwrap(), 3).unwrap();
-        let (lsm, workers) = engine_with_segment_max(&directory, None, segment_max);
-
-        let first = lsm.write(put(b"a", b"one")).unwrap();
-        let second = lsm.write(put(b"b", b"two")).unwrap();
-        let rolled = second.rolled_segment.unwrap();
-
-        assert!(first.rolled_segment.is_none());
-        assert_eq!(rolled.sealed_segment_id, 1);
-        assert_eq!(rolled.sealed_length, first.record_ref.unwrap().len);
-        assert_eq!(rolled.active_segment_id, 2);
-        assert_eq!(rolled.sealed_before_lsn, second.lsn);
-        assert_eq!(second.record_ref.unwrap().segment_id, 2);
-        lsm.sync().unwrap();
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn oversized_batch_is_rejected_before_rollover() {
-        let directory = TempDir::new().unwrap();
-        let segment_max =
-            strata_core::encoded_record_len(&BlobKey::new(b"a".to_vec()).unwrap(), 3).unwrap();
-        let (lsm, workers) = engine_with_segment_max(&directory, None, segment_max);
-
-        assert!(matches!(
-            lsm.write_batch(vec![put(b"a", b"one"), put(b"b", b"two")]),
-            Err(Error::Segment(strata_segment::Error::SegmentFull { .. }))
-        ));
-        let written = lsm.write(put(b"a", b"one")).unwrap();
-        assert_eq!(written.lsn, lsn(1));
-        assert_eq!(written.record_ref.unwrap().segment_id, 1);
-        assert!(written.rolled_segment.is_none());
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn flushed_generation_remains_visible_through_the_installed_manifest() {
-        let directory = TempDir::new().unwrap();
-        let policy = MemtableRolloverPolicy::new(NonZeroUsize::new(1).unwrap(), Duration::MAX);
-        let (lsm, workers) = engine(&directory, Some(policy));
-        let first = lsm.write(put(b"a", b"one")).unwrap();
-        let metadata = lsm
-            .write(Mutation::Metadata {
-                payload: b"metadata".to_vec(),
-            })
-            .unwrap();
-        let rolled = lsm
-            .write(put(b"b", b"two"))
-            .unwrap()
-            .rolled_memtable
-            .unwrap();
-        assert_eq!(rolled.generation, 1);
-
-        let meta = lsm
-            .flush_one(0, 1, "patch-1.sst", |edit| {
-                let mut manifest = (*lsm.manifest()).clone();
-                manifest.apply(edit)?;
-                Ok(manifest)
-            })
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(meta.record_count, 1);
-        assert!(lsm.frozen_generations(0).unwrap().is_empty());
-        assert_eq!(
-            lsm.manifest().materialized_through,
-            Some(metadata.lsn),
-            "metadata immediately following a materialized row needs no replay"
-        );
-        assert_eq!(
-            blob_ref(&lsm.get(0, b"a", &LastWriteWins).unwrap().unwrap()),
-            first.record_ref.unwrap()
-        );
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn failed_manifest_publication_does_not_advance_materialization() {
-        let directory = TempDir::new().unwrap();
-        let policy = MemtableRolloverPolicy::new(NonZeroUsize::new(1).unwrap(), Duration::MAX);
-        let (lsm, workers) = engine(&directory, Some(policy));
-        lsm.write(put(b"a", b"one")).unwrap();
-        lsm.write(put(b"b", b"two")).unwrap();
-
-        let error = lsm
-            .flush_one(0, 1, "orphan.sst", |_| {
-                Err(Error::InvalidManifest {
-                    reason: "injected publication failure".to_owned(),
-                })
-            })
-            .unwrap_err();
-
-        assert!(matches!(error, Error::InvalidManifest { .. }));
-        assert_eq!(lsm.manifest().materialized_through, None);
-        assert_eq!(lsm.frozen_generations(0).unwrap(), vec![1]);
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn startup_removes_unpublished_sst_outputs() {
-        let directory = TempDir::new().unwrap();
-        let table_root = directory.path().join("tables");
-        let mut orphan =
-            TableWriter::create_base(&table_root, "nested/orphan.sst", 1, 0, "base-v1").unwrap();
-        orphan.add(b"key", b"value").unwrap();
-        orphan.finish().unwrap();
-        fs::write(table_root.join("abandoned.sst.tmp"), b"partial").unwrap();
-
-        let (lsm, workers) = engine(&directory, None);
-
-        assert!(!table_root.join("nested/orphan.sst").exists());
-        assert!(!table_root.join("abandoned.sst.tmp").exists());
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn frozen_generation_limit_backpressures_the_pipeline_until_flush() {
-        let directory = TempDir::new().unwrap();
-        let policy = MemtableRolloverPolicy::new(NonZeroUsize::new(1).unwrap(), Duration::MAX);
-        let (lsm, workers) = engine(&directory, Some(policy));
-        lsm.write(put(b"a", b"one")).unwrap();
-        lsm.write(put(b"b", b"two")).unwrap();
-        let before = lsm.wal_position().unwrap();
-        let (result_tx, result_rx) = test_mpsc::channel();
-        let writer = {
-            let lsm = Arc::clone(&lsm);
-            thread::spawn(move || {
-                result_tx.send(lsm.write(put(b"c", b"three"))).unwrap();
-            })
-        };
-        while lsm.wal_position().unwrap() == before {
-            thread::yield_now();
-        }
-        assert!(matches!(
-            result_rx.recv_timeout(Duration::from_millis(20)),
-            Err(test_mpsc::RecvTimeoutError::Timeout)
-        ));
-
-        lsm.flush_one(0, 1, "patch-1.sst", |edit| {
-            let mut manifest = (*lsm.manifest()).clone();
-            manifest.apply(edit)?;
-            Ok(manifest)
-        })
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            result_rx
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .unwrap()
-                .lsn,
-            lsn(3)
-        );
-        writer.join().unwrap();
-        finish(lsm, workers);
-    }
-
-    #[test]
-    fn invalid_partition_is_rejected_before_physical_mutation() {
-        let directory = TempDir::new().unwrap();
-        let (lsm, workers) = engine(&directory, None);
-        let mut mutation = put(b"a", b"one");
-        let Mutation::PutBlob { partition, .. } = &mut mutation else {
-            unreachable!()
-        };
-        *partition = 1;
-        let wal_before = lsm.wal_position().unwrap();
-
-        assert!(matches!(
-            lsm.write(mutation),
-            Err(Error::InvalidPartition { .. })
-        ));
-        assert_eq!(lsm.wal_position().unwrap(), wal_before);
-        finish(lsm, workers);
+        // LSNs 1..=16 may be RocksDB-only. LSN 17 cannot be crossed until its row is in an SST.
+        assert_eq!(advanced, Some(16));
+        assert_eq!(lsm.manifest().materialized_through, Some(16));
     }
 }

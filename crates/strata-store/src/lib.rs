@@ -9,8 +9,9 @@
 //! ```text
 //! StrataStore::put
 //!   -> enqueue write command
-//!   -> LSM assigns the next store-global LSN
-//!   -> append segment bytes, WAL entry, and memtable row
+//!   -> store writer assigns the next store-global LSN
+//!   -> append segment bytes and a routed store-WAL entry
+//!   -> pass (LSN, keyed mutation) to the unlogged LSM
 //!   -> commit an atomic index batch:
 //!        segment_states[(store, segment_id)].write_offset = end_of_record
 //!        store_state[(store, NextLsn)] = lsn + 1
@@ -37,9 +38,9 @@
 //!
 //! ```text
 //! StrataStore::sync
-//!   -> LSM fsyncs active segment bytes and its WAL
+//!   -> store fsyncs active segment bytes, then its WAL
 //!   -> advance segment_states[active].durable_offset
-//!   -> publish store_state[PublishedLsn] and the LSM checkpoint together
+//!   -> publish store_state[PublishedLsn] and the store checkpoint together
 //!   -> fsync RocksDB WAL
 //! ```
 //!
@@ -50,9 +51,9 @@
 //!   -> validate config and create ingest directory
 //!   -> discard stale GC staging directories
 //!   -> discard or reject orphan segment files with no index state
-//!   -> recover unsealed segments and validate the exact LSM WAL prefix
+//!   -> recover unsealed segments and validate the exact store-WAL prefix
 //!   -> verify sealed segment files according to SealedSegmentIntegrityPolicy
-//!   -> load the blob LSM manifest, remove unpublished SSTs, and replay its remaining WAL suffix
+//!   -> load both LSM manifests, remove unpublished SSTs, and route the remaining store-WAL suffix
 //!   -> choose active segment
 //!   -> start memtable flush/compaction, garbage sweep, sealer, writer, and GC
 //! ```
@@ -63,7 +64,7 @@
 //!   is compatible with the recovery policy.
 //! - Orphan segment files without index state are ignored by point-in-time recovery by deleting
 //!   the file before any active writer is opened.
-//! - A complete committed LSM WAL tail is promoted. If an incomplete tail is newer than
+//! - A complete committed store-WAL tail is promoted. If an incomplete tail is newer than
 //!   `published_lsn`, its logical operations and segment bytes are rolled back together.
 //! - Sealed segments are expected to be stable. On open, their files must exist and match
 //!   indexed length; optional checksum verification recomputes the sealed SHA-256 digest.
@@ -102,10 +103,10 @@
 //! Blob-LSM compaction emits terminal transitions into the global garbage log; the sweeper folds
 //! them into per-segment summaries and local garbage logs. GC plans and copies from that state and
 //! revalidates every copied record against the current blob LSM before publication.
-mod blob_format;
 pub mod blob_lsm;
 mod config;
 mod error;
+mod file_sync;
 mod gc;
 mod gc_rate_limiter;
 mod layout;
@@ -115,6 +116,8 @@ mod reader_cache;
 mod relocation_cache;
 mod seal;
 mod shard_gc;
+mod wal;
+mod wal_format;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -126,23 +129,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+use file_sync::file_sync_channel;
 use strata_core::{
     BlobKey, BlobLifecycle, Epoch, GarbageEvent, PlacementClass, RecordRef, SegmentFileState,
     SegmentGcRecordRange, SegmentGcSummary, SegmentId, SegmentKey, SegmentOwner, SegmentState,
-    ShardCleanupJob, ShardCleanupState, ShardId, ShardInfo, ShardKey, ShardState, StrataLsn,
-    encoded_record_len,
+    ShardCleanupJob, ShardCleanupState, ShardId, ShardInfo, ShardKey, ShardState, StoreCheckpoint,
+    StrataLsn, WalPosition, encoded_record_len,
 };
 use strata_gc::GcAction;
 use strata_index::StrataIndex;
 use strata_lsm::{
-    GarbageLog, GarbageRecord, LiveSnapshots, Lsm, LsmCheckpoint, LsmOptions,
-    Manifest as LsmManifest, ManifestEdit, MemtableRolloverPolicy, Mutation as LsmMutation,
-    SegmentGarbageLog, SegmentRecord as LsmSegmentRecord, StoredValue, TableMeta, Wal, WalPosition,
-    decode_value, file_sync_channel, select_compaction_inputs, select_patch_compaction_inputs,
+    GarbageLog, GarbageRecord, LiveSnapshots, Lsm, LsmOptions, Manifest as LsmManifest,
+    ManifestEdit, MemtableRolloverPolicy, Mutation as LsmMutation, SegmentGarbageLog, StoredValue,
+    TableMeta, decode_value, select_compaction_inputs, select_patch_compaction_inputs,
     write_compaction, write_patch_compaction,
 };
 use strata_relocation::{RelocationEntry, RelocationMerge, RelocationStore};
 use strata_segment::{SegmentFactory, SegmentIdAllocator, SegmentScanner, SegmentWriter};
+use wal::{Wal, WalEntry};
+use wal_format::StoreWalMutation;
 
 pub use config::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
@@ -178,16 +183,16 @@ use seal::{
 use shard_gc::shard_generation_is_obsolete;
 pub use strata_gc::{GcPlanner, GcPlannerConfig};
 
-use crate::blob_format::BlobMutation;
 use crate::blob_lsm::{
-    BlobMerge, BlobMergeWithRelocations, BlobState as LsmBlobState, LazyGlobalState,
-    terminal_garbage_record,
+    BlobCompactionSnapshot, BlobMerge, BlobMergeWithRelocations, BlobMutation,
+    BlobState as LsmBlobState, terminal_garbage_record,
 };
 const FIRST_SEGMENT_ID: SegmentId = 1;
 /// How long the writer naps while waiting for the sealer to drain its backlog. Short, because
 /// this sleep sits on the foreground put path during rollover backpressure.
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
-const DURABILITY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const DURABILITY_PUBLISH_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const SEGMENT_ROLLOVER_INTERVAL: Duration = Duration::from_secs(20 * 60);
 const GARBAGE_LOG_HEAD: &str = "lsm-garbage";
 const GARBAGE_LOG_SWEEP_CURSOR: &str = "lsm-garbage-sweep";
 const GARBAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -207,9 +212,6 @@ const RETIRED_PROJECTION_DIR: &str = "accounting-index";
 const RELOCATION_LSM_BASE_FORMAT: &str = "relocation-base-v1";
 const RELOCATION_LSM_PATCH_FORMAT: &str = "relocation-patch-v1";
 const RELOCATION_LSM_MANIFEST: &str = "relocation";
-const LSM_EPOCH_CHANGE: u8 = 3;
-const LSM_SHARD_DROP: u8 = 4;
-const LSM_GC_RELOCATION: u8 = 5;
 /// Default logical shard used by the standalone convenience APIs.
 pub(crate) const STANDALONE_SHARD: ShardKey = ShardKey {
     id: 0,
@@ -356,6 +358,10 @@ impl LsmFlusher {
                 break;
             }
         }
+        let published_lsn = self.index.get_published_lsn()?;
+        lsm.materialize_through(published_lsn, |edit| {
+            publish_blob_lsm_edit(&self.index, edit)
+        })?;
         Ok(())
     }
 }
@@ -420,15 +426,11 @@ impl LsmCompactor {
         if patches.is_empty() {
             return Ok(());
         }
-        let Some(durable_lsn) = lsm.durable_lsn()? else {
-            return Ok(());
-        };
         let published_lsn = self.index.get_published_lsn()?;
-        if patches.iter().any(|table| {
-            table
-                .max_lsn
-                .is_none_or(|lsn| lsn > durable_lsn || lsn > published_lsn)
-        }) {
+        if patches
+            .iter()
+            .any(|table| table.max_lsn.is_none_or(|lsn| lsn > published_lsn))
+        {
             return Ok(());
         }
 
@@ -453,18 +455,17 @@ impl LsmCompactor {
             .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
         let mut next_table_id = manifest.next_table_id;
         let started = Instant::now();
-        // The manifest frontier proves that every earlier WAL mutation is represented in the
-        // frozen SST view. Durability and publication are additional conservative bounds.
+        // The LSM frontier proves that every earlier keyed mutation is represented in SSTs;
+        // publication is the store-wide durability bound for RocksDB-only transitions.
         let materialized_through_lsn = manifest
             .materialized_through
             .unwrap_or_default()
-            .min(durable_lsn)
             .min(published_lsn);
-        let materialize_from_lsn = self
+        let emit_garbage_from_lsn = self
             .index
-            .get_lazy_global_materialization_from_lsn()?
+            .get_blob_compaction_garbage_from_lsn()?
             .ok_or_else(|| Error::InvariantViolation {
-                reason: "lazy global materialization cutover is missing".to_owned(),
+                reason: "blob compaction garbage cutover is missing".to_owned(),
             })?;
         let epoch_changes = self
             .index
@@ -472,14 +473,14 @@ impl LsmCompactor {
             .into_iter()
             .filter(|(lsn, _)| *lsn <= materialized_through_lsn)
             .collect::<Vec<_>>();
-        let lazy_epoch_state = LazyGlobalState {
+        let epoch_snapshot = BlobCompactionSnapshot {
             materialized_through_lsn,
-            materialize_from_lsn,
+            emit_garbage_from_lsn,
             epoch_changes,
-            ..LazyGlobalState::default()
+            ..BlobCompactionSnapshot::default()
         };
         let (edit, garbage, healed_references) = if partial {
-            let merge = BlobMergeWithRelocations::new(None, lazy_epoch_state);
+            let merge = BlobMergeWithRelocations::new(None, epoch_snapshot);
             let (edit, garbage) =
                 write_patch_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
                     let id = next_table_id;
@@ -492,21 +493,18 @@ impl LsmCompactor {
             // correct because they resolve against the latest epoch, but GC discovery waits until
             // a later patch causes each range to enter full compaction. Add an incremental base
             // sweep or a per-base-SST applied frontier when prompt discovery is required.
-            let relocation_scan = match self
-                .index
-                .get_relocation_lsm_checkpoint()?
-                .and_then(|checkpoint| checkpoint.durable_lsn)
-            {
-                Some(max_lsn) => self
+            let relocation_max_lsn = self.index.get_published_lsn()?;
+            let relocation_scan = match relocation_max_lsn {
+                max_lsn if max_lsn != 0 => self
                     .relocations
                     .upgrade()
                     .map(|relocations| {
                         relocations.scan(0, &inputs.first_key, &inputs.last_key, max_lsn)
                     })
                     .transpose()?,
-                None => None,
+                _ => None,
             };
-            let lazy_global = LazyGlobalState {
+            let snapshot = BlobCompactionSnapshot {
                 shard_infos: self.index.iter_shards()?.into_iter().collect(),
                 shard_drop_lsns: self
                     .index
@@ -524,9 +522,9 @@ impl LsmCompactor {
                             .flatten()
                     })
                     .collect(),
-                ..lazy_epoch_state
+                ..epoch_snapshot
             };
-            let merge = BlobMergeWithRelocations::new(relocation_scan, lazy_global);
+            let merge = BlobMergeWithRelocations::new(relocation_scan, snapshot);
             let (edit, garbage) =
                 write_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
                     let id = next_table_id;
@@ -619,6 +617,27 @@ fn publish_blob_lsm_edit(
     })
 }
 
+fn publish_relocation_lsm_edit(
+    index: &StrataIndex,
+    edit: &ManifestEdit,
+) -> strata_lsm::Result<LsmManifest> {
+    let publish = || -> Result<LsmManifest> {
+        let mut batch = index.batch();
+        index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, edit)?;
+        batch
+            .write_with_sync(true)
+            .map_err(strata_index::Error::from)?;
+        index
+            .get_lsm_manifest(RELOCATION_LSM_MANIFEST)?
+            .ok_or_else(|| Error::InvariantViolation {
+                reason: "published relocation LSM manifest is missing".to_owned(),
+            })
+    };
+    publish().map_err(|error| strata_lsm::Error::InvalidManifest {
+        reason: format!("relocation manifest publication failed: {error}"),
+    })
+}
+
 fn flush_relocation_lsm(
     index: &StrataIndex,
     relocations: &RelocationStore,
@@ -629,21 +648,12 @@ fn flush_relocation_lsm(
     relocations
         .lsm()
         .flush_one(0, id, format!("patch-{id:020}.sst"), |edit| {
-            let publish = || -> Result<LsmManifest> {
-                let mut batch = index.batch();
-                index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, edit)?;
-                batch
-                    .write_with_sync(true)
-                    .map_err(strata_index::Error::from)?;
-                index
-                    .get_lsm_manifest(RELOCATION_LSM_MANIFEST)?
-                    .ok_or_else(|| Error::InvariantViolation {
-                        reason: "published relocation LSM manifest is missing".to_owned(),
-                    })
-            };
-            publish().map_err(|error| strata_lsm::Error::InvalidManifest {
-                reason: format!("relocation manifest publication failed: {error}"),
-            })
+            publish_relocation_lsm_edit(index, edit)
+        })?;
+    relocations
+        .lsm()
+        .materialize_through(index.get_published_lsn()?, |edit| {
+            publish_relocation_lsm_edit(index, edit)
         })?;
 
     let manifest = relocations.lsm().manifest();
@@ -666,12 +676,13 @@ fn compact_relocation_lsm(
 ) -> Result<()> {
     let manifest = relocations.lsm().manifest();
     let patches = &manifest.partitions[&0].patches;
-    let Some(durable_lsn) = relocations.lsm().durable_lsn()? else {
+    let published_lsn = index.get_published_lsn()?;
+    if published_lsn == 0 {
         return Ok(());
-    };
+    }
     if patches
         .iter()
-        .any(|table| table.max_lsn.is_none_or(|lsn| lsn > durable_lsn))
+        .any(|table| table.max_lsn.is_none_or(|lsn| lsn > published_lsn))
     {
         return Ok(());
     }
@@ -872,8 +883,8 @@ impl StrataStore {
         ensure_epoch_initialized(&index, config.starting_epoch)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
         recover_unsealed_segments(&config, &index, &metrics)?;
-        recover_lsm_wal_prefix(&config, &index, &metrics)?;
-        ensure_lazy_global_materialization_cutover(&index)?;
+        recover_store_wal_prefix(&config, &index, &metrics)?;
+        ensure_blob_compaction_garbage_cutover(&index)?;
         let current_epoch = index
             .get_current_epoch()?
             .ok_or(Error::EpochNotInitialized)?;
@@ -900,17 +911,12 @@ impl StrataStore {
             durable_offset,
         );
         metrics.set_lsn_state(next_lsn, published_lsn);
-        let lsm_checkpoint = index.get_lsm_checkpoint()?;
-        let (lsm, lsm_sync_handles) = open_lsm(
-            &config,
-            &index,
-            active_writer,
-            segment_ids.clone(),
-            next_lsn,
-            lsm_checkpoint,
-        )?;
-        publish_recovered_lsm_checkpoint(&index, &metrics, &lsm, &active_segment_state)?;
-        let relocations = open_relocation_lsm(&config, &index)?;
+        let store_checkpoint = index.get_store_checkpoint()?;
+        let (store_wal, blob_recovery, relocation_recovery, lsm_sync_handles) =
+            open_store_wal(&config, &index, next_lsn, store_checkpoint)?;
+        let lsm = open_lsm(&config, &index, next_lsn, blob_recovery)?;
+        publish_recovered_store_checkpoint(&index, &metrics, &store_wal, &active_segment_state)?;
+        let relocations = open_relocation_lsm(&config, &index, next_lsn, relocation_recovery)?;
         let live_snapshots = lsm.live_snapshots();
         metrics.initialize_gc_known(&gc_known_summary(&index)?);
         metrics.set_gc_relocating_segments(gc_relocating_segment_count(&index)?);
@@ -1001,13 +1007,22 @@ impl StrataStore {
             config: config.clone(),
             index: index.clone(),
             lsm: Arc::clone(&lsm),
+            wal: store_wal,
+            segment: active_writer,
+            segment_factory: SegmentFactory::new(
+                config.ingest_dir(),
+                segment_ids.clone(),
+                PlacementClass::Ingest,
+                config.segment_max_bytes,
+            ),
             live_snapshots: live_snapshots.clone(),
             durability_publish_lock: Arc::clone(&durability_publish_lock),
             active_segment_state,
             durable_offset,
             pending_allocation_records: 0,
-            last_checkpoint_at: Instant::now(),
-            last_checkpoint_next_lsn: next_lsn,
+            last_durability_publish_at: Instant::now(),
+            last_segment_rollover_at: Instant::now(),
+            last_segment_rollover_next_lsn: next_lsn,
             pending_rollovers: Vec::new(),
             lsm_flush_tx: lsm_flush_tx.clone(),
             lsm_compact_tx: lsm_compact_tx.clone(),
@@ -1260,9 +1275,9 @@ impl StrataStore {
 
     /// Records or updates a blob's logical lifetime without rewriting its payload.
     ///
-    /// Lifetime changes are metadata-only LSNs. Blob-LSM compaction applies them lazily and emits
-    /// expiration garbage without touching segment bytes. Rewriting the blob just to change its
-    /// lifetime would create an unnecessary second payload record.
+    /// Lifetime changes are metadata-only LSNs. Blob-LSM compaction applies them during merge and
+    /// emits expiration garbage without touching segment bytes. Rewriting the blob just to change
+    /// its lifetime would create an unnecessary second payload record.
     pub fn set_blob_lifetime(&self, key: &BlobKey, logical_end_epoch: Epoch) -> Result<StrataLsn> {
         let result = self.write_batch(vec![BatchOp::SetBlobLifetime {
             key: key.clone(),
@@ -1325,9 +1340,9 @@ impl StrataStore {
 
     /// Resolves the epoch that was active at a specific LSN.
     ///
-    /// Failure mode avoided: lazy compaction must classify an old write under the epoch that was
-    /// true when it happened. Using today's epoch for LSN 25 after several increments would expire
-    /// or pin bytes in the wrong bucket.
+    /// Failure mode avoided: snapshot compaction must classify an old write under the epoch that
+    /// was true when it happened. Using today's epoch for LSN 25 after several increments would
+    /// expire or pin bytes in the wrong bucket.
     pub fn epoch_at_lsn(&self, lsn: StrataLsn) -> Result<Option<Epoch>> {
         Ok(self.index.latest_epoch_at_lsn(lsn)?.map(|(_, epoch)| epoch))
     }
@@ -1369,13 +1384,15 @@ impl StrataStore {
     /// Rolls the current ingest segment so all preceding writes can be sealed and considered by
     /// retention organization or garbage collection.
     ///
-    /// Production performs this checkpoint periodically. Administrative tools and benchmarks can
-    /// request it explicitly when they need a bounded active tail. Returning means the rollover
-    /// metadata is visible and sealing has been queued; callers that require the sealed file should
-    /// wait for the segment state to leave `Sealing`.
-    pub fn checkpoint_active_segment(&self) -> Result<()> {
+    /// Production performs this rollover periodically. Administrative tools and benchmarks can
+    /// request it explicitly when they need a bounded active tail. This does not publish the WAL.
+    /// Returning means the rollover metadata is visible and sealing has been queued; callers that
+    /// require the sealed file should wait for the segment state to leave `Sealing`.
+    pub fn rollover_active_segment_for_sealing(&self) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
-        self.send_write_command(WriteCommand::Checkpoint(CheckpointRequest { response_tx }))?;
+        self.send_write_command(WriteCommand::RolloverSegment(RolloverSegmentRequest {
+            response_tx,
+        }))?;
         response_rx
             .recv()
             .map_err(|_| Error::WriteResponseDropped)??;
@@ -1388,7 +1405,6 @@ impl StrataStore {
     /// on-disk lookup and compaction paths used under sustained GC are exercised without issuing a
     /// synthetic relocation.
     pub fn flush_relocation_memtable_if_due(&self) -> Result<bool> {
-        self.relocations.lsm().sync()?;
         if self.relocations.lsm().roll_memtable_if_due(0)?.is_none() {
             return Ok(false);
         }
@@ -1521,7 +1537,7 @@ enum WriteCommand {
     Batch(BatchWriteRequest),
     DropShard(DropShardRequest),
     GcPublish(GcPublishRequest),
-    Checkpoint(CheckpointRequest),
+    RolloverSegment(RolloverSegmentRequest),
     Sync(SyncRequest),
     Shutdown,
 }
@@ -1603,7 +1619,7 @@ struct SyncRequest {
 }
 
 #[derive(Debug)]
-struct CheckpointRequest {
+struct RolloverSegmentRequest {
     response_tx: mpsc::Sender<Result<()>>,
 }
 
@@ -1818,90 +1834,60 @@ enum PreparedBatchOp {
         shard: ShardKey,
         key: BlobKey,
         payload: Arc<[u8]>,
-        lsn: Option<StrataLsn>,
+        lsn: StrataLsn,
         current_epoch: Epoch,
         record_ref: Option<RecordRef>,
         record_bytes: u64,
     },
     Lifecycle {
         key: BlobKey,
-        lsn: Option<StrataLsn>,
+        lsn: StrataLsn,
         logical_end_epoch: Epoch,
         current_epoch: Epoch,
     },
     Tombstone {
         shard: ShardKey,
         key: BlobKey,
-        lsn: Option<StrataLsn>,
+        lsn: StrataLsn,
     },
     EpochChange {
-        lsn: Option<StrataLsn>,
+        lsn: StrataLsn,
         epoch: Epoch,
     },
 }
 
 impl PreparedBatchOp {
-    fn assign_lsm_result(&mut self, result: &strata_lsm::WriteResult) -> Result<()> {
-        let lsn = result.lsn;
+    fn lsn(&self) -> StrataLsn {
         match self {
-            Self::Put {
-                lsn: assigned,
-                record_ref,
-                record_bytes,
-                ..
-            } => {
-                let written = result.record_ref.ok_or_else(|| Error::InvariantViolation {
-                    reason: format!("LSM put at LSN {lsn} returned no segment reference"),
-                })?;
-                if written.len != *record_bytes {
-                    return Err(Error::InvariantViolation {
-                        reason: format!(
-                            "LSM put at LSN {lsn} wrote {} bytes, expected {record_bytes}",
-                            written.len
-                        ),
-                    });
-                }
-                *assigned = Some(lsn);
-                *record_ref = Some(written);
-            }
-            Self::Lifecycle { lsn: assigned, .. }
-            | Self::Tombstone { lsn: assigned, .. }
-            | Self::EpochChange { lsn: assigned, .. } => {
-                if result.record_ref.is_some() {
-                    return Err(Error::InvariantViolation {
-                        reason: format!("LSM metadata at LSN {lsn} returned a segment reference"),
-                    });
-                }
-                *assigned = Some(lsn);
-            }
+            Self::Put { lsn, .. }
+            | Self::Lifecycle { lsn, .. }
+            | Self::Tombstone { lsn, .. }
+            | Self::EpochChange { lsn, .. } => *lsn,
         }
-        Ok(())
     }
 
-    fn lsm_mutation(&self) -> Result<LsmMutation> {
+    fn blob_mutation(&self) -> Result<Option<LsmMutation>> {
         match self {
             Self::Put {
                 shard,
                 key,
-                payload,
                 current_epoch,
+                record_ref,
                 ..
-            } => Ok(LsmMutation::PutBlob {
+            } => Ok(Some(LsmMutation::PutBlob {
                 partition: 0,
                 key: key.as_bytes().to_vec(),
                 metadata: BlobMutation::encode_put_metadata(*shard, *current_epoch),
-                record: LsmSegmentRecord {
-                    key: key.clone(),
-                    shard: *shard,
-                    payload: Arc::clone(payload),
-                },
-            }),
+                record_ref: record_ref.ok_or_else(|| Error::InvariantViolation {
+                    reason: format!("payload segment reference is missing at LSN {}", self.lsn()),
+                })?,
+            })),
             Self::Lifecycle {
                 key,
                 logical_end_epoch,
                 current_epoch,
                 ..
-            } => Ok(LsmMutation::Put {
+            } => Ok(Some(LsmMutation::Put {
                 partition: 0,
                 key: key.as_bytes().to_vec(),
                 value: BlobMutation::SetLifetime {
@@ -1909,18 +1895,13 @@ impl PreparedBatchOp {
                     current_epoch: *current_epoch,
                 }
                 .encode_inline()?,
-            }),
-            Self::Tombstone { shard, key, .. } => Ok(LsmMutation::Put {
+            })),
+            Self::Tombstone { shard, key, .. } => Ok(Some(LsmMutation::Put {
                 partition: 0,
                 key: key.as_bytes().to_vec(),
                 value: BlobMutation::Tombstone { shard: *shard }.encode_inline()?,
-            }),
-            Self::EpochChange { epoch, .. } => {
-                let mut payload = Vec::with_capacity(1 + 8);
-                payload.push(LSM_EPOCH_CHANGE);
-                payload.extend_from_slice(&epoch.to_le_bytes());
-                Ok(LsmMutation::Metadata { payload })
-            }
+            })),
+            Self::EpochChange { .. } => Ok(None),
         }
     }
 }
@@ -2005,21 +1986,26 @@ fn seal_action(
     }
 }
 
-/// Store metadata coordinator.
+/// Owner of the global sequence, payload segment, and store WAL.
 ///
-/// The LSM owns sequence allocation, segment/WAL order, memtable visibility, and durability. This
-/// thread serializes store-index publication and administrative operations.
+/// There is exactly one routing decision here: every LSN is appended to `wal`, then keyed records
+/// go to an LSM while epoch/shard records go to RocksDB. Neither LSM allocates LSNs or performs
+/// durability I/O.
 struct WriteCoordinator {
     config: StrataStoreConfig,
     index: StrataIndex,
     lsm: Arc<Lsm>,
+    wal: Wal,
+    segment: SegmentWriter,
+    segment_factory: SegmentFactory,
     live_snapshots: LiveSnapshots,
     durability_publish_lock: Arc<Mutex<()>>,
     active_segment_state: SegmentState,
     durable_offset: u64,
     pending_allocation_records: u64,
-    last_checkpoint_at: Instant,
-    last_checkpoint_next_lsn: StrataLsn,
+    last_durability_publish_at: Instant,
+    last_segment_rollover_at: Instant,
+    last_segment_rollover_next_lsn: StrataLsn,
     pending_rollovers: Vec<PendingRollover>,
     lsm_flush_tx: mpsc::Sender<()>,
     lsm_compact_tx: mpsc::Sender<()>,
@@ -2038,12 +2024,12 @@ impl WriteCoordinator {
     /// Main compatibility loop for store metadata publication and administrative operations.
     fn run(mut self) {
         loop {
-            let timeout = self.next_checkpoint_timeout();
+            let timeout = self.next_maintenance_timeout();
             let command = match self.write_rx.recv_timeout(timeout) {
                 Ok(command) => command,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(error) = self.process_timed_checkpoint() {
-                        self.halt_writer_error("timed durability checkpoint", &error);
+                    if let Err(error) = self.process_scheduled_maintenance() {
+                        self.halt_writer_error("scheduled writer maintenance", &error);
                     }
                     continue;
                 }
@@ -2070,8 +2056,8 @@ impl WriteCoordinator {
                 WriteCommand::GcPublish(request) => {
                     self.process_gc_publish(request);
                 }
-                WriteCommand::Checkpoint(request) => {
-                    let result = self.process_timed_checkpoint();
+                WriteCommand::RolloverSegment(request) => {
+                    let result = self.process_segment_rollover();
                     let _ = request.response_tx.send(result);
                 }
                 WriteCommand::Sync(request) => {
@@ -2082,8 +2068,46 @@ impl WriteCoordinator {
         }
     }
 
-    fn next_checkpoint_timeout(&self) -> Duration {
-        DURABILITY_CHECKPOINT_INTERVAL.saturating_sub(self.last_checkpoint_at.elapsed())
+    fn next_maintenance_timeout(&self) -> Duration {
+        self.next_durability_publish_timeout()
+            .min(self.next_segment_rollover_timeout())
+    }
+
+    fn next_durability_publish_timeout(&self) -> Duration {
+        DURABILITY_PUBLISH_INTERVAL.saturating_sub(self.last_durability_publish_at.elapsed())
+    }
+
+    fn next_segment_rollover_timeout(&self) -> Duration {
+        SEGMENT_ROLLOVER_INTERVAL.saturating_sub(self.last_segment_rollover_at.elapsed())
+    }
+
+    fn process_scheduled_maintenance(&mut self) -> Result<()> {
+        // Rollover first when both clocks expire together. The following publication then fsyncs
+        // the store WAL and the RocksDB metadata that installed the replacement active segment.
+        if self.next_segment_rollover_timeout().is_zero() {
+            self.process_segment_rollover()?;
+        }
+        if self.next_durability_publish_timeout().is_zero() {
+            self.process_scheduled_durability_publish()?;
+        }
+        Ok(())
+    }
+
+    fn process_scheduled_durability_publish(&mut self) -> Result<()> {
+        let committed_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        let published_lsn = self.index.get_published_lsn()?;
+        if published_lsn > committed_lsn {
+            return Err(Error::InvariantViolation {
+                reason: format!(
+                    "published LSN {published_lsn} follows committed LSN {committed_lsn}"
+                ),
+            });
+        }
+        if published_lsn == committed_lsn {
+            self.last_durability_publish_at = Instant::now();
+            return Ok(());
+        }
+        self.sync_data(None)
     }
 
     fn send_command_error(command: WriteCommand, error: Error) {
@@ -2100,7 +2124,7 @@ impl WriteCoordinator {
             WriteCommand::GcPublish(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
-            WriteCommand::Checkpoint(request) => {
+            WriteCommand::RolloverSegment(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
             WriteCommand::Sync(request) => {
@@ -2158,14 +2182,14 @@ impl WriteCoordinator {
 
     /// Runs a GC publish request on the writer thread and reports the result to the caller.
     ///
-    /// GC publish uses the LSM sequence stream, then commits its store metadata in this serialized
-    /// publication lane.
+    /// GC publish allocates from the store-global sequence, then commits its metadata in this
+    /// serialized publication lane.
     fn process_gc_publish(&mut self, request: GcPublishRequest) {
         let result = self.submit_gc_publish(request.publish);
         let _ = request.response_tx.send(result);
     }
 
-    /// Validates that a shard can be dropped and delegates the durable registry update.
+    /// Validates that a shard can be dropped and appends the asynchronous registry update.
     ///
     /// Treating "already dropped" as success makes retries idempotent after
     /// caller timeouts. Treating missing shards as success would hide bugs where a caller thinks it
@@ -2178,56 +2202,30 @@ impl WriteCoordinator {
             return Ok(info.key(shard_id));
         }
 
-        // The drop LSN orders lazy materialization after every preceding payload transition.
-        self.sync_data(None)?;
+        // Writer serialization gives the drop an LSN after every preceding payload transition.
+        // It becomes crash-durable at the next ordinary `sync()`; cleanup is gated by that
+        // published frontier below.
         let shard = info.key(shard_id);
         self.mark_shard_dropped(shard_id, shard)?;
         Ok(shard)
     }
 
-    /// Persists the dropped shard state, LSM fence, and resumable cleanup job.
+    /// Stores the drop in the store WAL and RocksDB. No fake LSM row is created.
     fn mark_shard_dropped(&mut self, shard_id: ShardId, shard: ShardKey) -> Result<()> {
         let dropped_info = ShardInfo {
             current_generation: shard.generation,
             state: ShardState::Dropped,
         };
-        let mut payload = Vec::with_capacity(1 + 4 + 8);
-        payload.push(LSM_SHARD_DROP);
-        payload.extend_from_slice(&shard.id.to_le_bytes());
-        payload.extend_from_slice(&shard.generation.to_le_bytes());
-        let lsm_write = self.lsm.write(LsmMutation::Metadata { payload })?;
-        if lsm_write.record_ref.is_some() {
-            let error = Error::InvariantViolation {
-                reason: "LSM shard-drop metadata returned a segment reference".to_owned(),
-            };
-            self.halt_writer_error("shard drop after LSM write", &error);
-            return Err(error);
-        }
-        let drop_lsn = lsm_write.lsn;
+        let drop_lsn = self.index.get_next_lsn()?;
         let next_lsn = drop_lsn
             .checked_add(1)
             .ok_or(strata_segment::Error::RangeOverflow)?;
+        self.wal.append(&[WalEntry {
+            lsn: drop_lsn,
+            payload: StoreWalMutation::ShardDrop { shard }.encode()?,
+        }])?;
 
         let commit_result = (|| {
-            let lsm_checkpoint = self.lsm.sync()?;
-            if lsm_checkpoint.durable_lsn != Some(lsm_write.lsn)
-                || lsm_checkpoint.active_segment_id != self.active_segment_state.segment_id
-                || lsm_checkpoint.active_segment_offset != self.active_segment_state.write_offset
-            {
-                return Err(Error::InvariantViolation {
-                    reason: format!(
-                        "shard-drop LSM checkpoint {lsm_checkpoint:?} does not match lsn {:?} and active segment {} at {}",
-                        lsm_write.lsn,
-                        self.active_segment_state.segment_id,
-                        self.active_segment_state.write_offset
-                    ),
-                });
-            }
-
-            let _publish_guard = self
-                .durability_publish_lock
-                .lock()
-                .expect("durability publish lock poisoned");
             let mut batch = self.index.batch();
             self.index
                 .put_shard_info_batch(&mut batch, shard_id, dropped_info)?;
@@ -2243,22 +2241,16 @@ impl WriteCoordinator {
                 },
             )?;
             self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-            self.index.put_published_lsn_batch(&mut batch, drop_lsn)?;
-            self.index
-                .put_lsm_checkpoint_batch(&mut batch, lsm_checkpoint)?;
-            batch
-                .write_with_sync(true)
-                .map_err(strata_index::Error::from)?;
+            batch.write().map_err(strata_index::Error::from)?;
             Ok::<(), Error>(())
         })();
 
         if let Err(error) = commit_result {
-            self.halt_writer_error("shard drop after LSM write", &error);
+            self.halt_writer_error("shard drop after store-WAL append", &error);
             return Err(error);
         }
 
         self.metrics.set_next_lsn(next_lsn);
-        self.metrics.set_published_lsn(drop_lsn);
         Ok(())
     }
 
@@ -2324,8 +2316,8 @@ impl WriteCoordinator {
         }
     }
 
-    /// Full write transaction for a batch: validate, append ordered LSM mutations, then commit one
-    /// index metadata batch.
+    /// Full write transaction for a batch: validate, append the payload/store-WAL records, apply
+    /// keyed projections, then commit one index metadata batch.
     ///
     /// User visible validation errors return normally before physical writer state changes. Once
     /// the physical write path starts, segment/WAL/index failures halt the store and crash recovery
@@ -2365,13 +2357,53 @@ impl WriteCoordinator {
         let mut appended_records = 0_u64;
         let mut appended_bytes = 0_u64;
         let mut put_metrics = Vec::new();
-        let mut rolled_memtable = false;
+        let mut lsm_writes = Vec::new();
+        let mut wal_entries = Vec::with_capacity(prepared.ops.len());
         for op in &mut prepared.ops {
-            let mutation = match op.lsm_mutation() {
-                Ok(mutation) => mutation,
-                Err(error) => {
+            let lsn = op.lsn();
+            if let PreparedBatchOp::Put {
+                shard,
+                key,
+                payload,
+                record_ref,
+                record_bytes,
+                ..
+            } = op
+            {
+                let append = profile_phase(
+                    profile.as_deref_mut(),
+                    |profile, elapsed| profile.segment_append += elapsed,
+                    || {
+                        if self.segment.ensure_capacity(*record_bytes).is_err() {
+                            self.rollover_active_segment(lsn)?;
+                        }
+                        self.segment
+                            .append_for_shard(key, lsn, *shard, payload)
+                            .map_err(Error::from)
+                    },
+                );
+                let written = match append {
+                    Ok(written) => written,
+                    Err(error) => {
+                        self.halt_submit_batch_failure(
+                            "payload segment append",
+                            &error,
+                            appended_records,
+                            appended_bytes,
+                        );
+                        let _ = response_tx.send(Err(error));
+                        return Err(());
+                    }
+                };
+                if written.record_len != *record_bytes {
+                    let error = Error::InvariantViolation {
+                        reason: format!(
+                            "segment put at LSN {lsn} wrote {}, expected {record_bytes}",
+                            written.record_len
+                        ),
+                    };
                     self.halt_submit_batch_failure(
-                        "encode LSM mutation",
+                        "payload segment length",
                         &error,
                         appended_records,
                         appended_bytes,
@@ -2379,65 +2411,8 @@ impl WriteCoordinator {
                     let _ = response_tx.send(Err(error));
                     return Err(());
                 }
-            };
-            let write_result = match profile_phase(
-                profile.as_deref_mut(),
-                |profile, elapsed| profile.segment_append += elapsed,
-                || self.lsm.write(mutation),
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    let error = Error::from(error);
-                    self.halt_submit_batch_failure(
-                        "LSM write",
-                        &error,
-                        appended_records,
-                        appended_bytes,
-                    );
-                    let _ = profile_phase(
-                        profile.as_deref_mut(),
-                        |profile, elapsed| profile.response_send += elapsed,
-                        || response_tx.send(Err(error)),
-                    );
-                    return Err(());
-                }
-            };
-            rolled_memtable |= write_result.rolled_memtable.is_some();
-            if let Some(rollover) = write_result.rolled_segment
-                && let Err(error) = self.accept_lsm_rollover(rollover)
-            {
-                self.halt_submit_batch_failure(
-                    "publish LSM segment rollover",
-                    &error,
-                    appended_records,
-                    appended_bytes,
-                );
-                let _ = response_tx.send(Err(error));
-                return Err(());
-            }
-            if let Err(error) = op.assign_lsm_result(&write_result) {
-                self.halt_submit_batch_failure(
-                    "apply LSM write result",
-                    &error,
-                    appended_records,
-                    appended_bytes,
-                );
-                let _ = response_tx.send(Err(error));
-                return Err(());
-            }
-            prepared.result.op_lsns.push(write_result.lsn);
-
-            if let PreparedBatchOp::Put {
-                payload,
-                lsn,
-                record_ref,
-                record_bytes,
-                ..
-            } = op
-            {
-                let lsn = lsn.expect("LSM result assigned the put lsn");
-                let record_ref = record_ref.expect("LSM result assigned the put record reference");
-                let Some(write_offset) = record_ref.end_offset() else {
+                *record_ref = Some(written.record_ref);
+                let Some(write_offset) = written.record_ref.end_offset() else {
                     let error = Error::InvariantViolation {
                         reason: format!("record reference at LSN {lsn} overflows its segment"),
                     };
@@ -2451,7 +2426,7 @@ impl WriteCoordinator {
                     return Err(());
                 };
                 appended_records = appended_records.saturating_add(1);
-                appended_bytes = appended_bytes.saturating_add(record_ref.len);
+                appended_bytes = appended_bytes.saturating_add(written.record_ref.len);
                 self.pending_allocation_records = self.pending_allocation_records.saturating_add(1);
                 put_metrics.push(PutMetric {
                     payload_bytes: payload.len() as u64,
@@ -2469,7 +2444,71 @@ impl WriteCoordinator {
                         .map_or(lsn, |last| last.max(lsn)),
                 );
             }
+
+            let store_mutation = match op.blob_mutation() {
+                Ok(Some(mutation)) => {
+                    lsm_writes.push((lsn, mutation.clone()));
+                    StoreWalMutation::Blob(mutation)
+                }
+                Ok(None) => match op {
+                    PreparedBatchOp::EpochChange { epoch, .. } => {
+                        StoreWalMutation::Epoch { epoch: *epoch }
+                    }
+                    _ => unreachable!("only epoch changes are RocksDB-only batch operations"),
+                },
+                Err(error) => {
+                    self.halt_submit_batch_failure(
+                        "encode store WAL mutation",
+                        &error,
+                        appended_records,
+                        appended_bytes,
+                    );
+                    let _ = response_tx.send(Err(error));
+                    return Err(());
+                }
+            };
+            let payload = match store_mutation.encode() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.halt_submit_batch_failure(
+                        "encode store WAL record",
+                        &error,
+                        appended_records,
+                        appended_bytes,
+                    );
+                    let _ = response_tx.send(Err(error));
+                    return Err(());
+                }
+            };
+            wal_entries.push(WalEntry { lsn, payload });
+            prepared.result.op_lsns.push(lsn);
         }
+
+        if let Err(error) = self.wal.append(&wal_entries).map_err(Error::from) {
+            self.halt_submit_batch_failure(
+                "store WAL append",
+                &error,
+                appended_records,
+                appended_bytes,
+            );
+            let _ = response_tx.send(Err(error));
+            return Err(());
+        }
+        let lsm_write = match self.lsm.write_batch(lsm_writes) {
+            Ok(result) => result,
+            Err(error) => {
+                let error = Error::from(error);
+                self.halt_submit_batch_failure(
+                    "blob LSM apply",
+                    &error,
+                    appended_records,
+                    appended_bytes,
+                );
+                let _ = response_tx.send(Err(error));
+                return Err(());
+            }
+        };
+        let rolled_memtable = !lsm_write.rolled_memtables.is_empty();
 
         let pending_rollovers = self.take_pending_rollovers();
         let commit_result = profile_phase(
@@ -2710,35 +2749,22 @@ impl WriteCoordinator {
         }
         let skipped_output_ranges =
             skipped_gc_output_ranges(&skipped_records, &output_plan.staged_to_final_segment_id);
-        let lsm_mutations = survivors
-            .iter()
-            .map(|_| LsmMutation::Metadata {
-                payload: vec![LSM_GC_RELOCATION],
-            })
-            .collect();
         let relocating_source_states = self.plan_gc_relocating_source_states(
             survivors.iter().map(|record| record.source.from.segment_id),
         )?;
-        let lsm_write = match self.lsm.write_batch(lsm_mutations) {
-            Ok(result) => result,
-            Err(error) => {
-                let error = Error::from(error);
-                self.halt_writer_error("GC LSM write", &error);
-                return Err(error);
-            }
-        };
-        if lsm_write.lsns.len() != survivors.len()
-            || !lsm_write.record_refs.iter().all(Option::is_none)
-        {
-            let error = Error::InvariantViolation {
-                reason: "LSM returned unexpected lsns or refs for GC metadata".to_owned(),
-            };
-            self.halt_writer_error("GC LSM write result", &error);
-            return Err(error);
-        }
-        let rolled_memtable = !lsm_write.rolled_memtables.is_empty();
+        let first_publish_lsn = self.index.get_next_lsn()?;
+        let publish_lsns = (0..survivors.len())
+            .map(|offset| {
+                first_publish_lsn
+                    .checked_add(
+                        u64::try_from(offset)
+                            .map_err(|_| Error::from(strata_segment::Error::RangeOverflow))?,
+                    )
+                    .ok_or_else(|| Error::from(strata_segment::Error::RangeOverflow))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let published_records = match assign_gc_publish_lsns(
-            &lsm_write.lsns,
+            &publish_lsns,
             &survivors,
             &output_plan.staged_to_final_segment_id,
         ) {
@@ -2756,27 +2782,6 @@ impl WriteCoordinator {
             .last()
             .expect("surviving GC records are non-empty")
             .publish_lsn;
-        let lsm_checkpoint = match self.lsm.sync() {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                let error = Error::from(error);
-                self.halt_writer_error("GC main LSM sync", &error);
-                return Err(error);
-            }
-        };
-        if lsm_checkpoint.durable_lsn != Some(last_publish_lsn)
-            || lsm_checkpoint.active_segment_id != self.active_segment_state.segment_id
-            || lsm_checkpoint.active_segment_offset != self.active_segment_state.write_offset
-        {
-            let error = Error::InvariantViolation {
-                reason: format!(
-                    "GC LSM checkpoint {lsm_checkpoint:?} does not match publish LSN {last_publish_lsn} and active segment {} at {}",
-                    self.active_segment_state.segment_id, self.active_segment_state.write_offset
-                ),
-            };
-            self.halt_writer_error("GC main LSM checkpoint", &error);
-            return Err(error);
-        }
         apply_gc_output_lsn_bounds(&mut output_plan.segment_states, &published_records);
         let relocation_entries = published_records
             .iter()
@@ -2788,6 +2793,19 @@ impl WriteCoordinator {
                 to: record.to,
             })
             .collect::<Vec<_>>();
+        let wal_entries = relocation_entries
+            .iter()
+            .map(|entry| {
+                Ok(WalEntry {
+                    lsn: entry.publish_lsn,
+                    payload: StoreWalMutation::Relocation(entry.clone()).encode()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Err(error) = self.wal.append(&wal_entries).map_err(Error::from) {
+            self.halt_writer_error("GC store WAL append", &error);
+            return Err(error);
+        }
         let relocation_write = match self.relocations.write_batch(0, &relocation_entries) {
             Ok(write) => write,
             Err(error) => {
@@ -2796,23 +2814,30 @@ impl WriteCoordinator {
                 return Err(error);
             }
         };
-        if relocation_write.lsns.len() != relocation_entries.len()
-            || !relocation_write.record_refs.iter().all(Option::is_none)
-        {
+        if relocation_write.lsns.len() != relocation_entries.len() {
             let error = Error::InvariantViolation {
-                reason: "relocation LSM returned unexpected lsns or refs".to_owned(),
+                reason: "relocation LSM returned an unexpected LSN count".to_owned(),
             };
             self.halt_writer_error("GC relocation LSM write result", &error);
             return Err(error);
         }
-        let relocation_checkpoint = match self.relocations.lsm().sync() {
+        let store_checkpoint = match self.sync_store_files() {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
-                let error = Error::from(error);
-                self.halt_writer_error("GC relocation LSM sync", &error);
+                self.halt_writer_error("GC store durability checkpoint", &error);
                 return Err(error);
             }
         };
+        if self.wal.last_lsn() != Some(last_publish_lsn) {
+            let error = Error::InvariantViolation {
+                reason: format!(
+                    "GC store WAL ends at {:?}, expected {last_publish_lsn}",
+                    self.wal.last_lsn()
+                ),
+            };
+            self.halt_writer_error("GC store durability frontier", &error);
+            return Err(error);
+        }
         let rolled_relocation_memtable = !relocation_write.rolled_memtables.is_empty();
 
         let pending_rollovers = self.take_pending_rollovers();
@@ -2913,8 +2938,6 @@ impl WriteCoordinator {
                 GARBAGE_LOG_HEAD,
                 garbage_position,
             )?;
-            self.index
-                .put_relocation_lsm_checkpoint_batch(&mut batch, relocation_checkpoint)?;
             for (source_segment_id, output_bytes) in &output_bytes_by_source {
                 self.index.put_gc_reclaim_pending_batch(
                     &mut batch,
@@ -2953,9 +2976,9 @@ impl WriteCoordinator {
             self.index
                 .put_published_lsn_batch(&mut batch, last_publish_lsn)?;
             self.index
-                .put_lsm_checkpoint_batch(&mut batch, lsm_checkpoint)?;
+                .put_store_checkpoint_batch(&mut batch, store_checkpoint)?;
             if let Err(error) = batch
-                .write()
+                .write_with_sync(true)
                 .map_err(strata_index::Error::from)
                 .map_err(Error::from)
             {
@@ -2966,10 +2989,10 @@ impl WriteCoordinator {
 
         match commit_result {
             Ok(()) => {
-                if let Err(error) = self
-                    .lsm
-                    .materialize_metadata(|edit| publish_blob_lsm_edit(&self.index, edit))
-                {
+                self.last_durability_publish_at = Instant::now();
+                if let Err(error) = self.lsm.materialize_through(last_publish_lsn, |edit| {
+                    publish_blob_lsm_edit(&self.index, edit)
+                }) {
                     let error = Error::from(error);
                     self.halt_writer_error("GC metadata materialization", &error);
                     return Err(error);
@@ -2996,7 +3019,6 @@ impl WriteCoordinator {
                 self.metrics
                     .record_gc_output_published(published_output_bytes);
                 self.run_rollover_post_commit(pending_rollovers);
-                self.request_lsm_flush(rolled_memtable);
                 let next_lsn = published_records
                     .last()
                     .and_then(|record| record.publish_lsn.checked_add(1))
@@ -3239,13 +3261,18 @@ impl WriteCoordinator {
         })
     }
 
-    /// Validates a client batch and resolves store metadata before the LSM assigns its LSNs.
+    /// Validates a client batch and assigns its contiguous store-owned LSN range.
     fn prepare_batch(&self, ops: Vec<BatchOp>) -> Result<PreparedBatch> {
         let mut prepared_ops = Vec::with_capacity(ops.len());
         let mut op_epochs = Vec::with_capacity(ops.len());
         let mut current_epoch = self.index.get_current_epoch()?;
+        let mut next_lsn = self.index.get_next_lsn()?;
 
         for op in ops {
+            let lsn = next_lsn;
+            next_lsn = next_lsn
+                .checked_add(1)
+                .ok_or(strata_segment::Error::RangeOverflow)?;
             match op {
                 BatchOp::Put {
                     shard_id,
@@ -3291,7 +3318,7 @@ impl WriteCoordinator {
                         shard,
                         key,
                         payload,
-                        lsn: None,
+                        lsn,
                         current_epoch,
                         record_ref: None,
                         record_bytes,
@@ -3311,7 +3338,7 @@ impl WriteCoordinator {
                     }
                     prepared_ops.push(PreparedBatchOp::Lifecycle {
                         key,
-                        lsn: None,
+                        lsn,
                         logical_end_epoch,
                         current_epoch: epoch,
                     });
@@ -3319,11 +3346,7 @@ impl WriteCoordinator {
                 }
                 BatchOp::Tombstone { shard_id, key } => {
                     let shard = self.openable_shard_key(shard_id)?;
-                    prepared_ops.push(PreparedBatchOp::Tombstone {
-                        shard,
-                        key,
-                        lsn: None,
-                    });
+                    prepared_ops.push(PreparedBatchOp::Tombstone { shard, key, lsn });
                     op_epochs.push(None);
                 }
                 BatchOp::IncrementEpoch => {
@@ -3333,7 +3356,7 @@ impl WriteCoordinator {
                         .ok_or(strata_segment::Error::RangeOverflow)?;
                     current_epoch = Some(next_epoch);
                     prepared_ops.push(PreparedBatchOp::EpochChange {
-                        lsn: None,
+                        lsn,
                         epoch: next_epoch,
                     });
                     op_epochs.push(Some(next_epoch));
@@ -3385,8 +3408,8 @@ impl WriteCoordinator {
                 }
                 PreparedBatchOp::Lifecycle { .. } | PreparedBatchOp::Tombstone { .. } => {}
                 PreparedBatchOp::EpochChange { lsn, epoch } => {
-                    let lsn = lsn.expect("LSM lsn must be assigned before metadata publication");
-                    self.index.put_epoch_change_batch(&mut batch, lsn, *epoch)?;
+                    self.index
+                        .put_epoch_change_batch(&mut batch, *lsn, *epoch)?;
                     self.index.put_current_epoch_batch(&mut batch, *epoch)?;
                 }
             }
@@ -3450,10 +3473,14 @@ impl WriteCoordinator {
         }
     }
 
-    fn process_timed_checkpoint(&mut self) -> Result<()> {
-        self.last_checkpoint_at = Instant::now();
+    /// Rolls a non-empty payload segment on its own cadence.
+    ///
+    /// This is not a durability publication: it syncs the segment being closed, but it neither
+    /// syncs the store WAL nor advances `PublishedLsn`. `sync_data` owns that separate boundary.
+    fn process_segment_rollover(&mut self) -> Result<()> {
+        self.last_segment_rollover_at = Instant::now();
         let sealed_before_lsn = self.index.get_next_lsn()?;
-        if sealed_before_lsn <= self.last_checkpoint_next_lsn {
+        if sealed_before_lsn <= self.last_segment_rollover_next_lsn {
             return Ok(());
         }
 
@@ -3480,61 +3507,62 @@ impl WriteCoordinator {
         }
     }
 
-    /// Asks the LSM append lane to roll and stages the matching store metadata.
+    /// Rolls the store-owned payload segment and stages its RocksDB metadata.
+    ///
+    /// Segment rollover is intentionally here, beside WAL ownership. The LSM sees only the
+    /// `RecordRef` produced after this method installs the next segment.
     fn rollover_active_segment(&mut self, sealed_before_lsn: StrataLsn) -> Result<()> {
-        let rollover = self.lsm.roll_segment()?;
-        if rollover.sealed_before_lsn != sealed_before_lsn {
-            return Err(Error::InvariantViolation {
-                reason: format!(
-                    "LSM rolled before {:?}, expected LSN {sealed_before_lsn}",
-                    rollover.sealed_before_lsn
-                ),
-            });
-        }
-        self.accept_lsm_rollover(rollover)
-    }
-
-    /// Mirrors an LSM-owned rollover into the store segment metadata.
-    fn accept_lsm_rollover(&mut self, rollover: strata_lsm::RolledSegment) -> Result<()> {
         self.wait_for_seal_backlog_capacity()?;
         let old_segment_id = self.active_segment_state.segment_id;
-        if rollover.sealed_segment_id != old_segment_id
-            || rollover.sealed_length != self.active_segment_state.write_offset
+        let sealed_length = self.segment.write_offset();
+        if self.segment.segment_id() != old_segment_id
+            || sealed_length != self.active_segment_state.write_offset
         {
             return Err(Error::InvariantViolation {
                 reason: format!(
-                    "LSM rolled segment {} at {}, expected {old_segment_id} at {}",
-                    rollover.sealed_segment_id,
-                    rollover.sealed_length,
+                    "payload writer is segment {} at {sealed_length}, expected {old_segment_id} at {}",
+                    self.segment.segment_id(),
                     self.active_segment_state.write_offset
                 ),
             });
         }
-        let new_segment_id = rollover.active_segment_id;
+        // A rollover is rare and already enters the sealing path, so synchronously closing this
+        // segment keeps the hand-off obvious without adding another pending-sync state machine.
+        self.segment.sync_data()?;
+        let next = self.segment_factory.create()?;
+        let new_segment_id = next.segment_id();
+        if new_segment_id <= old_segment_id {
+            return Err(Error::InvariantViolation {
+                reason: format!(
+                    "replacement segment {new_segment_id} must follow active segment {old_segment_id}"
+                ),
+            });
+        }
         let new_state =
             active_segment_state_from_path(&self.config, self.ingest_owner, new_segment_id, 0, 0);
         let mut old_state = self.active_segment_state.clone();
-        old_state.write_offset = rollover.sealed_length;
+        old_state.write_offset = sealed_length;
         old_state.durable_offset = self.durable_offset;
         old_state.state = SegmentFileState::Sealing;
-        old_state.sealed_before_lsn = Some(rollover.sealed_before_lsn);
+        old_state.sealed_before_lsn = Some(sealed_before_lsn);
 
         self.pending_rollovers.push(PendingRollover {
             old_segment_state: old_state,
             new_segment_state: new_state.clone(),
-            new_segment_published_at_lsn: rollover.sealed_before_lsn,
+            new_segment_published_at_lsn: sealed_before_lsn,
             seal_task: SegmentSealTask {
                 segment_id: old_segment_id,
-                sealed_len: rollover.sealed_length,
-                sealed_before_lsn: rollover.sealed_before_lsn,
+                sealed_len: sealed_length,
+                sealed_before_lsn,
                 allocation_records: self.pending_allocation_records,
             },
         });
+        self.segment = next;
         self.pending_allocation_records = 0;
         self.active_segment_state = new_state;
         self.durable_offset = 0;
-        self.last_checkpoint_at = Instant::now();
-        self.last_checkpoint_next_lsn = rollover.sealed_before_lsn;
+        self.last_segment_rollover_at = Instant::now();
+        self.last_segment_rollover_next_lsn = sealed_before_lsn;
         self.metrics.set_active_segment(
             self.active_segment_state.segment_id,
             self.active_segment_state.write_offset,
@@ -3568,10 +3596,65 @@ impl WriteCoordinator {
         }
     }
 
+    /// Syncs the two store-owned append streams and returns their physical coordinates.
+    ///
+    /// The returned value has no logical frontier. Its LSN is the `PublishedLsn` written beside it
+    /// in the same RocksDB batch by the caller.
+    fn sync_store_files(&mut self) -> Result<StoreCheckpoint> {
+        self.segment.sync_data()?;
+        let wal_position = self.wal.sync()?;
+        self.wal.wait_for_sync(wal_position)?;
+        Ok(StoreCheckpoint {
+            wal_position,
+            active_segment_id: self.segment.segment_id(),
+            active_segment_offset: self.segment.write_offset(),
+        })
+    }
+
+    /// Advances both keyed projections, then reclaims only the store-WAL prefix covered by both.
+    fn reclaim_store_wal(&mut self, published_lsn: StrataLsn) -> Result<()> {
+        self.lsm.materialize_through(published_lsn, |edit| {
+            publish_blob_lsm_edit(&self.index, edit)
+        })?;
+        self.relocations
+            .lsm()
+            .materialize_through(published_lsn, |edit| {
+                publish_relocation_lsm_edit(&self.index, edit)
+            })?;
+
+        let blob_frontier = self.lsm.manifest().materialized_through.unwrap_or_default();
+        let relocation_frontier = self
+            .relocations
+            .lsm()
+            .manifest()
+            .materialized_through
+            .unwrap_or_default();
+        let reclaim_through = blob_frontier.min(relocation_frontier);
+        if reclaim_through == 0 {
+            return Ok(());
+        }
+
+        let retained_from = self.wal.retained_from_after(reclaim_through)?;
+        let persisted = self.index.get_store_wal_retained_from()?;
+        let current = persisted.unwrap_or(self.lsm.manifest().wal_retained_from);
+        if retained_from > current || persisted.is_none() {
+            // Publish the store-owned deletion boundary before unlinking anything. Falling back
+            // to the manifest migrates databases written when this value lived on the blob LSM.
+            let mut batch = self.index.batch();
+            self.index
+                .put_store_wal_retained_from_batch(&mut batch, retained_from.max(current))?;
+            batch
+                .write_with_sync(true)
+                .map_err(strata_index::Error::from)?;
+        }
+        self.wal.reclaim_through(reclaim_through)?;
+        Ok(())
+    }
+
     /// The durability step. The ordering here is the single most load bearing thing in this
     /// file:
     ///
-    /// 1. fsync the LSM segment and WAL,
+    /// 1. fsync the store-owned payload segment, then the store WAL,
     /// 2. then write durable offsets, allocation baseline, and published_lsn to the index,
     /// 3. then fsync the RocksDB WAL.
     ///
@@ -3582,18 +3665,18 @@ impl WriteCoordinator {
     /// reached the platter, which is the one lie this design must never tell, because the Walrus
     /// event cursor advances based on it.
     ///
-    /// The allocation baseline, LSM checkpoint, and published_lsn share one RocksDB batch, so
+    /// The allocation baseline, store checkpoint, and published_lsn share one RocksDB batch, so
     /// compaction cannot retire a published record before GC knows that record started live.
     fn sync_data(&mut self, mut profile: Option<&mut StoreSyncProfile>) -> Result<()> {
         let started = Instant::now();
         let previous_durable_offset = self.durable_offset;
         let durable_offset = self.active_segment_state.write_offset;
-        let segment_sync_result = profile_phase(
+        let durability_result = profile_phase(
             profile.as_deref_mut(),
             |profile, elapsed| profile.segment_sync += elapsed,
-            || self.lsm.sync(),
+            || self.sync_store_files(),
         );
-        let lsm_checkpoint = match segment_sync_result {
+        let store_checkpoint = match durability_result {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 self.metrics.record_sync(Err(()), started.elapsed());
@@ -3601,18 +3684,18 @@ impl WriteCoordinator {
             }
         };
         let committed_lsn = self.index.get_next_lsn()?.saturating_sub(1);
-        if lsm_checkpoint.durable_lsn.unwrap_or_default() != committed_lsn
-            || lsm_checkpoint.active_segment_id != self.active_segment_state.segment_id
-            || lsm_checkpoint.active_segment_offset != durable_offset
+        if self.wal.last_lsn().unwrap_or_default() != committed_lsn
+            || store_checkpoint.active_segment_id != self.active_segment_state.segment_id
+            || store_checkpoint.active_segment_offset != durable_offset
         {
             let error = Error::InvariantViolation {
                 reason: format!(
-                    "LSM checkpoint {lsm_checkpoint:?} does not match store LSN {committed_lsn} and active segment {} at {durable_offset}",
+                    "store checkpoint {store_checkpoint:?} does not match store LSN {committed_lsn} and active segment {} at {durable_offset}",
                     self.active_segment_state.segment_id
                 ),
             };
             self.metrics.record_sync(Err(()), started.elapsed());
-            self.halt_writer_error("sync LSM checkpoint", &error);
+            self.halt_writer_error("sync store checkpoint", &error);
             return Err(error);
         }
         let _publish_guard = self
@@ -3650,14 +3733,18 @@ impl WriteCoordinator {
                     self.pending_allocation_records,
                 )?;
                 let current_published_lsn = self.index.get_published_lsn()?;
-                let published_lsn = lsm_checkpoint
-                    .durable_lsn
-                    .unwrap_or_default()
-                    .max(current_published_lsn);
+                if current_published_lsn > committed_lsn {
+                    return Err(Error::InvariantViolation {
+                        reason: format!(
+                            "published LSN {current_published_lsn} follows committed LSN {committed_lsn}"
+                        ),
+                    });
+                }
+                let published_lsn = committed_lsn;
                 self.index
                     .put_published_lsn_batch(&mut batch, published_lsn)?;
                 self.index
-                    .put_lsm_checkpoint_batch(&mut batch, lsm_checkpoint)?;
+                    .put_store_checkpoint_batch(&mut batch, store_checkpoint)?;
                 Ok::<_, Error>((state, batch, published_lsn))
             },
         )?;
@@ -3678,6 +3765,7 @@ impl WriteCoordinator {
         }
         self.active_segment_state = state;
         self.pending_allocation_records = 0;
+        self.last_durability_publish_at = Instant::now();
         profile_phase(
             profile,
             |profile, elapsed| profile.state_update += elapsed,
@@ -3692,6 +3780,14 @@ impl WriteCoordinator {
                 self.metrics.set_published_lsn(published_lsn);
             },
         );
+        // Reclaiming the WAL may publish LSM materialization frontiers. Those writes do not need
+        // to share the durability-publication mutex: published_lsn and the store checkpoint are
+        // already committed, and materialization can only lag that durable frontier.
+        drop(_publish_guard);
+        if let Err(error) = self.reclaim_store_wal(published_lsn) {
+            self.halt_writer_error("reclaim store WAL", &error);
+            return Err(error);
+        }
         self.metrics.record_sync(
             Ok(durable_offset.saturating_sub(previous_durable_offset)),
             started.elapsed(),
@@ -4297,18 +4393,14 @@ fn open_active_writer(
 fn open_lsm(
     config: &StrataStoreConfig,
     index: &StrataIndex,
-    active_writer: SegmentWriter,
-    segment_ids: SegmentIdAllocator,
     next_lsn: StrataLsn,
-    checkpoint: Option<LsmCheckpoint>,
-) -> Result<(Arc<Lsm>, Vec<JoinHandle<()>>)> {
+    recovered: Vec<(StrataLsn, LsmMutation)>,
+) -> Result<Arc<Lsm>> {
     open_lsm_with_options(
         config,
         index,
-        active_writer,
-        segment_ids,
         next_lsn,
-        checkpoint,
+        recovered,
         LsmOptions {
             rollover_policy: Some(MemtableRolloverPolicy::new(
                 LSM_MEMTABLE_MAX_KEYS,
@@ -4322,13 +4414,33 @@ fn open_lsm(
 fn open_lsm_with_options(
     config: &StrataStoreConfig,
     index: &StrataIndex,
-    active_writer: SegmentWriter,
-    segment_ids: SegmentIdAllocator,
     next_lsn: StrataLsn,
-    checkpoint: Option<LsmCheckpoint>,
+    recovered: Vec<(StrataLsn, LsmMutation)>,
     options: LsmOptions,
-) -> Result<(Arc<Lsm>, Vec<JoinHandle<()>>)> {
+) -> Result<Arc<Lsm>> {
     let lsm_dir = config.namespace_dir().join("lsm");
+    let last_lsn = next_lsn.checked_sub(1).filter(|lsn| *lsn != 0);
+    let manifest = Arc::new(load_blob_lsm_manifest(index)?);
+    Ok(Arc::new(Lsm::from_parts(
+        lsm_dir.join("tables"),
+        manifest,
+        recovered,
+        last_lsn,
+        options,
+    )?))
+}
+
+fn open_store_wal(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+    next_lsn: StrataLsn,
+    checkpoint: Option<StoreCheckpoint>,
+) -> Result<(
+    Wal,
+    Vec<(StrataLsn, LsmMutation)>,
+    Vec<RelocationEntry>,
+    Vec<JoinHandle<()>>,
+)> {
     let (sync_tx, syncer) = file_sync_channel(LSM_FILE_SYNC_QUEUE_CAPACITY);
     let mut sync_handles = Vec::with_capacity(LSM_FILE_SYNC_WORKERS);
     for worker in 0..LSM_FILE_SYNC_WORKERS {
@@ -4345,101 +4457,82 @@ fn open_lsm_with_options(
     let last_lsn = next_lsn.checked_sub(1).filter(|lsn| *lsn != 0);
     let checkpoint_position =
         checkpoint.map_or(WalPosition::default(), |checkpoint| checkpoint.wal_position);
-    let checkpoint_lsn = checkpoint.and_then(|checkpoint| checkpoint.durable_lsn);
-    let manifest = Arc::new(load_blob_lsm_manifest(index)?);
+    // The physical checkpoint and PublishedLsn are committed in one RocksDB batch. There is no
+    // second logical "checkpoint LSN" to reconcile during recovery.
+    let published_lsn = match index.get_published_lsn()? {
+        0 => None,
+        lsn => Some(lsn),
+    };
+    let (materialized_through, retained_from) = store_wal_recovery_state(index)?;
     let wal = Wal::recover(
-        lsm_dir.join("wal"),
+        config.namespace_dir().join("wal"),
         config.segment_max_bytes,
         checkpoint_position,
-        checkpoint_lsn,
-        manifest.materialized_through,
-        manifest.wal_retained_from,
+        published_lsn,
+        materialized_through,
+        retained_from,
         last_lsn,
         sync_tx,
     )?;
-    let segment_factory = SegmentFactory::new(
-        config.ingest_dir(),
-        segment_ids,
-        PlacementClass::Ingest,
-        config.segment_max_bytes,
-    );
-    let lsm = Lsm::from_parts(
-        lsm_dir.join("tables"),
-        manifest,
-        active_writer,
-        segment_factory,
-        wal,
-        last_lsn,
-        options,
-    )?;
-    Ok((Arc::new(lsm), sync_handles))
+    let mut blob = Vec::new();
+    let mut relocations = Vec::new();
+    wal.replay(|entry| {
+        let mutation = StoreWalMutation::decode(&entry.payload)
+            .map_err(|error| Error::InvalidWal(error.to_string()))?;
+        match mutation {
+            StoreWalMutation::Blob(mutation) => blob.push((entry.lsn, mutation)),
+            StoreWalMutation::Relocation(relocation) => {
+                if relocation.publish_lsn != entry.lsn {
+                    return Err(Error::InvalidWal(format!(
+                        "relocation publish LSN {} differs from WAL LSN {}",
+                        relocation.publish_lsn, entry.lsn
+                    )));
+                }
+                relocations.push(relocation);
+            }
+            StoreWalMutation::Epoch { .. } | StoreWalMutation::ShardDrop { .. } => {}
+        }
+        Ok(())
+    })?;
+    Ok((wal, blob, relocations, sync_handles))
+}
+
+/// Returns the two store-wide facts needed to recover the shared WAL.
+///
+/// A prefix is replay-safe only when both keyed projections have materialized it. For example,
+/// blob=100 and relocation=80 means the store frontier is 80, never 100. The retained file ID is
+/// store state; the blob-manifest value is read only to open databases created before that state
+/// key existed.
+fn store_wal_recovery_state(index: &StrataIndex) -> Result<(Option<StrataLsn>, u64)> {
+    let blob = load_blob_lsm_manifest(index)?;
+    let relocation = load_relocation_lsm_manifest(index)?;
+    let materialized_through = blob
+        .materialized_through
+        .zip(relocation.materialized_through)
+        .map(|(blob, relocation)| blob.min(relocation));
+    let retained_from = index
+        .get_store_wal_retained_from()?
+        .unwrap_or(blob.wal_retained_from);
+    Ok((materialized_through, retained_from))
 }
 
 fn open_relocation_lsm(
     config: &StrataStoreConfig,
     index: &StrataIndex,
+    next_lsn: StrataLsn,
+    recovered: Vec<RelocationEntry>,
 ) -> Result<Arc<RelocationStore>> {
     let root = config.relocation_dir();
-    let segment_dir = root.join("segment");
-    fs::create_dir_all(&segment_dir).map_err(|source| Error::Io {
-        path: segment_dir.clone(),
-        source,
-    })?;
-
-    let (sync_tx, syncer) = file_sync_channel(LSM_FILE_SYNC_QUEUE_CAPACITY);
-    thread::Builder::new()
-        .name(format!("strata-relocation-sync-{}", config.namespace))
-        .spawn(move || syncer.run())
-        .map_err(|source| Error::ThreadSpawn { source })?;
-
     let manifest = Arc::new(load_relocation_lsm_manifest(index)?);
-    let checkpoint = index.get_relocation_lsm_checkpoint()?;
-    let last_lsn = checkpoint
-        .and_then(|checkpoint| checkpoint.durable_lsn)
-        .or(manifest.materialized_through);
-    let wal = Wal::recover(
-        root.join("wal"),
-        config.segment_max_bytes,
-        checkpoint.map_or(WalPosition::default(), |checkpoint| checkpoint.wal_position),
-        checkpoint.and_then(|checkpoint| checkpoint.durable_lsn),
-        manifest.materialized_through,
-        manifest.wal_retained_from,
-        last_lsn,
-        sync_tx,
-    )?;
-
-    let segment_path = strata_segment::segment_path(&segment_dir, 1);
-    let segment = if segment_path.exists() {
-        SegmentWriter::open_existing(
-            &segment_path,
-            1,
-            PlacementClass::Ingest,
-            config.segment_max_bytes,
-        )?
-    } else {
-        SegmentWriter::create(
-            &segment_path,
-            1,
-            PlacementClass::Ingest,
-            config.segment_max_bytes,
-        )?
-    };
-    if segment.write_offset() != 0 {
-        return Err(Error::InvariantViolation {
-            reason: "relocation LSM wrote to its unused segment".to_owned(),
-        });
-    }
+    let recovered = recovered
+        .into_iter()
+        .map(|entry| (entry.publish_lsn, RelocationStore::lsm_mutation(0, &entry)))
+        .collect();
+    let last_lsn = next_lsn.checked_sub(1).filter(|lsn| *lsn != 0);
     let lsm = Arc::new(Lsm::from_parts(
         root.join("tables"),
         manifest,
-        segment,
-        SegmentFactory::new(
-            segment_dir,
-            SegmentIdAllocator::new(2),
-            PlacementClass::Ingest,
-            config.segment_max_bytes,
-        ),
-        wal,
+        recovered,
         last_lsn,
         LsmOptions {
             rollover_policy: Some(MemtableRolloverPolicy::new(
@@ -4600,7 +4693,7 @@ fn reconcile_orphan_ingest_segment_files(
 /// already-committed operations, but it must not discover new committed LSNs from payload bytes
 /// alone.
 ///
-/// The caller next validates the same logical prefix against the LSM WAL. A complete tail is
+/// The caller next validates the same logical prefix against the store WAL. A complete tail is
 /// promoted; an incomplete unpublished tail is truncated from both the logical and segment paths.
 fn recover_unsealed_segments(
     config: &StrataStoreConfig,
@@ -4693,28 +4786,30 @@ fn min_lsn(current: Option<StrataLsn>, candidate: Option<StrataLsn>) -> Option<S
     }
 }
 
-/// Validates the LSM WAL against the logical prefix selected by segment recovery.
+/// Validates the store WAL against the logical prefix selected by segment recovery.
 ///
 /// A complete WAL tail is retained even when its checkpoint metadata did not reach disk: opening
 /// the WAL will fsync and promote it. If the exact tail is unavailable, point-in-time recovery
 /// discards only operations newer than `published_lsn`; that frontier is the last prefix callers
 /// were promised would survive. The fallback target is validated independently, so corruption in
 /// the published prefix remains a hard recovery error.
-fn recover_lsm_wal_prefix(
+fn recover_store_wal_prefix(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     metrics: &StrataStoreMetrics,
 ) -> Result<()> {
     let requested_lsn = index.get_next_lsn()?.checked_sub(1).filter(|lsn| *lsn != 0);
-    let checkpoint = index.get_lsm_checkpoint()?;
-    let manifest = load_blob_lsm_manifest(index)?;
-    let validate = |checkpoint: Option<LsmCheckpoint>, last_lsn| {
+    let published_lsn = index.get_published_lsn()?;
+    let published_target = (published_lsn != 0).then_some(published_lsn);
+    let checkpoint = index.get_store_checkpoint()?;
+    let (materialized_through, retained_from) = store_wal_recovery_state(index)?;
+    let validate = |checkpoint: Option<StoreCheckpoint>, last_lsn| {
         Wal::validate_recovery_target(
-            config.namespace_dir().join("lsm/wal"),
+            config.namespace_dir().join("wal"),
             checkpoint.map_or(WalPosition::default(), |checkpoint| checkpoint.wal_position),
-            checkpoint.and_then(|checkpoint| checkpoint.durable_lsn),
-            manifest.materialized_through,
-            manifest.wal_retained_from,
+            published_target,
+            materialized_through,
+            retained_from,
             last_lsn,
         )
     };
@@ -4726,8 +4821,6 @@ fn recover_lsm_wal_prefix(
         unreachable!("failed WAL validation returned success on retry");
     }
 
-    let published_lsn = index.get_published_lsn()?;
-    let published_target = (published_lsn != 0).then_some(published_lsn);
     if requested_lsn.is_none_or(|requested| requested <= published_lsn) {
         validate(checkpoint, requested_lsn)?;
         unreachable!("failed published WAL validation returned success on retry");
@@ -4736,10 +4829,9 @@ fn recover_lsm_wal_prefix(
     validate(fallback_checkpoint, published_target)?;
     if fallback_checkpoint != checkpoint {
         let mut batch = index.batch();
-        index.put_lsm_checkpoint_batch(
+        index.put_store_checkpoint_batch(
             &mut batch,
-            LsmCheckpoint {
-                durable_lsn: None,
+            StoreCheckpoint {
                 wal_position: WalPosition::default(),
                 active_segment_id: 0,
                 active_segment_offset: 0,
@@ -4771,7 +4863,7 @@ struct SegmentRecovery {
 /// (as opposed to power loss) appended bytes usually survive in the kernel page cache, and after
 /// a power loss they may still have been fsynced without the durable-offset row committing. If
 /// complete records are sitting there inside the committed write prefix, throwing them away would
-/// be rolling back writes for no reason — so they get promoted and the matching LSM WAL entries
+/// be rolling back writes for no reason — so they get promoted and the matching store-WAL entries
 /// are replayed.
 ///
 /// `is_complete` is the signal the driver uses to discard later segments: an incomplete prefix
@@ -5126,15 +5218,15 @@ fn ensure_epoch_initialized(index: &StrataIndex, starting_epoch: Epoch) -> Resul
     Ok(current_epoch)
 }
 
-/// Establishes the lazy global-materialization lower bound for databases created before the
-/// marker existed.
-fn ensure_lazy_global_materialization_cutover(index: &StrataIndex) -> Result<StrataLsn> {
-    if let Some(lsn) = index.get_lazy_global_materialization_from_lsn()? {
+/// Establishes the lower bound for compaction-emitted terminal garbage in databases created before
+/// the marker existed.
+fn ensure_blob_compaction_garbage_cutover(index: &StrataIndex) -> Result<StrataLsn> {
+    if let Some(lsn) = index.get_blob_compaction_garbage_from_lsn()? {
         return Ok(lsn);
     }
     let lsn = 1;
     let mut batch = index.batch();
-    index.put_lazy_global_materialization_from_lsn_batch(&mut batch, lsn)?;
+    index.put_blob_compaction_garbage_from_lsn_batch(&mut batch, lsn)?;
     batch
         .write_with_sync(true)
         .map_err(strata_index::Error::from)?;
@@ -5143,7 +5235,7 @@ fn ensure_lazy_global_materialization_cutover(index: &StrataIndex) -> Result<Str
 
 /// Erases epoch operations from `rollback_from` onward and rewinds the store frontiers to that LSN.
 ///
-/// Blob patches live in the LSM WAL, which is reopened through the rewound `next_lsn`; RocksDB only
+/// Blob patches live in the store WAL, which is reopened through the rewound `next_lsn`; RocksDB only
 /// needs to remove its auxiliary LSN and epoch rows.
 fn rollback_operations_from(
     index: &StrataIndex,
@@ -5157,7 +5249,32 @@ fn rollback_operations_from(
         .map(|(lsn, _)| lsn)
         .collect::<Vec<_>>();
     index.remove_epoch_changes_batch(&mut batch, &hidden_epoch_changes)?;
-    let rollback_ops = hidden_epoch_changes.len() as u64;
+    let rolled_back_drops = index
+        .iter_shard_cleanup_jobs()?
+        .into_iter()
+        .filter(|job| job.drop_lsn >= rollback_from)
+        .collect::<Vec<_>>();
+    for job in &rolled_back_drops {
+        // Cleanup cannot have crossed an unpublished drop because the GC worker gates it on
+        // `published_lsn`. Restoring the same generation therefore makes the pre-drop shard
+        // visible again without resurrecting physically reclaimed files.
+        if index.get_shard_info(job.shard.id)?.is_some_and(|info| {
+            info.current_generation == job.shard.generation && info.state == ShardState::Dropped
+        }) {
+            index.put_shard_info_batch(
+                &mut batch,
+                job.shard.id,
+                ShardInfo {
+                    current_generation: job.shard.generation,
+                    state: ShardState::Active,
+                },
+            )?;
+        }
+        index.delete_shard_cleanup_job_batch(&mut batch, job.shard)?;
+    }
+    let rollback_ops = hidden_epoch_changes
+        .len()
+        .saturating_add(rolled_back_drops.len()) as u64;
 
     let previous_lsn = rollback_from.saturating_sub(1);
     let current_epoch = index
@@ -5175,34 +5292,44 @@ fn rollback_operations_from(
     Ok(())
 }
 
-/// Fsyncs the exact LSM prefix selected by recovery and publishes its checkpoint atomically.
+/// Publishes the exact store-WAL prefix selected by recovery.
 ///
-/// Segment recovery has already validated and fsynced the active data prefix. `Lsm::sync` also
-/// makes the recovered WAL tail durable, after which the index may safely promote
-/// `published_lsn` through the recovered store frontier.
-fn publish_recovered_lsm_checkpoint(
+/// `Wal::recover` has already fsynced a promoted complete tail, and segment recovery has fsynced
+/// the referenced active data prefix. The LSM is only the in-memory projection of that log.
+fn publish_recovered_store_checkpoint(
     index: &StrataIndex,
     metrics: &StrataStoreMetrics,
-    lsm: &Lsm,
+    wal: &Wal,
     active_segment_state: &SegmentState,
 ) -> Result<()> {
-    let checkpoint = lsm.sync()?;
     let recovered_lsn = index.get_next_lsn()?.saturating_sub(1);
-    if checkpoint.durable_lsn.unwrap_or_default() != recovered_lsn
-        || checkpoint.active_segment_id != active_segment_state.segment_id
+    let checkpoint = StoreCheckpoint {
+        wal_position: wal.position(),
+        active_segment_id: active_segment_state.segment_id,
+        active_segment_offset: active_segment_state.write_offset,
+    };
+    if checkpoint.active_segment_id != active_segment_state.segment_id
         || checkpoint.active_segment_offset != active_segment_state.write_offset
     {
         return Err(Error::InvariantViolation {
             reason: format!(
-                "recovered LSM checkpoint {checkpoint:?} does not match store LSN {recovered_lsn} and active segment {} at {}",
+                "recovered store checkpoint {checkpoint:?} does not match store LSN {recovered_lsn} and active segment {} at {}",
                 active_segment_state.segment_id, active_segment_state.write_offset
             ),
         });
     }
+    let current_published_lsn = index.get_published_lsn()?;
+    if current_published_lsn > recovered_lsn {
+        return Err(Error::InvariantViolation {
+            reason: format!(
+                "published LSN {current_published_lsn} follows recovered LSN {recovered_lsn}"
+            ),
+        });
+    }
     let mut batch = index.batch();
-    let published_lsn = recovered_lsn.max(index.get_published_lsn()?);
+    let published_lsn = recovered_lsn;
     index.put_published_lsn_batch(&mut batch, published_lsn)?;
-    index.put_lsm_checkpoint_batch(&mut batch, checkpoint)?;
+    index.put_store_checkpoint_batch(&mut batch, checkpoint)?;
     batch
         .write_with_sync(true)
         .map_err(strata_index::Error::from)?;

@@ -43,9 +43,10 @@ pub struct Manifest {
     pub patch_format_id: String,
     pub partition_count: u32,
     pub next_table_id: u64,
-    /// Highest contiguous WAL lsn fully represented by this manifest.
+    /// Highest contiguous caller LSN fully represented by this manifest.
     pub materialized_through: Option<StrataLsn>,
-    /// First WAL file that recovery must retain and validate.
+    /// Legacy store-WAL retention field, kept so existing manifests remain readable.
+    /// New stores persist this boundary as store state in RocksDB; the LSM does not update it.
     pub wal_retained_from: u64,
     pub partitions: BTreeMap<u32, PartitionManifest>,
 }
@@ -60,9 +61,9 @@ pub struct ManifestEdit {
     pub remove: Vec<String>,
     pub add_base: Vec<TableMeta>,
     pub add_patches: Vec<TableMeta>,
-    /// Advances the contiguous WAL prefix represented by the resulting manifest.
+    /// Advances the contiguous caller-LSN prefix represented by the resulting manifest.
     pub materialized_through: Option<StrataLsn>,
-    /// Advances the first WAL file required by recovery.
+    /// Advances the first caller-log file required by recovery.
     pub wal_retained_from: Option<u64>,
 }
 

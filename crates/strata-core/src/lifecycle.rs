@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Epoch, ShardKey, StrataLsn};
+use crate::{Epoch, SegmentId, ShardKey, StrataLsn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobLifecycle {
@@ -214,18 +214,48 @@ pub enum StoreStateKey {
     CurrentEpoch,
     /// Reserved legacy key. Kept in this position so persisted enum discriminants remain stable.
     LegacyProjectionFrontier,
+    /// Reserved legacy copy of `PublishedLsn`. New checkpoints store only physical coordinates;
+    /// this key remains here so persisted enum discriminants stay stable.
     LsmDurableLsn,
+    /// Store-checkpoint fields. The `Lsm` names are retained only because this enum's serialized
+    /// discriminants are already on disk.
     LsmWalLogId,
     LsmWalOffset,
     LsmActiveSegmentId,
     LsmActiveSegmentOffset,
+    /// Reserved fields from the removed relocation-LSM WAL. Do not reuse these discriminants.
     RelocationLsmDurableLsn,
     RelocationLsmWalLogId,
     RelocationLsmWalOffset,
-    /// First LSN whose epoch/shard terminal events are owned by lazy blob-LSM compaction.
+    /// First LSN whose epoch/shard terminal garbage is emitted by blob-LSM compaction.
     ///
     /// Earlier transitions may already have terminal garbage materialized by an older release.
-    LazyGlobalMaterializationFromLsn,
+    /// Kept in its original enum position so the persisted discriminant remains stable.
+    BlobCompactionGarbageFromLsn,
+    /// First store-WAL file that recovery must retain and validate.
+    /// Appended here so every preceding persisted discriminant remains stable.
+    StoreWalRetainedFrom,
+}
+
+/// Exclusive end of a store-WAL prefix made durable by a completed file sync.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WalPosition {
+    pub log_id: u64,
+    pub offset: u64,
+}
+
+/// Physical coordinates associated atomically with RocksDB's `PublishedLsn`.
+///
+/// For example, when `PublishedLsn = 42`, `wal_position` is the exact WAL prefix through LSN 42,
+/// while `active_segment_id` and `active_segment_offset` identify the active payload prefix synced
+/// by that publication. The checkpoint deliberately has no LSN of its own: `PublishedLsn` is the
+/// store's single logical durability frontier. It says nothing about whether blob or relocation
+/// LSM memtables have been flushed to SSTs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreCheckpoint {
+    pub wal_position: WalPosition,
+    pub active_segment_id: SegmentId,
+    pub active_segment_offset: u64,
 }
 
 /// Store-state field scoped to one shard generation.

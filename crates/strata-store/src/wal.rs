@@ -1,4 +1,4 @@
-//! Independently rolled operation write-ahead log.
+//! Store-owned rolling write-ahead log.
 
 use std::{
     collections::BTreeMap,
@@ -8,10 +8,11 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Error, FileSyncSender, FileSyncTask, Result, StrataLsn};
+use strata_core::{StrataLsn, WalPosition};
+
+use crate::{Error, Result, file_sync::FileSyncSender, file_sync::FileSyncTask};
 
 const MAGIC: &[u8; 8] = b"STRWAL01";
 const VERSION: u32 = 2;
@@ -23,13 +24,6 @@ const ENTRY_HEADER_LEN: u64 = 12;
 const FILE_PREFIX: &str = "wal-";
 const FILE_SUFFIX: &str = ".log";
 
-/// Exclusive end of a WAL prefix made durable by a completed file-sync task.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct WalPosition {
-    pub log_id: u64,
-    pub offset: u64,
-}
-
 /// One caller-encoded operation persisted in the WAL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalEntry {
@@ -39,7 +33,7 @@ pub struct WalEntry {
 
 /// Rolling WAL writer.
 ///
-/// `committed` must come from the engine's durable commit point. Opening validates that prefix,
+/// `committed` must come from the store checkpoint in RocksDB. Opening validates that prefix,
 /// truncates later bytes, and removes later WAL files.
 #[derive(Debug)]
 pub struct Wal {
@@ -85,7 +79,7 @@ impl Wal {
     pub fn validate_recovery_target(
         dir: impl AsRef<Path>,
         checkpoint: WalPosition,
-        checkpoint_lsn: Option<StrataLsn>,
+        published_lsn: Option<StrataLsn>,
         materialized_through: Option<StrataLsn>,
         retained_from: u64,
         last_lsn: Option<StrataLsn>,
@@ -102,9 +96,9 @@ impl Wal {
                 "a reclaimed WAL prefix needs a materialized frontier".to_owned(),
             ));
         }
-        if checkpoint_lsn.is_some_and(|checkpoint| last_lsn.is_none_or(|last| checkpoint > last)) {
+        if published_lsn.is_some_and(|published| last_lsn.is_none_or(|last| published > last)) {
             return Err(Error::InvalidWal(format!(
-                "checkpoint lsn {checkpoint_lsn:?} follows recovered store lsn {last_lsn:?}"
+                "published lsn {published_lsn:?} follows recovered store lsn {last_lsn:?}"
             )));
         }
         if materialized_through
@@ -117,7 +111,7 @@ impl Wal {
         if checkpoint != WalPosition::default()
             && retained_from > checkpoint.log_id
             && !matches!(
-                (checkpoint_lsn, materialized_through),
+                (published_lsn, materialized_through),
                 (Some(checkpoint), Some(materialized)) if checkpoint <= materialized
             )
         {
@@ -132,7 +126,7 @@ impl Wal {
             )));
         }
         if checkpoint == WalPosition::default()
-            && checkpoint_lsn.is_none()
+            && published_lsn.is_none()
             && last_lsn.is_some()
             && ids.is_empty()
         {
@@ -151,7 +145,7 @@ impl Wal {
         recover_position(
             dir,
             checkpoint,
-            checkpoint_lsn,
+            published_lsn,
             materialized_through,
             retained_from,
             last_lsn,
@@ -163,12 +157,29 @@ impl Wal {
     ///
     /// The checkpoint prefix is validated strictly. Recovery only promotes a tail when it reaches
     /// the exact requested lsn at a frame boundary.
+    ///
+    /// # Arguments
+    ///
+    /// - `dir`: directory containing `wal-<log_id>.log` files.
+    /// - `max_file_bytes`: soft rollover size for subsequent appends; one complete batch may exceed
+    ///   it.
+    /// - `checkpoint`: exact WAL file and byte offset covered by the RocksDB store checkpoint.
+    /// - `published_lsn`: canonical store `PublishedLsn` atomically associated with
+    ///   `checkpoint`, or `None` for an empty WAL. The checkpoint has no separate LSN frontier.
+    /// - `materialized_through`: store-wide replay-safe LSN. This is
+    ///   `min(blob_lsm.materialized_through, relocation_lsm.materialized_through)`, not either
+    ///   projection's frontier by itself. For example, blob=100 and relocation=80 means 80.
+    /// - `retained_from`: first WAL file ID that must exist. Files with smaller IDs were
+    ///   intentionally reclaimed only after `materialized_through` made them unnecessary.
+    /// - `last_lsn`: final globally committed LSN selected by store recovery, normally
+    ///   `next_lsn - 1`. Complete frames after `checkpoint` are preserved only through this LSN.
+    /// - `file_sync_tx`: store-owned worker queue used by the returned WAL for later syncs.
     #[allow(clippy::too_many_arguments)]
     pub fn recover(
         dir: impl AsRef<Path>,
         max_file_bytes: u64,
         checkpoint: WalPosition,
-        checkpoint_lsn: Option<StrataLsn>,
+        published_lsn: Option<StrataLsn>,
         materialized_through: Option<StrataLsn>,
         retained_from: u64,
         last_lsn: Option<StrataLsn>,
@@ -186,9 +197,9 @@ impl Wal {
                 "a reclaimed WAL prefix needs a materialized frontier".to_owned(),
             ));
         }
-        if checkpoint_lsn.is_some_and(|checkpoint| last_lsn.is_none_or(|last| checkpoint > last)) {
+        if published_lsn.is_some_and(|published| last_lsn.is_none_or(|last| published > last)) {
             return Err(Error::InvalidWal(format!(
-                "checkpoint lsn {checkpoint_lsn:?} follows recovered store lsn {last_lsn:?}"
+                "published lsn {published_lsn:?} follows recovered store lsn {last_lsn:?}"
             )));
         }
         if materialized_through
@@ -201,7 +212,7 @@ impl Wal {
         if checkpoint != WalPosition::default()
             && retained_from > checkpoint.log_id
             && !matches!(
-                (checkpoint_lsn, materialized_through),
+                (published_lsn, materialized_through),
                 (Some(checkpoint), Some(materialized)) if checkpoint <= materialized
             )
         {
@@ -217,7 +228,7 @@ impl Wal {
         }
         remove_logs_before(dir, retained_from)?;
         if checkpoint == WalPosition::default()
-            && checkpoint_lsn.is_none()
+            && published_lsn.is_none()
             && last_lsn.is_some()
             && log_ids(dir)?.is_empty()
         {
@@ -228,7 +239,7 @@ impl Wal {
         let recovered = recover_position(
             dir,
             checkpoint,
-            checkpoint_lsn,
+            published_lsn,
             materialized_through,
             retained_from,
             last_lsn,
@@ -365,10 +376,6 @@ impl Wal {
         self.last_lsn
     }
 
-    pub(crate) fn file_sync_sender(&self) -> FileSyncSender {
-        self.file_sync_tx.clone()
-    }
-
     /// Appends one ordered batch.
     ///
     /// The returned position is not durable until [`Self::committed_position`] reaches it.
@@ -410,7 +417,7 @@ impl Wal {
 
     /// Queues a file sync and returns the position its completion will cover.
     ///
-    /// The engine must first sync any segment bytes referenced by the batch, then publish this
+    /// The store must first sync any segment bytes referenced by the batch, then publish this
     /// position after [`Self::committed_position`] reaches it.
     pub fn sync(&mut self) -> Result<WalPosition> {
         let path = Self::path(&self.dir, self.log_id);
@@ -442,6 +449,7 @@ impl Wal {
     }
 
     /// Latest contiguous position whose queued file syncs have completed.
+    #[cfg(test)]
     pub fn committed_position(&self) -> Result<WalPosition> {
         self.sync_tracker.committed()
     }
@@ -489,7 +497,7 @@ impl Wal {
     }
 
     /// Deletes complete rolled files whose final lsn is materialized in durable SST metadata.
-    pub(crate) fn reclaim_through(&mut self, materialized: StrataLsn) -> Result<()> {
+    pub fn reclaim_through(&mut self, materialized: StrataLsn) -> Result<()> {
         let ids = log_ids(&self.dir)?;
         let mut expected_id = ids.first().copied().ok_or_else(|| {
             Error::InvalidWal(format!("active WAL file {} does not exist", self.log_id))
@@ -528,7 +536,7 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn retained_from_after(&self, materialized: StrataLsn) -> Result<u64> {
+    pub fn retained_from_after(&self, materialized: StrataLsn) -> Result<u64> {
         let ids = log_ids(&self.dir)?;
         let mut expected_id = ids.first().copied().ok_or_else(|| {
             Error::InvalidWal(format!("active WAL file {} does not exist", self.log_id))
@@ -640,6 +648,7 @@ impl WalSyncTracker {
         self.changed.notify_all();
     }
 
+    #[cfg(test)]
     fn committed(&self) -> Result<WalPosition> {
         let state = self.state.lock().expect("WAL sync tracker lock poisoned");
         match &state.failure {
@@ -668,16 +677,16 @@ impl WalSyncTracker {
 fn recover_position(
     dir: &Path,
     checkpoint: WalPosition,
-    checkpoint_lsn: Option<StrataLsn>,
+    published_lsn: Option<StrataLsn>,
     materialized_through: Option<StrataLsn>,
     retained_from: u64,
     last_lsn: Option<StrataLsn>,
 ) -> Result<WalPosition> {
     fs::create_dir_all(dir).map_err(|source| io_error(dir, source))?;
     validate_position(checkpoint)?;
-    if checkpoint_lsn.is_some_and(|checkpoint| last_lsn.is_none_or(|last| checkpoint > last)) {
+    if published_lsn.is_some_and(|published| last_lsn.is_none_or(|last| published > last)) {
         return Err(Error::InvalidWal(format!(
-            "checkpoint lsn {checkpoint_lsn:?} follows recovered store lsn {last_lsn:?}"
+            "published lsn {published_lsn:?} follows recovered store lsn {last_lsn:?}"
         )));
     }
     if materialized_through
@@ -689,7 +698,7 @@ fn recover_position(
     }
 
     let ids = log_ids(dir)?;
-    let missing_checkpoint_is_materialized = match checkpoint_lsn {
+    let missing_checkpoint_is_materialized = match published_lsn {
         Some(lsn) => {
             checkpoint != WalPosition::default()
                 && retained_from > checkpoint.log_id
@@ -701,20 +710,20 @@ fn recover_position(
                 && materialized_through.is_some()
         }
     };
-    let actual_checkpoint_lsn = if missing_checkpoint_is_materialized {
-        checkpoint_lsn
+    let actual_published_lsn = if missing_checkpoint_is_materialized {
+        published_lsn
     } else {
         lsn_through_position(dir, checkpoint)?
     };
-    let starts_after_materialized_checkpoint = actual_checkpoint_lsn.is_none()
-        && checkpoint_lsn.is_some()
+    let starts_after_materialized_checkpoint = actual_published_lsn.is_none()
+        && published_lsn.is_some()
         && checkpoint.offset == HEADER_LEN;
-    if actual_checkpoint_lsn != checkpoint_lsn && !starts_after_materialized_checkpoint {
+    if actual_published_lsn != published_lsn && !starts_after_materialized_checkpoint {
         return Err(Error::InvalidWal(format!(
-            "WAL checkpoint ends at {actual_checkpoint_lsn:?}, expected {checkpoint_lsn:?}"
+            "WAL bytes through the checkpoint end at {actual_published_lsn:?}, expected PublishedLsn {published_lsn:?}"
         )));
     }
-    if last_lsn == checkpoint_lsn {
+    if last_lsn == published_lsn {
         return if missing_checkpoint_is_materialized {
             Ok(WalPosition {
                 log_id: retained_from,
@@ -736,7 +745,7 @@ fn recover_position(
         checkpoint.log_id
     };
     let mut expected_id = first_id;
-    let mut previous = checkpoint_lsn;
+    let mut previous = published_lsn;
 
     for id in ids.into_iter().filter(|id| *id >= first_id) {
         if id != expected_id {
@@ -1150,7 +1159,7 @@ mod tests {
         path: &Path,
         max_file_bytes: u64,
         checkpoint: WalPosition,
-        checkpoint_lsn: Option<StrataLsn>,
+        published_lsn: Option<StrataLsn>,
         last_lsn: Option<StrataLsn>,
     ) -> Result<Wal> {
         let (file_sync_tx, syncer) = crate::file_sync_channel(8);
@@ -1159,7 +1168,7 @@ mod tests {
             path,
             max_file_bytes,
             checkpoint,
-            checkpoint_lsn,
+            published_lsn,
             None,
             1,
             last_lsn,

@@ -2488,7 +2488,7 @@ fn prepare_relocation_profile(
     let deadline = Instant::now() + timeout;
     store.sync()?;
     store.sync()?;
-    store.checkpoint_active_segment()?;
+    store.rollover_active_segment_for_sealing()?;
     store.sync()?;
     thread::sleep(Duration::from_millis(2_500));
 

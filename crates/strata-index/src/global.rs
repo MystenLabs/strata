@@ -1,5 +1,4 @@
-use strata_core::{Epoch, StoreStateKey, StrataLsn};
-use strata_lsm::{LsmCheckpoint, WalPosition};
+use strata_core::{Epoch, StoreCheckpoint, StoreStateKey, StrataLsn, WalPosition};
 use typed_store::{Map, rocks::DBBatch};
 
 use crate::{Error, Result};
@@ -22,15 +21,18 @@ impl StrataIndex {
         Ok(self.store_state.get(&StoreStateKey::CurrentEpoch)?)
     }
 
-    pub fn get_lazy_global_materialization_from_lsn(&self) -> Result<Option<StrataLsn>> {
+    pub fn get_blob_compaction_garbage_from_lsn(&self) -> Result<Option<StrataLsn>> {
         Ok(self
             .store_state
-            .get(&StoreStateKey::LazyGlobalMaterializationFromLsn)?)
+            .get(&StoreStateKey::BlobCompactionGarbageFromLsn)?)
     }
 
-    pub fn get_lsm_checkpoint(&self) -> Result<Option<LsmCheckpoint>> {
+    pub fn get_store_wal_retained_from(&self) -> Result<Option<u64>> {
+        Ok(self.store_state.get(&StoreStateKey::StoreWalRetainedFrom)?)
+    }
+
+    pub fn get_store_checkpoint(&self) -> Result<Option<StoreCheckpoint>> {
         let values = [
-            self.store_state.get(&StoreStateKey::LsmDurableLsn)?,
             self.store_state.get(&StoreStateKey::LsmWalLogId)?,
             self.store_state.get(&StoreStateKey::LsmWalOffset)?,
             self.store_state.get(&StoreStateKey::LsmActiveSegmentId)?,
@@ -41,47 +43,20 @@ impl StrataIndex {
             return Ok(None);
         }
         let [
-            Some(durable_lsn),
             Some(log_id),
             Some(offset),
             Some(segment_id),
             Some(segment_offset),
         ] = values
         else {
-            return Err(Error::InvalidLsmCheckpoint(
+            return Err(Error::InvalidStoreCheckpoint(
                 "checkpoint fields are incomplete".to_owned(),
             ));
         };
-        Ok(Some(LsmCheckpoint {
-            durable_lsn: (durable_lsn != 0).then_some(durable_lsn),
+        Ok(Some(StoreCheckpoint {
             wal_position: WalPosition { log_id, offset },
             active_segment_id: segment_id,
             active_segment_offset: segment_offset,
-        }))
-    }
-
-    pub fn get_relocation_lsm_checkpoint(&self) -> Result<Option<LsmCheckpoint>> {
-        let values = [
-            self.store_state
-                .get(&StoreStateKey::RelocationLsmDurableLsn)?,
-            self.store_state
-                .get(&StoreStateKey::RelocationLsmWalLogId)?,
-            self.store_state
-                .get(&StoreStateKey::RelocationLsmWalOffset)?,
-        ];
-        if values.iter().all(Option::is_none) {
-            return Ok(None);
-        }
-        let [Some(durable_lsn), Some(log_id), Some(offset)] = values else {
-            return Err(Error::InvalidLsmCheckpoint(
-                "relocation checkpoint fields are incomplete".to_owned(),
-            ));
-        };
-        Ok(Some(LsmCheckpoint {
-            durable_lsn: (durable_lsn != 0).then_some(durable_lsn),
-            wal_position: WalPosition { log_id, offset },
-            active_segment_id: 1,
-            active_segment_offset: 0,
         }))
     }
 
@@ -105,16 +80,26 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn put_lsm_checkpoint_batch(
+    pub fn put_store_wal_retained_from_batch(
         &self,
         batch: &mut DBBatch,
-        checkpoint: LsmCheckpoint,
+        first_log_id: u64,
     ) -> Result<()> {
-        let durable_lsn = checkpoint.durable_lsn.unwrap_or_default();
+        batch.insert_batch(
+            self.store_state(),
+            [(&StoreStateKey::StoreWalRetainedFrom, &first_log_id)],
+        )?;
+        Ok(())
+    }
+
+    pub fn put_store_checkpoint_batch(
+        &self,
+        batch: &mut DBBatch,
+        checkpoint: StoreCheckpoint,
+    ) -> Result<()> {
         batch.insert_batch(
             self.store_state(),
             [
-                (&StoreStateKey::LsmDurableLsn, &durable_lsn),
                 (&StoreStateKey::LsmWalLogId, &checkpoint.wal_position.log_id),
                 (
                     &StoreStateKey::LsmWalOffset,
@@ -133,34 +118,6 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn put_relocation_lsm_checkpoint_batch(
-        &self,
-        batch: &mut DBBatch,
-        checkpoint: LsmCheckpoint,
-    ) -> Result<()> {
-        if checkpoint.active_segment_id != 1 || checkpoint.active_segment_offset != 0 {
-            return Err(Error::InvalidLsmCheckpoint(
-                "relocation LSM wrote to its unused segment".to_owned(),
-            ));
-        }
-        let durable_lsn = checkpoint.durable_lsn.unwrap_or_default();
-        batch.insert_batch(
-            self.store_state(),
-            [
-                (&StoreStateKey::RelocationLsmDurableLsn, &durable_lsn),
-                (
-                    &StoreStateKey::RelocationLsmWalLogId,
-                    &checkpoint.wal_position.log_id,
-                ),
-                (
-                    &StoreStateKey::RelocationLsmWalOffset,
-                    &checkpoint.wal_position.offset,
-                ),
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn put_current_epoch_batch(&self, batch: &mut DBBatch, epoch: Epoch) -> Result<()> {
         batch
             .insert_batch(self.store_state(), [(&StoreStateKey::CurrentEpoch, &epoch)])
@@ -168,14 +125,14 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn put_lazy_global_materialization_from_lsn_batch(
+    pub fn put_blob_compaction_garbage_from_lsn_batch(
         &self,
         batch: &mut DBBatch,
         lsn: StrataLsn,
     ) -> Result<()> {
         batch.insert_batch(
             self.store_state(),
-            [(&StoreStateKey::LazyGlobalMaterializationFromLsn, &lsn)],
+            [(&StoreStateKey::BlobCompactionGarbageFromLsn, &lsn)],
         )?;
         Ok(())
     }

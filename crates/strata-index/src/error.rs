@@ -16,8 +16,8 @@ pub enum Error {
     #[error("invalid LSM manifest: {0}")]
     InvalidLsmManifest(String),
 
-    #[error("invalid LSM checkpoint: {0}")]
-    InvalidLsmCheckpoint(String),
+    #[error("invalid store checkpoint: {0}")]
+    InvalidStoreCheckpoint(String),
 
     #[error(transparent)]
     Lsm(#[from] strata_lsm::Error),

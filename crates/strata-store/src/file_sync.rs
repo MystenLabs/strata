@@ -1,4 +1,4 @@
-//! Channel-driven file syncing.
+//! Store-owned channel for batched file syncing.
 
 use std::{
     fmt,
@@ -34,10 +34,6 @@ impl FileSyncTask {
             file,
             completion: Box::new(completion),
         }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 

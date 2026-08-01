@@ -76,7 +76,7 @@ pub enum ShardCleanupState {
     PendingMaterialization,
     ReadyForGc,
     /// Shard-owned files and their GC metadata have been removed. The job remains as the durable
-    /// generation tombstone used by later lazy blob-LSM compactions.
+    /// generation tombstone used by later snapshot-driven blob-LSM compactions.
     ShardOwnedReclaimed,
 }
 
