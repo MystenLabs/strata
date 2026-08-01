@@ -5,11 +5,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use strata_core::{BlobKey, RecordRef, SegmentFileState, SegmentOwner, ShardId, ShardKey};
+use strata_core::{
+    BlobKey, BlobLifecycle, RecordRef, SegmentFileState, SegmentOwner, ShardId, ShardKey, StrataLsn,
+};
 use strata_segment::{SegmentPayloadStream, SegmentReadOptions};
 
+use strata_lsm::{StoredValue, decode_value};
+
 use crate::{
-    Error, Result, STANDALONE_SHARD, StrataStore, layout::segment_state_path, resolve_blob_version,
+    Error, Result, STANDALONE_SHARD, StrataStore,
+    blob_lsm::{BlobMerge, BlobState as LsmBlobState},
+    layout::segment_state_path,
 };
 
 /// Options for point reads.
@@ -467,4 +473,47 @@ fn segment_read_not_found(error: &Error) -> bool {
 
 pub(crate) fn segment_state_is_readable(state: SegmentFileState) -> bool {
     state != SegmentFileState::Deleted
+}
+
+/// What the read path needs from the index: where the payload bytes live, plus the current
+/// blob-level lifecycle when one has been recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedBlobVersion {
+    pub head_lsn: StrataLsn,
+    pub record_ref: strata_core::RecordRef,
+    pub generation: strata_core::Generation,
+    pub lifecycle: Option<BlobLifecycle>,
+    pub payload_lsn: StrataLsn,
+}
+
+/// Resolves a key to its readable payload, or None for missing/tombstoned blobs.
+///
+/// A live head without a payload ref should not be produced by new writes. If recovery leaves such
+/// a head behind, there are no bytes to return, so None is the honest answer.
+pub(crate) fn resolve_blob_version(
+    store: &StrataStore,
+    shard: ShardKey,
+    key: &BlobKey,
+) -> Result<Option<ResolvedBlobVersion>> {
+    let lsm = store.lsm()?;
+    let Some(encoded) = lsm.get(0, key.as_bytes(), &BlobMerge)? else {
+        return Ok(None);
+    };
+    let StoredValue::Inline(bytes) = decode_value(&encoded)? else {
+        return Err(Error::InvariantViolation {
+            reason: format!("materialized blob state for {key:?} is segment-backed"),
+        });
+    };
+    let state = LsmBlobState::decode(bytes)?;
+    let current_epoch = store.current_epoch()?;
+    let Some((version, lifecycle)) = state.resolve(shard, current_epoch) else {
+        return Ok(None);
+    };
+    Ok(Some(ResolvedBlobVersion {
+        head_lsn: version.lsn,
+        record_ref: version.record_ref,
+        generation: version.lsn,
+        lifecycle,
+        payload_lsn: version.lsn,
+    }))
 }
