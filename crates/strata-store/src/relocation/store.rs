@@ -8,9 +8,11 @@ use std::{
 };
 
 use strata_core::{BlobKey, RecordRef, SegmentId, ShardKey, StrataLsn};
+#[cfg(test)]
+use strata_lsm::WriteBatchResult;
 use strata_lsm::{
-    GarbageRecord, Lsm, LsmIter, MergeOperator, Mutation, Replace, StoredValue, WriteBatchResult,
-    decode_value,
+    GarbageRecord, Lsm, LsmIter, ManifestEdit, MergeOperator, Mutation, Replace, StoredValue,
+    TableMeta, TableWriter, decode_value, encode_inline_value,
 };
 
 use crate::{Error, Result};
@@ -63,6 +65,7 @@ impl RelocationStore {
         Self { lsm }
     }
 
+    #[cfg(test)]
     pub fn write_batch(
         &self,
         partition: u32,
@@ -75,8 +78,87 @@ impl RelocationStore {
         Ok(self.lsm.write_batch(mutations)?)
     }
 
-    /// Encodes the keyed projection stored in the relocation LSM. The store WAL calls this during
-    /// recovery so live writes and replay cannot drift into two formats.
+    /// Writes one GC relocation batch directly as a fully synced immutable patch table.
+    ///
+    /// The returned edit is not visible until the caller atomically publishes it with the output
+    /// and source segment states. Until then the table is an orphan and recovery may remove it.
+    pub fn prepare_l0(&self, entries: &[RelocationEntry]) -> Result<(StrataLsn, ManifestEdit)> {
+        if entries.is_empty() {
+            return Err(Error::InvalidRelocation(
+                "cannot prepare an empty relocation L0".to_owned(),
+            ));
+        }
+        let manifest = self.lsm.manifest();
+        let table_id = manifest.next_table_id;
+        let sequence = self
+            .lsm
+            .last_lsn()?
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidRelocation("relocation sequence overflow".to_owned()))?;
+        let relative_path = format!("patch-{table_id:020}.sst");
+        let mut sorted = entries.iter().collect::<Vec<_>>();
+        sorted.sort_unstable_by(|left, right| {
+            left.key.as_bytes().cmp(right.key.as_bytes()).then_with(|| {
+                encode_suffix(left.shard, left.payload_lsn)
+                    .cmp(&encode_suffix(right.shard, right.payload_lsn))
+            })
+        });
+        for pair in sorted.windows(2) {
+            if pair[0].key == pair[1].key
+                && pair[0].shard == pair[1].shard
+                && pair[0].payload_lsn == pair[1].payload_lsn
+            {
+                return Err(Error::InvalidRelocation(
+                    "one GC publish contains duplicate relocation identities".to_owned(),
+                ));
+            }
+        }
+        let table_store = self.lsm.table_store();
+        let table_root = table_store.root();
+        let tmp_path = table_root.join(format!("{relative_path}.tmp"));
+        let table = match (|| -> strata_lsm::Result<TableMeta> {
+            let mut writer = TableWriter::create_patch(
+                table_root,
+                &relative_path,
+                table_id,
+                0,
+                &manifest.patch_format_id,
+            )?;
+            for entry in sorted {
+                writer.add_prefix_patch(
+                    entry.key.as_bytes(),
+                    &encode_suffix(entry.shard, entry.payload_lsn),
+                    sequence,
+                    &encode_inline_value(&encode_value(entry.publish_lsn, entry.to)),
+                )?;
+            }
+            writer.finish()
+        })() {
+            Ok(table) => table,
+            Err(error) => {
+                let _ = std::fs::remove_file(tmp_path);
+                return Err(error.into());
+            }
+        };
+        Ok((
+            sequence,
+            ManifestEdit {
+                remove: Vec::new(),
+                add_base: Vec::new(),
+                add_patches: vec![table],
+                materialized_through: Some(sequence),
+                wal_retained_from: None,
+            },
+        ))
+    }
+
+    pub fn manifest_sequence(&self) -> StrataLsn {
+        manifest_sequence(&self.lsm.manifest())
+    }
+
+    /// Encodes the keyed projection stored in the relocation LSM. Legacy shared-WAL recovery uses
+    /// the same encoding as immutable relocation tables.
     pub fn lsm_mutation(partition: u32, entry: &RelocationEntry) -> Mutation {
         Mutation::PutPrefix {
             partition,
@@ -100,7 +182,7 @@ impl RelocationStore {
             return Ok(None);
         };
         let StoredValue::Inline(value) = decode_value(&value)? else {
-            return Err(Error::Invalid(
+            return Err(Error::InvalidRelocation(
                 "relocation value is segment-backed".to_owned(),
             ));
         };
@@ -115,7 +197,7 @@ impl RelocationStore {
         max_lsn: StrataLsn,
     ) -> Result<RelocationScan> {
         if first_key > last_key {
-            return Err(Error::Invalid(
+            return Err(Error::InvalidRelocation(
                 "relocation scan range is reversed".to_owned(),
             ));
         }
@@ -138,6 +220,17 @@ impl RelocationStore {
     pub fn lsm(&self) -> &Lsm {
         &self.lsm
     }
+}
+
+fn manifest_sequence(manifest: &strata_lsm::Manifest) -> StrataLsn {
+    manifest
+        .partitions
+        .values()
+        .flat_map(|partition| partition.base.iter().chain(&partition.patches))
+        .filter_map(|table: &TableMeta| table.max_lsn)
+        .chain(manifest.materialized_through)
+        .max()
+        .unwrap_or_default()
 }
 
 impl RelocationMerge {
@@ -229,7 +322,7 @@ impl RelocationScan {
             Some((key, value)) => {
                 let (key, shard, payload_lsn) = decode_key(&key)?;
                 let StoredValue::Inline(value) = decode_value(&value)? else {
-                    return Err(Error::Invalid(
+                    return Err(Error::InvalidRelocation(
                         "relocation value is segment-backed".to_owned(),
                     ));
                 };
@@ -250,13 +343,14 @@ impl RelocationScan {
 
 fn decode_key(key: &[u8]) -> Result<(BlobKey, ShardKey, StrataLsn)> {
     if key.len() <= KEY_SUFFIX_BYTES {
-        return Err(Error::Invalid(
+        return Err(Error::InvalidRelocation(
             "relocation key is missing its blob key".to_owned(),
         ));
     }
     let suffix = key.len() - KEY_SUFFIX_BYTES;
     Ok((
-        BlobKey::new(key[..suffix].to_vec()).map_err(|error| Error::Invalid(error.to_string()))?,
+        BlobKey::new(key[..suffix].to_vec())
+            .map_err(|error| Error::InvalidRelocation(error.to_string()))?,
         ShardKey {
             id: u32::from_be_bytes(
                 key[suffix..suffix + 4]
@@ -296,7 +390,7 @@ fn encode_value(publish_lsn: StrataLsn, to: RecordRef) -> [u8; VALUE_BYTES] {
 
 fn decode_value_bytes(value: &[u8]) -> Result<Relocation> {
     if value.len() != VALUE_BYTES {
-        return Err(Error::Invalid(format!(
+        return Err(Error::InvalidRelocation(format!(
             "encoded relocation has {} bytes instead of {VALUE_BYTES}",
             value.len()
         )));

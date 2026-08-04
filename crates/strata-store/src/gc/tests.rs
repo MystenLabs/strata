@@ -1,5 +1,7 @@
 use super::*;
-use strata_core::SegmentGcLifetimeRange;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+use strata_core::{BlobLifecycle, SegmentGcLifetimeRange, SegmentGcRecordRange};
 
 fn controller_config(max_workers: usize, initial_workers: usize) -> GcConcurrencyConfig {
     GcConcurrencyConfig {
@@ -54,7 +56,7 @@ fn overlay_record_classifier_advances_through_sorted_ranges() {
     );
     assert_eq!(
         classifier.classify(gc_test_range(100, 50)).unwrap(),
-        OverlayRecordState::Skip
+        OverlayRecordState::Expired
     );
     assert_eq!(
         classifier.classify(gc_test_range(200, 50)).unwrap(),
@@ -64,7 +66,7 @@ fn overlay_record_classifier_advances_through_sorted_ranges() {
     );
     assert_eq!(
         classifier.classify(gc_test_range(300, 50)).unwrap(),
-        OverlayRecordState::Skip
+        OverlayRecordState::Retired
     );
     assert_eq!(
         classifier.classify(gc_test_range(350, 50)).unwrap(),

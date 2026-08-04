@@ -285,21 +285,28 @@ impl StrataStore {
         Ok(())
     }
 
-    /// Flushes the active relocation memtable once its normal age or size threshold is due.
+    /// Flushes relocation entries recovered from a legacy shared-WAL database once their active
+    /// memtable reaches its normal age or size threshold.
     ///
-    /// Quiet maintenance tools and benchmarks can call this after a GC publish so the same
-    /// on-disk lookup and compaction paths used under sustained GC are exercised without issuing a
-    /// synthetic relocation.
+    /// New GC publications already write immutable relocation L0 tables directly.
     pub fn flush_relocation_memtable_if_due(&self) -> Result<bool> {
         if self.relocations.lsm().roll_memtable_if_due(0)?.is_none() {
             return Ok(false);
         }
+        let admission_lock = Arc::clone(&self.compaction_admission_lock);
+        let _admission_guard = admission_lock
+            .read()
+            .expect("compaction admission lock poisoned");
         flush_relocation_lsm(
             &self.index,
             &self.relocations,
             &self.relocation_cache,
             &self.metrics,
         )?;
+        self.durable_relocation_lsn.fetch_max(
+            self.relocations.lsm().last_lsn()?.unwrap_or_default(),
+            std::sync::atomic::Ordering::Release,
+        );
         Ok(true)
     }
 
@@ -397,6 +404,7 @@ impl Drop for StrataStore {
         if let Some(lsm_flush_handle) = self.lsm_flush_handle.take() {
             let _ = lsm_flush_handle.join();
         }
+        self.lsm_compact_tx.take();
         if let Some(lsm_compact_handle) = self.lsm_compact_handle.take() {
             let _ = lsm_compact_handle.join();
         }

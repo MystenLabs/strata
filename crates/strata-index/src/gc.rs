@@ -66,27 +66,42 @@ impl StrataIndex {
         }))
     }
 
-    /// Persists GC output bytes that must be subtracted when the source is eventually unlinked.
+    /// Persists GC output bytes and the relocation activation that must be durable before the
+    /// source can be unlinked.
     pub fn put_gc_reclaim_pending_batch(
         &self,
         batch: &mut DBBatch,
         source_segment_id: SegmentId,
-        publish_lsn: StrataLsn,
+        activation_lsn: StrataLsn,
         output_bytes: u64,
     ) -> Result<()> {
-        let key = (source_segment_id, publish_lsn);
+        let key = (source_segment_id, activation_lsn);
         batch
             .insert_batch(self.gc_reclaim_pending(), [(&key, &output_bytes)])
             .map_err(Error::from)?;
         Ok(())
     }
 
-    /// Returns all pending reclaim attribution rows, ordered by source segment and publish LSN.
+    /// Returns all pending reclaim attribution rows, ordered by source segment and activation
+    /// sequence.
     pub fn iter_gc_reclaim_pending(&self) -> Result<Vec<((SegmentId, StrataLsn), u64)>> {
         self.gc_reclaim_pending
             .safe_iter()?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)
+    }
+
+    pub fn get_gc_reclaim_activation_lsn(
+        &self,
+        source_segment_id: SegmentId,
+    ) -> Result<Option<StrataLsn>> {
+        Ok(self
+            .iter_gc_reclaim_pending()?
+            .into_iter()
+            .filter_map(|((segment_id, activation_lsn), _)| {
+                (segment_id == source_segment_id).then_some(activation_lsn)
+            })
+            .max())
     }
 
     /// Removes and sums published-output attribution for deleted source segments in one scan.
@@ -113,7 +128,8 @@ impl StrataIndex {
         Ok(output_bytes)
     }
 
-    /// Removes reclaim attribution created by GC publications hidden during recovery rollback.
+    /// Removes legacy reclaim attribution created by GC publications hidden during foreground-LSN
+    /// recovery rollback.
     pub fn remove_gc_reclaim_pending_from_lsn_batch(
         &self,
         batch: &mut DBBatch,

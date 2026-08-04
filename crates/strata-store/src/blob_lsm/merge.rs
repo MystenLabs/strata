@@ -5,14 +5,16 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use super::format::{BlobMutation, BlobMutationWithLSN, BlobState, invalid};
+use super::garbage::{emit_lifetime_change, terminal_garbage_record};
+use super::reduce::reduce_patch_mutations;
+use super::snapshot::BlobCompactionSnapshot;
+use super::state::effective_lifecycle;
+use crate::relocation::{RelocationEntry, RelocationScan};
+use strata_core::GarbageEvent;
 use strata_lsm::{
     GarbageRecord, MergeOperator, Result, StoredValue, StrataLsn, decode_value, encode_inline_value,
 };
-use strata_relocation::RelocationScan;
-
-use super::format::{BlobMutation, BlobMutationWithLSN, BlobState, invalid};
-use super::reduce::reduce_patch_mutations;
-use super::snapshot::BlobCompactionSnapshot;
 
 /// Materializes Store blob operations during reads and compaction.
 pub struct BlobMerge;
@@ -91,6 +93,34 @@ impl BlobMergeWithRelocations {
     pub(crate) fn healed_references(&self) -> u64 {
         self.healed_references.load(Ordering::Relaxed)
     }
+
+    fn relocations_for_key(&self, key: &[u8]) -> Result<Vec<RelocationEntry>> {
+        let Some(relocations) = &self.relocations else {
+            return Ok(Vec::new());
+        };
+        let mut relocations = relocations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while relocations
+            .current()
+            .is_some_and(|relocation| relocation.key.as_bytes() < key)
+        {
+            relocations
+                .advance()
+                .map_err(|error| invalid(format!("relocation scan failed: {error}")))?;
+        }
+        let mut entries = Vec::new();
+        while let Some(relocation) = relocations
+            .current()
+            .filter(|relocation| relocation.key.as_bytes() == key)
+        {
+            entries.push(relocation.clone());
+            relocations
+                .advance()
+                .map_err(|error| invalid(format!("relocation scan failed: {error}")))?;
+        }
+        Ok(entries)
+    }
 }
 
 impl MergeOperator for BlobMergeWithRelocations {
@@ -105,6 +135,7 @@ impl MergeOperator for BlobMergeWithRelocations {
         patches: &[(StrataLsn, &[u8])],
         emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
+        let relocations = self.relocations_for_key(key)?;
         let Some(value) = BlobMerge.merge(key, base, patches, emit)? else {
             return Ok(None);
         };
@@ -112,39 +143,47 @@ impl MergeOperator for BlobMergeWithRelocations {
             return Err(invalid("materialized blob state cannot be segment-backed"));
         };
         let mut state = BlobState::decode(bytes)?;
-        if let Some(relocations) = &self.relocations {
-            let mut relocations = relocations
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-
-            while relocations
-                .current()
-                .is_some_and(|relocation| relocation.key.as_bytes() < key)
-            {
-                relocations
-                    .advance()
-                    .map_err(|error| invalid(format!("relocation scan failed: {error}")))?;
-            }
-            while let Some(relocation) = relocations
-                .current()
-                .filter(|relocation| relocation.key.as_bytes() == key)
-            {
-                if let Some(version) = state
+        for relocation in relocations {
+            let lifecycle = state
+                .versions
+                .get(&relocation.shard)
+                .filter(|version| version.lsn == relocation.payload_lsn)
+                .map(|version| effective_lifecycle(state.lifetime, version));
+            if let Some(lifecycle) = lifecycle {
+                let version = state
                     .versions
                     .get_mut(&relocation.shard)
-                    .filter(|version| version.lsn == relocation.payload_lsn)
-                {
-                    if version.record_ref.len != relocation.to.len {
-                        return Err(invalid("relocation changed the payload length"));
-                    }
-                    if version.record_ref != relocation.to {
-                        version.record_ref = relocation.to;
-                        self.healed_references.fetch_add(1, Ordering::Relaxed);
+                    .expect("matching relocation version was resolved above");
+                if version.record_ref.len != relocation.to.len {
+                    return Err(invalid("relocation changed the payload length"));
+                }
+                if version.record_ref != relocation.to {
+                    version.record_ref = relocation.to;
+                    self.healed_references.fetch_add(1, Ordering::Relaxed);
+                    if let Some(lifecycle) = lifecycle {
+                        emit_lifetime_change(
+                            key,
+                            relocation.publish_lsn,
+                            *version,
+                            None,
+                            Some(lifecycle),
+                            emit,
+                        )?;
                     }
                 }
-                relocations
-                    .advance()
-                    .map_err(|error| invalid(format!("relocation scan failed: {error}")))?;
+            } else if relocation.publish_lsn <= self.snapshot.materialized_through_lsn {
+                // GC may conservatively publish a copy whose tombstone, overwrite, or expiry had
+                // not reached the garbage log yet. Once a complete blob compaction proves that the
+                // payload identity is absent, retire the physical destination created by GC.
+                emit(terminal_garbage_record(
+                    key,
+                    relocation.publish_lsn,
+                    relocation.to,
+                    None,
+                    GarbageEvent::Retired {
+                        record: relocation.to,
+                    },
+                )?)?;
             }
         }
 

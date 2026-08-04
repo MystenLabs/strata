@@ -11,13 +11,11 @@ use strata_core::{ShardCleanupJob, ShardCleanupState, ShardId, ShardInfo, ShardK
 
 use crate::{
     AddShardRequest, BatchOp, BatchWriteRequest, DURABILITY_PUBLISH_INTERVAL, DropShardRequest,
-    Error, GcPublishRequest, Result, SEGMENT_ROLLOVER_INTERVAL, SyncRequest, WriteCommand,
-    WriteCoordinator, profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
+    Error, Result, SEGMENT_ROLLOVER_INTERVAL, SyncRequest, WriteCommand, WriteCoordinator,
+    profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
 };
 
 mod commit;
-pub(crate) mod gc_output;
-mod gc_publish;
 mod rollover;
 mod sync;
 
@@ -53,9 +51,6 @@ impl WriteCoordinator {
                 }
                 WriteCommand::DropShard(request) => {
                     self.process_drop_shard(request);
-                }
-                WriteCommand::GcPublish(request) => {
-                    self.process_gc_publish(request);
                 }
                 WriteCommand::RolloverSegment(request) => {
                     let result = self.process_segment_rollover();
@@ -122,9 +117,6 @@ impl WriteCoordinator {
             WriteCommand::DropShard(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
-            WriteCommand::GcPublish(request) => {
-                let _ = request.response_tx.send(Err(error));
-            }
             WriteCommand::RolloverSegment(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
@@ -178,15 +170,6 @@ impl WriteCoordinator {
 
     fn process_drop_shard(&mut self, request: DropShardRequest) {
         let result = self.submit_drop_shard(request.shard_id);
-        let _ = request.response_tx.send(result);
-    }
-
-    /// Runs a GC publish request on the writer thread and reports the result to the caller.
-    ///
-    /// GC publish allocates from the store-global sequence, then commits its metadata in this
-    /// serialized publication lane.
-    fn process_gc_publish(&mut self, request: GcPublishRequest) {
-        let result = self.submit_gc_publish(request.publish);
         let _ = request.response_tx.send(result);
     }
 

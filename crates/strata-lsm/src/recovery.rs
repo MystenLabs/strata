@@ -11,8 +11,8 @@ use super::garbage_log::{
 };
 use crate::{Error, Result};
 
-pub(super) const MAGIC: &[u8; 8] = b"STRGL001";
-pub(super) const VERSION: u32 = 1;
+pub(super) const MAGIC: &[u8; 8] = b"STRGL002";
+pub(super) const VERSION: u32 = 2;
 
 pub(super) fn recover(dir: &Path, committed: GarbageLogPosition) -> Result<(File, u64, u64)> {
     validate_position(committed)?;

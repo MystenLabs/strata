@@ -6,7 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bcs.workspace = true
 serde.workspace = true
 sha2.workspace = true
 strata-core.workspace = true

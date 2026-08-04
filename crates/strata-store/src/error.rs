@@ -70,8 +70,8 @@ pub enum Error {
         next: StrataLsn,
     },
 
-    #[error("relocation error: {0}")]
-    Relocation(#[from] strata_relocation::Error),
+    #[error("invalid relocation: {0}")]
+    InvalidRelocation(String),
 
     #[error("gc selection error: {0}")]
     GcSelection(#[from] strata_gc::GcSelectionError),

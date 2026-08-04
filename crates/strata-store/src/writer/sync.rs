@@ -6,8 +6,7 @@ use std::time::Instant;
 use strata_core::{StoreCheckpoint, StrataLsn};
 
 use crate::{
-    Error, Result, StoreSyncProfile, WriteCoordinator,
-    maintenance::{publish_blob_lsm_edit, publish_relocation_lsm_edit},
+    Error, Result, StoreSyncProfile, WriteCoordinator, maintenance::publish_blob_lsm_edit,
     profile_phase, publish_segment_allocation_baseline,
 };
 
@@ -27,25 +26,12 @@ impl WriteCoordinator {
         })
     }
 
-    /// Advances both keyed projections, then reclaims only the store-WAL prefix covered by both.
+    /// Advances the blob projection, then reclaims the store WAL it alone consumes.
     fn reclaim_store_wal(&mut self, published_lsn: StrataLsn) -> Result<()> {
         self.lsm.materialize_through(published_lsn, |edit| {
             publish_blob_lsm_edit(&self.index, edit)
         })?;
-        self.relocations
-            .lsm()
-            .materialize_through(published_lsn, |edit| {
-                publish_relocation_lsm_edit(&self.index, edit)
-            })?;
-
-        let blob_frontier = self.lsm.manifest().materialized_through.unwrap_or_default();
-        let relocation_frontier = self
-            .relocations
-            .lsm()
-            .manifest()
-            .materialized_through
-            .unwrap_or_default();
-        let reclaim_through = blob_frontier.min(relocation_frontier);
+        let reclaim_through = self.lsm.manifest().materialized_through.unwrap_or_default();
         if reclaim_through == 0 {
             return Ok(());
         }
@@ -118,6 +104,7 @@ impl WriteCoordinator {
             .durability_publish_lock
             .lock()
             .expect("durability publish lock poisoned");
+        let durable_relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
         let (state, batch, published_lsn) = profile_phase(
             profile.as_deref_mut(),
             |profile, elapsed| profile.published_lsn_compute += elapsed,
@@ -180,6 +167,8 @@ impl WriteCoordinator {
             return Err(error);
         }
         self.active_segment_state = state;
+        self.durable_relocation_lsn
+            .fetch_max(durable_relocation_lsn, std::sync::atomic::Ordering::Release);
         self.pending_allocation_records = 0;
         self.last_durability_publish_at = Instant::now();
         profile_phase(

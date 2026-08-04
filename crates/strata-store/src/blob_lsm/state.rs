@@ -208,7 +208,7 @@ impl BlobState {
     }
 }
 
-fn effective_lifecycle(
+pub(super) fn effective_lifecycle(
     lifetime: Option<BlobLifetime>,
     version: &BlobVersion,
 ) -> Option<BlobLifecycle> {

@@ -125,14 +125,32 @@ fn folds_history_without_reviving_garbage() {
 }
 
 #[test]
-fn rejects_duplicate_key_and_lsn() {
+fn folds_identical_duplicate_event_once() {
     let duplicate = event(b"a", 1, retire(1, 6));
-    let error = fold_segment_garbage(
+    let overlay = fold_segment_garbage(
         vec![duplicate.clone(), duplicate],
         SegmentGcSummary::default(),
     )
+    .unwrap();
+    assert_eq!(overlay.retired, vec![range(1, 6)]);
+}
+
+#[test]
+fn rejects_conflicting_event_at_one_position() {
+    let record = record(1, 6);
+    let error = fold_segment_garbage(
+        vec![
+            event(b"a", 1, GarbageEvent::Retired { record }),
+            event(b"a", 1, GarbageEvent::Expired { record }),
+        ],
+        SegmentGcSummary::default(),
+    )
     .unwrap_err();
-    assert!(error.to_string().contains("duplicate key, lsn, and record"));
+    assert!(
+        error
+            .to_string()
+            .contains("conflicting events for one key, lsn, and record")
+    );
 }
 
 fn event(key: &[u8], sequence: u64, event: GarbageEvent) -> GarbageRecord {

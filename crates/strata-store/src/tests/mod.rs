@@ -12,7 +12,6 @@ use std::{
 use prometheus::Registry;
 use strata_core::{BlobLifecycle, EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcRecordRange};
 use strata_gc::{DestinationClass, GcAction, GcCopyRecord, GcPlanner, GcPlannerConfig, GcScenario};
-use strata_relocation::RelocationEntry;
 use tempfile::tempdir;
 use typed_store::{
     DBMetrics,
@@ -20,6 +19,7 @@ use typed_store::{
 };
 
 use super::*;
+use crate::relocation::RelocationEntry;
 
 mod garbage_log;
 
@@ -509,7 +509,7 @@ async fn store_wal_routes_payload_and_metadata_without_fake_lsm_rows() {
 }
 
 #[tokio::test]
-async fn store_wal_recovery_uses_the_slower_projection_frontier() {
+async fn store_wal_recovery_uses_the_blob_projection_frontier() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "store-wal-frontier");
@@ -549,7 +549,7 @@ async fn store_wal_recovery_uses_the_slower_projection_frontier() {
         .unwrap();
     batch.write().unwrap();
 
-    assert_eq!(store_wal_recovery_state(&index).unwrap(), (Some(80), 3));
+    assert_eq!(store_wal_recovery_state(&index).unwrap(), (Some(100), 3));
 }
 
 #[tokio::test]
@@ -631,6 +631,7 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
     store.store.writer_handle.take().unwrap().join().unwrap();
     store.store.lsm_flush_tx.take();
     store.store.lsm_flush_handle.take().unwrap().join().unwrap();
+    store.store.lsm_compact_tx.take();
     store
         .store
         .lsm_compact_handle
@@ -2384,7 +2385,6 @@ async fn metrics_track_seal_backpressure_waits() {
     let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
-    let live_snapshots = lsm.live_snapshots();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
     let coordinator = WriteCoordinator {
@@ -2399,8 +2399,8 @@ async fn metrics_track_seal_backpressure_waits() {
             PlacementClass::Ingest,
             cfg.segment_max_bytes,
         ),
-        live_snapshots,
         durability_publish_lock: Arc::new(Mutex::new(())),
+        durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
         pending_allocation_records: 0,
@@ -2413,7 +2413,6 @@ async fn metrics_track_seal_backpressure_waits() {
         seal_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
-        reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
         relocations: open_relocation_lsm(
             &cfg,
             &index,
@@ -2421,7 +2420,6 @@ async fn metrics_track_seal_backpressure_waits() {
             relocation_recovery,
         )
         .unwrap(),
-        relocation_cache: Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES)),
         gc_concurrency,
         store_halt: StoreHalt::default(),
         metrics,
@@ -3757,7 +3755,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
     let registry = Registry::new();
     let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
-    let store = try_open_standalone_store(cfg, metrics).unwrap();
+    let mut store = try_open_standalone_store(cfg, metrics).unwrap();
 
     let lsn_a = store.put(&key_a, b"payload-a").unwrap();
     store.put(&key_b, b"payload-b").unwrap();
@@ -3789,6 +3787,23 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     let staged_path = copied.outputs[0].path.clone();
+    store
+        .store
+        .garbage_sweep_tx
+        .take()
+        .unwrap()
+        .send(())
+        .unwrap();
+    store
+        .store
+        .garbage_sweep_handle
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    let next_lsn_before_publish = store.index().get_next_lsn().unwrap();
+    let published_lsn_before_publish = store.published_lsn().unwrap();
+    let checkpoint_before_publish = store.index().get_store_checkpoint().unwrap();
 
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
@@ -3796,6 +3811,15 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(published.skipped_records, Vec::new());
     assert_eq!(published.output_segments.len(), 1);
     assert_eq!(published.published_records.len(), 1);
+    assert_eq!(
+        store.index().get_next_lsn().unwrap(),
+        next_lsn_before_publish
+    );
+    assert_eq!(store.published_lsn().unwrap(), published_lsn_before_publish);
+    assert_eq!(
+        store.index().get_store_checkpoint().unwrap(),
+        checkpoint_before_publish
+    );
     assert_eq!(store.relocation_cache.len(), 1);
     assert_eq!(
         counter_value(&registry, "strata_store_gc_output_bytes_total"),
@@ -3813,6 +3837,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert!(published.output_segments[0].path.exists());
 
     let published_record = &published.published_records[0];
+    assert_eq!(published_record.publish_lsn, published_lsn_before_publish);
     assert_eq!(published_record.source.from, ref_b);
     assert_eq!(
         store
@@ -3860,7 +3885,41 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
             .unwrap(),
         published_record.publish_lsn
     );
-    assert!(store.published_lsn().unwrap() >= published_record.publish_lsn);
+    assert_eq!(store.published_lsn().unwrap(), published_record.publish_lsn);
+    let executor = store.store.gc_executor().unwrap();
+    assert!(
+        !executor
+            .relocation_activation_is_durable(ref_b.segment_id)
+            .unwrap()
+    );
+    store.sync().unwrap();
+    assert!(
+        executor
+            .relocation_activation_is_durable(ref_b.segment_id)
+            .unwrap()
+    );
+
+    loop {
+        let swept = {
+            let _publish_guard = store
+                .store
+                .durability_publish_lock
+                .lock()
+                .expect("durability publication lock poisoned");
+            store
+                .index()
+                .sweep_garbage_log(
+                    garbage_log_dir(store.config()),
+                    store.config().namespace_dir(),
+                    GARBAGE_LOG_HEAD,
+                    GARBAGE_LOG_SWEEP_CURSOR,
+                )
+                .unwrap()
+        };
+        if !swept {
+            break;
+        }
+    }
 
     wait_for_lsm_gc(&store, published_record.publish_lsn);
 
@@ -3931,6 +3990,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     );
 
     let cfg = store.config().clone();
+    drop(executor);
     drop(store);
     let reopened = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     assert_eq!(reopened.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
@@ -4093,20 +4153,35 @@ async fn gc_publish_tombstoned_pending_copy_retires_destination_after_forwarding
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
     assert!(published.reconciled_lsn >= tombstone_b_lsn);
-    assert!(published.published_records.is_empty());
-    assert!(published.output_segments.is_empty());
-    assert_eq!(published.skipped_records.len(), 1);
-    assert_eq!(published.skipped_records[0].source.from, ref_b);
+    assert_eq!(published.published_records.len(), 1);
+    assert_eq!(published.output_segments.len(), 1);
+    assert!(published.skipped_records.is_empty());
+    assert_eq!(published.published_records[0].source.from, ref_b);
     assert_eq!(store.get(&key_b).unwrap(), None);
+    let destination = published.published_records[0].to;
+    let publish_lsn = published.published_records[0].publish_lsn;
     assert!(
         store
             .relocations
             .lookup(0, &key_b, STANDALONE_SHARD, payload_lsn_b)
             .unwrap()
-            .is_none()
+            .is_some_and(|relocation| relocation.to == destination)
     );
     let source_overlay = segment_overlay(&store, ref_a.segment_id);
     assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
+
+    // The tombstone was not in a committed garbage event when GC reconciled, so the destination
+    // starts conservatively live. Full compaction resolves the payload identity through the
+    // relocation and retires the physical destination.
+    let initial_destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(!gc_ranges_contain(
+        &initial_destination_overlay.retired,
+        destination
+    ));
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, publish_lsn.max(tombstone_b_lsn));
+    let destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(gc_ranges_contain(&destination_overlay.retired, destination));
 }
 
 #[tokio::test]
@@ -4155,15 +4230,21 @@ async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
 
+    // Leave a keyed patch pending as well as the epoch transition. GC must not infer expiry from
+    // current_epoch; the subsequent full compaction is what emits the explicit Expired event.
+    let lifetime_touch_lsn = store.extend(&key_b, 43).unwrap().unwrap();
     let (_, epoch_lsn) = store.increment_epoch().unwrap();
     assert_eq!(store.get(&key_b).unwrap(), None);
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
+    assert!(published.reconciled_lsn >= lifetime_touch_lsn);
     assert!(published.reconciled_lsn >= epoch_lsn);
-    assert!(published.published_records.is_empty());
-    assert!(published.output_segments.is_empty());
-    assert_eq!(published.skipped_records.len(), 1);
-    assert_eq!(published.skipped_records[0].source.from, ref_b);
+    assert_eq!(published.published_records.len(), 1);
+    assert_eq!(published.output_segments.len(), 1);
+    assert!(published.skipped_records.is_empty());
+    assert_eq!(published.published_records[0].source.from, ref_b);
+    let destination = published.published_records[0].to;
+    let publish_lsn = published.published_records[0].publish_lsn;
 
     let source_overlay = segment_overlay(&store, ref_a.segment_id);
     assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
@@ -4172,12 +4253,23 @@ async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
             .relocations
             .lookup(0, &key_b, STANDALONE_SHARD, payload_lsn_b)
             .unwrap()
-            .is_none()
+            .is_some_and(|relocation| relocation.to == destination)
     );
+
+    let initial_destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(!gc_ranges_contain(
+        &initial_destination_overlay.expired,
+        destination
+    ));
+    assert!(initial_destination_overlay.lifetimes.is_empty());
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, publish_lsn.max(lifetime_touch_lsn).max(epoch_lsn));
+    let destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(gc_ranges_contain(&destination_overlay.expired, destination));
 }
 
 #[tokio::test]
-async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
+async fn gc_publish_forwards_lagging_lifetime_after_compaction() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -4222,17 +4314,17 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     assert_eq!(copied.copied_records[0].source.lifecycle, None);
 
-    let lifetime_b_lsn = store.extend(&key_b, 43).unwrap().unwrap();
-    let (_, epoch_lsn) = store.increment_epoch().unwrap();
-    assert_eq!(store.get(&key_b).unwrap(), None);
+    let lifetime_b_lsn = store.extend(&key_b, 50).unwrap().unwrap();
+    assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
     let published = store.publish_prepared_gc_copy(copied).unwrap();
 
     assert!(published.reconciled_lsn >= lifetime_b_lsn);
-    assert!(published.reconciled_lsn >= epoch_lsn);
-    assert!(published.published_records.is_empty());
-    assert!(published.output_segments.is_empty());
-    assert_eq!(published.skipped_records.len(), 1);
-    assert_eq!(published.skipped_records[0].source.from, ref_b);
+    assert_eq!(published.published_records.len(), 1);
+    assert_eq!(published.output_segments.len(), 1);
+    assert!(published.skipped_records.is_empty());
+    assert_eq!(published.published_records[0].source.from, ref_b);
+    let destination = published.published_records[0].to;
+    let publish_lsn = published.published_records[0].publish_lsn;
 
     let source_overlay = segment_overlay(&store, ref_a.segment_id);
     assert!(gc_ranges_contain(&source_overlay.retired, ref_a));
@@ -4241,8 +4333,21 @@ async fn gc_publish_forwards_lagging_lifetime_before_epoch_expiry() {
             .relocations
             .lookup(0, &key_b, STANDALONE_SHARD, payload_lsn_b)
             .unwrap()
-            .is_none()
+            .is_some_and(|relocation| relocation.to == destination)
     );
+
+    // Output publication starts unknown even though the pending main-LSM patch already contains
+    // lifetime 50. Compaction heals the main-LSM ref and emits SetLifecycle for the destination.
+    let initial_destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(initial_destination_overlay.lifetimes.is_empty());
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, publish_lsn.max(lifetime_b_lsn));
+    let destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(destination_overlay.lifetimes.iter().any(|entry| {
+        entry.range == SegmentGcRecordRange::from(destination)
+            && entry.lifecycle.logical_end_epoch == 50
+    }));
+    assert_eq!(lsm_blob_ref(&store, &key_b), destination);
 }
 #[tokio::test]
 async fn blob_lsm_retire_removes_lifetime_hint() {
@@ -4898,7 +5003,6 @@ async fn scheduled_rollover_rolls_empty_segment_for_metadata_only_lsn() {
     let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
-    let live_snapshots = lsm.live_snapshots();
     let (seal_tx, seal_rx) = mpsc::channel();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
@@ -4916,8 +5020,8 @@ async fn scheduled_rollover_rolls_empty_segment_for_metadata_only_lsn() {
             PlacementClass::Ingest,
             cfg.segment_max_bytes,
         ),
-        live_snapshots,
         durability_publish_lock: Arc::new(Mutex::new(())),
+        durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
         pending_allocation_records: 0,
@@ -4930,7 +5034,6 @@ async fn scheduled_rollover_rolls_empty_segment_for_metadata_only_lsn() {
         seal_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
-        reader_cache: Arc::new(SegmentReaderCache::new(cfg.segment_reader_cache_capacity)),
         relocations: open_relocation_lsm(
             &cfg,
             &index,
@@ -4938,7 +5041,6 @@ async fn scheduled_rollover_rolls_empty_segment_for_metadata_only_lsn() {
             relocation_recovery,
         )
         .unwrap(),
-        relocation_cache: Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES)),
         gc_concurrency,
         store_halt: StoreHalt::default(),
         metrics,

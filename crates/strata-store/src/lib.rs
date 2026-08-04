@@ -113,9 +113,10 @@
 //! - [`store`]: runtime API of `StrataStore` (writes, shards, epochs, sync, shutdown)
 //! - [`open`] / [`recovery`]: `StrataStore::open`, config validation, crash recovery
 //! - [`batch`]: the write protocol between `StrataStore` and the writer thread
-//! - [`writer`]: the single-threaded write coordinator (commit, GC publish, rollover, sync)
+//! - [`writer`]: the foreground commit, rollover, and sync coordinator
+//! - [`gc`]: GC worker admission, copy execution, publication, and output accounting
 //! - [`maintenance`]: background workers (garbage-log sweeper, LSM flusher/compactor)
-//! - [`read`]: point reads and blob streaming; [`gc`]: GC planning/execution
+//! - [`read`]: point reads and blob streaming
 //! - [`seal`]: segment sealing; [`wal`] / [`wal_format`]: the store WAL
 //! - [`segment_state`] / [`fs_util`] / [`layout`]: shared segment-row and filesystem helpers
 mod batch;
@@ -133,7 +134,7 @@ mod open;
 mod read;
 mod reader_cache;
 mod recovery;
-mod relocation_cache;
+mod relocation;
 mod seal;
 mod segment_state;
 mod shard_gc;
@@ -144,7 +145,7 @@ mod writer;
 
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, Mutex, Weak, mpsc},
+    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -166,7 +167,6 @@ use strata_index::StrataIndex;
 #[cfg(test)]
 use strata_lsm::ManifestEdit;
 use strata_lsm::{LiveSnapshots, Lsm};
-use strata_relocation::RelocationStore;
 use strata_segment::{SegmentFactory, SegmentIdAllocator, SegmentWriter};
 use wal::Wal;
 #[cfg(test)]
@@ -196,8 +196,8 @@ use layout::{relative_segment_path, segment_path, segment_state_path};
 pub use metrics::StrataStoreMetrics;
 pub use read::{ReadOptions, StoreGetProfile};
 use reader_cache::SegmentReaderCache;
-pub use relocation_cache::DEFAULT_RELOCATION_CACHE_ENTRIES;
-use relocation_cache::RelocationCache;
+pub use relocation::DEFAULT_RELOCATION_CACHE_ENTRIES;
+use relocation::{RelocationCache, RelocationStore};
 use seal::SealCommand;
 #[cfg(test)]
 use seal::SealWorker;
@@ -208,12 +208,14 @@ pub use strata_gc::{GcPlanner, GcPlannerConfig};
 #[cfg(feature = "internal-profiling")]
 pub use batch::StoreProfileSink;
 use batch::{
-    AddShardRequest, BatchOp, BatchWriteRequest, DropShardRequest, GcPreparedPublish,
-    GcPublishRequest, PendingRollover, PreparedBatch, PreparedBatchOp, ProfileRequest,
-    RolloverSegmentRequest, SyncRequest, WriteCommand, profile_phase,
+    AddShardRequest, BatchOp, BatchWriteRequest, DropShardRequest, PendingRollover, PreparedBatch,
+    PreparedBatchOp, ProfileRequest, RolloverSegmentRequest, SyncRequest, WriteCommand,
+    profile_phase,
 };
 pub use batch::{BatchWriteResult, StoreSyncProfile, StoreWriteProfile, StrataBatch};
 use fs_util::{prune_empty_retention_dirs, segment_garbage_log_path, sync_parent_dir};
+#[cfg(test)]
+use gc::output::{GcSkippedCopiedRecord, GcSkippedCopiedRecordKind, gc_output_bytes_by_source};
 #[cfg(test)]
 use maintenance::{compact_relocation_lsm, flush_relocation_lsm, garbage_log_dir};
 #[cfg(test)]
@@ -222,9 +224,6 @@ use segment_state::{
     active_segment_state_from_path, publish_segment_allocation_baseline,
     unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
-use writer::gc_output::GcSkippedCopiedRecord;
-#[cfg(test)]
-use writer::gc_output::{GcSkippedCopiedRecordKind, gc_output_bytes_by_source};
 
 const FIRST_SEGMENT_ID: SegmentId = 1;
 /// How long the writer naps while waiting for the sealer to drain its backlog. Short, because
@@ -277,6 +276,7 @@ pub struct StrataStore {
     pub(crate) write_tx: Option<mpsc::SyncSender<WriteCommand>>,
     writer_handle: Option<JoinHandle<()>>,
     lsm_flush_tx: Option<mpsc::Sender<()>>,
+    lsm_compact_tx: Option<mpsc::Sender<()>>,
     lsm_flush_handle: Option<JoinHandle<()>>,
     lsm_compact_handle: Option<JoinHandle<()>>,
     lsm_sync_handles: Vec<JoinHandle<()>>,
@@ -288,6 +288,8 @@ pub struct StrataStore {
     gc_handles: Vec<JoinHandle<()>>,
     pub(crate) gc_publish_cleanup_lock: Arc<Mutex<()>>,
     pub(crate) durability_publish_lock: Arc<Mutex<()>>,
+    pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
+    pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
     pub(crate) gc_io_limiter: Arc<GcIoLimiter>,
@@ -295,7 +297,6 @@ pub struct StrataStore {
     pub(crate) reader_cache: Arc<SegmentReaderCache>,
     pub(crate) relocations: Arc<RelocationStore>,
     pub(crate) relocation_cache: Arc<RelocationCache>,
-    #[cfg(test)]
     live_snapshots: LiveSnapshots,
     pub(crate) store_halt: StoreHalt,
     metrics: StrataStoreMetrics,
@@ -342,8 +343,8 @@ struct WriteCoordinator {
     wal: Wal,
     segment: SegmentWriter,
     segment_factory: SegmentFactory,
-    live_snapshots: LiveSnapshots,
     durability_publish_lock: Arc<Mutex<()>>,
+    durable_relocation_lsn: Arc<AtomicU64>,
     active_segment_state: SegmentState,
     durable_offset: u64,
     pending_allocation_records: u64,
@@ -356,9 +357,7 @@ struct WriteCoordinator {
     seal_tx: mpsc::Sender<SealCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
     ingest_owner: SegmentOwner,
-    reader_cache: Arc<SegmentReaderCache>,
     relocations: Arc<RelocationStore>,
-    relocation_cache: Arc<RelocationCache>,
     gc_concurrency: Arc<GcConcurrencyController>,
     store_halt: StoreHalt,
     metrics: StrataStoreMetrics,

@@ -595,9 +595,31 @@ impl Lsm {
     pub fn install_manifest(&self, manifest: Manifest) -> Result<()> {
         let _flush = lock(&self.flush_lock);
         manifest.validate()?;
+        let manifest_lsn = manifest
+            .partitions
+            .values()
+            .flat_map(|partition| partition.base.iter().chain(&partition.patches))
+            .filter_map(|table| table.max_lsn)
+            .chain(manifest.materialized_through)
+            .max();
         let manifest = Arc::new(manifest);
         self.check_running()?;
+        if let Some(manifest_lsn) = manifest_lsn {
+            let mut writes = lock(&self.writes);
+            writes.last_lsn = Some(
+                writes
+                    .last_lsn
+                    .map_or(manifest_lsn, |current| current.max(manifest_lsn)),
+            );
+        }
         let mut state = lock(&self.memory);
+        if let Some(manifest_lsn) = manifest_lsn {
+            state.last_visible_lsn = Some(
+                state
+                    .last_visible_lsn
+                    .map_or(manifest_lsn, |current| current.max(manifest_lsn)),
+            );
+        }
         let snapshot = Arc::new(Snapshot::new_current(
             Arc::clone(&self.tables),
             Arc::clone(&manifest),

@@ -6,8 +6,8 @@ use std::{
     sync::Mutex,
 };
 
+use super::RelocationEntry;
 use strata_core::{BlobKey, RecordRef, ShardKey, StrataLsn};
-use strata_relocation::RelocationEntry;
 
 pub const DEFAULT_RELOCATION_CACHE_ENTRIES: usize = 100_000;
 

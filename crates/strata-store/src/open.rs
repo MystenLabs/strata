@@ -4,7 +4,7 @@
 use std::{
     fs,
     num::NonZeroU32,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, RwLock, mpsc},
     thread::{self, JoinHandle},
     time::Instant,
 };
@@ -17,7 +17,6 @@ use strata_index::StrataIndex;
 use strata_lsm::{
     Lsm, LsmOptions, Manifest as LsmManifest, MemtableRolloverPolicy, Mutation as LsmMutation,
 };
-use strata_relocation::{RelocationEntry, RelocationStore};
 use strata_segment::{SegmentFactory, SegmentIdAllocator, SegmentWriter};
 
 use crate::{
@@ -41,7 +40,7 @@ use crate::{
         publish_recovered_store_checkpoint, reconcile_orphan_ingest_segment_files,
         recover_store_wal_prefix, recover_unsealed_segments,
     },
-    relocation_cache::RelocationCache,
+    relocation::{RelocationCache, RelocationEntry, RelocationStore},
     seal::{
         SealWorker, active_segment_durable_offset, enqueue_unsealed_segments_for_sealing,
         verify_sealed_segments,
@@ -111,11 +110,11 @@ impl StrataStore {
     /// 3. Sealed segments are only *verified*; they were declared immutable at seal time, so
     ///    anything wrong with them is an error, not something to repair silently.
     /// 4. Only then are the workers started. The LSM flusher publishes immutable memtables, a
-    ///    separate compactor merges durable tables, and the sealer handles segment rollovers. GC
-    ///    starts after the writer because GC publish uses the same serialized write queue.
+    ///    separate compactor merges durable tables, the sealer handles segment rollovers, and GC
+    ///    publishes relocation L0s on its independent path.
     ///
-    /// Everything mutable ends up owned by the writer thread; the `StrataStore` handle itself
-    /// only holds channels, the index, and the read-side cache.
+    /// Foreground segment/WAL state remains writer-owned; GC only shares the index, relocation
+    /// LSM, and the small publication locks needed for atomic activation.
     fn open_inner(
         config: StrataStoreConfig,
         index: StrataIndex,
@@ -163,6 +162,10 @@ impl StrataStore {
         let lsm = open_lsm(&config, &index, next_lsn, blob_recovery)?;
         publish_recovered_store_checkpoint(&index, &metrics, &store_wal, &active_segment_state)?;
         let relocations = open_relocation_lsm(&config, &index, next_lsn, relocation_recovery)?;
+        let durable_relocation_lsn = Arc::new(std::sync::atomic::AtomicU64::new(
+            relocations.manifest_sequence(),
+        ));
+        let relocation_cache = Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES));
         let live_snapshots = lsm.live_snapshots();
         metrics.initialize_gc_known(&gc_known_summary(&index)?);
         metrics.set_gc_relocating_segments(gc_relocating_segment_count(&index)?);
@@ -174,6 +177,7 @@ impl StrataStore {
         let gc_claims = Arc::new(GcSourceClaims::default());
         let gc_io_limiter = Arc::new(GcIoLimiter::new(config.gc_io_bytes_per_sec));
         let store_halt = StoreHalt::default();
+        let compaction_admission_lock = Arc::new(RwLock::new(()));
         let durability_publish_lock = Arc::new(Mutex::new(()));
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
@@ -185,7 +189,10 @@ impl StrataStore {
             index: index.clone(),
             lsm: Arc::downgrade(&lsm),
             relocations: Arc::downgrade(&relocations),
+            relocation_cache: Arc::downgrade(&relocation_cache),
+            durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             garbage_log_dir: garbage_log_dir(&config),
+            compaction_admission_lock: Arc::clone(&compaction_admission_lock),
             garbage_publish_lock: Arc::clone(&durability_publish_lock),
             wake_rx: lsm_compact_rx,
             store_halt: store_halt.clone(),
@@ -222,6 +229,8 @@ impl StrataStore {
             global_log_dir: garbage_log_dir(&config),
             namespace_dir: config.namespace_dir(),
             durability_publish_lock: Arc::clone(&durability_publish_lock),
+            relocations: Arc::downgrade(&relocations),
+            durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             gc_txs: Arc::clone(&gc_wake_txs),
             shutdown_rx: garbage_sweep_rx,
         };
@@ -248,7 +257,6 @@ impl StrataStore {
         let reader_cache = Arc::new(SegmentReaderCache::new(
             config.segment_reader_cache_capacity,
         ));
-        let relocation_cache = Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES));
         let coordinator = WriteCoordinator {
             config: config.clone(),
             index: index.clone(),
@@ -261,8 +269,8 @@ impl StrataStore {
                 PlacementClass::Ingest,
                 config.segment_max_bytes,
             ),
-            live_snapshots: live_snapshots.clone(),
             durability_publish_lock: Arc::clone(&durability_publish_lock),
+            durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             active_segment_state,
             durable_offset,
             pending_allocation_records: 0,
@@ -275,9 +283,7 @@ impl StrataStore {
             seal_tx: seal_tx.clone(),
             write_rx,
             ingest_owner: INGEST_SEGMENT_OWNER,
-            reader_cache: Arc::clone(&reader_cache),
             relocations: Arc::clone(&relocations),
-            relocation_cache: Arc::clone(&relocation_cache),
             gc_concurrency: Arc::clone(&gc_concurrency),
             store_halt: store_halt.clone(),
             metrics: metrics.clone(),
@@ -299,9 +305,14 @@ impl StrataStore {
                 executor: GcExecutor {
                     config: config.clone(),
                     index: index.clone(),
-                    write_tx: write_tx.clone(),
                     publish_cleanup_lock: Arc::clone(&gc_publish_cleanup_lock),
                     durability_publish_lock: Arc::clone(&durability_publish_lock),
+                    compaction_admission_lock: Arc::clone(&compaction_admission_lock),
+                    relocations: Arc::clone(&relocations),
+                    relocation_cache: Arc::clone(&relocation_cache),
+                    durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
+                    live_snapshots: live_snapshots.clone(),
+                    lsm_compact_tx: lsm_compact_tx.clone(),
                     claims: Arc::clone(&gc_claims),
                     gc_concurrency: Arc::clone(&gc_concurrency),
                     gc_io_limiter: Arc::clone(&gc_io_limiter),
@@ -354,13 +365,13 @@ impl StrataStore {
             relocations,
             relocation_cache,
             lsm: Arc::downgrade(&lsm),
-            #[cfg(test)]
             live_snapshots,
             config,
             index,
             write_tx: Some(write_tx),
             writer_handle: Some(writer_handle),
             lsm_flush_tx: Some(lsm_flush_tx),
+            lsm_compact_tx: Some(lsm_compact_tx),
             lsm_flush_handle: Some(lsm_flush_handle),
             lsm_compact_handle: Some(lsm_compact_handle),
             lsm_sync_handles,
@@ -372,6 +383,8 @@ impl StrataStore {
             gc_handles,
             gc_publish_cleanup_lock,
             durability_publish_lock,
+            compaction_admission_lock,
+            durable_relocation_lsn,
             gc_claims,
             gc_concurrency,
             gc_io_limiter,
@@ -562,23 +575,17 @@ pub(crate) fn open_store_wal(
     Ok((wal, blob, relocations, sync_handles))
 }
 
-/// Returns the two store-wide facts needed to recover the shared WAL.
+/// Returns the two store-wide facts needed to recover the foreground store WAL.
 ///
-/// A prefix is replay-safe only when both keyed projections have materialized it. For example,
-/// blob=100 and relocation=80 means the store frontier is 80, never 100. The retained file ID is
-/// store state; the blob-manifest value is read only to open databases created before that state
+/// Relocations are durable immutable L0 files and no longer consume this WAL. The retained file ID
+/// is store state; the blob-manifest value is read only to open databases created before that state
 /// key existed.
 pub(crate) fn store_wal_recovery_state(index: &StrataIndex) -> Result<(Option<StrataLsn>, u64)> {
     let blob = load_blob_lsm_manifest(index)?;
-    let relocation = load_relocation_lsm_manifest(index)?;
-    let materialized_through = blob
-        .materialized_through
-        .zip(relocation.materialized_through)
-        .map(|(blob, relocation)| blob.min(relocation));
     let retained_from = index
         .get_store_wal_retained_from()?
         .unwrap_or(blob.wal_retained_from);
-    Ok((materialized_through, retained_from))
+    Ok((blob.materialized_through, retained_from))
 }
 
 pub(crate) fn open_relocation_lsm(
@@ -589,11 +596,25 @@ pub(crate) fn open_relocation_lsm(
 ) -> Result<Arc<RelocationStore>> {
     let root = config.relocation_dir();
     let manifest = Arc::new(load_relocation_lsm_manifest(index)?);
+    let recovered_last_lsn = recovered.iter().map(|entry| entry.publish_lsn).max();
     let recovered = recovered
         .into_iter()
         .map(|entry| (entry.publish_lsn, RelocationStore::lsm_mutation(0, &entry)))
         .collect();
-    let last_lsn = next_lsn.checked_sub(1).filter(|lsn| *lsn != 0);
+    let manifest_lsn = manifest
+        .partitions
+        .values()
+        .flat_map(|partition| partition.base.iter().chain(&partition.patches))
+        .filter_map(|table| table.max_lsn)
+        .chain(manifest.materialized_through)
+        .max();
+    let last_lsn = next_lsn
+        .checked_sub(1)
+        .filter(|lsn| *lsn != 0)
+        .into_iter()
+        .chain(recovered_last_lsn)
+        .chain(manifest_lsn)
+        .max();
     let lsm = Arc::new(Lsm::from_parts(
         root.join("tables"),
         manifest,
@@ -847,8 +868,7 @@ fn gc_relocating_segment_count(index: &StrataIndex) -> Result<usize> {
 /// Cleans up pending GC output segments.
 ///
 /// Pending GC output segments are segments that are pre published by GC. They are marked
-/// as `PendingGcOutput` and are deleted if there is a crash before the GC publish LSN could become
-/// durable.
+/// as `PendingGcOutput` and are deleted if a crash loses the later relocation activation batch.
 fn cleanup_pending_gc_outputs(config: &StrataStoreConfig, index: &StrataIndex) -> Result<()> {
     let pending_outputs = index
         .iter_segment_states()?

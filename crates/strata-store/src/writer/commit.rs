@@ -1,5 +1,8 @@
 //! Foreground batch commit path: batch preparation, segment append, and the
 //! atomic index metadata commit.
+//! One writer thread, one LSN sequence: prepare_batch reserves a contiguous range, so a batch's ops can never interleave with another writer's.
+//! Fixed publication order — segment bytes → store WAL → LSM memtable → RocksDB batch — and the RocksDB batch is the commit point.
+//! Committed ≠ durable: when the caller gets its LSN back, the write is visible and ordered, but only a later sync (or the periodic durability publish) makes it crash-proof. Callers needing durability gate on published_lsn() >= lsn
 
 use std::sync::mpsc;
 
@@ -12,12 +15,32 @@ use crate::{
 };
 
 impl WriteCoordinator {
-    /// Full write transaction for a batch: validate, append the payload/store-WAL records, apply
-    /// keyed projections, then commit one index metadata batch.
-    ///
-    /// User visible validation errors return normally before physical writer state changes. Once
-    /// the physical write path starts, segment/WAL/index failures halt the store and crash recovery
-    /// remains the single repair path for partially published bytes or rollovers.
+    /// This is the main entry point for the write protocol. It receives the prepared client ops, a channel
+    /// to reply on and a profile to track the time taken and then drives a batch from vector of requests
+    /// to durably ordered visible writes. Let's walk through an example batch -
+    /// say [put("user:1", 2MB), increment_epoch, put("user:2", 1MB)]:
+    /// 1. Empyty batch short circuit. Zero ops mean immediately result with empty write result. No need to
+    /// burn any LSN.
+    /// 2. Prepare: It calls a `prepare_batch` which validates everything and assigns the batch a contiguous LSN range
+    ///  - our example gets LSNs 100, 101, 102. A failure here is sent back on response_tx as a normal error. Nothing
+    /// on disk changed yet.
+    /// 3. Segment append for puts: For each put, it first asks if the record fits in active segment. If not, it triggers
+    /// `rollover_active_segment` to swap in a fresh segment, then appends the payload bytes. After each append it checks
+    /// a paranoid invariant - the segment wrote the exact number of bytes prepare_batch predicted and updates the
+    /// in memory counters of the active segment - its `write_offset` and `min_lsn` and `max_lsn` bounds (so GC can later
+    /// discover which LSNs live in this segment without scanning it). It also counts records and bytes written. Our two
+    /// puts land as lsnS 100 and 102, the epoch change at 101 writes no data in segments at all.
+    /// 4. Store WAL encoding: Every op, including metadata ops like epoch change become exactly one WAL entry at its LSN.
+    /// Keyed ops (Put/Lifecycle/Tombstone) produce a blob mutation that goes two places - `lsm_writes` list and into the
+    /// WAL record. `IncrementEpoch` becomes a special epoch change entry in the WAL - there is no keyed blob mutation for it.
+    /// It is RocksDB only batch operation and its WAL record is a bare `StoreWALMutation::Epoch`.
+    /// 5. Durability ordering: The three storage systems are updated in a fixed order.
+    /// Segments, WAL and LSM are updated in that order. Finally, the metadata is committed in RocksDB in `commit_write_batch`.
+    /// Before that, `take_pending_rollovers` also adds any staged rollover metadata to the batch.
+    /// 6. Post commit: Only after the index batch commits, does it run `run_rollover_post_commit` (queue the old segment for sealing
+    /// ), wake th elsm flusher if the memtable rolled during step 5, refresh the metrics and send the result back to the client.
+    /// Worth noting throughout: After step 3, every error path calls `halt_submit_batch_failure` before replying. If the WAL
+    /// append succeeded but the index commit failed - the store freezes, and let crash recovery run repair.
     pub(crate) fn submit_batch(
         &mut self,
         ops: Vec<BatchOp>,
@@ -265,6 +288,15 @@ impl WriteCoordinator {
     }
 
     /// Validates a client batch and assigns its contiguous store-owned LSN range.
+    /// This translates each `BatchOp` into a `PreparedBatchOp`, it touches no physical state.
+    /// `Put`: resolves the shard id to its active generation via `openable_shard_key`, computes
+    /// the exact encoded size upfront and rejects the payloads that could never fit in any single segment.
+    /// It also stamps the op with the current epoch of the system.
+    /// `SetBlobLifetime`: requires the target epoch to be strictly in future. `logical_end_epoch <= current` is
+    /// rejected as `InvalidBlobLifetime` error.
+    /// `Tombstone`: just needs a shard resolved.
+    /// `IncrementEpoch`: bumps the epoch in the current batch which means later ops in the same batch
+    /// will see the new epoch.
     fn prepare_batch(&self, ops: Vec<BatchOp>) -> Result<PreparedBatch> {
         let mut prepared_ops = Vec::with_capacity(ops.len());
         let mut op_epochs = Vec::with_capacity(ops.len());
@@ -391,8 +423,15 @@ impl WriteCoordinator {
 
     /// Commits the index side of a prepared batch.
     ///
-    /// Epoch changes, active segment offsets, rollover rows, and `next_lsn` move together. Blob
-    /// state is already ordered and visible in the LSM at this point.
+    /// This assembles the rocksdb write batch and commits these changes as part of the single atomic write:
+    /// 1. Any pending rollover rows are part of the batch i.e. old segments flipped to `Sealing` state
+    /// and new segments are registered and published at LSN.
+    /// 2. For epoch change, the `epoch_changes[lsn]` history row and the `current_epoch` pointer.
+    /// 3. The updated active segment state row but only if op actually wrote payload bytes
+    /// 4. `next_lsn = last committed lsn + 1`
+    /// A rollover segment that happens during this write (Segment A retired, segment B now active) stages
+    /// its metadata in `self.pending_rollovers` rather than committing immediately. It must be updated as
+    /// part of the single commit beucase if the commit fails we don't want to change the system state.
     fn commit_write_batch(
         &self,
         pending_rollovers: &[PendingRollover],

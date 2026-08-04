@@ -22,7 +22,6 @@ members = [
     "crates/strata-gc",
     "crates/strata-index",
     "crates/strata-lsm",
-    "crates/strata-relocation",
     "crates/strata-segment",
     "crates/strata-store",
 ]
@@ -45,7 +44,6 @@ strata-core = { path = "crates/strata-core" }
 strata-gc = { path = "crates/strata-gc" }
 strata-index = { path = "crates/strata-index" }
 strata-lsm = { path = "crates/strata-lsm" }
-strata-relocation = { path = "crates/strata-relocation" }
 strata-segment = { path = "crates/strata-segment" }
 strata-store = { path = "crates/strata-store" }
 tempfile = "3"

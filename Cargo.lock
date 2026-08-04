@@ -8036,7 +8036,6 @@ dependencies = [
 name = "strata-lsm"
 version = "0.1.0"
 dependencies = [
- "bcs",
  "serde",
  "sha2 0.10.9",
  "strata-core",
@@ -8062,17 +8061,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "strata-relocation"
-version = "0.1.0"
-dependencies = [
- "serde",
- "strata-core",
- "strata-lsm",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "strata-segment"
 version = "0.1.0"
 dependencies = [
@@ -8092,7 +8080,6 @@ dependencies = [
  "strata-gc",
  "strata-index",
  "strata-lsm",
- "strata-relocation",
  "strata-segment",
  "tempfile",
  "thiserror 2.0.18",

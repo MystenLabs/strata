@@ -16,7 +16,6 @@ strata-core.workspace = true
 strata-gc.workspace = true
 strata-index.workspace = true
 strata-lsm.workspace = true
-strata-relocation.workspace = true
 strata-segment.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

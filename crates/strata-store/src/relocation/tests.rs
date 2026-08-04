@@ -2,8 +2,9 @@ use std::{num::NonZeroU32, sync::Arc};
 
 use strata_core::{BlobKey, RecordRef, ShardKey};
 use strata_lsm::{Lsm, LsmOptions, Manifest};
-use strata_relocation::{RelocationEntry, RelocationStore};
 use tempfile::TempDir;
+
+use super::{RelocationEntry, RelocationStore};
 
 fn record(segment_id: u64, offset: u64) -> RecordRef {
     RecordRef {

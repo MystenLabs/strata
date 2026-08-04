@@ -12,9 +12,8 @@ use strata_index::StrataIndex;
 use strata_lsm::Mutation as LsmMutation;
 
 use crate::{
-    Error, GcPublishResult, GcSkippedCopiedRecord, Result, StrataStore, StrataStoreMetrics,
+    Error, Result, StrataStore, StrataStoreMetrics,
     blob_lsm::BlobMutation,
-    gc::GcPrepublishedCopy,
     seal::{SealCommand, SegmentSealTask},
 };
 
@@ -24,7 +23,6 @@ pub(crate) enum WriteCommand {
     AddShard(AddShardRequest),
     Batch(BatchWriteRequest),
     DropShard(DropShardRequest),
-    GcPublish(GcPublishRequest),
     RolloverSegment(RolloverSegmentRequest),
     Sync(SyncRequest),
     Shutdown,
@@ -83,21 +81,6 @@ pub(crate) struct BatchWriteRequest {
 pub(crate) struct DropShardRequest {
     pub(crate) shard_id: ShardId,
     pub(crate) response_tx: mpsc::Sender<Result<ShardKey>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct GcPublishRequest {
-    /// Prepublished copy bundle to reconcile and commit in the ordered writer lane.
-    pub(crate) publish: GcPrepublishedCopy,
-    /// One-shot response channel back to the caller that requested GC publication.
-    pub(crate) response_tx: mpsc::Sender<Result<GcPublishResult>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct GcPreparedPublish {
-    pub(crate) copy: GcPrepublishedCopy,
-    pub(crate) reconciled_lsn: StrataLsn,
-    pub(crate) skipped_records: Vec<GcSkippedCopiedRecord>,
 }
 
 #[derive(Debug)]

@@ -12,11 +12,9 @@
 //! Payload bytes are not duplicated here. `Blob::PutBlob` stores the `RecordRef` produced by the
 //! store's payload segment writer; `sync()` makes that segment durable before syncing this WAL.
 
+use crate::{Error, Result, relocation::RelocationEntry};
 use strata_core::{BlobKey, Epoch, RecordRef, ShardKey};
 use strata_lsm::{Mutation, decode_record_ref, encode_record_ref};
-use strata_relocation::RelocationEntry;
-
-use crate::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"STW1";
 const BLOB_PUT: u8 = 1;
