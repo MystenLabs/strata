@@ -448,6 +448,11 @@ impl Wal {
         Ok(position)
     }
 
+    /// Clones the store-owned file-sync queue for other immutable store files.
+    pub(crate) fn file_sync_sender(&self) -> FileSyncSender {
+        self.file_sync_tx.clone()
+    }
+
     /// Latest contiguous position whose queued file syncs have completed.
     #[cfg(test)]
     pub fn committed_position(&self) -> Result<WalPosition> {

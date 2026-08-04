@@ -183,19 +183,20 @@ impl LsmFlusher {
             let Some(lsm) = self.lsm.upgrade() else {
                 return;
             };
-            let rolled = if timed {
-                match lsm.roll_memtable_if_due(0) {
-                    Ok(rolled) => rolled.is_some(),
-                    Err(error) => {
-                        let reason = format!("LSM memtable rollover failed: {error}");
-                        self.store_halt.halt(reason.clone());
-                        lsm.halt(reason);
-                        return;
+            let mut rolled = false;
+            if timed {
+                for partition in 0..lsm.manifest().partition_count {
+                    match lsm.roll_memtable_if_due(partition) {
+                        Ok(partition_rolled) => rolled |= partition_rolled.is_some(),
+                        Err(error) => {
+                            let reason = format!("LSM memtable rollover failed: {error}");
+                            self.store_halt.halt(reason.clone());
+                            lsm.halt(reason);
+                            return;
+                        }
                     }
                 }
-            } else {
-                false
-            };
+            }
             if let Err(error) = self.flush_all(&lsm) {
                 let reason = format!("LSM flush failed: {error}");
                 self.store_halt.halt(reason.clone());
@@ -223,14 +224,18 @@ impl LsmFlusher {
     /// published_lsn because publication is the durability bound for RocksDB-only transitions.
     fn flush_all(&self, lsm: &Lsm) -> Result<()> {
         loop {
-            let table_id = lsm.manifest().next_table_id;
-            let relative_path = format!("patch-{table_id:020}.sst");
-            if lsm
-                .flush_one(0, table_id, relative_path, |edit| {
-                    publish_blob_lsm_edit(&self.index, edit)
-                })?
-                .is_none()
-            {
+            let mut flushed = false;
+            let partition_count = lsm.manifest().partition_count;
+            for partition in 0..partition_count {
+                let table_id = lsm.manifest().next_table_id;
+                let relative_path = format!("patch-{table_id:020}.sst");
+                flushed |= lsm
+                    .flush_one(partition, table_id, relative_path, |edit| {
+                        publish_blob_lsm_edit(&self.index, edit)
+                    })?
+                    .is_some();
+            }
+            if !flushed {
                 break;
             }
         }
@@ -315,11 +320,14 @@ impl LsmCompactor {
             return Ok(());
         };
         let manifest = relocations.lsm().manifest();
-        let patches = &manifest.partitions[&0].patches;
-        let patch_bytes = patches
+        let pressured = manifest
+            .partitions
             .iter()
-            .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
-        if patches.len() < LSM_COMPACTION_PATCH_COUNT && patch_bytes < LSM_COMPACTION_PATCH_BYTES {
+            .filter_map(|(&partition, tables)| {
+                partition_needs_compaction(&tables.patches).then_some(partition)
+            })
+            .collect::<Vec<_>>();
+        if pressured.is_empty() {
             return Ok(());
         }
 
@@ -328,7 +336,17 @@ impl LsmCompactor {
             .read()
             .expect("compaction admission lock poisoned");
         let relocation_lsn = relocations.lsm().last_lsn()?.unwrap_or_default();
-        if compact_relocation_lsm(&self.index, &relocations, &relocation_cache, &self.metrics)? {
+        let mut compacted = false;
+        for partition in pressured {
+            compacted |= compact_relocation_lsm_partition(
+                &self.index,
+                &relocations,
+                &relocation_cache,
+                &self.metrics,
+                partition,
+            )?;
+        }
+        if compacted {
             self.durable_relocation_lsn
                 .fetch_max(relocation_lsn, std::sync::atomic::Ordering::Release);
         }
@@ -373,6 +391,14 @@ impl LsmCompactor {
     /// are recorded, and the replaced input SSTs go onto the deferred `obsolete` list rather than
     /// being unlinked here — a concurrent reader may still hold them pinned.
     fn compact(&mut self, lsm: &Lsm, force: bool) -> Result<()> {
+        let partition_count = lsm.manifest().partition_count;
+        for partition in 0..partition_count {
+            self.compact_partition(lsm, partition, force)?;
+        }
+        Ok(())
+    }
+
+    fn compact_partition(&mut self, lsm: &Lsm, partition: u32, force: bool) -> Result<()> {
         // TODO: Replace this coarse admission barrier with late relocation resolution at garbage
         // publication time. Carry shard/payload identity and the original transition LSN so an
         // already-built compaction can retarget every event through the latest relocation map.
@@ -383,7 +409,7 @@ impl LsmCompactor {
             .read()
             .expect("compaction admission lock poisoned");
         let manifest = lsm.manifest();
-        let patches = &manifest.partitions[&0].patches;
+        let patches = &manifest.partitions[&partition].patches;
         let patch_bytes = patches
             .iter()
             .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
@@ -408,9 +434,9 @@ impl LsmCompactor {
         let partial = !force && patch_bytes < LSM_COMPACTION_PATCH_BYTES;
         let tables = lsm.table_store();
         let selected = if partial {
-            select_patch_compaction_inputs(&manifest, &tables, 0, patches)
+            select_patch_compaction_inputs(&manifest, &tables, partition, patches)
         } else {
-            select_compaction_inputs(&manifest, &tables, 0, patches)
+            select_compaction_inputs(&manifest, &tables, partition, patches)
         };
         let Some(inputs) = selected? else {
             return Ok(());
@@ -475,7 +501,7 @@ impl LsmCompactor {
                     .relocations
                     .upgrade()
                     .map(|relocations| {
-                        relocations.scan(0, &inputs.first_key, &inputs.last_key, max_lsn)
+                        relocations.scan(partition, &inputs.first_key, &inputs.last_key, max_lsn)
                     })
                     .transpose()?,
                 _ => None,
@@ -644,12 +670,22 @@ pub(crate) fn flush_relocation_lsm(
     relocation_cache: &RelocationCache,
     metrics: &StrataStoreMetrics,
 ) -> Result<()> {
-    let id = relocations.lsm().manifest().next_table_id;
-    relocations
-        .lsm()
-        .flush_one(0, id, format!("patch-{id:020}.sst"), |edit| {
-            publish_relocation_lsm_edit(index, edit)
-        })?;
+    loop {
+        let mut flushed = false;
+        let partition_count = relocations.lsm().manifest().partition_count;
+        for partition in 0..partition_count {
+            let id = relocations.lsm().manifest().next_table_id;
+            flushed |= relocations
+                .lsm()
+                .flush_one(partition, id, format!("patch-{id:020}.sst"), |edit| {
+                    publish_relocation_lsm_edit(index, edit)
+                })?
+                .is_some();
+        }
+        if !flushed {
+            break;
+        }
+    }
     relocations
         .lsm()
         .materialize_through(relocations.lsm().last_lsn()?.unwrap_or_default(), |edit| {
@@ -657,16 +693,24 @@ pub(crate) fn flush_relocation_lsm(
         })?;
 
     let manifest = relocations.lsm().manifest();
-    let patches = &manifest.partitions[&0].patches;
+    let pressured = manifest
+        .partitions
+        .iter()
+        .filter_map(|(&partition, tables)| {
+            partition_needs_compaction(&tables.patches).then_some(partition)
+        })
+        .collect::<Vec<_>>();
+    for partition in pressured {
+        compact_relocation_lsm_partition(index, relocations, relocation_cache, metrics, partition)?;
+    }
+    Ok(())
+}
+
+fn partition_needs_compaction(patches: &[TableMeta]) -> bool {
     let patch_bytes = patches
         .iter()
         .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
-    if patches.len() < LSM_COMPACTION_PATCH_COUNT && patch_bytes < LSM_COMPACTION_PATCH_BYTES {
-        return Ok(());
-    }
-
-    compact_relocation_lsm(index, relocations, relocation_cache, metrics)?;
-    Ok(())
+    patches.len() >= LSM_COMPACTION_PATCH_COUNT || patch_bytes >= LSM_COMPACTION_PATCH_BYTES
 }
 
 /// Rewrites the relocation LSM's base plus all patches into one fresh base table.
@@ -684,16 +728,38 @@ pub(crate) fn flush_relocation_lsm(
 /// compaction, the replaced inputs are unlinked immediately (still respecting reader pins) —
 /// there is no deferred-obsolete list on this path. Returns whether a compaction actually ran,
 /// which the caller uses to decide whether to advance `durable_relocation_lsn`.
+#[cfg(test)]
 pub(crate) fn compact_relocation_lsm(
     index: &StrataIndex,
     relocations: &RelocationStore,
     relocation_cache: &RelocationCache,
     metrics: &StrataStoreMetrics,
 ) -> Result<bool> {
+    let partition_count = relocations.lsm().manifest().partition_count;
+    let mut compacted = false;
+    for partition in 0..partition_count {
+        compacted |= compact_relocation_lsm_partition(
+            index,
+            relocations,
+            relocation_cache,
+            metrics,
+            partition,
+        )?;
+    }
+    Ok(compacted)
+}
+
+fn compact_relocation_lsm_partition(
+    index: &StrataIndex,
+    relocations: &RelocationStore,
+    relocation_cache: &RelocationCache,
+    metrics: &StrataStoreMetrics,
+    partition: u32,
+) -> Result<bool> {
     let manifest = relocations.lsm().manifest();
-    let patches = &manifest.partitions[&0].patches;
+    let patches = &manifest.partitions[&partition].patches;
     let tables = relocations.lsm().table_store();
-    let Some(inputs) = select_compaction_inputs(&manifest, &tables, 0, patches)? else {
+    let Some(inputs) = select_compaction_inputs(&manifest, &tables, partition, patches)? else {
         return Ok(false);
     };
     let obsolete = inputs

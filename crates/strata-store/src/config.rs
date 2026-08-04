@@ -18,6 +18,7 @@ pub const DEFAULT_GC_MIN_IO_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_SEAL_WORKER_COUNT: usize = 1;
+pub const DEFAULT_LSM_PARTITION_COUNT: u32 = 1;
 
 /// Runtime configuration for one Strata store namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,11 @@ pub struct StrataStoreConfig {
     pub max_unsealed_segments: usize,
     pub seal_worker_count: usize,
     pub segment_reader_cache_capacity: usize,
+    /// Number of hash partitions shared by the main and relocation LSMs.
+    ///
+    /// This is an on-disk compatibility setting. Reopening an existing namespace with a
+    /// different value is rejected rather than silently routing keys to different tables.
+    pub lsm_partition_count: u32,
     pub recovery_policy: StrataRecoveryPolicy,
     pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     /// Whether background GC workers are started.

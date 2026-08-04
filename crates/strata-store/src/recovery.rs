@@ -203,7 +203,7 @@ pub(crate) fn recover_store_wal_prefix(
     let published_lsn = index.get_published_lsn()?;
     let published_target = (published_lsn != 0).then_some(published_lsn);
     let checkpoint = index.get_store_checkpoint()?;
-    let (materialized_through, retained_from) = store_wal_recovery_state(index)?;
+    let (materialized_through, retained_from) = store_wal_recovery_state(config, index)?;
     let validate = |checkpoint: Option<StoreCheckpoint>, last_lsn| {
         Wal::validate_recovery_target(
             config.namespace_dir().join("wal"),

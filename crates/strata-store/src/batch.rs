@@ -14,6 +14,7 @@ use strata_lsm::Mutation as LsmMutation;
 use crate::{
     Error, Result, StrataStore, StrataStoreMetrics,
     blob_lsm::BlobMutation,
+    partition::partition_for_key,
     seal::{SealCommand, SegmentSealTask},
 };
 
@@ -337,7 +338,7 @@ impl PreparedBatchOp {
         }
     }
 
-    pub(crate) fn blob_mutation(&self) -> Result<Option<LsmMutation>> {
+    pub(crate) fn blob_mutation(&self, partition_count: u32) -> Result<Option<LsmMutation>> {
         match self {
             Self::Put {
                 shard,
@@ -346,7 +347,7 @@ impl PreparedBatchOp {
                 record_ref,
                 ..
             } => Ok(Some(LsmMutation::PutBlob {
-                partition: 0,
+                partition: partition_for_key(key.as_bytes(), partition_count),
                 key: key.as_bytes().to_vec(),
                 metadata: BlobMutation::encode_put_metadata(*shard, *current_epoch),
                 record_ref: record_ref.ok_or_else(|| Error::InvariantViolation {
@@ -359,7 +360,7 @@ impl PreparedBatchOp {
                 current_epoch,
                 ..
             } => Ok(Some(LsmMutation::Put {
-                partition: 0,
+                partition: partition_for_key(key.as_bytes(), partition_count),
                 key: key.as_bytes().to_vec(),
                 value: BlobMutation::SetLifetime {
                     logical_end_epoch: *logical_end_epoch,
@@ -368,7 +369,7 @@ impl PreparedBatchOp {
                 .encode_inline()?,
             })),
             Self::Tombstone { shard, key, .. } => Ok(Some(LsmMutation::Put {
-                partition: 0,
+                partition: partition_for_key(key.as_bytes(), partition_count),
                 key: key.as_bytes().to_vec(),
                 value: BlobMutation::Tombstone { shard: *shard }.encode_inline()?,
             })),

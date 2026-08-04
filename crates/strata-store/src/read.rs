@@ -16,6 +16,7 @@ use crate::{
     Error, Result, STANDALONE_SHARD, StrataStore,
     blob_lsm::{BlobMerge, BlobState as LsmBlobState},
     layout::segment_state_path,
+    partition::partition_for_key,
 };
 
 /// Options for point reads.
@@ -351,7 +352,7 @@ impl StrataStore {
                 Some(to) => to,
                 None => {
                     let started = Instant::now();
-                    let relocation = self.relocations.lookup(0, key, shard, resolved.payload_lsn);
+                    let relocation = self.relocations.lookup(key, shard, resolved.payload_lsn);
                     self.metrics.record_relocation_lookup(
                         match &relocation {
                             Ok(Some(_)) => Ok(true),
@@ -496,7 +497,8 @@ pub(crate) fn resolve_blob_version(
     key: &BlobKey,
 ) -> Result<Option<ResolvedBlobVersion>> {
     let lsm = store.lsm()?;
-    let Some(encoded) = lsm.get(0, key.as_bytes(), &BlobMerge)? else {
+    let partition = partition_for_key(key.as_bytes(), store.config.lsm_partition_count);
+    let Some(encoded) = lsm.get(partition, key.as_bytes(), &BlobMerge)? else {
         return Ok(None);
     };
     let StoredValue::Inline(bytes) = decode_value(&encoded)? else {

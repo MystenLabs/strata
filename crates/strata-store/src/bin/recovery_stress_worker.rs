@@ -199,6 +199,7 @@ impl Config {
             max_unsealed_segments: self.max_unsealed_segments,
             seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
             segment_reader_cache_capacity: 8,
+            lsm_partition_count: strata_store::DEFAULT_LSM_PARTITION_COUNT,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             gc_workers_enabled: true,

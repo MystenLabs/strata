@@ -38,7 +38,7 @@
 //!
 //! ```text
 //! StrataStore::sync
-//!   -> store fsyncs active segment bytes, then its WAL
+//!   -> store waits for rolled segment fsyncs, then fsyncs the active segment and its WAL
 //!   -> advance segment_states[active].durable_offset
 //!   -> publish store_state[PublishedLsn] and the store checkpoint together
 //!   -> fsync RocksDB WAL
@@ -131,6 +131,7 @@ mod layout;
 mod maintenance;
 mod metrics;
 mod open;
+mod partition;
 mod read;
 mod reader_cache;
 mod recovery;
@@ -150,6 +151,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use file_sync::FileSyncSender;
 #[cfg(test)]
 use file_sync::file_sync_channel;
 #[cfg(test)]
@@ -177,8 +179,8 @@ use wal_format::StoreWalMutation;
 pub use config::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
-    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEAL_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_LSM_PARTITION_COUNT,
+    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
     DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
 };
@@ -343,6 +345,8 @@ struct WriteCoordinator {
     wal: Wal,
     segment: SegmentWriter,
     segment_factory: SegmentFactory,
+    segment_sync_tx: FileSyncSender,
+    pending_segment_syncs: Vec<PendingSegmentSync>,
     durability_publish_lock: Arc<Mutex<()>>,
     durable_relocation_lsn: Arc<AtomicU64>,
     active_segment_state: SegmentState,
@@ -361,6 +365,11 @@ struct WriteCoordinator {
     gc_concurrency: Arc<GcConcurrencyController>,
     store_halt: StoreHalt,
     metrics: StrataStoreMetrics,
+}
+
+struct PendingSegmentSync {
+    segment_id: SegmentId,
+    completion_rx: mpsc::Receiver<Result<()>>,
 }
 
 #[cfg(test)]

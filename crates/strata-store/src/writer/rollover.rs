@@ -26,13 +26,14 @@
 //! the timer case. Phase three (run_rollover_post_commit) queues the seal task strictly after the
 //! commit. Each function below explains what breaks if its phase ran in a different order.
 
-use std::{thread, time::Instant};
+use std::{sync::mpsc, thread, time::Instant};
 
 use strata_core::{SegmentFileState, StrataLsn};
 
 use crate::{
-    Error, PendingRollover, Result, SEAL_BACKLOG_WAIT, WriteCoordinator,
-    active_segment_state_from_path, seal::SegmentSealTask, unsealed_ingest_segment_count,
+    Error, PendingRollover, PendingSegmentSync, Result, SEAL_BACKLOG_WAIT, WriteCoordinator,
+    active_segment_state_from_path, file_sync::FileSyncTask, seal::SegmentSealTask,
+    unsealed_ingest_segment_count,
 };
 
 impl WriteCoordinator {
@@ -106,9 +107,9 @@ impl WriteCoordinator {
     /// ride whichever commit happens next rather than be dropped on the floor.
     ///
     /// The batch is deliberately written without sync, and this is not a durability publication:
-    /// it syncs the segment being closed, but it neither syncs the store WAL nor advances
-    /// `PublishedLsn`. `sync_data` owns that separate boundary, and these rows become
-    /// crash-durable with the next synced index write.
+    /// rollover starts syncing the segment being closed, but it neither waits for that sync nor
+    /// syncs the store WAL or advances `PublishedLsn`. `sync_data` owns that separate boundary,
+    /// waits for the rollover sync, and makes these rows crash-durable with its synced index write.
     pub(crate) fn process_segment_rollover(&mut self) -> Result<()> {
         self.last_segment_rollover_at = Instant::now();
         let sealed_before_lsn = self.index.get_next_lsn()?;
@@ -139,8 +140,9 @@ impl WriteCoordinator {
         }
     }
 
-    /// Phase one of a rollover: swaps the physical writer to a fresh segment and stages every
-    /// metadata consequence in memory. Nothing durable happens in this function.
+    /// Phase one of a rollover: starts syncing the closing segment in the background, swaps the
+    /// physical writer to a fresh segment, and stages every metadata consequence in memory. It does
+    /// not wait for durability or publish any durable metadata.
     ///
     /// Segment rollover is intentionally here, beside WAL ownership. The LSM sees only the
     /// `RecordRef` produced after this method installs the next segment.
@@ -158,8 +160,8 @@ impl WriteCoordinator {
     /// 2. Cross-check the physical writer against the tracked segment row: same segment id, same
     ///    write offset. A mismatch means bytes went somewhere the metadata did not follow, the
     ///    seal would record the wrong length, and the only honest answer is InvariantViolation.
-    /// 3. fsync the closing segment, synchronously, right on the writer thread — the inline
-    ///    comment below explains why that simplicity is affordable here.
+    /// 3. Clone the closing file descriptor and queue its fsync. The completion is retained until
+    ///    sync_data waits for it, keeping the rollover-triggering put off the fsync critical path.
     /// 4. Create the replacement file and require its id to be strictly larger. Segment ids are
     ///    how "later" is spelled on disk; a reused or non-monotonic id would corrupt every
     ///    ordering assumption recovery and GC make.
@@ -195,9 +197,18 @@ impl WriteCoordinator {
                 ),
             });
         }
-        // A rollover is rare and already enters the sealing path, so synchronously closing this
-        // segment keeps the hand-off obvious without adding another pending-sync state machine.
-        self.segment.sync_data()?;
+        let path = self.segment.path().to_path_buf();
+        let file = self.segment.clone_file_for_sync()?;
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        self.segment_sync_tx
+            .send(FileSyncTask::new(path, file, move |result| {
+                let _ = completion_tx.send(result);
+            }))
+            .map_err(|_| Error::FileSyncQueueClosed)?;
+        let pending_segment_sync = PendingSegmentSync {
+            segment_id: old_segment_id,
+            completion_rx,
+        };
         let next = self.segment_factory.create()?;
         let new_segment_id = next.segment_id();
         if new_segment_id <= old_segment_id {
@@ -226,6 +237,7 @@ impl WriteCoordinator {
                 allocation_records: self.pending_allocation_records,
             },
         });
+        self.pending_segment_syncs.push(pending_segment_sync);
         self.segment = next;
         self.pending_allocation_records = 0;
         self.active_segment_state = new_state;

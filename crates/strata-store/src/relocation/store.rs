@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt,
     sync::{
         Arc, Mutex,
@@ -15,7 +15,7 @@ use strata_lsm::{
     TableMeta, TableWriter, decode_value, encode_inline_value,
 };
 
-use crate::{Error, Result};
+use crate::{Error, Result, partition::partition_for_key};
 
 const KEY_SUFFIX_BYTES: usize = 20;
 const RECORD_REF_BYTES: usize = 24;
@@ -73,12 +73,17 @@ impl RelocationStore {
     ) -> Result<WriteBatchResult> {
         let mutations = entries
             .iter()
-            .map(|entry| (entry.publish_lsn, Self::lsm_mutation(partition, entry)))
+            .map(|entry| {
+                (
+                    entry.publish_lsn,
+                    Self::lsm_mutation_in_partition(partition, entry),
+                )
+            })
             .collect();
         Ok(self.lsm.write_batch(mutations)?)
     }
 
-    /// Writes one GC relocation batch directly as a fully synced immutable patch table.
+    /// Writes one GC relocation batch directly as fully synced immutable patch tables.
     ///
     /// The returned edit is not visible until the caller atomically publishes it with the output
     /// and source segment states. Until then the table is an orphan and recovery may remove it.
@@ -89,64 +94,84 @@ impl RelocationStore {
             ));
         }
         let manifest = self.lsm.manifest();
-        let table_id = manifest.next_table_id;
         let sequence = self
             .lsm
             .last_lsn()?
             .unwrap_or_default()
             .checked_add(1)
             .ok_or_else(|| Error::InvalidRelocation("relocation sequence overflow".to_owned()))?;
-        let relative_path = format!("patch-{table_id:020}.sst");
-        let mut sorted = entries.iter().collect::<Vec<_>>();
-        sorted.sort_unstable_by(|left, right| {
-            left.key.as_bytes().cmp(right.key.as_bytes()).then_with(|| {
-                encode_suffix(left.shard, left.payload_lsn)
-                    .cmp(&encode_suffix(right.shard, right.payload_lsn))
-            })
-        });
-        for pair in sorted.windows(2) {
-            if pair[0].key == pair[1].key
-                && pair[0].shard == pair[1].shard
-                && pair[0].payload_lsn == pair[1].payload_lsn
-            {
-                return Err(Error::InvalidRelocation(
-                    "one GC publish contains duplicate relocation identities".to_owned(),
-                ));
+        let mut partitioned = BTreeMap::<u32, Vec<&RelocationEntry>>::new();
+        for entry in entries {
+            let partition = partition_for_key(entry.key.as_bytes(), manifest.partition_count);
+            partitioned.entry(partition).or_default().push(entry);
+        }
+        for sorted in partitioned.values_mut() {
+            sorted.sort_unstable_by(|left, right| {
+                left.key.as_bytes().cmp(right.key.as_bytes()).then_with(|| {
+                    encode_suffix(left.shard, left.payload_lsn)
+                        .cmp(&encode_suffix(right.shard, right.payload_lsn))
+                })
+            });
+            for pair in sorted.windows(2) {
+                if pair[0].key == pair[1].key
+                    && pair[0].shard == pair[1].shard
+                    && pair[0].payload_lsn == pair[1].payload_lsn
+                {
+                    return Err(Error::InvalidRelocation(
+                        "one GC publish contains duplicate relocation identities".to_owned(),
+                    ));
+                }
             }
         }
         let table_store = self.lsm.table_store();
         let table_root = table_store.root();
-        let tmp_path = table_root.join(format!("{relative_path}.tmp"));
-        let table = match (|| -> strata_lsm::Result<TableMeta> {
-            let mut writer = TableWriter::create_patch(
-                table_root,
-                &relative_path,
-                table_id,
-                0,
-                &manifest.patch_format_id,
-            )?;
-            for entry in sorted {
-                writer.add_prefix_patch(
-                    entry.key.as_bytes(),
-                    &encode_suffix(entry.shard, entry.payload_lsn),
-                    sequence,
-                    &encode_inline_value(&encode_value(entry.publish_lsn, entry.to)),
+        let mut tables = Vec::with_capacity(partitioned.len());
+        let mut next_table_id = manifest.next_table_id;
+        for (partition, sorted) in partitioned {
+            if next_table_id == u64::MAX {
+                remove_prepared_tables(table_root, &tables);
+                return Err(Error::InvalidRelocation(
+                    "relocation table id overflow".to_owned(),
+                ));
+            }
+            let table_id = next_table_id;
+            next_table_id += 1;
+            let relative_path = format!("patch-{table_id:020}.sst");
+            let tmp_path = table_root.join(format!("{relative_path}.tmp"));
+            let table = match (|| -> strata_lsm::Result<TableMeta> {
+                let mut writer = TableWriter::create_patch(
+                    table_root,
+                    &relative_path,
+                    table_id,
+                    partition,
+                    &manifest.patch_format_id,
                 )?;
-            }
-            writer.finish()
-        })() {
-            Ok(table) => table,
-            Err(error) => {
-                let _ = std::fs::remove_file(tmp_path);
-                return Err(error.into());
-            }
-        };
+                for entry in sorted {
+                    writer.add_prefix_patch(
+                        entry.key.as_bytes(),
+                        &encode_suffix(entry.shard, entry.payload_lsn),
+                        sequence,
+                        &encode_inline_value(&encode_value(entry.publish_lsn, entry.to)),
+                    )?;
+                }
+                writer.finish()
+            })() {
+                Ok(table) => table,
+                Err(error) => {
+                    let _ = std::fs::remove_file(tmp_path);
+                    let _ = std::fs::remove_file(table_root.join(&relative_path));
+                    remove_prepared_tables(table_root, &tables);
+                    return Err(error.into());
+                }
+            };
+            tables.push(table);
+        }
         Ok((
             sequence,
             ManifestEdit {
                 remove: Vec::new(),
                 add_base: Vec::new(),
-                add_patches: vec![table],
+                add_patches: tables,
                 materialized_through: Some(sequence),
                 wal_retained_from: None,
             },
@@ -159,7 +184,14 @@ impl RelocationStore {
 
     /// Encodes the keyed projection stored in the relocation LSM. Legacy shared-WAL recovery uses
     /// the same encoding as immutable relocation tables.
-    pub fn lsm_mutation(partition: u32, entry: &RelocationEntry) -> Mutation {
+    pub fn lsm_mutation(partition_count: u32, entry: &RelocationEntry) -> Mutation {
+        Self::lsm_mutation_in_partition(
+            partition_for_key(entry.key.as_bytes(), partition_count),
+            entry,
+        )
+    }
+
+    fn lsm_mutation_in_partition(partition: u32, entry: &RelocationEntry) -> Mutation {
         Mutation::PutPrefix {
             partition,
             key_prefix: entry.key.as_bytes().to_vec(),
@@ -170,11 +202,11 @@ impl RelocationStore {
 
     pub fn lookup(
         &self,
-        partition: u32,
         key: &BlobKey,
         shard: ShardKey,
         payload_lsn: StrataLsn,
     ) -> Result<Option<Relocation>> {
+        let partition = partition_for_key(key.as_bytes(), self.lsm.manifest().partition_count);
         let mut encoded_key = Vec::with_capacity(key.len() + KEY_SUFFIX_BYTES);
         encoded_key.extend_from_slice(key.as_bytes());
         encoded_key.extend_from_slice(&encode_suffix(shard, payload_lsn));
@@ -219,6 +251,12 @@ impl RelocationStore {
 
     pub fn lsm(&self) -> &Lsm {
         &self.lsm
+    }
+}
+
+fn remove_prepared_tables(root: &std::path::Path, tables: &[TableMeta]) {
+    for table in tables {
+        let _ = std::fs::remove_file(root.join(&table.relative_path));
     }
 }
 

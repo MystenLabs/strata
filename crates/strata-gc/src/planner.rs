@@ -245,7 +245,7 @@ pub enum GcAction {
     },
     /// Move all currently planned live bytes out of one source segment.
     ///
-    /// This is used for L0, DeadRef, and small pinned-epoch drains. The exact copied records are
+    /// This is used for L0, DeadRef, and small pinned epoch drains. The exact copied records are
     /// discovered later by scanning the segment-local GC overlay and applying these route decisions.
     MoveLiveBytes {
         /// Source segment to drain.
@@ -253,7 +253,7 @@ pub enum GcAction {
         /// Aggregate route estimates for the source's live lifetime buckets.
         routes: Vec<RouteEstimate>,
     },
-    /// Move same-epoch live buckets from multiple sources.
+    /// Move same epoch live buckets from multiple sources.
     ///
     /// JoinMultiple uses this action when the benefit is output density rather than immediate whole
     /// source deletion.

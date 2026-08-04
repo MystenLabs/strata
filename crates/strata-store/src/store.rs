@@ -290,7 +290,15 @@ impl StrataStore {
     ///
     /// New GC publications already write immutable relocation L0 tables directly.
     pub fn flush_relocation_memtable_if_due(&self) -> Result<bool> {
-        if self.relocations.lsm().roll_memtable_if_due(0)?.is_none() {
+        let mut rolled = false;
+        for partition in 0..self.config.lsm_partition_count {
+            rolled |= self
+                .relocations
+                .lsm()
+                .roll_memtable_if_due(partition)?
+                .is_some();
+        }
+        if !rolled {
             return Ok(false);
         }
         let admission_lock = Arc::clone(&self.compaction_admission_lock);

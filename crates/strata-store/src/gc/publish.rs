@@ -249,16 +249,17 @@ impl GcExecutor {
     /// output files that nothing references yet, so they are exactly as invisible as the outputs
     /// themselves.
     ///
-    /// Part one: the durable half. prepare_l0 turns the relocation entries into one immutable
-    /// patch SST. It claims the manifest's next table id, takes the relocation LSM's next
-    /// sequence — 87, which becomes the activation sequence — sorts the entries by key identity,
-    /// rejects duplicate identities, and writes, fsyncs, and renames the file into the table
-    /// directory. The manifest edit that would add this table is still just a value in memory.
+    /// Part one: the durable half. prepare_l0 partitions the relocation entries and turns them into
+    /// immutable patch SSTs. It claims consecutive manifest table ids, takes the relocation LSM's
+    /// next sequence — 87, which becomes the shared activation sequence — sorts each partition by
+    /// key identity, rejects duplicate identities, and writes, fsyncs, and renames the files into
+    /// the table directory. The manifest edit that would add these tables is still just a value in
+    /// memory.
     /// This is the trick the whole protocol stands on: the expensive durable artifact is created
     /// first, but it is inert — no manifest references it, no reader can see it, and a crash right
     /// now leaves an orphan that remove_orphan_tables deletes at the next open.
     ///
-    /// Part two: activation, under the durability-publication lock. First the global garbage log
+    /// Part two: activation, under the durability publication lock. First the global garbage log
     /// is opened at its last committed position (truncating any unpublished tail an earlier crash
     /// left behind) and the sorted retirement frame for A@S7 and D@S7 is appended and synced.
     /// Then one RocksDB batch assembles the entire publication: the manifest merge that adds the
@@ -281,10 +282,10 @@ impl GcExecutor {
     /// absorb the known-garbage delta, the relocating-segment count, and the published byte
     /// total, and the LSM compactor gets a best-effort nudge (the inline comment explains why a
     /// compaction pass is wanted at all). The two failure arms fall on either side of the batch
-    /// write. BeforeIndexBatch means activation never happened: the orphan patch SST is unlinked
-    /// best-effort (startup would remove it anyway) and the error returns cleanly — no halt, the
+    /// write. BeforeIndexBatch means activation never happened: the orphan patch SSTs are unlinked
+    /// best-effort (startup would remove it anyway) and the error returns cleanly - no halt, the
     /// plan is simply retryable. IndexCommit means the batch write, or the manifest read-back and
-    /// install after it, failed — the durable and in-memory views can no longer be trusted to
+    /// install after it, failed - the durable and in-memory views can no longer be trusted to
     /// agree, and that halts the store.
     ///
     /// One thing deliberately does not happen here: S7 is not deleted, and cannot be for a while.
@@ -584,7 +585,7 @@ impl GcExecutor {
                 })
             }
             Err(GcPublishCommitError::BeforeIndexBatch(error)) => {
-                if let Some(table) = relocation_edit.add_patches.first() {
+                for table in &relocation_edit.add_patches {
                     let _ = std::fs::remove_file(
                         self.relocations
                             .lsm()

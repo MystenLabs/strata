@@ -11,11 +11,12 @@ use crate::{
 };
 
 impl WriteCoordinator {
-    /// Syncs the two store-owned append streams and returns their physical coordinates.
+    /// Syncs the store-owned append streams and returns their physical coordinates.
     ///
     /// The returned value has no logical frontier. Its LSN is the `PublishedLsn` written beside it
     /// in the same RocksDB batch by the caller.
     pub(crate) fn sync_store_files(&mut self) -> Result<StoreCheckpoint> {
+        self.wait_for_rolled_segment_syncs()?;
         self.segment.sync_data()?;
         let wal_position = self.wal.sync()?;
         self.wal.wait_for_sync(wal_position)?;
@@ -24,6 +25,28 @@ impl WriteCoordinator {
             active_segment_id: self.segment.segment_id(),
             active_segment_offset: self.segment.write_offset(),
         })
+    }
+
+    /// Waits for every immutable segment handed to the file-sync workers by rollover.
+    ///
+    /// Rollover and sync are serialized by the writer loop, so this vector contains every segment
+    /// that stopped being active before the current durability publication. Dropping any one of
+    /// these waits would allow PublishedLsn to cover a record whose segment fsync was still pending.
+    fn wait_for_rolled_segment_syncs(&mut self) -> Result<()> {
+        for pending in std::mem::take(&mut self.pending_segment_syncs) {
+            match pending.completion_rx.recv() {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(Error::InvariantViolation {
+                        reason: format!(
+                            "segment {} sync completion was dropped",
+                            pending.segment_id
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Advances the blob projection, then reclaims the store WAL it alone consumes.
@@ -56,7 +79,7 @@ impl WriteCoordinator {
     /// The durability step. The ordering here is the single most load bearing thing in this
     /// file:
     ///
-    /// 1. fsync the store-owned payload segment, then the store WAL,
+    /// 1. wait for rolled payload segments, fsync the active payload segment, then the store WAL,
     /// 2. then write durable offsets, allocation baseline, and published_lsn to the index,
     /// 3. then fsync the RocksDB WAL.
     ///
@@ -82,17 +105,18 @@ impl WriteCoordinator {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 self.metrics.record_sync(Err(()), started.elapsed());
-                return Err(error.into());
+                self.halt_writer_error("sync store files", &error);
+                return Err(error);
             }
         };
-        let committed_lsn = self.index.get_next_lsn()?.saturating_sub(1);
-        if self.wal.last_lsn().unwrap_or_default() != committed_lsn
+        let publish_through_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        if self.wal.last_lsn().unwrap_or_default() != publish_through_lsn
             || store_checkpoint.active_segment_id != self.active_segment_state.segment_id
             || store_checkpoint.active_segment_offset != durable_offset
         {
             let error = Error::InvariantViolation {
                 reason: format!(
-                    "store checkpoint {store_checkpoint:?} does not match store LSN {committed_lsn} and active segment {} at {durable_offset}",
+                    "store checkpoint {store_checkpoint:?} does not match store LSN {publish_through_lsn} and active segment {} at {durable_offset}",
                     self.active_segment_state.segment_id
                 ),
             };
@@ -136,14 +160,14 @@ impl WriteCoordinator {
                     self.pending_allocation_records,
                 )?;
                 let current_published_lsn = self.index.get_published_lsn()?;
-                if current_published_lsn > committed_lsn {
+                if current_published_lsn > publish_through_lsn {
                     return Err(Error::InvariantViolation {
                         reason: format!(
-                            "published LSN {current_published_lsn} follows committed LSN {committed_lsn}"
+                            "published LSN {current_published_lsn} follows publish target {publish_through_lsn}"
                         ),
                     });
                 }
-                let published_lsn = committed_lsn;
+                let published_lsn = publish_through_lsn;
                 self.index
                     .put_published_lsn_batch(&mut batch, published_lsn)?;
                 self.index

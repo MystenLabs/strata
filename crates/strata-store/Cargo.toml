@@ -20,6 +20,7 @@ strata-segment.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 typed-store.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 strata-index = { workspace = true, features = ["test-utils"] }

@@ -164,7 +164,7 @@ impl WriteCoordinator {
                 );
             }
 
-            let store_mutation = match op.blob_mutation() {
+            let store_mutation = match op.blob_mutation(self.config.lsm_partition_count) {
                 Ok(Some(mutation)) => {
                     lsm_writes.push((lsn, mutation.clone()));
                     StoreWalMutation::Blob(mutation)

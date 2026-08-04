@@ -5,6 +5,7 @@ use strata_lsm::{Lsm, LsmOptions, Manifest};
 use tempfile::TempDir;
 
 use super::{RelocationEntry, RelocationStore};
+use crate::partition::partition_for_key;
 
 fn record(segment_id: u64, offset: u64) -> RecordRef {
     RecordRef {
@@ -31,16 +32,29 @@ fn entry(
 }
 
 fn open(directory: &TempDir, recovered: Vec<RelocationEntry>) -> RelocationStore {
+    open_partitioned(directory, recovered, 1)
+}
+
+fn open_partitioned(
+    directory: &TempDir,
+    recovered: Vec<RelocationEntry>,
+    partition_count: u32,
+) -> RelocationStore {
     let root = directory.path();
     let manifest = Arc::new(Manifest::empty(
         "relocation-base-v1",
         "relocation-patch-v1",
-        NonZeroU32::MIN,
+        NonZeroU32::new(partition_count).unwrap(),
     ));
     let last_lsn = recovered.last().map(|entry| entry.publish_lsn);
     let recovered = recovered
         .iter()
-        .map(|entry| (entry.publish_lsn, RelocationStore::lsm_mutation(0, entry)))
+        .map(|entry| {
+            (
+                entry.publish_lsn,
+                RelocationStore::lsm_mutation(partition_count, entry),
+            )
+        })
         .collect();
     let lsm = Lsm::from_parts(
         root.join("tables"),
@@ -51,6 +65,13 @@ fn open(directory: &TempDir, recovered: Vec<RelocationEntry>) -> RelocationStore
     )
     .unwrap();
     RelocationStore::new(Arc::new(lsm))
+}
+
+fn key_for_partition(partition: u32, partition_count: u32) -> BlobKey {
+    (0..)
+        .map(|candidate| BlobKey::new(format!("partition-key-{candidate}").into_bytes()).unwrap())
+        .find(|key| partition_for_key(key.as_bytes(), partition_count) == partition)
+        .unwrap()
 }
 
 fn finish(store: RelocationStore) {
@@ -71,7 +92,7 @@ fn resolves_one_logical_payload() {
 
     assert_eq!(
         store
-            .lookup(0, &BlobKey::new(b"blob".to_vec()).unwrap(), shard, 9)
+            .lookup(&BlobKey::new(b"blob".to_vec()).unwrap(), shard, 9)
             .unwrap()
             .unwrap()
             .to,
@@ -96,7 +117,7 @@ fn repeated_move_replaces_the_current_location() {
         .unwrap();
 
     let relocation = store
-        .lookup(0, &BlobKey::new(b"blob".to_vec()).unwrap(), shard, 9)
+        .lookup(&BlobKey::new(b"blob".to_vec()).unwrap(), shard, 9)
         .unwrap()
         .unwrap();
     assert_eq!(relocation.publish_lsn, 15);
@@ -147,11 +168,10 @@ fn shard_and_payload_lsn_are_part_of_the_key() {
         .unwrap();
 
     let key = BlobKey::new(b"blob".to_vec()).unwrap();
-    assert!(store.lookup(0, &key, shard, 8).unwrap().is_none());
+    assert!(store.lookup(&key, shard, 8).unwrap().is_none());
     assert!(
         store
             .lookup(
-                0,
                 &key,
                 ShardKey {
                     id: 5,
@@ -176,11 +196,63 @@ fn decoded_store_wal_record_reopens_the_current_location() {
     let store = open(&directory, vec![relocation]);
     assert_eq!(
         store
-            .lookup(0, &BlobKey::new(b"blob".to_vec()).unwrap(), shard, 9)
+            .lookup(&BlobKey::new(b"blob".to_vec()).unwrap(), shard, 9)
             .unwrap()
             .unwrap()
             .to,
         record(7, 20)
     );
+    finish(store);
+}
+
+#[test]
+fn direct_l0_publication_writes_one_table_per_touched_partition() {
+    let directory = TempDir::new().unwrap();
+    let partition_count = 4;
+    let store = open_partitioned(&directory, Vec::new(), partition_count);
+    let shard = ShardKey {
+        id: 4,
+        generation: 2,
+    };
+    let entries = (0..partition_count)
+        .map(|partition| RelocationEntry {
+            key: key_for_partition(partition, partition_count),
+            shard,
+            payload_lsn: 10 + u64::from(partition),
+            publish_lsn: 20 + u64::from(partition),
+            to: record(100 + u64::from(partition), 0),
+        })
+        .collect::<Vec<_>>();
+
+    let (_sequence, edit) = store.prepare_l0(&entries).unwrap();
+    assert_eq!(edit.add_patches.len(), partition_count as usize);
+    assert_eq!(
+        edit.add_patches
+            .iter()
+            .map(|table| table.partition)
+            .collect::<Vec<_>>(),
+        (0..partition_count).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        edit.add_patches
+            .iter()
+            .map(|table| table.id)
+            .collect::<Vec<_>>(),
+        (1..=u64::from(partition_count)).collect::<Vec<_>>()
+    );
+
+    let mut published = store.lsm().manifest().as_ref().clone();
+    published.apply(&edit).unwrap();
+    store.lsm().install_manifest(published).unwrap();
+    for entry in &entries {
+        assert_eq!(
+            store
+                .lookup(&entry.key, entry.shard, entry.payload_lsn)
+                .unwrap()
+                .unwrap()
+                .to,
+            entry.to
+        );
+    }
     finish(store);
 }

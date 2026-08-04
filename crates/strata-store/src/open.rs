@@ -183,7 +183,10 @@ impl StrataStore {
             GcConcurrencyConfig::from_store_config(&config),
             metrics.clone(),
         ));
-        let recovered_frozen_memtables = !lsm.frozen_generations(0)?.is_empty();
+        let mut recovered_frozen_memtables = false;
+        for partition in 0..config.lsm_partition_count {
+            recovered_frozen_memtables |= !lsm.frozen_generations(partition)?.is_empty();
+        }
         let (lsm_compact_tx, lsm_compact_rx) = mpsc::channel();
         let lsm_compactor = LsmCompactor {
             index: index.clone(),
@@ -257,6 +260,7 @@ impl StrataStore {
         let reader_cache = Arc::new(SegmentReaderCache::new(
             config.segment_reader_cache_capacity,
         ));
+        let segment_sync_tx = store_wal.file_sync_sender();
         let coordinator = WriteCoordinator {
             config: config.clone(),
             index: index.clone(),
@@ -269,6 +273,8 @@ impl StrataStore {
                 PlacementClass::Ingest,
                 config.segment_max_bytes,
             ),
+            segment_sync_tx,
+            pending_segment_syncs: Vec::new(),
             durability_publish_lock: Arc::clone(&durability_publish_lock),
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             active_segment_state,
@@ -498,7 +504,7 @@ fn open_lsm_with_options(
 ) -> Result<Arc<Lsm>> {
     let lsm_dir = config.namespace_dir().join("lsm");
     let last_lsn = next_lsn.checked_sub(1).filter(|lsn| *lsn != 0);
-    let manifest = Arc::new(load_blob_lsm_manifest(index)?);
+    let manifest = Arc::new(load_blob_lsm_manifest(config, index)?);
     Ok(Arc::new(Lsm::from_parts(
         lsm_dir.join("tables"),
         manifest,
@@ -541,7 +547,7 @@ pub(crate) fn open_store_wal(
         0 => None,
         lsn => Some(lsn),
     };
-    let (materialized_through, retained_from) = store_wal_recovery_state(index)?;
+    let (materialized_through, retained_from) = store_wal_recovery_state(config, index)?;
     let wal = Wal::recover(
         config.namespace_dir().join("wal"),
         config.segment_max_bytes,
@@ -580,8 +586,11 @@ pub(crate) fn open_store_wal(
 /// Relocations are durable immutable L0 files and no longer consume this WAL. The retained file ID
 /// is store state; the blob-manifest value is read only to open databases created before that state
 /// key existed.
-pub(crate) fn store_wal_recovery_state(index: &StrataIndex) -> Result<(Option<StrataLsn>, u64)> {
-    let blob = load_blob_lsm_manifest(index)?;
+pub(crate) fn store_wal_recovery_state(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+) -> Result<(Option<StrataLsn>, u64)> {
+    let blob = load_blob_lsm_manifest(config, index)?;
     let retained_from = index
         .get_store_wal_retained_from()?
         .unwrap_or(blob.wal_retained_from);
@@ -595,11 +604,16 @@ pub(crate) fn open_relocation_lsm(
     recovered: Vec<RelocationEntry>,
 ) -> Result<Arc<RelocationStore>> {
     let root = config.relocation_dir();
-    let manifest = Arc::new(load_relocation_lsm_manifest(index)?);
+    let manifest = Arc::new(load_relocation_lsm_manifest(config, index)?);
     let recovered_last_lsn = recovered.iter().map(|entry| entry.publish_lsn).max();
     let recovered = recovered
         .into_iter()
-        .map(|entry| (entry.publish_lsn, RelocationStore::lsm_mutation(0, &entry)))
+        .map(|entry| {
+            (
+                entry.publish_lsn,
+                RelocationStore::lsm_mutation(config.lsm_partition_count, &entry),
+            )
+        })
         .collect();
     let manifest_lsn = manifest
         .partitions
@@ -631,11 +645,14 @@ pub(crate) fn open_relocation_lsm(
     Ok(Arc::new(RelocationStore::new(lsm)))
 }
 
-pub(crate) fn load_blob_lsm_manifest(index: &StrataIndex) -> Result<LsmManifest> {
+pub(crate) fn load_blob_lsm_manifest(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+) -> Result<LsmManifest> {
     if let Some(manifest) = index.get_lsm_manifest(BLOB_LSM_MANIFEST)? {
         if manifest.schema_id != LSM_BASE_FORMAT
             || manifest.patch_format_id != LSM_PATCH_FORMAT
-            || manifest.partition_count != 1
+            || manifest.partition_count != config.lsm_partition_count
         {
             return Err(Error::InvariantViolation {
                 reason: format!(
@@ -647,7 +664,9 @@ pub(crate) fn load_blob_lsm_manifest(index: &StrataIndex) -> Result<LsmManifest>
         return Ok(manifest);
     }
 
-    let manifest = LsmManifest::empty(LSM_BASE_FORMAT, LSM_PATCH_FORMAT, NonZeroU32::MIN);
+    let partition_count = NonZeroU32::new(config.lsm_partition_count)
+        .ok_or(Error::InvalidConfig("lsm_partition_count must be non-zero"))?;
+    let manifest = LsmManifest::empty(LSM_BASE_FORMAT, LSM_PATCH_FORMAT, partition_count);
     let mut batch = index.batch();
     index.put_lsm_manifest_batch(&mut batch, BLOB_LSM_MANIFEST, &manifest)?;
     batch
@@ -656,11 +675,14 @@ pub(crate) fn load_blob_lsm_manifest(index: &StrataIndex) -> Result<LsmManifest>
     Ok(manifest)
 }
 
-pub(crate) fn load_relocation_lsm_manifest(index: &StrataIndex) -> Result<LsmManifest> {
+pub(crate) fn load_relocation_lsm_manifest(
+    config: &StrataStoreConfig,
+    index: &StrataIndex,
+) -> Result<LsmManifest> {
     if let Some(manifest) = index.get_lsm_manifest(RELOCATION_LSM_MANIFEST)? {
         if manifest.schema_id != RELOCATION_LSM_BASE_FORMAT
             || manifest.patch_format_id != RELOCATION_LSM_PATCH_FORMAT
-            || manifest.partition_count != 1
+            || manifest.partition_count != config.lsm_partition_count
         {
             return Err(Error::InvariantViolation {
                 reason: format!(
@@ -675,7 +697,8 @@ pub(crate) fn load_relocation_lsm_manifest(index: &StrataIndex) -> Result<LsmMan
     let manifest = LsmManifest::empty(
         RELOCATION_LSM_BASE_FORMAT,
         RELOCATION_LSM_PATCH_FORMAT,
-        NonZeroU32::MIN,
+        NonZeroU32::new(config.lsm_partition_count)
+            .ok_or(Error::InvalidConfig("lsm_partition_count must be non-zero"))?,
     );
     let mut batch = index.batch();
     index.put_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, &manifest)?;
@@ -763,6 +786,9 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
     }
     if config.segment_max_bytes == 0 {
         return Err(Error::InvalidConfig("segment_max_bytes must be non-zero"));
+    }
+    if config.lsm_partition_count == 0 {
+        return Err(Error::InvalidConfig("lsm_partition_count must be non-zero"));
     }
     if config.write_queue_capacity == 0 {
         return Err(Error::InvalidConfig(
