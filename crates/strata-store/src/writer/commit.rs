@@ -146,7 +146,7 @@ impl WriteCoordinator {
                 };
                 appended_records = appended_records.saturating_add(1);
                 appended_bytes = appended_bytes.saturating_add(written.record_ref.len);
-                self.pending_allocation_records = self.pending_allocation_records.saturating_add(1);
+                self.active_allocation_records = self.active_allocation_records.saturating_add(1);
                 put_metrics.push(PutMetric {
                     payload_bytes: payload.len() as u64,
                     record_bytes: *record_bytes,

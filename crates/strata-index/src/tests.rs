@@ -42,6 +42,7 @@ fn lsm_table(id: u64, path: &str) -> TableMeta {
         last_key: b"z".to_vec(),
         min_lsn: None,
         max_lsn: None,
+        merge_applied_through_lsn: None,
         record_count: 1,
         file_len: 100,
         checksum: [id as u8; 32],
@@ -178,10 +179,30 @@ async fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
 
     let snapshot = index.build_gc_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.current_epoch, 10);
+    assert_eq!(snapshot.expiry_accounted_epoch, None);
     assert_eq!(snapshot.published_lsn, 7);
     assert_eq!(snapshot.segments.len(), 1);
     assert_eq!(snapshot.segments[0].state, live);
     assert_eq!(snapshot.segments[0].summary, summary);
+
+    // The durable frontier is an LSN, while the planner consumes an epoch. Both rows are read from
+    // one RocksDB snapshot: accounting through LSN 5 includes epoch 9 at LSN 4 but not epoch 10 at
+    // LSN 6, even though CurrentEpoch is already 10.
+    let mut batch = index.batch();
+    index.put_epoch_change_batch(&mut batch, 4, 9).unwrap();
+    index.put_epoch_change_batch(&mut batch, 6, 10).unwrap();
+    index
+        .put_blob_expiry_accounted_lsn_batch(&mut batch, 5)
+        .unwrap();
+    batch.write().unwrap();
+    assert_eq!(
+        index
+            .build_gc_snapshot()
+            .unwrap()
+            .unwrap()
+            .expiry_accounted_epoch,
+        Some(9)
+    );
 }
 
 #[tokio::test]

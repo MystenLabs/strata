@@ -411,6 +411,25 @@ fn wait_for_lsm_gc(store: &StrataStore, expected_lsn: StrataLsn) {
     }
 }
 
+fn wait_for_expiry_accounting(store: &StrataStore, expected_lsn: StrataLsn) {
+    let started = Instant::now();
+    loop {
+        let accounted = store
+            .index()
+            .get_blob_expiry_accounted_lsn()
+            .unwrap()
+            .unwrap_or_default();
+        if accounted >= expected_lsn {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for expiry accounting through LSN {expected_lsn}; current frontier was {accounted}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_for_shard_cleanup(store: &StrataStore, shard: ShardKey) {
     let started = Instant::now();
     loop {
@@ -2459,7 +2478,7 @@ async fn metrics_track_seal_backpressure_waits() {
     )
     .unwrap();
     let (seal_tx, _seal_rx) = mpsc::channel();
-    let (_write_tx, write_rx) = mpsc::sync_channel(1);
+    let (write_tx, write_rx) = mpsc::sync_channel(1);
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
     let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
@@ -2481,11 +2500,17 @@ async fn metrics_track_seal_backpressure_waits() {
         ),
         segment_sync_tx,
         pending_segment_syncs: Vec::new(),
+        internal_write_tx: write_tx,
+        durability_in_flight_lsn: None,
+        pending_sync_requests: Vec::new(),
         durability_publish_lock: Arc::new(Mutex::new(())),
         durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
-        pending_allocation_records: 0,
+        active_allocation_records: 0,
+        active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
+        pending_segment_bytes: 0,
+        oldest_unpublished_at: None,
         last_durability_publish_at: Instant::now(),
         last_segment_rollover_at: Instant::now(),
         last_segment_rollover_next_lsn: index.get_next_lsn().unwrap(),
@@ -3598,7 +3623,7 @@ async fn gc_worker_request_runs_production_gc_plan() {
 }
 
 #[tokio::test]
-async fn snapshot_compaction_epoch_expiry_nudges_gc() {
+async fn cold_epoch_expiry_enables_gc_after_the_accounting_frontier() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -3619,20 +3644,15 @@ async fn snapshot_compaction_epoch_expiry_nudges_gc() {
     let sealed_path = segment_state_path(store.config(), &sealed_state);
     store.sync().unwrap();
 
-    store.increment_epoch().unwrap();
+    let (_, epoch_lsn) = store.increment_epoch().unwrap();
     store.sync().unwrap();
-    let state = store
-        .index()
-        .get_segment_state(FIRST_SEGMENT_ID)
-        .unwrap()
-        .unwrap();
-    assert_ne!(state.state, SegmentFileState::Deleted);
     assert_eq!(store.get(&key_a).unwrap(), None);
+    wait_for_expiry_accounting(&store, epoch_lsn);
 
-    let touch_lsn = store.extend(&key_a, 50).unwrap().unwrap();
-    store.sync().unwrap();
-    wait_for_lsm_gc(&store, touch_lsn);
-
+    // The planner could observe current epoch 43 before this frontier, but must not use it to move
+    // the apparently-live ExactEpoch(43) segment. The cold major compaction and garbage sweep make
+    // the frontier visible only after the summary reaches zero live refs; that sweep also nudges GC
+    // so no synthetic lifetime update is needed to delete the segment.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let state = store
@@ -3645,7 +3665,7 @@ async fn snapshot_compaction_epoch_expiry_nudges_gc() {
         }
         assert!(
             Instant::now() < deadline,
-            "blob-LSM compaction expiry did not nudge GC"
+            "expiry-accounting frontier did not enable empty-segment GC"
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -3726,9 +3746,12 @@ async fn gc_worker_count_broadcasts_request_to_parallel_workers() {
 async fn gc_publish_reclassify_plan_updates_segment_placement() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
+    let mut cfg = config(dir.path(), "default");
+    // This test drives prepare/copy/publish itself and intentionally creates only index metadata
+    // for the source segment. Once the fixture publishes an expiry frontier, a production GC
+    // worker would be woken and could race the manual path to that nonexistent source file.
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     let current_epoch = store.current_epoch().unwrap();
     let segment_id = 10;
     let range = SegmentGcRecordRange {
@@ -3781,6 +3804,15 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
                 ..Default::default()
             },
         )
+        .unwrap();
+    // This test constructs an exact-epoch segment and its GC summary directly, bypassing the
+    // blob-LSM compaction and garbage-sweeper pipeline that normally advances this frontier.
+    // LSN 0 contains the store's genesis epoch transition, so accounting through LSN 0 means:
+    // "all bases have applied the genesis epoch, and its garbage records have been swept."
+    // Without this explicit test fixture state, the planner must conservatively return no plan.
+    store
+        .index()
+        .put_blob_expiry_accounted_lsn_batch(&mut batch, 0)
         .unwrap();
     batch.write().unwrap();
     store.index().flush_wal(true).unwrap();
@@ -4460,14 +4492,14 @@ async fn blob_lsm_retire_removes_lifetime_hint() {
 }
 
 #[tokio::test]
-async fn ordinary_lsm_compaction_updates_gc_summary_from_epoch_snapshot() {
+async fn cold_base_sweep_updates_gc_summary_without_a_user_touch() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
     store.put(&key_a, b"payload-a").unwrap();
     store.put(&key_b, b"payload-bb").unwrap();
@@ -4486,20 +4518,11 @@ async fn ordinary_lsm_compaction_updates_gc_summary_from_epoch_snapshot() {
     let (epoch, epoch_lsn) = store.increment_epoch().unwrap();
     assert_eq!(epoch, 43);
     store.sync().unwrap();
-    wait_for_lsm_gc(&store, epoch_lsn);
+    wait_for_expiry_accounting(&store, epoch_lsn);
 
-    // Advancing the epoch alone does not scan cold blob keys or segment overlays.
-    let stats = segment_summary(store.index(), ref_a.segment_id);
-    assert_eq!(stats.live_bytes, ref_a.len + ref_b.len);
-    assert_eq!(stats.live_ref_count, 2);
-    assert_eq!(stats.expired_bytes, 0);
-
-    // Updating another key in the same base-table range causes ordinary compaction to visit the
-    // expired key and publish its terminal garbage atomically with the replacement SST.
-    let touch_lsn = store.extend(&key_b, 51).unwrap().unwrap();
-    store.sync().unwrap();
-    wait_for_lsm_gc(&store, touch_lsn);
-
+    // No foreground mutation touched either key after the epoch change. Reaching the frontier
+    // proves a forced major compaction nevertheless visited the cold base, emitted key A's expiry,
+    // and waited for the sweeper to fold that event into this summary.
     let stats = segment_summary(store.index(), ref_a.segment_id);
     assert_eq!(stats.live_bytes, ref_b.len);
     assert_eq!(stats.live_ref_count, 1);
@@ -4507,31 +4530,25 @@ async fn ordinary_lsm_compaction_updates_gc_summary_from_epoch_snapshot() {
     assert_eq!(stats.retired_bytes, 0);
     assert_eq!(stats.future_epoch_histogram.get(&43), None);
     assert_eq!(
-        stats.future_epoch_histogram.get(&51),
+        stats.future_epoch_histogram.get(&50),
         Some(&EpochBucket {
             refs: 1,
             bytes: ref_b.len,
         })
     );
-    assert_eq!(stats.min_live_end_epoch, Some(51));
+    assert_eq!(stats.min_live_end_epoch, Some(50));
     assert!(!stats.is_empty());
 
     let mut last_epoch_lsn = epoch_lsn;
-    while store.current_epoch().unwrap() < 51 {
+    while store.current_epoch().unwrap() < 50 {
         let (_, lsn) = store.increment_epoch().unwrap();
         last_epoch_lsn = lsn;
     }
     store.sync().unwrap();
-    wait_for_lsm_gc(&store, last_epoch_lsn);
+    wait_for_expiry_accounting(&store, last_epoch_lsn);
 
-    let stats = segment_summary(store.index(), ref_a.segment_id);
-    assert_eq!(stats.live_bytes, ref_b.len);
-    assert_eq!(stats.expired_bytes, ref_a.len);
-
-    let second_touch_lsn = store.extend(&key_a, 60).unwrap().unwrap();
-    store.sync().unwrap();
-    wait_for_lsm_gc(&store, second_touch_lsn);
-
+    // The second cold sweep likewise expires B without manufacturing a patch just to wake
+    // compaction. At this point GC may safely consume the zero-live summary.
     let stats = segment_summary(store.index(), ref_a.segment_id);
     assert_eq!(stats.live_bytes, 0);
     assert_eq!(stats.live_ref_count, 0);
@@ -4817,6 +4834,7 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
                 sealed_len: 64,
                 sealed_before_lsn: 1,
                 allocation_records: 1,
+                allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
             },
             sealed_sha256: None,
         },
@@ -4849,6 +4867,7 @@ async fn seal_publisher_waits_for_lowest_sealing_segment() {
                 sealed_len: 64,
                 sealed_before_lsn: 1,
                 allocation_records: 1,
+                allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
             },
             sealed_sha256: None,
         },
@@ -5005,6 +5024,7 @@ async fn seal_segment_reports_error_without_marking_failed() {
                 sealed_len: 64,
                 sealed_before_lsn: 1,
                 allocation_records: 1,
+                allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
             })
             .is_err()
     );
@@ -5057,17 +5077,13 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
 }
 
 #[tokio::test]
-async fn scheduled_rollover_queues_segment_sync_and_sync_waits_for_it() {
+async fn asynchronous_durability_wait_does_not_block_following_write() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     ensure_ingest_dir(&cfg).unwrap();
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     ensure_epoch_initialized(&index, cfg.starting_epoch).unwrap();
-    let mut batch = index.batch();
-    index.put_next_lsn_batch(&mut batch, 2).unwrap();
-    batch.write().unwrap();
-
     let registry = Registry::new();
     let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
     let gc_concurrency = Arc::new(GcConcurrencyController::new(
@@ -5085,11 +5101,11 @@ async fn scheduled_rollover_queues_segment_sync_and_sync_waits_for_it() {
     let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
-    let (segment_sync_tx, segment_syncer) = file_sync_channel(1);
+    let (segment_sync_tx, segment_syncer) = file_sync_channel();
     let (seal_tx, seal_rx) = mpsc::channel();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
-    let (_write_tx, write_rx) = mpsc::sync_channel(1);
+    let (write_tx, write_rx) = mpsc::sync_channel(1);
 
     let mut coordinator = WriteCoordinator {
         config: cfg.clone(),
@@ -5105,11 +5121,17 @@ async fn scheduled_rollover_queues_segment_sync_and_sync_waits_for_it() {
         ),
         segment_sync_tx,
         pending_segment_syncs: Vec::new(),
+        internal_write_tx: write_tx,
+        durability_in_flight_lsn: None,
+        pending_sync_requests: Vec::new(),
         durability_publish_lock: Arc::new(Mutex::new(())),
         durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
-        pending_allocation_records: 0,
+        active_allocation_records: 0,
+        active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
+        pending_segment_bytes: 0,
+        oldest_unpublished_at: None,
         last_durability_publish_at: Instant::now(),
         last_segment_rollover_at: Instant::now() - SEGMENT_ROLLOVER_INTERVAL,
         last_segment_rollover_next_lsn: 1,
@@ -5131,6 +5153,16 @@ async fn scheduled_rollover_queues_segment_sync_and_sync_waits_for_it() {
         metrics,
     };
 
+    let (first_response_tx, first_response_rx) = mpsc::channel();
+    coordinator
+        .submit_batch(vec![BatchOp::IncrementEpoch], first_response_tx, None)
+        .unwrap();
+    assert_eq!(
+        first_response_rx.recv().unwrap().unwrap().last_lsn(),
+        Some(1)
+    );
+    coordinator.note_committed_write(0).unwrap();
+
     coordinator.process_segment_rollover().unwrap();
     assert_eq!(coordinator.pending_segment_syncs.len(), 1);
 
@@ -5149,24 +5181,38 @@ async fn scheduled_rollover_queues_segment_sync_and_sync_waits_for_it() {
     assert_eq!(task.sealed_before_lsn, 2);
     assert_eq!(task.allocation_records, 0);
 
-    let (wait_tx, wait_rx) = mpsc::channel();
-    let waiter = thread::spawn(move || {
-        let result = coordinator.sync_store_files().map(|_| ());
-        wait_tx.send(result).unwrap();
-        coordinator
-    });
-    // No file-sync worker is running yet: rollover returned, but durability must still wait.
+    coordinator.pending_segment_bytes = DURABILITY_PUBLISH_SEGMENT_BYTES;
+    assert!(coordinator.maybe_start_durability_publish(false).unwrap());
+    assert!(coordinator.pending_segment_syncs.is_empty());
+    let (second_response_tx, second_response_rx) = mpsc::channel();
+    coordinator
+        .submit_batch(vec![BatchOp::IncrementEpoch], second_response_tx, None)
+        .unwrap();
+    assert_eq!(
+        second_response_rx
+            .recv_timeout(Duration::from_millis(50))
+            .unwrap()
+            .unwrap()
+            .last_lsn(),
+        Some(2)
+    );
+    // No segment file-sync worker is running yet: publication is pending, but the writer-side
+    // start and the following write returned instead of waiting behind the filesystem operation.
     assert!(matches!(
-        wait_rx.recv_timeout(Duration::from_millis(50)),
+        coordinator.write_rx.recv_timeout(Duration::from_millis(50)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
     let sync_handle = thread::spawn(move || segment_syncer.run());
-    wait_rx
+    let WriteCommand::DurabilityReady(ready) = coordinator
+        .write_rx
         .recv_timeout(Duration::from_secs(1))
         .unwrap()
-        .unwrap();
-    let coordinator = waiter.join().unwrap();
-    assert!(coordinator.pending_segment_syncs.is_empty());
+    else {
+        panic!("expected durability completion");
+    };
+    coordinator.finish_durability_publish(ready).unwrap();
+    assert_eq!(index.get_published_lsn().unwrap(), 1);
+    assert_eq!(index.get_next_lsn().unwrap(), 3);
     drop(coordinator);
     sync_handle.join().unwrap();
 }

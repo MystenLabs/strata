@@ -648,6 +648,9 @@ impl TableWriter {
             last_key,
             min_lsn: self.min_lsn,
             max_lsn: self.max_lsn,
+            // TableWriter knows the file's rows but not the merge snapshot that produced them.
+            // The full-compaction caller stamps this manifest-only field before publication.
+            merge_applied_through_lsn: None,
             record_count: self.record_count,
             file_len,
             checksum: footer_checksum,

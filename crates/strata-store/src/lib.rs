@@ -146,7 +146,11 @@ mod writer;
 
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicU64, AtomicUsize},
+        mpsc,
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -164,7 +168,7 @@ use strata_core::{
     BlobKey, Epoch, PlacementClass, RecordRef, SegmentFileState, ShardCleanupState, ShardInfo,
     ShardState,
 };
-use strata_core::{SegmentId, SegmentOwner, SegmentState, ShardKey, StrataLsn};
+use strata_core::{SegmentId, SegmentOwner, SegmentState, ShardKey, StrataLsn, WalPosition};
 use strata_index::StrataIndex;
 #[cfg(test)]
 use strata_lsm::ManifestEdit;
@@ -223,7 +227,7 @@ use maintenance::{compact_relocation_lsm, flush_relocation_lsm, garbage_log_dir}
 #[cfg(test)]
 use segment_state::active_segment_state;
 use segment_state::{
-    active_segment_state_from_path, publish_segment_allocation_baseline,
+    SegmentAllocationTracker, active_segment_state_from_path, publish_segment_allocation_baseline,
     unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
 
@@ -232,6 +236,8 @@ const FIRST_SEGMENT_ID: SegmentId = 1;
 /// this sleep sits on the foreground put path during rollover backpressure.
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
 const DURABILITY_PUBLISH_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const DURABILITY_PUBLISH_WAL_BYTES: u64 = 64 * 1024 * 1024;
+const DURABILITY_PUBLISH_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 const SEGMENT_ROLLOVER_INTERVAL: Duration = Duration::from_secs(20 * 60);
 const GARBAGE_LOG_HEAD: &str = "lsm-garbage";
 const GARBAGE_LOG_SWEEP_CURSOR: &str = "lsm-garbage-sweep";
@@ -239,7 +245,6 @@ const GARBAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const LSM_MEMTABLE_MAX_AGE: Duration = Duration::from_secs(1);
 const LSM_MEMTABLE_MAX_KEYS: NonZeroUsize = NonZeroUsize::new(1_000_000).unwrap();
 const LSM_FILE_SYNC_WORKERS: usize = 2;
-const LSM_FILE_SYNC_QUEUE_CAPACITY: usize = 64;
 const LSM_COMPACTION_PATCH_COUNT: usize = 8;
 const LSM_COMPACTION_PATCH_BYTES: u64 = 64 * 1024 * 1024;
 const LSM_COMPACTION_TARGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -346,12 +351,18 @@ struct WriteCoordinator {
     segment: SegmentWriter,
     segment_factory: SegmentFactory,
     segment_sync_tx: FileSyncSender,
-    pending_segment_syncs: Vec<PendingSegmentSync>,
+    pending_segment_syncs: Vec<SegmentSync>,
+    internal_write_tx: mpsc::SyncSender<WriteCommand>,
+    durability_in_flight_lsn: Option<StrataLsn>,
+    pending_sync_requests: Vec<PendingSyncRequest>,
     durability_publish_lock: Arc<Mutex<()>>,
     durable_relocation_lsn: Arc<AtomicU64>,
     active_segment_state: SegmentState,
     durable_offset: u64,
-    pending_allocation_records: u64,
+    active_allocation_records: u64,
+    active_allocation_tracker: Arc<SegmentAllocationTracker>,
+    pending_segment_bytes: u64,
+    oldest_unpublished_at: Option<Instant>,
     last_durability_publish_at: Instant,
     last_segment_rollover_at: Instant,
     last_segment_rollover_next_lsn: StrataLsn,
@@ -367,9 +378,41 @@ struct WriteCoordinator {
     metrics: StrataStoreMetrics,
 }
 
-struct PendingSegmentSync {
+#[derive(Clone, Debug)]
+struct SegmentSync {
     segment_id: SegmentId,
-    completion_rx: mpsc::Receiver<Result<()>>,
+    durable_offset: u64,
+    allocation_records: u64,
+    allocation_tracker: Arc<SegmentAllocationTracker>,
+    completion: file_sync::FileSyncCompletion,
+}
+
+struct PendingSyncRequest {
+    target_lsn: StrataLsn,
+    /// A request received after the current snapshot was captured must wait for the next one,
+    /// even when both snapshots have the same foreground LSN. GC may have published unsynced
+    /// relocation metadata between them.
+    needs_follow_up: bool,
+    response_tx: mpsc::Sender<Result<()>>,
+    profile_request: ProfileRequest<StoreSyncProfile>,
+    profile: Option<StoreSyncProfile>,
+    started: Instant,
+}
+
+#[derive(Debug)]
+struct DurabilityPublish {
+    target_lsn: StrataLsn,
+    wal_position: WalPosition,
+    checkpoint_segment_id: SegmentId,
+    checkpoint_segment_offset: u64,
+    segments: Vec<SegmentSync>,
+    wal_bytes: u64,
+    segment_bytes: u64,
+    started: Instant,
+    file_sync_started: Instant,
+    remaining_syncs: AtomicUsize,
+    file_sync_result: Mutex<Option<Result<Duration>>>,
+    ready_tx: mpsc::SyncSender<WriteCommand>,
 }
 
 #[cfg(test)]

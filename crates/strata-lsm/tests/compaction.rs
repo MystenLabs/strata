@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use strata_lsm::{
-    Error, Manifest, ManifestEdit, TableMeta, TableStore, select_compaction_inputs,
-    select_patch_compaction_inputs,
+    Error, Manifest, ManifestEdit, TableMeta, TableStore, select_base_compaction_inputs,
+    select_compaction_inputs, select_patch_compaction_inputs,
 };
 use tempfile::TempDir;
 
@@ -116,6 +116,35 @@ fn rejects_a_patch_that_is_not_live() {
     assert!(matches!(error, Error::InvalidTable(_)));
 }
 
+#[test]
+fn base_seed_selects_a_cold_base_and_every_overlapping_patch() {
+    let cold = table(1, "cold.sst", b"a", b"z", false);
+    let first = table(2, "first.sst", b"b", b"m", true);
+    let transitive = table(3, "transitive.sst", b"m", b"x", true);
+    let separate = table(4, "separate.sst", b"zz", b"zz", true);
+    let mut manifest =
+        Manifest::empty("base-v1", "patch-v1", std::num::NonZeroU32::new(1).unwrap());
+    manifest
+        .apply(&ManifestEdit {
+            remove: Vec::new(),
+            add_base: vec![cold.clone()],
+            add_patches: vec![first.clone(), transitive.clone(), separate.clone()],
+            materialized_through: None,
+            wal_retained_from: None,
+        })
+        .unwrap();
+
+    let directory = TempDir::new().unwrap();
+    let files = Arc::new(TableStore::new(directory.path()));
+    let inputs = select_base_compaction_inputs(&manifest, &files, 0, &cold)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(inputs.base, [cold]);
+    assert_eq!(inputs.patches, [first, transitive]);
+    assert!(!files.is_pinned(&separate));
+}
+
 fn table(id: u64, path: &str, first: &[u8], last: &[u8], patch: bool) -> TableMeta {
     TableMeta {
         id,
@@ -125,6 +154,7 @@ fn table(id: u64, path: &str, first: &[u8], last: &[u8], patch: bool) -> TableMe
         last_key: last.to_vec(),
         min_lsn: patch.then_some(1),
         max_lsn: patch.then_some(1),
+        merge_applied_through_lsn: None,
         record_count: 1,
         file_len: 1,
         checksum: [0; 32],

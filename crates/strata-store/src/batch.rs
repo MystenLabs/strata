@@ -12,7 +12,7 @@ use strata_index::StrataIndex;
 use strata_lsm::Mutation as LsmMutation;
 
 use crate::{
-    Error, Result, StrataStore, StrataStoreMetrics,
+    DurabilityPublish, Error, Result, StrataStore, StrataStoreMetrics,
     blob_lsm::BlobMutation,
     partition::partition_for_key,
     seal::{SealCommand, SegmentSealTask},
@@ -26,6 +26,7 @@ pub(crate) enum WriteCommand {
     DropShard(DropShardRequest),
     RolloverSegment(RolloverSegmentRequest),
     Sync(SyncRequest),
+    DurabilityReady(Arc<DurabilityPublish>),
     Shutdown,
 }
 

@@ -104,6 +104,13 @@ pub struct GcSnapshot {
     /// This is used for expiry-sensitive routing and for detecting exact-epoch segments whose
     /// physical epoch has already passed.
     pub current_epoch: Epoch,
+    /// Latest epoch whose transition has been applied to every blob-LSM key range and folded into
+    /// the segment summaries in this same snapshot.
+    ///
+    /// `None` is intentionally conservative. It is the state of an upgraded store before its cold
+    /// bases have been swept, and prevents `ExactEpoch(50)` from being treated as expired merely
+    /// because `current_epoch` reached 50 while its summary still calls all bytes live.
+    pub expiry_accounted_epoch: Option<Epoch>,
     /// Highest contiguous LSN whose segment allocations are durable and published.
     ///
     /// A source segment whose `max_lsn` is above this frontier may contain refs that are still
@@ -494,6 +501,16 @@ impl GcPlanner {
     }
 
     fn pinned_epoch_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
+        // Pinned-epoch cleanup is the one planner scenario whose eligibility is created by the
+        // wall-clock-like epoch pointer rather than by explicit retired/expired counters. Require
+        // the independent accounting frontier before using it. Example: current epoch 50 with no
+        // accounted epoch may still have a pre-expiry SetLifetime(70) waiting in a patch, so an
+        // ExactEpoch(50) segment is left alone. Once `expiry_accounted_epoch >= 50`, every such
+        // patch and cold base has been merged and its garbage swept, making `live_bytes` suitable
+        // for the copy-versus-reclassify decision below.
+        let Some(expiry_accounted_epoch) = snapshot.expiry_accounted_epoch else {
+            return Vec::new();
+        };
         snapshot
             .segments
             .iter()
@@ -501,7 +518,8 @@ impl GcPlanner {
             .filter(|segment| {
                 matches!(
                     segment.state.placement_class,
-                    PlacementClass::ExactEpoch(epoch) if epoch <= snapshot.current_epoch
+                    PlacementClass::ExactEpoch(epoch)
+                        if epoch <= snapshot.current_epoch && epoch <= expiry_accounted_epoch
                 )
             })
             .filter(|segment| segment.summary.live_bytes > 0)
@@ -730,6 +748,7 @@ mod tests {
     fn snapshot(segments: Vec<SegmentSnapshot>) -> GcSnapshot {
         GcSnapshot {
             current_epoch: 10,
+            expiry_accounted_epoch: Some(10),
             published_lsn: 10,
             segments,
         }
@@ -1021,11 +1040,37 @@ mod tests {
     }
 
     #[test]
+    fn pinned_epoch_waits_for_expiry_accounting_frontier() {
+        let mut segment_summary = summary(2_000, 1_500, 0);
+        add_epoch_bucket(&mut segment_summary, 30, 1_500, 3);
+        let segment = sealed_segment(1, PlacementClass::ExactEpoch(9), segment_summary);
+
+        // `current_epoch` alone used to create an eager reclassification here. With no accounted
+        // frontier the 1,500 bytes may still include records whose expiry or pre-expiry extension
+        // has not reached the summary, so the planner must leave the exact-epoch segment alone.
+        let mut unaccounted = snapshot(vec![segment.clone()]);
+        unaccounted.expiry_accounted_epoch = None;
+        assert!(planner().plan(&unaccounted).is_none());
+
+        // A frontier behind the physical directory is equally insufficient: accounting through
+        // epoch 8 says nothing about the transition that made ExactEpoch(9) eligible.
+        unaccounted.expiry_accounted_epoch = Some(8);
+        assert!(planner().plan(&unaccounted).is_none());
+
+        unaccounted.expiry_accounted_epoch = Some(9);
+        assert_eq!(
+            planner().plan(&unaccounted).unwrap().scenario,
+            GcScenario::PinnedEpochExpiry
+        );
+    }
+
+    #[test]
     fn unpublished_liveness_blocks_full_source_planning() {
         let mut segment = sealed_segment(1, PlacementClass::ExactEpoch(20), summary(500, 0, 500));
         segment.state.max_lsn = Some(11);
         let snapshot = GcSnapshot {
             current_epoch: 10,
+            expiry_accounted_epoch: Some(10),
             published_lsn: 10,
             segments: vec![segment],
         };

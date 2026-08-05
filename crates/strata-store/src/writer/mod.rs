@@ -12,7 +12,7 @@ use strata_core::{ShardCleanupJob, ShardCleanupState, ShardId, ShardInfo, ShardK
 use crate::{
     AddShardRequest, BatchOp, BatchWriteRequest, DURABILITY_PUBLISH_INTERVAL, DropShardRequest,
     Error, Result, SEGMENT_ROLLOVER_INTERVAL, SyncRequest, WriteCommand, WriteCoordinator,
-    profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
+    wal::WalEntry, wal_format::StoreWalMutation,
 };
 
 mod commit;
@@ -23,6 +23,11 @@ impl WriteCoordinator {
     /// Main compatibility loop for store metadata publication and administrative operations.
     pub(crate) fn run(mut self) {
         loop {
+            if self.next_maintenance_timeout().is_zero()
+                && let Err(error) = self.process_scheduled_maintenance()
+            {
+                self.halt_writer_error("scheduled writer maintenance", &error);
+            }
             let timeout = self.next_maintenance_timeout();
             let command = match self.write_rx.recv_timeout(timeout) {
                 Ok(command) => command,
@@ -37,8 +42,12 @@ impl WriteCoordinator {
             if matches!(command, WriteCommand::Shutdown) {
                 break;
             }
-            self.metrics.dequeue_write_command();
-            if let Some(error) = self.store_halt.error() {
+            if !matches!(command, WriteCommand::DurabilityReady(_)) {
+                self.metrics.dequeue_write_command();
+            }
+            if let Some(error) = self.store_halt.error()
+                && !matches!(command, WriteCommand::DurabilityReady(_))
+            {
                 Self::send_command_error(command, error);
                 continue;
             }
@@ -59,9 +68,37 @@ impl WriteCoordinator {
                 WriteCommand::Sync(request) => {
                     self.process_sync(request);
                 }
+                WriteCommand::DurabilityReady(ready) => {
+                    match self.finish_durability_publish(ready) {
+                        Ok((published_lsn, phases)) => {
+                            self.complete_sync_requests(published_lsn, &phases);
+                            let force = !self.pending_sync_requests.is_empty();
+                            if let Err(error) = self.maybe_start_durability_publish(force) {
+                                self.halt_writer_error(
+                                    "start follow-up durability publication",
+                                    &error,
+                                );
+                                self.fail_pending_sync_requests();
+                            }
+                        }
+                        Err(error) => {
+                            self.metrics.record_sync(Err(()), Duration::ZERO);
+                            self.metrics.set_durability_pending(
+                                self.wal.pending_bytes(),
+                                self.pending_segment_bytes,
+                                false,
+                            );
+                            self.halt_writer_error("finish durability publication", &error);
+                            self.fail_pending_sync_requests();
+                        }
+                    }
+                }
                 WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
             }
         }
+        // A completion callback may be waiting for capacity in the bounded public command queue.
+        // Dropping the receiver releases it immediately during shutdown.
+        drop(self.write_rx);
     }
 
     fn next_maintenance_timeout(&self) -> Duration {
@@ -70,7 +107,13 @@ impl WriteCoordinator {
     }
 
     fn next_durability_publish_timeout(&self) -> Duration {
-        DURABILITY_PUBLISH_INTERVAL.saturating_sub(self.last_durability_publish_at.elapsed())
+        if self.durability_in_flight_lsn.is_some() {
+            return DURABILITY_PUBLISH_INTERVAL;
+        }
+        self.oldest_unpublished_at
+            .map_or(DURABILITY_PUBLISH_INTERVAL, |started| {
+                DURABILITY_PUBLISH_INTERVAL.saturating_sub(started.elapsed())
+            })
     }
 
     fn next_segment_rollover_timeout(&self) -> Duration {
@@ -103,7 +146,7 @@ impl WriteCoordinator {
             self.last_durability_publish_at = Instant::now();
             return Ok(());
         }
-        self.sync_data(None)
+        self.maybe_start_durability_publish(true).map(|_| ())
     }
 
     fn send_command_error(command: WriteCommand, error: Error) {
@@ -123,6 +166,7 @@ impl WriteCoordinator {
             WriteCommand::Sync(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
+            WriteCommand::DurabilityReady(_) => {}
             WriteCommand::Shutdown => {}
         }
     }
@@ -169,8 +213,16 @@ impl WriteCoordinator {
     }
 
     fn process_drop_shard(&mut self, request: DropShardRequest) {
+        let pending_wal_bytes = self.wal.pending_bytes();
         let result = self.submit_drop_shard(request.shard_id);
+        let committed = result.is_ok();
         let _ = request.response_tx.send(result);
+        if committed
+            && self.wal.pending_bytes() > pending_wal_bytes
+            && let Err(error) = self.note_committed_write(0)
+        {
+            self.halt_writer_error("schedule shard-drop durability", &error);
+        }
     }
 
     /// Validates that a shard can be dropped and appends the asynchronous registry update.
@@ -257,6 +309,9 @@ impl WriteCoordinator {
         let mut profile = profile_request.begin(started);
         match self.submit_batch(ops, response_tx, profile.as_mut()) {
             Ok((result, put_metrics)) => {
+                let segment_bytes = put_metrics.iter().fold(0_u64, |total, metric| {
+                    total.saturating_add(metric.record_bytes)
+                });
                 for metric in put_metrics {
                     self.metrics.record_put(Ok(metric), started.elapsed());
                 }
@@ -265,6 +320,11 @@ impl WriteCoordinator {
                 }
                 if let Some(epoch) = result.last_epoch() {
                     self.metrics.set_current_epoch(epoch);
+                }
+                if result.last_lsn().is_some()
+                    && let Err(error) = self.note_committed_write(segment_bytes)
+                {
+                    self.halt_writer_error("schedule batch durability", &error);
                 }
             }
             Err(()) => {
@@ -280,23 +340,6 @@ impl WriteCoordinator {
     }
 
     fn process_sync(&mut self, request: SyncRequest) {
-        let SyncRequest {
-            response_tx,
-            profile: profile_request,
-        } = request;
-        let started = Instant::now();
-        let mut profile = profile_request.begin(started);
-        let result = self.sync_data(profile.as_mut());
-        if let Some(profile) = profile.as_mut() {
-            profile.writer_total = started.elapsed();
-        }
-        let _ = profile_phase(
-            profile.as_mut(),
-            |profile, elapsed| profile.response_send = elapsed,
-            || response_tx.send(result),
-        );
-        if let Some(profile) = profile {
-            profile_request.send(profile);
-        }
+        self.enqueue_sync_request(request);
     }
 }

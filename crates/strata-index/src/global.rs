@@ -27,6 +27,17 @@ impl StrataIndex {
             .get(&StoreStateKey::BlobCompactionGarbageFromLsn)?)
     }
 
+    /// Returns the durable expiry-accounting frontier consumed by GC planning.
+    ///
+    /// Missing means no background pass has yet proved end-to-end coverage. In particular, it is
+    /// different from LSN 0: an upgraded store with old base SSTs must sweep those bases before GC
+    /// treats even an old exact-epoch directory as expiry-complete.
+    pub fn get_blob_expiry_accounted_lsn(&self) -> Result<Option<StrataLsn>> {
+        Ok(self
+            .store_state
+            .get(&StoreStateKey::BlobExpiryAccountedLsn)?)
+    }
+
     pub fn get_store_wal_retained_from(&self) -> Result<Option<u64>> {
         Ok(self.store_state.get(&StoreStateKey::StoreWalRetainedFrom)?)
     }
@@ -133,6 +144,24 @@ impl StrataIndex {
         batch.insert_batch(
             self.store_state(),
             [(&StoreStateKey::BlobCompactionGarbageFromLsn, &lsn)],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the end-to-end expiry frontier in the caller's batch.
+    ///
+    /// The caller advances this only after major-compaction coverage is complete and the global
+    /// garbage log is drained. Storing it beside the segment summaries lets `build_gc_snapshot`
+    /// read both from one RocksDB snapshot; a planner can never combine a new frontier with old
+    /// per-segment counters.
+    pub fn put_blob_expiry_accounted_lsn_batch(
+        &self,
+        batch: &mut DBBatch,
+        lsn: StrataLsn,
+    ) -> Result<()> {
+        batch.insert_batch(
+            self.store_state(),
+            [(&StoreStateKey::BlobExpiryAccountedLsn, &lsn)],
         )?;
         Ok(())
     }

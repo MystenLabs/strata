@@ -21,11 +21,10 @@ use strata_segment::{SegmentFactory, SegmentIdAllocator, SegmentWriter};
 
 use crate::{
     BLOB_LSM_MANIFEST, DEFAULT_RELOCATION_CACHE_ENTRIES, Error, FIRST_SEGMENT_ID, GcPlanner,
-    INGEST_SEGMENT_OWNER, LSM_BASE_FORMAT, LSM_FILE_SYNC_QUEUE_CAPACITY, LSM_FILE_SYNC_WORKERS,
-    LSM_MEMTABLE_MAX_AGE, LSM_MEMTABLE_MAX_KEYS, LSM_PATCH_FORMAT, RELOCATION_LSM_BASE_FORMAT,
-    RELOCATION_LSM_MANIFEST, RELOCATION_LSM_PATCH_FORMAT, RETIRED_PROJECTION_DIR, Result,
-    STANDALONE_SHARD, StoreHalt, StrataStore, StrataStoreConfig, StrataStoreMetrics,
-    WriteCoordinator,
+    INGEST_SEGMENT_OWNER, LSM_BASE_FORMAT, LSM_FILE_SYNC_WORKERS, LSM_MEMTABLE_MAX_AGE,
+    LSM_MEMTABLE_MAX_KEYS, LSM_PATCH_FORMAT, RELOCATION_LSM_BASE_FORMAT, RELOCATION_LSM_MANIFEST,
+    RELOCATION_LSM_PATCH_FORMAT, RETIRED_PROJECTION_DIR, Result, STANDALONE_SHARD, StoreHalt,
+    StrataStore, StrataStoreConfig, StrataStoreMetrics, WriteCoordinator,
     file_sync::file_sync_channel,
     fs_util::{sync_parent_dir, unlink_gc_segment_file},
     gc::{
@@ -45,7 +44,9 @@ use crate::{
         SealWorker, active_segment_durable_offset, enqueue_unsealed_segments_for_sealing,
         verify_sealed_segments,
     },
-    segment_state::{publish_active_segment_state, unsealed_ingest_segment_count},
+    segment_state::{
+        SegmentAllocationTracker, publish_active_segment_state, unsealed_ingest_segment_count,
+    },
     wal::Wal,
     wal_format::StoreWalMutation,
 };
@@ -275,11 +276,17 @@ impl StrataStore {
             ),
             segment_sync_tx,
             pending_segment_syncs: Vec::new(),
+            internal_write_tx: write_tx.clone(),
+            durability_in_flight_lsn: None,
+            pending_sync_requests: Vec::new(),
             durability_publish_lock: Arc::clone(&durability_publish_lock),
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             active_segment_state,
             durable_offset,
-            pending_allocation_records: 0,
+            active_allocation_records: 0,
+            active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
+            pending_segment_bytes: 0,
+            oldest_unpublished_at: None,
             last_durability_publish_at: Instant::now(),
             last_segment_rollover_at: Instant::now(),
             last_segment_rollover_next_lsn: next_lsn,
@@ -525,7 +532,7 @@ pub(crate) fn open_store_wal(
     Vec<RelocationEntry>,
     Vec<JoinHandle<()>>,
 )> {
-    let (sync_tx, syncer) = file_sync_channel(LSM_FILE_SYNC_QUEUE_CAPACITY);
+    let (sync_tx, syncer) = file_sync_channel();
     let mut sync_handles = Vec::with_capacity(LSM_FILE_SYNC_WORKERS);
     for worker in 0..LSM_FILE_SYNC_WORKERS {
         let syncer = syncer.clone();

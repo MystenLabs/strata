@@ -251,7 +251,8 @@ impl StrataStore {
 
     /// Makes everything written so far crash-safe. Writes are visible immediately but only
     /// durable after a sync — fsyncing per put would destroy throughput on spinning disks, so
-    /// durability is batched here. See `WriteCoordinator::sync_data` for the ordering invariant.
+    /// durability is batched here. See `WriteCoordinator::start_durability_publish` for the
+    /// ordering invariant.
     pub fn sync(&self) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
         let (profile, profile_rx) = self.profile_channel();

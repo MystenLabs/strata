@@ -235,6 +235,16 @@ pub enum StoreStateKey {
     /// First store-WAL file that recovery must retain and validate.
     /// Appended here so every preceding persisted discriminant remains stable.
     StoreWalRetainedFrom,
+    /// Highest Store LSN whose epoch transitions have been applied to every blob-LSM key range
+    /// and whose resulting garbage has reached the per-segment summaries consumed by GC.
+    ///
+    /// This is deliberately an LSN rather than an epoch. For example, if epoch 50 was published at
+    /// LSN 120, GC may trust expiry at epoch 50 only after this value reaches 120. Keeping the
+    /// ordering boundary in the Store's single LSN domain also covers a lifetime extension at LSN
+    /// 119 without inventing a second ordering scheme for epochs.
+    ///
+    /// Appended here so every preceding persisted discriminant remains stable.
+    BlobExpiryAccountedLsn,
 }
 
 /// Exclusive end of a store-WAL prefix made durable by a completed file sync.

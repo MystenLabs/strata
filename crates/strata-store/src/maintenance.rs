@@ -41,8 +41,9 @@ use crate::{
 use strata_core::SegmentFileState;
 use strata_index::StrataIndex;
 use strata_lsm::{
-    GarbageLog, Lsm, Manifest as LsmManifest, ManifestEdit, TableMeta, select_compaction_inputs,
-    select_patch_compaction_inputs, write_compaction, write_patch_compaction,
+    GarbageLog, Lsm, Manifest as LsmManifest, ManifestEdit, TableMeta,
+    select_base_compaction_inputs, select_compaction_inputs, select_patch_compaction_inputs,
+    write_compaction, write_patch_compaction,
 };
 
 /// Folds the global garbage log into per-segment overlays on a one-second cadence.
@@ -116,7 +117,7 @@ impl GarbageLogSweeper {
     fn drain(&self) -> Result<bool> {
         let mut advanced = false;
         loop {
-            let (swept, relocation_lsn) = {
+            let (swept, relocation_lsn, expiry_frontier_advanced) = {
                 let _publish_guard = self
                     .durability_publish_lock
                     .lock()
@@ -134,8 +135,20 @@ impl GarbageLogSweeper {
                     GARBAGE_LOG_HEAD,
                     GARBAGE_LOG_SWEEP_CURSOR,
                 )?;
-                (swept, relocation_lsn)
+                // A compaction publishes its new base frontiers and its garbage-log head in one
+                // batch. Only the iteration that observes no remaining frame may expose that
+                // coverage to GC: at this point every Expired event produced by those bases is in
+                // the segment summaries. The shared publication lock prevents a new compaction or
+                // GC publish from appending between the empty-log observation and the frontier
+                // write below.
+                let expiry_frontier_advanced = if swept {
+                    false
+                } else {
+                    self.refresh_expiry_accounting_frontier()?
+                };
+                (swept, relocation_lsn, expiry_frontier_advanced)
             };
+            advanced |= expiry_frontier_advanced;
             if !swept {
                 break;
             }
@@ -144,6 +157,50 @@ impl GarbageLogSweeper {
             advanced = true;
         }
         Ok(advanced)
+    }
+
+    /// Advances the durable frontier only when both merge coverage and garbage accounting agree.
+    ///
+    /// Suppose epoch 50 was published at LSN 120. Major compaction may already have stamped every
+    /// base as merged through 120, but an Expired frame can still sit between the global head and
+    /// sweep cursor. Publishing 120 in that state would let GC read old `live_bytes`. Requiring an
+    /// empty global log before copying the manifest-derived bound closes that final gap.
+    ///
+    /// The caller holds `durability_publish_lock`, which serializes all garbage-head publishers.
+    fn refresh_expiry_accounting_frontier(&self) -> Result<bool> {
+        let head = self
+            .index
+            .get_garbage_log_position(GARBAGE_LOG_HEAD)?
+            .unwrap_or_default();
+        let cursor = self
+            .index
+            .get_garbage_log_position(GARBAGE_LOG_SWEEP_CURSOR)?
+            .unwrap_or_default();
+        if head != cursor {
+            return Ok(false);
+        }
+        let Some(manifest) = self.index.get_lsm_manifest(BLOB_LSM_MANIFEST)? else {
+            return Ok(false);
+        };
+        let candidate = manifest.merge_applied_through_lsn();
+        let current = self
+            .index
+            .get_blob_expiry_accounted_lsn()?
+            .unwrap_or_default();
+        // LSN 0 is only the genesis epoch and cannot expire a valid foreground write: lifetimes
+        // must be strictly greater than the current epoch when assigned. Waiting for a positive
+        // frontier also avoids waking GC on every empty store merely to publish genesis coverage.
+        if candidate <= current {
+            return Ok(false);
+        }
+
+        let mut batch = self.index.batch();
+        self.index
+            .put_blob_expiry_accounted_lsn_batch(&mut batch, candidate)?;
+        batch
+            .write_with_sync(true)
+            .map_err(strata_index::Error::from)?;
+        Ok(true)
     }
 }
 
@@ -360,7 +417,9 @@ impl LsmCompactor {
     /// view can never be reconciled and activated while a compaction is mid-flight (the TODO
     /// below describes the finer-grained future). Then the pressure gates: skip unless the patch
     /// count or patch bytes crossed their thresholds, or `force` (the periodic tick) says run
-    /// anyway. Skip if there are no patches at all.
+    /// anyway. A forced pass can also select one cold base whose expiry-accounting frontier is
+    /// behind the latest epoch transition. For example, a base last merged at LSN 40 is selected
+    /// after an epoch change at LSN 50 even when no user has written a patch over that key range.
     ///
     /// The durability gate. Every input patch must have max_lsn <= published_lsn. Compaction is
     /// about to emit garbage events describing retirements it discovers while folding; if it
@@ -409,7 +468,8 @@ impl LsmCompactor {
             .read()
             .expect("compaction admission lock poisoned");
         let manifest = lsm.manifest();
-        let patches = &manifest.partitions[&partition].patches;
+        let partition_manifest = &manifest.partitions[&partition];
+        let patches = &partition_manifest.patches;
         let patch_bytes = patches
             .iter()
             .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
@@ -417,9 +477,6 @@ impl LsmCompactor {
             && patches.len() < LSM_COMPACTION_PATCH_COUNT
             && patch_bytes < LSM_COMPACTION_PATCH_BYTES
         {
-            return Ok(());
-        }
-        if patches.is_empty() {
             return Ok(());
         }
         let published_lsn = self.index.get_published_lsn()?;
@@ -430,27 +487,6 @@ impl LsmCompactor {
             return Ok(());
         }
 
-        // Count pressure coalesces patches; byte pressure and the periodic pass materialize a base.
-        let partial = !force && patch_bytes < LSM_COMPACTION_PATCH_BYTES;
-        let tables = lsm.table_store();
-        let selected = if partial {
-            select_patch_compaction_inputs(&manifest, &tables, partition, patches)
-        } else {
-            select_compaction_inputs(&manifest, &tables, partition, patches)
-        };
-        let Some(inputs) = selected? else {
-            return Ok(());
-        };
-        let obsolete = if partial {
-            inputs.patches.clone()
-        } else {
-            inputs.base.iter().chain(&inputs.patches).cloned().collect()
-        };
-        let input_bytes = obsolete
-            .iter()
-            .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
-        let mut next_table_id = manifest.next_table_id;
-        let started = Instant::now();
         // The LSM frontier proves that every earlier keyed mutation is represented in SSTs;
         // publication is the store-wide durability bound for RocksDB-only transitions.
         let materialized_through_lsn = manifest
@@ -469,6 +505,53 @@ impl LsmCompactor {
             .into_iter()
             .filter(|(lsn, _)| *lsn <= materialized_through_lsn)
             .collect::<Vec<_>>();
+        let expiry_target_lsn = epoch_changes
+            .last()
+            .map(|(lsn, _)| *lsn)
+            .unwrap_or_default();
+
+        // A forced pass advances expiry across one cold base per partition. Starting from the base
+        // (rather than mixing it with unrelated patch-pressure work) keeps the output range
+        // contiguous: if bases [a,f] and [n,z] have an untouched [g,m] base between them, writing
+        // the two disjoint seeds into one SST would create an invalid [a,z] overlap. The base-seed
+        // selector still pulls in every patch transitively connected to this one range.
+        let stale_base = if force {
+            partition_manifest
+                .base
+                .iter()
+                .find(|base| base.merge_applied_through_lsn.unwrap_or_default() < expiry_target_lsn)
+        } else {
+            None
+        };
+
+        // Count pressure coalesces patches; byte pressure and the periodic pass materialize a base.
+        // A quiet partition with no patches still enters the full path when `stale_base` exists,
+        // which is the new cold-key expiry sweep.
+        let partial = !force && patch_bytes < LSM_COMPACTION_PATCH_BYTES;
+        if patches.is_empty() && stale_base.is_none() {
+            return Ok(());
+        }
+        let tables = lsm.table_store();
+        let selected = if partial {
+            select_patch_compaction_inputs(&manifest, &tables, partition, patches)
+        } else if let Some(base) = stale_base {
+            select_base_compaction_inputs(&manifest, &tables, partition, base)
+        } else {
+            select_compaction_inputs(&manifest, &tables, partition, patches)
+        };
+        let Some(inputs) = selected? else {
+            return Ok(());
+        };
+        let obsolete = if partial {
+            inputs.patches.clone()
+        } else {
+            inputs.base.iter().chain(&inputs.patches).cloned().collect()
+        };
+        let input_bytes = obsolete
+            .iter()
+            .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
+        let mut next_table_id = manifest.next_table_id;
+        let started = Instant::now();
         let epoch_snapshot = BlobCompactionSnapshot {
             materialized_through_lsn,
             emit_garbage_from_lsn,
@@ -485,10 +568,6 @@ impl LsmCompactor {
                 })?;
             (edit, garbage, 0)
         } else {
-            // TODO: An epoch advance does not currently rewrite base-only ranges. Reads remain
-            // correct because they resolve against the latest epoch, but GC discovery waits until
-            // a later patch causes each range to enter full compaction. Add an incremental base
-            // sweep or a per-base-SST applied frontier when prompt discovery is required.
             let relocation_max_lsn = self
                 .relocations
                 .upgrade()
@@ -527,12 +606,19 @@ impl LsmCompactor {
                 ..epoch_snapshot
             };
             let merge = BlobMergeWithRelocations::new(relocation_scan, snapshot);
-            let (edit, garbage) =
+            let (mut edit, garbage) =
                 write_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
                     let id = next_table_id;
                     next_table_id = next_table_id.saturating_add(1);
                     (id, format!("base-{id:020}.sst"))
                 })?;
+            // All rows in every output passed through `merge` with the epoch snapshot bounded by
+            // this exact materialized frontier. If the frontier is 120, a later global coverage
+            // calculation may count these bases as having considered the epoch transition at 120;
+            // it must not stamp the store's newer `current_epoch` instead.
+            for table in &mut edit.add_base {
+                table.merge_applied_through_lsn = Some(materialized_through_lsn);
+            }
             (edit, garbage, merge.healed_references())
         };
         let output_bytes = edit

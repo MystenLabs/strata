@@ -33,6 +33,27 @@ impl StrataIndex {
             .store_state
             .get_with_snapshot(&snapshot, &StoreStateKey::PublishedLsn)?
             .unwrap_or_default();
+        let expiry_accounted_lsn = self
+            .store_state
+            .get_with_snapshot(&snapshot, &StoreStateKey::BlobExpiryAccountedLsn)?;
+        let expiry_accounted_epoch = if let Some(accounted_lsn) = expiry_accounted_lsn {
+            // Epoch history and the frontier are read from the same RocksDB snapshot as the
+            // segment summaries below. For example, frontier LSN 120 maps to epoch 50 only when
+            // the `(120, 50)` history row is visible here; this prevents a newly published epoch
+            // pointer from being paired with counters from before its expiry sweep.
+            let mut accounted_epoch = None;
+            for result in self.epoch_changes.safe_iter_with_snapshot(&snapshot)? {
+                let (lsn, epoch) = result?;
+                if lsn <= accounted_lsn
+                    && accounted_epoch.is_none_or(|(latest_lsn, _)| lsn > latest_lsn)
+                {
+                    accounted_epoch = Some((lsn, epoch));
+                }
+            }
+            accounted_epoch.map(|(_, epoch)| epoch)
+        } else {
+            None
+        };
         let shard_infos = self
             .shards
             .safe_iter_with_snapshot(&snapshot)?
@@ -61,6 +82,7 @@ impl StrataIndex {
 
         Ok(Some(GcSnapshot {
             current_epoch,
+            expiry_accounted_epoch,
             published_lsn,
             segments,
         }))

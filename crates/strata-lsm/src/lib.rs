@@ -29,8 +29,8 @@ mod table;
 mod table_format;
 
 pub use compaction::{
-    CompactionInputs, merge_compaction, select_compaction_inputs, select_patch_compaction_inputs,
-    write_compaction, write_patch_compaction,
+    CompactionInputs, merge_compaction, select_base_compaction_inputs, select_compaction_inputs,
+    select_patch_compaction_inputs, write_compaction, write_patch_compaction,
 };
 pub use engine::{
     Lsm, LsmOptions, Mutation, RolledMemtable, StoredValue, WriteBatchResult, WriteResult,

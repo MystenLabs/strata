@@ -101,6 +101,7 @@ fn manifest_edit() -> ManifestEdit {
             last_key: b"z".to_vec(),
             min_lsn: None,
             max_lsn: None,
+            merge_applied_through_lsn: None,
             record_count: 1,
             file_len: 1,
             checksum: [1; 32],

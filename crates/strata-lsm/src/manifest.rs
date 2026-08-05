@@ -17,6 +17,15 @@ pub struct TableMeta {
     pub last_key: Vec<u8>,
     pub min_lsn: Option<StrataLsn>,
     pub max_lsn: Option<StrataLsn>,
+    /// Highest external LSN whose merge-time global state was applied to every row in this base.
+    ///
+    /// Patch tables leave this unset because they still contain ordered operands rather than a
+    /// resolved value. A base produced while the merge snapshot covered LSN 120 stores `Some(120)`:
+    /// a caller can then prove that a global event at LSN 120, such as an epoch transition, was
+    /// considered for every key in the table. The field is manifest-only; it describes how the
+    /// table was produced and is not part of the immutable SST byte format.
+    #[serde(default)]
+    pub merge_applied_through_lsn: Option<StrataLsn>,
     pub record_count: u64,
     pub file_len: u64,
     pub checksum: [u8; 32],
@@ -101,6 +110,39 @@ impl Manifest {
         self.format_version == other.format_version
             && self.partition_count == other.partition_count
             && self.patch_format_id == other.patch_format_id
+    }
+
+    /// Returns the largest contiguous external-LSN prefix resolved into every live base range.
+    ///
+    /// Three independent bounds meet here. `materialized_through` proves no earlier mutation is
+    /// hiding in a memtable. Every base must have been merged with a snapshot at least this new.
+    /// Finally, a live patch beginning at LSN 115 caps the result at 114 because it may contain a
+    /// pre-transition lifetime extension not yet folded into its base. For example:
+    ///
+    /// ```text
+    /// materialized through:       140
+    /// oldest base merge frontier: 130
+    /// oldest patch min LSN:        125
+    /// result:                      124
+    /// ```
+    ///
+    /// Empty sides do not impose a bound: an LSM with no bases or patches has no keys whose merge
+    /// state can lag its materialized frontier.
+    pub fn merge_applied_through_lsn(&self) -> StrataLsn {
+        let mut applied = self.materialized_through.unwrap_or_default();
+        for tables in self.partitions.values() {
+            for base in &tables.base {
+                applied = applied.min(base.merge_applied_through_lsn.unwrap_or_default());
+            }
+            for patch in &tables.patches {
+                let before_patch = patch
+                    .min_lsn
+                    .expect("validated patch tables have a minimum LSN")
+                    .saturating_sub(1);
+                applied = applied.min(before_patch);
+            }
+        }
+        applied
     }
 
     /// Applies one file level edit without requiring the manifest generation captured by its
@@ -308,11 +350,16 @@ fn validate_added_table(table: &TableMeta, patch: bool) -> Result<()> {
     if table.id == u64::MAX {
         return invalid_manifest(format!("SST {} has an overflowing ID", table.relative_path));
     }
-    match (patch, table.min_lsn, table.max_lsn) {
-        (false, None, None) => Ok(()),
-        (true, Some(min), Some(max)) if min <= max => Ok(()),
+    match (
+        patch,
+        table.min_lsn,
+        table.max_lsn,
+        table.merge_applied_through_lsn,
+    ) {
+        (false, None, None, _) => Ok(()),
+        (true, Some(min), Some(max), None) if min <= max => Ok(()),
         _ => invalid_manifest(format!(
-            "SST {} has invalid lsn bounds",
+            "SST {} has invalid lsn bounds or merge frontier",
             table.relative_path
         )),
     }
@@ -367,12 +414,17 @@ fn validate_table<'a>(
             table.relative_path
         ));
     }
-    match (patch, table.min_lsn, table.max_lsn) {
-        (false, None, None) => {}
-        (true, Some(min), Some(max)) if min <= max => {}
+    match (
+        patch,
+        table.min_lsn,
+        table.max_lsn,
+        table.merge_applied_through_lsn,
+    ) {
+        (false, None, None, _) => {}
+        (true, Some(min), Some(max), None) if min <= max => {}
         _ => {
             return invalid_manifest(format!(
-                "SST {} has invalid lsn bounds",
+                "SST {} has invalid lsn bounds or merge frontier",
                 table.relative_path
             ));
         }
@@ -400,6 +452,7 @@ mod tests {
             last_key: last.to_vec(),
             min_lsn: None,
             max_lsn: None,
+            merge_applied_through_lsn: None,
             record_count: 1,
             file_len: 1,
             checksum: [0; 32],
@@ -473,6 +526,32 @@ mod tests {
             Err(crate::Error::InvalidManifest { .. })
         ));
         assert_eq!(manifest.materialized_through, Some(2));
+    }
+
+    #[test]
+    fn merge_frontier_is_bounded_by_the_oldest_base_and_patch() {
+        let mut first_base = base(1, "a.sst", b"a", b"m");
+        first_base.merge_applied_through_lsn = Some(130);
+        let mut second_base = base(2, "n.sst", b"n", b"z");
+        second_base.merge_applied_through_lsn = Some(135);
+        let mut old_patch = patch(3, "p.sst", b"b", b"b");
+        old_patch.min_lsn = Some(125);
+        old_patch.max_lsn = Some(140);
+
+        let mut manifest =
+            Manifest::empty("test-v1", "test-patches-v1", NonZeroU32::new(1).unwrap());
+        let mut initial = edit(&[], vec![first_base, second_base], vec![old_patch]);
+        initial.materialized_through = Some(140);
+        manifest.apply(&initial).unwrap();
+
+        // Even though the patch extends to LSN 140, its LSN-125 operand may be a lifetime
+        // extension that must be folded before an epoch transition at 125 can be called applied.
+        assert_eq!(manifest.merge_applied_through_lsn(), 124);
+
+        manifest
+            .apply(&edit(&["p.sst"], Vec::new(), Vec::new()))
+            .unwrap();
+        assert_eq!(manifest.merge_applied_through_lsn(), 130);
     }
 
     #[test]

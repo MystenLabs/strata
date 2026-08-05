@@ -17,8 +17,9 @@ use crate::{
     Error, Result, SealedSegmentIntegrityPolicy, StoreHalt, StrataStoreConfig, StrataStoreMetrics,
     active_segment_state_from_path,
     layout::{segment_path, segment_state_path},
-    publish_segment_allocation_baseline, unsealed_ingest_segment_count,
-    unsealed_ingest_segment_ids,
+    publish_segment_allocation_baseline,
+    segment_state::SegmentAllocationTracker,
+    unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
 
 const SEAL_COMMAND_RECV_TIMEOUT: Duration = Duration::from_millis(100);
@@ -35,12 +36,14 @@ enum SealPublisherEvent {
     Completed(SealTaskResult),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct SegmentSealTask {
     pub(crate) segment_id: SegmentId,
     pub(crate) sealed_len: u64,
     pub(crate) sealed_before_lsn: StrataLsn,
+    /// Cumulative records appended since this segment's allocation tracker was created.
     pub(crate) allocation_records: u64,
+    pub(crate) allocation_tracker: Arc<SegmentAllocationTracker>,
 }
 
 #[derive(Debug)]
@@ -160,7 +163,7 @@ struct SealTaskWorker {
 impl SealTaskWorker {
     fn run(self) {
         while let Some(task) = self.recv_task() {
-            let result = prepare_seal_segment(&self.config, &self.index, task);
+            let result = prepare_seal_segment(&self.config, &self.index, task.clone());
             let is_error = result.is_err();
             if self
                 .publisher_tx
@@ -432,16 +435,21 @@ fn publish_sealed_segment(
             .expect("durability publish lock poisoned");
         let mut batch = index.batch();
         index.put_segment_state_batch(&mut batch, &state)?;
+        let allocation_records = task
+            .allocation_tracker
+            .unpublished_records(task.allocation_records)?;
         publish_segment_allocation_baseline(
             index,
             &mut batch,
             state.segment_id,
             task.sealed_len,
-            task.allocation_records,
+            allocation_records,
         )?;
         batch
             .write_with_sync(true)
             .map_err(strata_index::Error::from)?;
+        task.allocation_tracker
+            .mark_published(task.allocation_records);
     }
     metrics.record_segment_sealed();
     metrics.set_unsealed_segments(unsealed_ingest_segment_count(index)?);
@@ -473,6 +481,7 @@ pub(crate) fn enqueue_unsealed_segments_for_sealing(
                         })
                         .min(committed_before_lsn),
                     allocation_records: 0,
+                    allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
                 }))
                 .map_err(|_| Error::SealQueueClosed)?;
             metrics.record_seal_enqueued();

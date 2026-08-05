@@ -1,6 +1,7 @@
 //! Segment-state row construction and publication primitives shared by the open,
 //! recovery, seal, and write paths.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use strata_core::{
     PlacementClass, SegmentFileState, SegmentId, SegmentOwner, SegmentState, StrataLsn,
 };
@@ -11,6 +12,31 @@ use crate::{
     Error, Result, StrataStoreConfig,
     layout::{relative_segment_path, segment_path},
 };
+
+/// In-memory allocation publication state shared by the active writer, durability checkpoints,
+/// and the sealer after a segment rolls.
+///
+/// A durability checkpoint and sealing can finish in either order. Both carry a cumulative record
+/// count captured at their byte boundary; this tracker turns that count into a delta under the
+/// store's durability-publication lock so the GC baseline is applied exactly once.
+#[derive(Debug, Default)]
+pub(crate) struct SegmentAllocationTracker {
+    published_records: AtomicU64,
+}
+
+impl SegmentAllocationTracker {
+    pub(crate) fn unpublished_records(&self, captured_records: u64) -> Result<u64> {
+        let published = self.published_records.load(Ordering::Acquire);
+        // A later full-segment seal can win the publication race against an older durability
+        // snapshot. In that case the captured prefix is already covered and contributes no delta.
+        Ok(captured_records.saturating_sub(published))
+    }
+
+    pub(crate) fn mark_published(&self, captured_records: u64) {
+        self.published_records
+            .fetch_max(captured_records, Ordering::Release);
+    }
+}
 
 /// Makes the active segment visible in the index at open time, before any write happens. This is
 /// what keeps a brand new (or just recovered) segment from looking like an orphan to the next
@@ -130,17 +156,15 @@ pub(crate) fn publish_segment_allocation_baseline(
     segment_id: SegmentId,
     durable_bytes: u64,
     allocation_records: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let mut summary = index
         .get_segment_gc_summary(segment_id)?
         .unwrap_or_default();
-    if summary.total_bytes > durable_bytes {
-        return Err(Error::InvariantViolation {
-            reason: format!(
-                "segment {segment_id} GC baseline {} exceeds durable bytes {durable_bytes}",
-                summary.total_bytes
-            ),
-        });
+    // Another publisher (normally the sealer racing an asynchronous durability checkpoint) may
+    // already have covered this exact or a later byte boundary. The cumulative record tracker lets
+    // the caller mark its captured count covered without applying a second GC delta.
+    if summary.total_bytes >= durable_bytes {
+        return Ok(false);
     }
     let allocation_bytes = durable_bytes - summary.total_bytes;
     if (allocation_bytes == 0) != (allocation_records == 0) {
@@ -177,7 +201,7 @@ pub(crate) fn publish_segment_allocation_baseline(
             reason: format!("segment {segment_id} unknown-lifetime ref baseline overflow"),
         })?;
     index.put_segment_gc_summary_batch(batch, segment_id, &summary)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Returns unsealed ingest segments in write order.

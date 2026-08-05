@@ -46,6 +46,7 @@ pub struct Wal {
     needs_dir_sync: bool,
     file_sync_tx: FileSyncSender,
     sync_tracker: Arc<WalSyncTracker>,
+    pending_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -61,7 +62,22 @@ struct WalSyncState {
     next_ticket: u64,
     next_commit: u64,
     completed: BTreeMap<u64, WalSyncCompletion>,
+    notifications: Vec<WalSyncNotification>,
     failure: Option<String>,
+}
+
+struct WalSyncNotification {
+    through_ticket: u64,
+    notify: Box<dyn FnOnce(Result<()>) + Send + 'static>,
+}
+
+impl std::fmt::Debug for WalSyncNotification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WalSyncNotification")
+            .field("through_ticket", &self.through_ticket)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -281,6 +297,7 @@ impl Wal {
                 needs_dir_sync: true,
                 file_sync_tx,
                 sync_tracker,
+                pending_bytes: 0,
             });
         }
 
@@ -357,6 +374,7 @@ impl Wal {
             needs_dir_sync: false,
             file_sync_tx,
             sync_tracker,
+            pending_bytes: 0,
         })
     }
 
@@ -372,6 +390,7 @@ impl Wal {
         }
     }
 
+    #[cfg(test)]
     pub fn last_lsn(&self) -> Option<StrataLsn> {
         self.last_lsn
     }
@@ -412,6 +431,7 @@ impl Wal {
         }
         self.offset = new_offset;
         self.last_lsn = entries.last().map(|entry| entry.lsn);
+        self.pending_bytes = self.pending_bytes.saturating_add(frame_len);
         Ok(self.position())
     }
 
@@ -420,6 +440,23 @@ impl Wal {
     /// The store must first sync any segment bytes referenced by the batch, then publish this
     /// position after [`Self::committed_position`] reaches it.
     pub fn sync(&mut self) -> Result<WalPosition> {
+        self.sync_inner(None)
+    }
+
+    /// Queues a WAL sync and invokes `notify` after this ticket and every earlier ticket complete.
+    /// The notification is registered before task submission, so even an immediately completed
+    /// worker task cannot race past it.
+    pub(crate) fn sync_with_notification(
+        &mut self,
+        notify: impl FnOnce(Result<()>) + Send + 'static,
+    ) -> Result<WalPosition> {
+        self.sync_inner(Some(Box::new(notify)))
+    }
+
+    fn sync_inner(
+        &mut self,
+        notify: Option<Box<dyn FnOnce(Result<()>) + Send + 'static>>,
+    ) -> Result<WalPosition> {
         let path = Self::path(&self.dir, self.log_id);
         let file = self
             .file
@@ -427,6 +464,9 @@ impl Wal {
             .map_err(|source| io_error(&path, source))?;
         let position = self.position();
         let ticket = self.sync_tracker.reserve(position)?;
+        if let Some(notify) = notify {
+            self.sync_tracker.notify_after(ticket, notify);
+        }
         let sync_tracker = Arc::clone(&self.sync_tracker);
         let dir = self.needs_dir_sync.then(|| self.dir.clone());
         if self
@@ -448,6 +488,14 @@ impl Wal {
         Ok(position)
     }
 
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.pending_bytes
+    }
+
+    pub(crate) fn mark_pending_bytes_captured(&mut self) {
+        self.pending_bytes = 0;
+    }
+
     /// Clones the store-owned file-sync queue for other immutable store files.
     pub(crate) fn file_sync_sender(&self) -> FileSyncSender {
         self.file_sync_tx.clone()
@@ -460,6 +508,7 @@ impl Wal {
     }
 
     /// Waits until `position` is committed or an earlier sync fails.
+    #[cfg(test)]
     pub fn wait_for_sync(&self, position: WalPosition) -> Result<()> {
         self.sync_tracker.wait_for(position)
     }
@@ -601,6 +650,7 @@ impl WalSyncTracker {
                 next_ticket: 0,
                 next_commit: 0,
                 completed: BTreeMap::new(),
+                notifications: Vec::new(),
                 failure: None,
             }),
             changed: Condvar::new(),
@@ -631,26 +681,69 @@ impl WalSyncTracker {
             Ok(()) => WalSyncCompletion::Synced(position),
             Err(error) => WalSyncCompletion::Failed(error.to_string()),
         };
-        let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
-        state.completed.insert(ticket, completion);
-        loop {
-            let next_commit = state.next_commit;
-            let Some(completion) = state.completed.remove(&next_commit) else {
-                break;
-            };
-            match completion {
-                WalSyncCompletion::Synced(position) => {
-                    state.committed = position;
-                    state.next_commit += 1;
-                }
-                WalSyncCompletion::Failed(error) => {
-                    state.failure = Some(error);
+        let notifications = {
+            let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
+            state.completed.insert(ticket, completion);
+            loop {
+                let next_commit = state.next_commit;
+                let Some(completion) = state.completed.remove(&next_commit) else {
                     break;
+                };
+                match completion {
+                    WalSyncCompletion::Synced(position) => {
+                        state.committed = position;
+                        state.next_commit += 1;
+                    }
+                    WalSyncCompletion::Failed(error) => {
+                        state.failure = Some(error);
+                        break;
+                    }
                 }
             }
-        }
-        drop(state);
+            let failure = state.failure.clone();
+            let next_commit = state.next_commit;
+            let mut pending = Vec::new();
+            let mut ready = Vec::new();
+            for notification in std::mem::take(&mut state.notifications) {
+                if failure.is_some() || notification.through_ticket < next_commit {
+                    ready.push(notification);
+                } else {
+                    pending.push(notification);
+                }
+            }
+            state.notifications = pending;
+            (ready, failure)
+        };
         self.changed.notify_all();
+        let (notifications, failure) = notifications;
+        for notification in notifications {
+            (notification.notify)(match &failure {
+                Some(failure) => Err(Error::WalSyncFailed(failure.clone())),
+                None => Ok(()),
+            });
+        }
+    }
+
+    fn notify_after(
+        &self,
+        through_ticket: u64,
+        notify: Box<dyn FnOnce(Result<()>) + Send + 'static>,
+    ) {
+        let immediate = {
+            let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
+            if let Some(failure) = &state.failure {
+                Some(Err(Error::WalSyncFailed(failure.clone())))
+            } else if through_ticket < state.next_commit {
+                Some(Ok(()))
+            } else {
+                state.notifications.push(WalSyncNotification {
+                    through_ticket,
+                    notify,
+                });
+                return;
+            }
+        };
+        notify(immediate.expect("immediate WAL notification missing"));
     }
 
     #[cfg(test)]
@@ -662,6 +755,7 @@ impl WalSyncTracker {
         }
     }
 
+    #[cfg(test)]
     fn wait_for(&self, position: WalPosition) -> Result<()> {
         let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
         loop {
@@ -1155,7 +1249,7 @@ mod tests {
     }
 
     fn open_wal(path: &Path, max_file_bytes: u64, committed: WalPosition) -> Result<Wal> {
-        let (file_sync_tx, syncer) = crate::file_sync_channel(8);
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
         thread::spawn(move || syncer.run());
         Wal::open(path, max_file_bytes, committed, file_sync_tx)
     }
@@ -1167,7 +1261,7 @@ mod tests {
         published_lsn: Option<StrataLsn>,
         last_lsn: Option<StrataLsn>,
     ) -> Result<Wal> {
-        let (file_sync_tx, syncer) = crate::file_sync_channel(8);
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
         thread::spawn(move || syncer.run());
         Wal::recover(
             path,
@@ -1350,7 +1444,7 @@ mod tests {
         assert!(Wal::path(dir.path(), recovered.log_id).exists());
         drop(wal);
 
-        let (file_sync_tx, syncer) = crate::file_sync_channel(8);
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
         thread::spawn(move || syncer.run());
         let wal = Wal::recover(
             dir.path(),
@@ -1383,7 +1477,7 @@ mod tests {
         drop(wal);
         assert!(Wal::path(dir.path(), 1).exists());
 
-        let (file_sync_tx, syncer) = crate::file_sync_channel(8);
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
         thread::spawn(move || syncer.run());
         let wal = Wal::recover(
             dir.path(),
@@ -1419,7 +1513,7 @@ mod tests {
         drop(wal);
         fs::remove_file(Wal::path(dir.path(), 2)).unwrap();
 
-        let (file_sync_tx, syncer) = crate::file_sync_channel(8);
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
         thread::spawn(move || syncer.run());
         assert!(matches!(
             Wal::recover(
@@ -1494,7 +1588,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let first = entry(1, b"alpha");
         let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
-        let (file_sync_tx, syncer) = crate::file_sync_channel(2);
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
         let mut wal = Wal::open(
             dir.path(),
             max_file_bytes,
@@ -1518,6 +1612,7 @@ mod tests {
     #[test]
     fn committed_position_waits_for_out_of_order_completions() {
         let tracker = WalSyncTracker::new(WalPosition::default());
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel();
         let first = WalPosition {
             log_id: 1,
             offset: 100,
@@ -1528,10 +1623,16 @@ mod tests {
         };
         let first_ticket = tracker.reserve(first).unwrap();
         let second_ticket = tracker.reserve(second).unwrap();
+        tracker.notify_after(
+            second_ticket,
+            Box::new(move |result| notify_tx.send(result).unwrap()),
+        );
 
         tracker.complete(second_ticket, second, Ok(()));
         assert_eq!(tracker.committed().unwrap(), WalPosition::default());
+        assert!(notify_rx.try_recv().is_err());
         tracker.complete(first_ticket, first, Ok(()));
         assert_eq!(tracker.committed().unwrap(), second);
+        notify_rx.recv().unwrap().unwrap();
     }
 }

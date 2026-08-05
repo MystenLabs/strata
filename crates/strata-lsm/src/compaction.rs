@@ -27,7 +27,23 @@ pub fn select_compaction_inputs(
     partition: u32,
     patches: &[TableMeta],
 ) -> Result<Option<CompactionInputs>> {
-    select_inputs(manifest, tables, partition, patches, true)
+    select_inputs(manifest, tables, partition, patches, None, true)
+}
+
+/// Selects one base seed and the complete transitive set of files that can affect its keys.
+///
+/// Ordinary full compaction starts from a patch. A global-state sweep sometimes needs the inverse:
+/// revisit a cold base even though no foreground write touched it. For example, a base containing a
+/// key whose lifetime ends at epoch 50 must still see the epoch-50 transition when it has no patch.
+/// Starting from that base pulls in every overlapping patch, and the same closure loop then pulls
+/// in any further bases and patches needed to keep the selected key set complete.
+pub fn select_base_compaction_inputs(
+    manifest: &Manifest,
+    tables: &Arc<TableStore>,
+    partition: u32,
+    base: &TableMeta,
+) -> Result<Option<CompactionInputs>> {
+    select_inputs(manifest, tables, partition, &[], Some(base), true)
 }
 
 /// Selects and reserves an overlap-closed patch set for patch-only compaction.
@@ -39,7 +55,7 @@ pub fn select_patch_compaction_inputs(
     partition: u32,
     patches: &[TableMeta],
 ) -> Result<Option<CompactionInputs>> {
-    select_inputs(manifest, tables, partition, patches, false)
+    select_inputs(manifest, tables, partition, patches, None, false)
 }
 
 fn select_inputs(
@@ -47,12 +63,18 @@ fn select_inputs(
     tables: &Arc<TableStore>,
     partition: u32,
     patches: &[TableMeta],
+    base: Option<&TableMeta>,
     include_base: bool,
 ) -> Result<Option<CompactionInputs>> {
     manifest.validate()?;
-    if patches.is_empty() {
+    if patches.is_empty() && base.is_none() {
         return Err(Error::InvalidTable(
-            "compaction requires at least one patch SST".to_owned(),
+            "compaction requires at least one base or patch SST".to_owned(),
+        ));
+    }
+    if !include_base && base.is_some() {
+        return Err(Error::InvalidTable(
+            "patch-only compaction cannot start from a base SST".to_owned(),
         ));
     }
     let partition_manifest =
@@ -88,7 +110,20 @@ fn select_inputs(
         selected_patches.push(patch.clone());
     }
 
-    let mut selected_base = Vec::<TableMeta>::new();
+    let mut selected_base = Vec::with_capacity(usize::from(base.is_some()));
+    if let Some(table) = base {
+        let live = partition_manifest
+            .base
+            .iter()
+            .find(|live| live.relative_path == table.relative_path);
+        if live != Some(table) {
+            return Err(Error::InvalidTable(format!(
+                "base SST {} is not live in partition {partition}",
+                table.relative_path
+            )));
+        }
+        selected_base.push(table.clone());
+    }
 
     // Full compaction must close over the connected component spanning both levels, not merely
     // close patches before selecting base files. For example:
@@ -157,13 +192,13 @@ fn select_inputs(
         .iter()
         .map(|table| &table.first_key)
         .min()
-        .expect("patch input makes the reservation non-empty")
+        .expect("a base or patch seed makes the reservation non-empty")
         .clone();
     let last_key = reserved
         .iter()
         .map(|table| &table.last_key)
         .max()
-        .expect("patch input makes the reservation non-empty")
+        .expect("a base or patch seed makes the reservation non-empty")
         .clone();
 
     Ok(Some(CompactionInputs {
@@ -301,7 +336,8 @@ pub fn write_compaction(
     let partition = inputs
         .patches
         .first()
-        .expect("compaction inputs always contain a patch")
+        .or_else(|| inputs.base.first())
+        .expect("compaction inputs always contain a base or patch")
         .partition;
     let mut writer = None;
     let mut outputs = Vec::new();

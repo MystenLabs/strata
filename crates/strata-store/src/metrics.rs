@@ -37,6 +37,10 @@ struct PrometheusMetrics {
     sync_errors_total: IntCounter,
     sync_duration_seconds: Histogram,
     sync_bytes_total: IntCounter,
+    durability_wal_bytes_total: IntCounter,
+    durability_pending_wal_bytes: IntGauge,
+    durability_pending_segment_bytes: IntGauge,
+    durability_publish_in_flight: IntGauge,
     get_calls_total: IntCounter,
     get_hits_total: IntCounter,
     get_misses_total: IntCounter,
@@ -201,6 +205,30 @@ impl StrataStoreMetrics {
                     &labels,
                     "sync_bytes_total",
                     "Total bytes made durable by Strata sync calls.",
+                )?,
+                durability_wal_bytes_total: register_counter(
+                    registry,
+                    &labels,
+                    "durability_wal_bytes_total",
+                    "Total store-WAL bytes covered by successful durability publications.",
+                )?,
+                durability_pending_wal_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "durability_pending_wal_bytes",
+                    "Store-WAL bytes committed since the latest captured durability boundary.",
+                )?,
+                durability_pending_segment_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "durability_pending_segment_bytes",
+                    "Encoded segment bytes committed since the latest captured durability boundary.",
+                )?,
+                durability_publish_in_flight: register_gauge(
+                    registry,
+                    &labels,
+                    "durability_publish_in_flight",
+                    "Whether one asynchronous durability publication is currently in flight.",
                 )?,
                 get_calls_total: register_counter(
                     registry,
@@ -773,6 +801,30 @@ impl StrataStoreMetrics {
         match result {
             Ok(bytes) => metrics.sync_bytes_total.inc_by(bytes),
             Err(()) => metrics.sync_errors_total.inc(),
+        }
+    }
+
+    pub(crate) fn set_durability_pending(
+        &self,
+        wal_bytes: u64,
+        segment_bytes: u64,
+        in_flight: bool,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics.durability_pending_wal_bytes.set(to_i64(wal_bytes));
+        metrics
+            .durability_pending_segment_bytes
+            .set(to_i64(segment_bytes));
+        metrics
+            .durability_publish_in_flight
+            .set(i64::from(in_flight));
+    }
+
+    pub(crate) fn record_durability_wal_bytes(&self, bytes: u64) {
+        if let Some(metrics) = &self.inner {
+            metrics.durability_wal_bytes_total.inc_by(bytes);
         }
     }
 
