@@ -26,6 +26,7 @@ mod merge;
 mod recovery;
 mod snapshot;
 mod table;
+mod table_format;
 
 pub use compaction::{
     CompactionInputs, merge_compaction, select_compaction_inputs, select_patch_compaction_inputs,

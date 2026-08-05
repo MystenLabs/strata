@@ -12,29 +12,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use sha2::{Digest, Sha256};
-use xxhash_rust::xxh3::xxh3_64_with_seed;
+use crate::{Error, Result, StrataLsn, TableMeta, table_format::*};
 
-use crate::{Error, FORMAT_VERSION, Result, StrataLsn, TableMeta};
-
-const FILE_MAGIC: &[u8; 8] = b"STRLSM01";
-const INDEX_MAGIC: &[u8; 8] = b"STRIDX01";
-const BLOOM_MAGIC: &[u8; 8] = b"STRBLM01";
-const PREFIX_INDEX_MAGIC: &[u8; 8] = b"STRPFXI1";
-const PREFIX_BLOOM_MAGIC: &[u8; 8] = b"STRPFXB1";
-const FOOTER_MAGIC: &[u8; 8] = b"STRFTR01";
-const TRAILER_MAGIC: &[u8; 8] = b"STREND01";
-const HEADER_FIXED_LEN: usize = 32;
-const TRAILER_LEN: usize = 48;
-const CHECKSUM_LEN: usize = 32;
-const DATA_BLOCK_HEADER_LEN: usize = 12;
-const DATA_BLOCK_OVERHEAD: usize = DATA_BLOCK_HEADER_LEN + CHECKSUM_LEN;
-const FOOTER_FIXED_LEN: usize = 112;
-const MAX_FORMAT_ID_BYTES: usize = 1024;
 const TARGET_BLOCK_BYTES: usize = 64 * 1024;
-const BLOOM_BITS_PER_KEY: u64 = 10;
-const BLOOM_SEED: u64 = 0x6a09_e667_f3bc_c909;
-const PREFIX_BLOOM_SEED: u64 = 0xbb67_ae85_84ca_a73b;
 pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Point-read data-block cache counters and current occupancy.
@@ -60,9 +40,17 @@ type EncodedBlock = Arc<[u8]>;
 
 struct CachedBlock {
     bytes: EncodedBlock,
+    /// Set on insertion and every hit; the clock hand clears it when granting a second chance.
     referenced: bool,
 }
 
+/// State for a second-chance (clock) cache.
+///
+/// `entries` owns the blocks and provides constant-time lookup. `clock` contains the same keys in
+/// clock-hand order: its front is the next eviction candidate. A lookup marks an entry referenced
+/// without moving it. When space is needed, the hand repeatedly removes the front key. Referenced
+/// entries have their bit cleared and move to the back; an already-clear entry is evicted. This
+/// approximates LRU without maintaining a linked recency list on every cache hit.
 #[derive(Default)]
 struct BlockCacheState {
     entries: HashMap<BlockCacheKey, CachedBlock>,
@@ -97,6 +85,7 @@ impl BlockCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(block) = state.entries.get_mut(&key) {
+            // The next clock sweep will grant this block one full pass before it can be evicted.
             block.referenced = true;
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(Arc::clone(&block.bytes));
@@ -128,6 +117,8 @@ impl BlockCache {
         state.clock.push_back(key);
         self.insertions.fetch_add(1, Ordering::Relaxed);
 
+        // Advance the clock hand until the cache fits. Hot entries get one second chance per
+        // observed reference; cold entries are removed when encountered with a clear bit.
         while state.bytes > self.capacity {
             let Some(candidate) = state.clock.pop_front() else {
                 break;
@@ -161,6 +152,7 @@ impl BlockCache {
             .sum::<usize>();
         state.bytes = state.bytes.saturating_sub(removed);
         if removed > 0 {
+            // Purge the removed table's clock slots so future sweeps only visit live entries.
             let mut clock = std::mem::take(&mut state.clock);
             clock.retain(|key| state.entries.contains_key(key));
             state.clock = clock;
@@ -181,81 +173,6 @@ impl BlockCache {
             bytes: state.bytes,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableKind {
-    Base = 0,
-    Patch = 1,
-}
-
-impl TableKind {
-    fn from_byte(byte: u8, path: &Path) -> Result<Self> {
-        match byte {
-            0 => Ok(Self::Base),
-            1 => Ok(Self::Patch),
-            _ => Err(corrupt(path, format!("unknown table kind {byte}"))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockEncoding {
-    Plain = 0,
-    Prefix = 1,
-}
-
-impl BlockEncoding {
-    fn from_byte(byte: u8, path: &Path) -> Result<Self> {
-        match byte {
-            0 => Ok(Self::Plain),
-            1 => Ok(Self::Prefix),
-            _ => Err(corrupt(path, format!("unknown block encoding {byte}"))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BlockMeta {
-    encoding: BlockEncoding,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
-    key_prefix: Vec<u8>,
-    offset: u64,
-    len: u64,
-    record_count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BlockHandle {
-    offset: u64,
-    len: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Footer {
-    index: BlockHandle,
-    full_bloom: BlockHandle,
-    prefix_index: BlockHandle,
-    prefix_bloom: BlockHandle,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
-    min_lsn: Option<StrataLsn>,
-    max_lsn: Option<StrataLsn>,
-    record_count: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BloomFilter {
-    bits: Vec<u8>,
-    bit_count: u64,
-    hash_count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrefixIndexEntry {
-    key_prefix: Vec<u8>,
-    block: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,14 +437,11 @@ impl TableWriter {
                 "versions of one key must use one block encoding".to_owned(),
             ));
         }
-        encode_lengths(&mut block.rows, key_suffix, value)?;
+        encode_row(&mut block.rows, key_suffix, lsn, value)?;
         if let Some(lsn) = lsn {
-            block.rows.extend_from_slice(&lsn.to_le_bytes());
             self.min_lsn = Some(self.min_lsn.map_or(lsn, |current| current.min(lsn)));
             self.max_lsn = Some(self.max_lsn.map_or(lsn, |current| current.max(lsn)));
         }
-        block.rows.extend_from_slice(key_suffix);
-        block.rows.extend_from_slice(value);
         block.last_key = key.to_vec();
         block.record_count = block
             .record_count
@@ -607,21 +521,12 @@ impl TableWriter {
             BlockLayout::Plain => &[][..],
             BlockLayout::Prefix { key_prefix } => key_prefix.as_slice(),
         };
-        let mut payload = Vec::new();
-        if block.layout.encoding() == BlockEncoding::Prefix {
-            payload.extend_from_slice(&(key_prefix.len() as u32).to_le_bytes());
-            payload.extend_from_slice(key_prefix);
-        }
-        payload.extend_from_slice(&block.rows);
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| Error::InvalidTable("block exceeds u32 length".to_owned()))?;
-        let mut encoded = Vec::with_capacity(payload.len() + DATA_BLOCK_OVERHEAD);
-        encoded.extend_from_slice(&payload_len.to_le_bytes());
-        encoded.extend_from_slice(&block.record_count.to_le_bytes());
-        encoded.push(block.layout.encoding() as u8);
-        encoded.extend_from_slice(&[0; 3]);
-        encoded.append(&mut payload);
-        encoded.extend_from_slice(&checksum(&encoded));
+        let encoded = encode_data_block(
+            block.layout.encoding(),
+            key_prefix,
+            &block.rows,
+            block.record_count,
+        )?;
         let len = encoded.len() as u64;
         self.writer
             .write_all(&encoded)
@@ -707,11 +612,10 @@ impl TableWriter {
         let footer_len = u64::try_from(footer_bytes.len())
             .map_err(|_| Error::InvalidTable("footer exceeds u64 length".to_owned()))?;
         let footer_checksum = checksum(&footer_bytes);
+        let trailer = encode_trailer(footer_len, footer_checksum);
         self.writer
             .write_all(&footer_bytes)
-            .and_then(|_| self.writer.write_all(&footer_len.to_le_bytes()))
-            .and_then(|_| self.writer.write_all(&footer_checksum))
-            .and_then(|_| self.writer.write_all(TRAILER_MAGIC))
+            .and_then(|_| self.writer.write_all(&trailer))
             .and_then(|_| self.writer.flush())
             .map_err(|source| Error::Io {
                 path: self.tmp_path.clone(),
@@ -865,80 +769,59 @@ impl TableReader {
             return Err(corrupt(&path, "file is too short"));
         }
         let fixed = read_exact_at(&file, 0, HEADER_FIXED_LEN, &path)?;
-        if &fixed[..8] != FILE_MAGIC {
-            return Err(corrupt(&path, "invalid file magic"));
-        }
-        let version = u32::from_le_bytes(fixed[8..12].try_into().expect("fixed header slice"));
-        if version != FORMAT_VERSION {
-            return Err(corrupt(
-                &path,
-                format!("format version {version} is not {FORMAT_VERSION}"),
-            ));
-        }
-        if fixed[13..16] != [0; 3] {
-            return Err(corrupt(&path, "non-zero reserved header bytes"));
-        }
-        let kind = TableKind::from_byte(fixed[12], &path)?;
-        if kind != expected_kind {
+        let header = decode_header(&fixed, &path)?;
+        if header.kind != expected_kind {
             return Err(corrupt(
                 &path,
                 "table kind does not match manifest placement",
             ));
         }
-        let id = u64::from_le_bytes(fixed[16..24].try_into().expect("fixed header slice"));
-        let partition = u32::from_le_bytes(fixed[24..28].try_into().expect("fixed header slice"));
-        let format_len =
-            u32::from_le_bytes(fixed[28..32].try_into().expect("fixed header slice")) as usize;
-        if format_len == 0 || format_len > MAX_FORMAT_ID_BYTES {
-            return Err(corrupt(&path, "invalid value format identifier length"));
-        }
-        if id != meta.id || partition != meta.partition {
+        if header.id != meta.id || header.partition != meta.partition {
             return Err(corrupt(&path, "table identity does not match manifest"));
         }
         let header_end = HEADER_FIXED_LEN
-            .checked_add(format_len)
+            .checked_add(header.format_len)
             .ok_or_else(|| corrupt(&path, "header length overflow"))?;
         if header_end as u64 > file_len - TRAILER_LEN as u64 {
             return Err(corrupt(&path, "value format identifier exceeds file"));
         }
-        let format_bytes = read_exact_at(&file, HEADER_FIXED_LEN as u64, format_len, &path)?;
+        let format_bytes = read_exact_at(&file, HEADER_FIXED_LEN as u64, header.format_len, &path)?;
         if format_bytes != expected_format_id.as_bytes() {
             return Err(corrupt(&path, "value format identifier mismatch"));
         }
 
         let trailer_offset = file_len - TRAILER_LEN as u64;
-        let trailer = read_exact_at(&file, trailer_offset, TRAILER_LEN, &path)?;
-        if &trailer[40..] != TRAILER_MAGIC {
-            return Err(corrupt(&path, "invalid trailer magic"));
-        }
-        let footer_len = u64::from_le_bytes(trailer[..8].try_into().expect("trailer slice"));
+        let trailer_bytes = read_exact_at(&file, trailer_offset, TRAILER_LEN, &path)?;
+        let trailer = decode_trailer(&trailer_bytes, &path)?;
         let footer_offset = trailer_offset
-            .checked_sub(footer_len)
+            .checked_sub(trailer.footer_len)
             .ok_or_else(|| corrupt(&path, "footer length exceeds file"))?;
         if footer_offset < header_end as u64 {
             return Err(corrupt(&path, "footer overlaps table header"));
         }
-        let footer_len = usize::try_from(footer_len)
+        let footer_len = usize::try_from(trailer.footer_len)
             .map_err(|_| corrupt(&path, "footer does not fit in memory"))?;
         let footer_bytes = read_exact_at(&file, footer_offset, footer_len, &path)?;
-        let footer_checksum: [u8; 32] = trailer[8..40].try_into().expect("trailer slice");
-        if checksum(&footer_bytes) != footer_checksum || meta.checksum != footer_checksum {
+        if checksum(&footer_bytes) != trailer.footer_checksum
+            || meta.checksum != trailer.footer_checksum
+        {
             return Err(corrupt(&path, "footer checksum mismatch"));
         }
         let footer = decode_footer(&footer_bytes, &path)?;
         validate_metadata_handles(&path, &footer, header_end as u64, footer_offset)?;
-        let blocks = read_index_block(&file, &footer.index, &path)?;
-        let full_bloom = read_bloom_block(
-            &file,
-            &footer.full_bloom,
-            &path,
-            BLOOM_MAGIC,
-            "full-key Bloom",
-        )?;
-        let prefix_index = read_prefix_index_block(&file, &footer.prefix_index, &blocks, &path)?;
-        let prefix_bloom = read_bloom_block(
-            &file,
-            &footer.prefix_bloom,
+        let index_bytes = read_metadata_block(&file, &footer.index, &path, "index")?;
+        let blocks = decode_index_block(&index_bytes, &path)?;
+        let full_bloom_bytes =
+            read_metadata_block(&file, &footer.full_bloom, &path, "full-key Bloom")?;
+        let full_bloom =
+            decode_bloom_block(&full_bloom_bytes, &path, BLOOM_MAGIC, "full-key Bloom")?;
+        let prefix_index_bytes =
+            read_metadata_block(&file, &footer.prefix_index, &path, "prefix index")?;
+        let prefix_index = decode_prefix_index_block(&prefix_index_bytes, &blocks, &path)?;
+        let prefix_bloom_bytes =
+            read_metadata_block(&file, &footer.prefix_bloom, &path, "prefix Bloom")?;
+        let prefix_bloom = decode_bloom_block(
+            &prefix_bloom_bytes,
             &path,
             PREFIX_BLOOM_MAGIC,
             "prefix Bloom",
@@ -948,17 +831,17 @@ impl TableReader {
             &footer,
             &blocks,
             [&full_bloom, &prefix_bloom],
-            meta,
-            kind,
+            header.kind,
             header_end as u64,
         )?;
+        validate_manifest_footer(&path, &footer, meta)?;
         validate_prefix_metadata(&path, &blocks, &prefix_index)?;
 
         Ok(Self {
-            id,
+            id: header.id,
             path,
             file,
-            kind,
+            kind: header.kind,
             footer,
             blocks,
             full_bloom,
@@ -1126,71 +1009,14 @@ impl TableReader {
             Some(encoded) => encoded,
             None => read_exact_at(&self.file, block.offset, len, &self.path)?.into(),
         };
-        if encoded.len() < DATA_BLOCK_OVERHEAD {
-            return Err(corrupt(&self.path, "block is too short"));
-        }
-        let checksum_offset = encoded.len() - CHECKSUM_LEN;
-        if !was_cached && checksum(&encoded[..checksum_offset]) != encoded[checksum_offset..] {
-            return Err(corrupt(&self.path, "block checksum mismatch"));
-        }
-        let payload_len =
-            u32::from_le_bytes(encoded[..4].try_into().expect("block header slice")) as usize;
-        let record_count =
-            u32::from_le_bytes(encoded[4..8].try_into().expect("block header slice"));
-        let encoding = BlockEncoding::from_byte(encoded[8], &self.path)?;
-        if payload_len.checked_add(DATA_BLOCK_OVERHEAD) != Some(encoded.len())
-            || record_count != block.record_count
-            || encoding != block.encoding
-            || encoded[9..12] != [0; 3]
-        {
-            return Err(corrupt(&self.path, "invalid block header"));
-        }
-        let payload = &encoded[DATA_BLOCK_HEADER_LEN..DATA_BLOCK_HEADER_LEN + payload_len];
-        let mut cursor = 0;
-        let key_prefix = if encoding == BlockEncoding::Prefix {
-            let key_prefix_len = take_u32(payload, &mut cursor, &self.path)? as usize;
-            let key_prefix = take(payload, &mut cursor, key_prefix_len, &self.path)?;
-            if key_prefix != block.key_prefix {
-                return Err(corrupt(
-                    &self.path,
-                    "prefix block does not match sparse index",
-                ));
-            }
-            key_prefix
-        } else {
-            if !block.key_prefix.is_empty() {
-                return Err(corrupt(&self.path, "plain block contains prefixes"));
-            }
-            &[][..]
-        };
-        let mut previous_key: Option<Vec<u8>> = None;
-        for _ in 0..record_count {
-            let key_len = take_u32(payload, &mut cursor, &self.path)? as usize;
-            let value_len = take_u32(payload, &mut cursor, &self.path)? as usize;
-            let lsn = if self.kind == TableKind::Patch {
-                Some(take_u64(payload, &mut cursor, &self.path)?)
-            } else {
-                None
-            };
-            let key_part = take(payload, &mut cursor, key_len, &self.path)?;
-            let value_part = take(payload, &mut cursor, value_len, &self.path)?;
-            if encoding == BlockEncoding::Plain {
-                visit(key_part, lsn, value_part)?;
-                continue;
-            }
-            let key = joined(key_prefix, key_part)?;
-            if previous_key
-                .as_deref()
-                .is_some_and(|previous| key.as_slice() < previous)
-            {
-                return Err(corrupt(&self.path, "prefix block keys are not ordered"));
-            }
-            visit(&key, lsn, value_part)?;
-            previous_key = Some(key);
-        }
-        if cursor != payload.len() {
-            return Err(corrupt(&self.path, "trailing bytes in data block"));
-        }
+        visit_data_block(
+            &encoded,
+            block,
+            self.kind,
+            &self.path,
+            !was_cached,
+            &mut visit,
+        )?;
         if !was_cached && let Some(cache) = &self.block_cache {
             cache.insert(cache_key, encoded);
         }
@@ -1275,367 +1101,7 @@ impl TableCursor {
     }
 }
 
-fn encode_header(kind: TableKind, id: u64, partition: u32, format_id: &str) -> Result<Vec<u8>> {
-    let format_len = u32::try_from(format_id.len())
-        .map_err(|_| Error::InvalidTable("value format identifier is too long".to_owned()))?;
-    let mut header = Vec::with_capacity(HEADER_FIXED_LEN + format_id.len());
-    header.extend_from_slice(FILE_MAGIC);
-    header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    header.push(kind as u8);
-    header.extend_from_slice(&[0; 3]);
-    header.extend_from_slice(&id.to_le_bytes());
-    header.extend_from_slice(&partition.to_le_bytes());
-    header.extend_from_slice(&format_len.to_le_bytes());
-    header.extend_from_slice(format_id.as_bytes());
-    Ok(header)
-}
-
-fn encode_footer(footer: &Footer) -> Result<Vec<u8>> {
-    let first_key_len = u32::try_from(footer.first_key.len())
-        .map_err(|_| Error::InvalidTable("footer key exceeds u32 length".to_owned()))?;
-    let last_key_len = u32::try_from(footer.last_key.len())
-        .map_err(|_| Error::InvalidTable("footer key exceeds u32 length".to_owned()))?;
-    let (has_lsns, min_lsn, max_lsn) = match (footer.min_lsn, footer.max_lsn) {
-        (None, None) => (0, 0, 0),
-        (Some(min_lsn), Some(max_lsn)) => (1, min_lsn, max_lsn),
-        _ => {
-            return Err(Error::InvalidTable(
-                "footer must contain both lsn bounds or neither".to_owned(),
-            ));
-        }
-    };
-
-    let mut encoded =
-        Vec::with_capacity(FOOTER_FIXED_LEN + footer.first_key.len() + footer.last_key.len());
-    encoded.extend_from_slice(FOOTER_MAGIC);
-    encoded.extend_from_slice(&footer.index.offset.to_le_bytes());
-    encoded.extend_from_slice(&footer.index.len.to_le_bytes());
-    encoded.extend_from_slice(&footer.full_bloom.offset.to_le_bytes());
-    encoded.extend_from_slice(&footer.full_bloom.len.to_le_bytes());
-    encoded.extend_from_slice(&footer.prefix_index.offset.to_le_bytes());
-    encoded.extend_from_slice(&footer.prefix_index.len.to_le_bytes());
-    encoded.extend_from_slice(&footer.prefix_bloom.offset.to_le_bytes());
-    encoded.extend_from_slice(&footer.prefix_bloom.len.to_le_bytes());
-    encoded.extend_from_slice(&footer.record_count.to_le_bytes());
-    encoded.push(has_lsns);
-    encoded.extend_from_slice(&[0; 7]);
-    encoded.extend_from_slice(&min_lsn.to_le_bytes());
-    encoded.extend_from_slice(&max_lsn.to_le_bytes());
-    encoded.extend_from_slice(&first_key_len.to_le_bytes());
-    encoded.extend_from_slice(&last_key_len.to_le_bytes());
-    encoded.extend_from_slice(&footer.first_key);
-    encoded.extend_from_slice(&footer.last_key);
-    Ok(encoded)
-}
-
-fn decode_footer(bytes: &[u8], path: &Path) -> Result<Footer> {
-    if bytes.len() < FOOTER_FIXED_LEN || &bytes[..FOOTER_MAGIC.len()] != FOOTER_MAGIC {
-        return Err(corrupt(path, "invalid footer header"));
-    }
-    let mut cursor = FOOTER_MAGIC.len();
-    let index = BlockHandle {
-        offset: take_u64(bytes, &mut cursor, path)?,
-        len: take_u64(bytes, &mut cursor, path)?,
-    };
-    let full_bloom = BlockHandle {
-        offset: take_u64(bytes, &mut cursor, path)?,
-        len: take_u64(bytes, &mut cursor, path)?,
-    };
-    let prefix_index = BlockHandle {
-        offset: take_u64(bytes, &mut cursor, path)?,
-        len: take_u64(bytes, &mut cursor, path)?,
-    };
-    let prefix_bloom = BlockHandle {
-        offset: take_u64(bytes, &mut cursor, path)?,
-        len: take_u64(bytes, &mut cursor, path)?,
-    };
-    let record_count = take_u64(bytes, &mut cursor, path)?;
-    let has_lsns = take(bytes, &mut cursor, 1, path)?[0];
-    if take(bytes, &mut cursor, 7, path)? != [0; 7] {
-        return Err(corrupt(path, "non-zero reserved footer bytes"));
-    }
-    let min_lsn = take_u64(bytes, &mut cursor, path)?;
-    let max_lsn = take_u64(bytes, &mut cursor, path)?;
-    let first_key_len = take_u32(bytes, &mut cursor, path)? as usize;
-    let last_key_len = take_u32(bytes, &mut cursor, path)? as usize;
-    let first_key = take(bytes, &mut cursor, first_key_len, path)?.to_vec();
-    let last_key = take(bytes, &mut cursor, last_key_len, path)?.to_vec();
-    if cursor != bytes.len() {
-        return Err(corrupt(path, "trailing bytes in footer"));
-    }
-    let (min_lsn, max_lsn) = match has_lsns {
-        0 if min_lsn == 0 && max_lsn == 0 => (None, None),
-        0 => return Err(corrupt(path, "lsn-free footer has non-zero lsn bounds")),
-        1 => (Some(min_lsn), Some(max_lsn)),
-        _ => return Err(corrupt(path, "invalid footer lsn flag")),
-    };
-    Ok(Footer {
-        index,
-        full_bloom,
-        prefix_index,
-        prefix_bloom,
-        first_key,
-        last_key,
-        min_lsn,
-        max_lsn,
-        record_count,
-    })
-}
-
-fn encode_lengths(output: &mut Vec<u8>, key: &[u8], value: &[u8]) -> Result<()> {
-    let key_len = u32::try_from(key.len())
-        .map_err(|_| Error::InvalidTable("key exceeds u32 length".to_owned()))?;
-    let value_len = u32::try_from(value.len())
-        .map_err(|_| Error::InvalidTable("value exceeds u32 length".to_owned()))?;
-    output.extend_from_slice(&key_len.to_le_bytes());
-    output.extend_from_slice(&value_len.to_le_bytes());
-    Ok(())
-}
-
-fn encode_index_block(blocks: &[BlockMeta]) -> Result<Vec<u8>> {
-    let block_count = u32::try_from(blocks.len())
-        .map_err(|_| Error::InvalidTable("index has too many data blocks".to_owned()))?;
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(INDEX_MAGIC);
-    encoded.extend_from_slice(&block_count.to_le_bytes());
-    for block in blocks {
-        let first_key_len = u32::try_from(block.first_key.len())
-            .map_err(|_| Error::InvalidTable("index key exceeds u32 length".to_owned()))?;
-        let last_key_len = u32::try_from(block.last_key.len())
-            .map_err(|_| Error::InvalidTable("index key exceeds u32 length".to_owned()))?;
-        let key_prefix_len = u32::try_from(block.key_prefix.len())
-            .map_err(|_| Error::InvalidTable("index prefix exceeds u32 length".to_owned()))?;
-        encoded.push(block.encoding as u8);
-        encoded.extend_from_slice(&[0; 3]);
-        encoded.extend_from_slice(&first_key_len.to_le_bytes());
-        encoded.extend_from_slice(&last_key_len.to_le_bytes());
-        encoded.extend_from_slice(&key_prefix_len.to_le_bytes());
-        encoded.extend_from_slice(&block.offset.to_le_bytes());
-        encoded.extend_from_slice(&block.len.to_le_bytes());
-        encoded.extend_from_slice(&block.record_count.to_le_bytes());
-        encoded.extend_from_slice(&block.first_key);
-        encoded.extend_from_slice(&block.last_key);
-        encoded.extend_from_slice(&block.key_prefix);
-    }
-    encoded.extend_from_slice(&checksum(&encoded));
-    Ok(encoded)
-}
-
-fn read_index_block(file: &File, handle: &BlockHandle, path: &Path) -> Result<Vec<BlockMeta>> {
-    let bytes = read_metadata_block(file, handle, path, INDEX_MAGIC, "index")?;
-    let mut cursor = 0;
-    let block_count = take_u32(&bytes, &mut cursor, path)? as usize;
-    if block_count > bytes.len() / 36 {
-        return Err(corrupt(path, "invalid index block count"));
-    }
-    let mut blocks = Vec::with_capacity(block_count);
-    for _ in 0..block_count {
-        let encoding = BlockEncoding::from_byte(take(&bytes, &mut cursor, 1, path)?[0], path)?;
-        if take(&bytes, &mut cursor, 3, path)? != [0; 3] {
-            return Err(corrupt(path, "non-zero reserved index bytes"));
-        }
-        let first_key_len = take_u32(&bytes, &mut cursor, path)? as usize;
-        let last_key_len = take_u32(&bytes, &mut cursor, path)? as usize;
-        let key_prefix_len = take_u32(&bytes, &mut cursor, path)? as usize;
-        let offset = take_u64(&bytes, &mut cursor, path)?;
-        let len = take_u64(&bytes, &mut cursor, path)?;
-        let record_count = take_u32(&bytes, &mut cursor, path)?;
-        let first_key = take(&bytes, &mut cursor, first_key_len, path)?.to_vec();
-        let last_key = take(&bytes, &mut cursor, last_key_len, path)?.to_vec();
-        let key_prefix = take(&bytes, &mut cursor, key_prefix_len, path)?.to_vec();
-        blocks.push(BlockMeta {
-            encoding,
-            first_key,
-            last_key,
-            key_prefix,
-            offset,
-            len,
-            record_count,
-        });
-    }
-    if cursor != bytes.len() {
-        return Err(corrupt(path, "trailing bytes in index block"));
-    }
-    Ok(blocks)
-}
-
-fn encode_prefix_index_block(blocks: &[BlockMeta]) -> Result<Vec<u8>> {
-    let mut entries = blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, block)| block.encoding == BlockEncoding::Prefix)
-        .collect::<Vec<_>>();
-    entries.sort_unstable_by(|(left_index, left), (right_index, right)| {
-        left.key_prefix
-            .cmp(&right.key_prefix)
-            .then_with(|| left.first_key.cmp(&right.first_key))
-            .then_with(|| left_index.cmp(right_index))
-    });
-    let count = u32::try_from(entries.len())
-        .map_err(|_| Error::InvalidTable("prefix index has too many blocks".to_owned()))?;
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(PREFIX_INDEX_MAGIC);
-    encoded.extend_from_slice(&count.to_le_bytes());
-    for (_, block) in entries {
-        let key_prefix_len = u32::try_from(block.key_prefix.len())
-            .map_err(|_| Error::InvalidTable("key prefix exceeds u32 length".to_owned()))?;
-        encoded.extend_from_slice(&key_prefix_len.to_le_bytes());
-        encoded.extend_from_slice(&block.offset.to_le_bytes());
-        encoded.extend_from_slice(&block.len.to_le_bytes());
-        encoded.extend_from_slice(&block.key_prefix);
-    }
-    encoded.extend_from_slice(&checksum(&encoded));
-    Ok(encoded)
-}
-
-fn read_prefix_index_block(
-    file: &File,
-    handle: &BlockHandle,
-    blocks: &[BlockMeta],
-    path: &Path,
-) -> Result<Vec<PrefixIndexEntry>> {
-    let bytes = read_metadata_block(file, handle, path, PREFIX_INDEX_MAGIC, "prefix index")?;
-    let mut cursor = 0;
-    let count = take_u32(&bytes, &mut cursor, path)? as usize;
-    if count > bytes.len() / 20 {
-        return Err(corrupt(path, "invalid prefix index count"));
-    }
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let key_prefix_len = take_u32(&bytes, &mut cursor, path)? as usize;
-        let offset = take_u64(&bytes, &mut cursor, path)?;
-        let len = take_u64(&bytes, &mut cursor, path)?;
-        let key_prefix = take(&bytes, &mut cursor, key_prefix_len, path)?.to_vec();
-        let block = blocks.partition_point(|block| block.offset < offset);
-        let Some(meta) = blocks.get(block).filter(|block| block.offset == offset) else {
-            return Err(corrupt(path, "prefix index references an unknown block"));
-        };
-        if meta.encoding != BlockEncoding::Prefix
-            || meta.offset != offset
-            || meta.len != len
-            || meta.key_prefix != key_prefix
-        {
-            return Err(corrupt(path, "prefix index does not match sparse index"));
-        }
-        entries.push(PrefixIndexEntry { key_prefix, block });
-    }
-    if cursor != bytes.len() {
-        return Err(corrupt(path, "trailing bytes in prefix index"));
-    }
-    Ok(entries)
-}
-
-fn encode_bloom_block(magic: &[u8; 8], bloom: &BloomFilter) -> Result<Vec<u8>> {
-    let byte_count = u64::try_from(bloom.bits.len())
-        .map_err(|_| Error::InvalidTable("Bloom filter exceeds u64 length".to_owned()))?;
-    let mut encoded = Vec::with_capacity(bloom.bits.len() + 60);
-    encoded.extend_from_slice(magic);
-    encoded.extend_from_slice(&bloom.bit_count.to_le_bytes());
-    encoded.extend_from_slice(&bloom.hash_count.to_le_bytes());
-    encoded.extend_from_slice(&byte_count.to_le_bytes());
-    encoded.extend_from_slice(&bloom.bits);
-    encoded.extend_from_slice(&checksum(&encoded));
-    Ok(encoded)
-}
-
-fn read_bloom_block(
-    file: &File,
-    handle: &BlockHandle,
-    path: &Path,
-    magic: &[u8; 8],
-    name: &str,
-) -> Result<BloomFilter> {
-    let bytes = read_metadata_block(file, handle, path, magic, name)?;
-    let mut cursor = 0;
-    let bit_count = take_u64(&bytes, &mut cursor, path)?;
-    let hash_count = take_u32(&bytes, &mut cursor, path)?;
-    let byte_count = usize::try_from(take_u64(&bytes, &mut cursor, path)?)
-        .map_err(|_| corrupt(path, format!("{name} filter does not fit in memory")))?;
-    let bits = take(&bytes, &mut cursor, byte_count, path)?.to_vec();
-    if cursor != bytes.len() {
-        return Err(corrupt(path, format!("trailing bytes in {name} block")));
-    }
-    Ok(BloomFilter {
-        bits,
-        bit_count,
-        hash_count,
-    })
-}
-
-fn read_metadata_block(
-    file: &File,
-    handle: &BlockHandle,
-    path: &Path,
-    magic: &[u8; 8],
-    name: &str,
-) -> Result<Vec<u8>> {
-    let len = usize::try_from(handle.len)
-        .map_err(|_| corrupt(path, format!("{name} block does not fit in memory")))?;
-    let encoded = read_exact_at(file, handle.offset, len, path)?;
-    if encoded.len() < magic.len() + CHECKSUM_LEN || &encoded[..magic.len()] != magic {
-        return Err(corrupt(path, format!("invalid {name} block header")));
-    }
-    let checksum_offset = encoded.len() - CHECKSUM_LEN;
-    if checksum(&encoded[..checksum_offset]) != encoded[checksum_offset..] {
-        return Err(corrupt(path, format!("{name} block checksum mismatch")));
-    }
-    Ok(encoded[magic.len()..checksum_offset].to_vec())
-}
-
-fn validate_metadata_handles(
-    path: &Path,
-    footer: &Footer,
-    header_end: u64,
-    footer_offset: u64,
-) -> Result<()> {
-    let index_end = footer.index.offset.checked_add(footer.index.len);
-    let full_bloom_end = footer.full_bloom.offset.checked_add(footer.full_bloom.len);
-    let prefix_index_end = footer
-        .prefix_index
-        .offset
-        .checked_add(footer.prefix_index.len);
-    let prefix_bloom_end = footer
-        .prefix_bloom
-        .offset
-        .checked_add(footer.prefix_bloom.len);
-    if footer.index.offset < header_end
-        || footer.index.len < (INDEX_MAGIC.len() + 4 + CHECKSUM_LEN) as u64
-        || index_end != Some(footer.full_bloom.offset)
-        || footer.full_bloom.len < (BLOOM_MAGIC.len() + 20 + CHECKSUM_LEN) as u64
-        || full_bloom_end != Some(footer.prefix_index.offset)
-        || footer.prefix_index.len < (PREFIX_INDEX_MAGIC.len() + 4 + CHECKSUM_LEN) as u64
-        || prefix_index_end != Some(footer.prefix_bloom.offset)
-        || footer.prefix_bloom.len < (PREFIX_BLOOM_MAGIC.len() + 20 + CHECKSUM_LEN) as u64
-        || prefix_bloom_end != Some(footer_offset)
-    {
-        return Err(corrupt(path, "invalid metadata block handles"));
-    }
-    Ok(())
-}
-
-fn validate_footer(
-    path: &Path,
-    footer: &Footer,
-    blocks: &[BlockMeta],
-    blooms: [&BloomFilter; 2],
-    meta: &TableMeta,
-    kind: TableKind,
-    header_end: u64,
-) -> Result<()> {
-    if blocks.is_empty()
-        || footer.record_count == 0
-        || footer.first_key > footer.last_key
-        || blooms.iter().any(|bloom| {
-            bloom.bits.is_empty()
-                || bloom.bit_count == 0
-                || !bloom.bit_count.is_multiple_of(8)
-                || bloom.bit_count / 8 != bloom.bits.len() as u64
-                || bloom.hash_count == 0
-                || bloom.hash_count > 30
-        })
-    {
-        return Err(corrupt(path, "invalid empty footer field"));
-    }
+fn validate_manifest_footer(path: &Path, footer: &Footer, meta: &TableMeta) -> Result<()> {
     if footer.first_key != meta.first_key
         || footer.last_key != meta.last_key
         || footer.min_lsn != meta.min_lsn
@@ -1644,184 +1110,18 @@ fn validate_footer(
     {
         return Err(corrupt(path, "footer does not match manifest"));
     }
-    if (kind == TableKind::Base && (footer.min_lsn.is_some() || footer.max_lsn.is_some()))
-        || (kind == TableKind::Patch && (footer.min_lsn.is_none() || footer.max_lsn.is_none()))
-    {
-        return Err(corrupt(path, "lsn bounds do not match table kind"));
-    }
-    if blocks.first().map(|block| &block.first_key) != Some(&footer.first_key)
-        || blocks.last().map(|block| &block.last_key) != Some(&footer.last_key)
-    {
-        return Err(corrupt(path, "block bounds do not match footer"));
-    }
-    let mut previous_end = header_end;
-    let mut previous_key: Option<&[u8]> = None;
-    let mut records = 0_u64;
-    for block in blocks {
-        if block.first_key > block.last_key
-            || block.offset != previous_end
-            || block.len < DATA_BLOCK_OVERHEAD as u64
-            || block
-                .offset
-                .checked_add(block.len)
-                .is_none_or(|end| end > footer.index.offset)
-            || previous_key.is_some_and(|key| key >= block.first_key.as_slice())
-            || block.record_count == 0
-            || (block.encoding == BlockEncoding::Plain && !block.key_prefix.is_empty())
-            || (block.encoding == BlockEncoding::Prefix
-                && (block.key_prefix.is_empty()
-                    || !block.first_key.starts_with(&block.key_prefix)
-                    || !block.last_key.starts_with(&block.key_prefix)))
-        {
-            return Err(corrupt(path, "invalid sparse block index"));
-        }
-        previous_end = block.offset + block.len;
-        previous_key = Some(&block.last_key);
-        records = records
-            .checked_add(u64::from(block.record_count))
-            .ok_or_else(|| corrupt(path, "block record count overflow"))?;
-    }
-    if records != footer.record_count {
-        return Err(corrupt(path, "block record counts do not match footer"));
-    }
-    if previous_end != footer.index.offset {
-        return Err(corrupt(path, "data blocks do not end at the index"));
-    }
     Ok(())
 }
 
-fn validate_prefix_metadata(
+fn read_metadata_block(
+    file: &File,
+    handle: &BlockHandle,
     path: &Path,
-    blocks: &[BlockMeta],
-    prefix_index: &[PrefixIndexEntry],
-) -> Result<()> {
-    let prefix_block_count = blocks
-        .iter()
-        .filter(|block| block.encoding == BlockEncoding::Prefix)
-        .count();
-    if prefix_index.len() != prefix_block_count {
-        return Err(corrupt(
-            path,
-            "prefix metadata does not cover prefix blocks",
-        ));
-    }
-    if !prefix_index
-        .windows(2)
-        .all(|pair| compare_prefix_index_entries(&pair[0], &pair[1], blocks).is_le())
-    {
-        return Err(corrupt(path, "prefix index is not ordered"));
-    }
-    let mut indexed = vec![false; blocks.len()];
-    for entry in prefix_index {
-        if indexed[entry.block] {
-            return Err(corrupt(path, "prefix index contains a duplicate block"));
-        }
-        indexed[entry.block] = true;
-    }
-    if blocks
-        .iter()
-        .enumerate()
-        .any(|(index, block)| (block.encoding == BlockEncoding::Prefix) != indexed[index])
-    {
-        return Err(corrupt(path, "prefix index does not cover prefix blocks"));
-    }
-    Ok(())
-}
-
-/// The two independent hashes of one key that derive every Bloom probe: probe `i` tests bit
-/// `first + i * second` (classic double hashing), so a filter with any `hash_count` needs
-/// only this pair per key.
-type BloomHashPair = (u64, u64);
-
-fn build_bloom(hashes: &[BloomHashPair]) -> Result<BloomFilter> {
-    let key_count = u64::try_from(hashes.len())
-        .map_err(|_| Error::InvalidTable("too many Bloom filter keys".to_owned()))?;
-    let raw_bit_count = key_count
-        .checked_mul(BLOOM_BITS_PER_KEY)
-        .ok_or_else(|| Error::InvalidTable("Bloom filter size overflow".to_owned()))?
-        .max(64);
-    let bit_count = raw_bit_count
-        .checked_add(7)
-        .ok_or_else(|| Error::InvalidTable("Bloom filter size overflow".to_owned()))?
-        / 8
-        * 8;
-    let byte_count = usize::try_from(bit_count / 8)
-        .map_err(|_| Error::InvalidTable("Bloom filter does not fit in memory".to_owned()))?;
-    let hash_count = ((BLOOM_BITS_PER_KEY * 69 + 50) / 100).clamp(1, 30) as u32;
-    let mut bits = vec![0_u8; byte_count];
-    for &(first, second) in hashes {
-        for index in 0..hash_count {
-            let bit = first.wrapping_add(u64::from(index).wrapping_mul(second)) % bit_count;
-            bits[(bit / 8) as usize] |= 1 << (bit % 8);
-        }
-    }
-    Ok(BloomFilter {
-        bits,
-        bit_count,
-        hash_count,
-    })
-}
-
-fn bloom_may_contain(key: &[u8], bits: &[u8], bit_count: u64, hash_count: u32) -> bool {
-    bloom_may_contain_with_seed(key, bits, bit_count, hash_count, BLOOM_SEED)
-}
-
-fn bloom_may_contain_with_seed(
-    key: &[u8],
-    bits: &[u8],
-    bit_count: u64,
-    hash_count: u32,
-    seed: u64,
-) -> bool {
-    let (first, second) = hashes_with_seed(key, seed);
-    (0..hash_count).all(|index| {
-        let bit = first.wrapping_add(u64::from(index).wrapping_mul(second)) % bit_count;
-        bits[(bit / 8) as usize] & (1 << (bit % 8)) != 0
-    })
-}
-
-fn bloom_hashes(key: &[u8]) -> BloomHashPair {
-    hashes_with_seed(key, BLOOM_SEED)
-}
-
-fn prefix_bloom_hashes(key: &[u8]) -> BloomHashPair {
-    hashes_with_seed(key, PREFIX_BLOOM_SEED)
-}
-
-fn hashes_with_seed(key: &[u8], seed: u64) -> BloomHashPair {
-    let first = xxh3_64_with_seed(key, seed);
-    let second = xxh3_64_with_seed(key, seed ^ 0x9e37_79b9_7f4a_7c15) | 1;
-    (first, second)
-}
-
-fn joined(prefix: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
-    let len = prefix
-        .len()
-        .checked_add(suffix.len())
-        .ok_or_else(|| Error::InvalidTable("joined table field is too large".to_owned()))?;
-    let mut joined = Vec::with_capacity(len);
-    joined.extend_from_slice(prefix);
-    joined.extend_from_slice(suffix);
-    Ok(joined)
-}
-
-fn compare_prefix_index_entries(
-    left: &PrefixIndexEntry,
-    right: &PrefixIndexEntry,
-    blocks: &[BlockMeta],
-) -> std::cmp::Ordering {
-    left.key_prefix
-        .cmp(&right.key_prefix)
-        .then_with(|| {
-            blocks[left.block]
-                .first_key
-                .cmp(&blocks[right.block].first_key)
-        })
-        .then_with(|| left.block.cmp(&right.block))
-}
-
-fn checksum(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
+    name: &str,
+) -> Result<Vec<u8>> {
+    let len = usize::try_from(handle.len)
+        .map_err(|_| corrupt(path, format!("{name} block does not fit in memory")))?;
+    read_exact_at(file, handle.offset, len, path)
 }
 
 pub(crate) fn validate_relative_path(relative_path: &str) -> Result<()> {
@@ -1876,40 +1176,6 @@ fn read_exact_at(file: &File, offset: u64, len: usize, path: &Path) -> Result<Ve
 
 #[cfg(not(unix))]
 compile_error!("strata-lsm table reads currently require positioned Unix file I/O");
-
-fn take_u32(bytes: &[u8], cursor: &mut usize, path: &Path) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        take(bytes, cursor, 4, path)?
-            .try_into()
-            .expect("four-byte slice"),
-    ))
-}
-
-fn take_u64(bytes: &[u8], cursor: &mut usize, path: &Path) -> Result<u64> {
-    Ok(u64::from_le_bytes(
-        take(bytes, cursor, 8, path)?
-            .try_into()
-            .expect("eight-byte slice"),
-    ))
-}
-
-fn take<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize, path: &Path) -> Result<&'a [u8]> {
-    let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| corrupt(path, "record length overflow"))?;
-    let value = bytes
-        .get(*cursor..end)
-        .ok_or_else(|| corrupt(path, "record exceeds data block"))?;
-    *cursor = end;
-    Ok(value)
-}
-
-fn corrupt(path: &Path, reason: impl Into<String>) -> Error {
-    Error::CorruptTable {
-        path: path.to_path_buf(),
-        reason: reason.into(),
-    }
-}
 
 #[cfg(test)]
 mod tests {
