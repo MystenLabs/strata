@@ -25,7 +25,11 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 
@@ -220,6 +224,7 @@ pub(crate) struct LsmFlusher {
     pub(crate) lsm: Weak<Lsm>,
     pub(crate) wake_rx: mpsc::Receiver<()>,
     pub(crate) compact_tx: mpsc::Sender<()>,
+    pub(crate) next_table_id: Arc<AtomicU64>,
     pub(crate) store_halt: StoreHalt,
 }
 
@@ -285,7 +290,11 @@ impl LsmFlusher {
             let mut flushed = false;
             let partition_count = lsm.manifest().partition_count;
             for partition in 0..partition_count {
-                let table_id = lsm.manifest().next_table_id;
+                if lsm.frozen_generations(partition)?.is_empty() {
+                    continue;
+                }
+                let manifest_next_table_id = lsm.manifest().next_table_id;
+                let table_id = allocate_table_id(&self.next_table_id, manifest_next_table_id);
                 let relative_path = format!("patch-{table_id:020}.sst");
                 flushed |= lsm
                     .flush_one(partition, table_id, relative_path, |edit| {
@@ -319,6 +328,7 @@ pub(crate) struct LsmCompactor {
     pub(crate) garbage_log_dir: PathBuf,
     pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
+    pub(crate) next_table_id: Arc<AtomicU64>,
     pub(crate) wake_rx: mpsc::Receiver<()>,
     pub(crate) store_halt: StoreHalt,
     pub(crate) metrics: StrataStoreMetrics,
@@ -573,7 +583,6 @@ impl LsmCompactor {
         let input_bytes = obsolete
             .iter()
             .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
-        let mut next_table_id = manifest.next_table_id;
         let started = Instant::now();
         let epoch_snapshot = BlobCompactionSnapshot {
             materialized_through_lsn,
@@ -585,8 +594,7 @@ impl LsmCompactor {
             let merge = BlobMergeWithRelocations::new(None, epoch_snapshot);
             let (edit, garbage) =
                 write_patch_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
-                    let id = next_table_id;
-                    next_table_id = next_table_id.saturating_add(1);
+                    let id = allocate_table_id(&self.next_table_id, manifest.next_table_id);
                     (id, format!("patch-{id:020}.sst"))
                 })?;
             (edit, garbage, 0)
@@ -631,8 +639,7 @@ impl LsmCompactor {
             let merge = BlobMergeWithRelocations::new(relocation_scan, snapshot);
             let (mut edit, garbage) =
                 write_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
-                    let id = next_table_id;
-                    next_table_id = next_table_id.saturating_add(1);
+                    let id = allocate_table_id(&self.next_table_id, manifest.next_table_id);
                     (id, format!("base-{id:020}.sst"))
                 })?;
             // All rows in every output passed through `merge` with the epoch snapshot bounded by
@@ -716,6 +723,55 @@ impl LsmCompactor {
             }
         }
         self.obsolete = retained;
+    }
+}
+
+/// Reserves one main-LSM table id across the concurrent flusher and compactor.
+///
+/// The manifest floor keeps the in-memory allocator in sync with tables installed through direct
+/// manifest edits, while `fetch_add` gives each concurrent writer a distinct id.
+fn allocate_table_id(next_table_id: &AtomicU64, manifest_next_table_id: u64) -> u64 {
+    next_table_id.fetch_max(manifest_next_table_id, Ordering::Relaxed);
+    next_table_id.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod table_id_tests {
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    use super::*;
+
+    #[test]
+    fn flusher_and_compactor_allocate_distinct_table_ids() {
+        let next_table_id = Arc::new(AtomicU64::new(217));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut writers = Vec::new();
+
+        for _ in 0..2 {
+            let next_table_id = Arc::clone(&next_table_id);
+            let barrier = Arc::clone(&barrier);
+            writers.push(thread::spawn(move || {
+                barrier.wait();
+                (0..1_000)
+                    .map(|_| allocate_table_id(&next_table_id, 217))
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        barrier.wait();
+        let ids = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().unwrap())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), 2_000);
+        assert!(ids.contains(&217));
+        assert!(ids.contains(&2_216));
+        assert_eq!(allocate_table_id(&next_table_id, 3_000), 3_000);
     }
 }
 

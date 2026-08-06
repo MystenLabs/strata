@@ -4,7 +4,7 @@
 use std::{
     fs,
     num::NonZeroU32,
-    sync::{Arc, Mutex, RwLock, mpsc},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicU64, mpsc},
     thread::{self, JoinHandle},
     time::Instant,
 };
@@ -159,11 +159,10 @@ impl StrataStore {
         let (store_wal, blob_recovery, relocation_recovery, lsm_sync_handles) =
             open_store_wal(&config, &index, next_lsn, store_checkpoint)?;
         let lsm = open_lsm(&config, &index, next_lsn, blob_recovery)?;
+        let main_lsm_next_table_id = Arc::new(AtomicU64::new(lsm.manifest().next_table_id));
         publish_recovered_store_checkpoint(&index, &metrics, &store_wal, &active_segment_state)?;
         let relocations = open_relocation_lsm(&config, &index, next_lsn, relocation_recovery)?;
-        let durable_relocation_lsn = Arc::new(std::sync::atomic::AtomicU64::new(
-            relocations.manifest_sequence(),
-        ));
+        let durable_relocation_lsn = Arc::new(AtomicU64::new(relocations.manifest_sequence()));
         let relocation_cache = Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES));
         let live_snapshots = lsm.live_snapshots();
         metrics.initialize_gc_known(&gc_known_summary(&index)?);
@@ -195,6 +194,7 @@ impl StrataStore {
             garbage_log_dir: garbage_log_dir(&config),
             compaction_admission_lock: Arc::clone(&compaction_admission_lock),
             garbage_publish_lock: Arc::clone(&durability_publish_lock),
+            next_table_id: Arc::clone(&main_lsm_next_table_id),
             wake_rx: lsm_compact_rx,
             store_halt: store_halt.clone(),
             metrics: metrics.clone(),
@@ -210,6 +210,7 @@ impl StrataStore {
             lsm: Arc::downgrade(&lsm),
             wake_rx: lsm_flush_rx,
             compact_tx: lsm_compact_tx.clone(),
+            next_table_id: Arc::clone(&main_lsm_next_table_id),
             store_halt: store_halt.clone(),
         };
         let lsm_flush_handle = thread::Builder::new()
