@@ -33,8 +33,9 @@ pub use compaction::{
     select_patch_compaction_inputs, write_compaction, write_patch_compaction,
 };
 pub use engine::{
-    Lsm, LsmOptions, Mutation, RolledMemtable, StoredValue, WriteBatchResult, WriteResult,
-    decode_record_ref, decode_value, encode_blob_value, encode_inline_value, encode_record_ref,
+    Lsm, LsmOptions, Mutation, RolledMemtable, StoredValue, TableTarget, WriteBatchResult,
+    WriteResult, decode_record_ref, decode_value, encode_blob_value, encode_inline_value,
+    encode_record_ref,
 };
 pub use error::{Error, Result};
 pub use garbage_log::{

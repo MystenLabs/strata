@@ -225,9 +225,32 @@ impl PendingBlock {
 /// Rows must arrive in unsigned lexicographic key order. Patch rows for the same key must also have
 /// strictly increasing lsns. `finish` syncs a temporary file, renames it to its final relative
 /// path, syncs the parent directory, and returns metadata for that one file.
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub struct TableWriter {
     path: PathBuf,
-    tmp_path: PathBuf,
+    tmp_file: TempFileGuard,
     relative_path: String,
     writer: BufWriter<File>,
     kind: TableKind,
@@ -319,16 +342,17 @@ impl TableWriter {
                 path: tmp_path.clone(),
                 source,
             })?;
+        let tmp_file = TempFileGuard::new(tmp_path);
         let mut writer = BufWriter::new(file);
         let header = encode_header(kind, id, partition, value_format_id)?;
         writer.write_all(&header).map_err(|source| Error::Io {
-            path: tmp_path.clone(),
+            path: tmp_file.path.clone(),
             source,
         })?;
 
         Ok(Self {
             path,
-            tmp_path,
+            tmp_file,
             relative_path,
             writer,
             kind,
@@ -531,7 +555,7 @@ impl TableWriter {
         self.writer
             .write_all(&encoded)
             .map_err(|source| Error::Io {
-                path: self.tmp_path.clone(),
+                path: self.tmp_file.path.clone(),
                 source,
             })?;
         let encoding = block.layout.encoding();
@@ -559,7 +583,7 @@ impl TableWriter {
             len,
         };
         self.writer.write_all(bytes).map_err(|source| Error::Io {
-            path: self.tmp_path.clone(),
+            path: self.tmp_file.path.clone(),
             source,
         })?;
         self.offset = self
@@ -618,14 +642,14 @@ impl TableWriter {
             .and_then(|_| self.writer.write_all(&trailer))
             .and_then(|_| self.writer.flush())
             .map_err(|source| Error::Io {
-                path: self.tmp_path.clone(),
+                path: self.tmp_file.path.clone(),
                 source,
             })?;
         self.writer
             .get_ref()
             .sync_all()
             .map_err(|source| Error::Io {
-                path: self.tmp_path.clone(),
+                path: self.tmp_file.path.clone(),
                 source,
             })?;
         let file_len = self
@@ -634,10 +658,11 @@ impl TableWriter {
             .and_then(|len| len.checked_add(TRAILER_LEN as u64))
             .ok_or_else(|| Error::InvalidTable("table length overflow".to_owned()))?;
         drop(self.writer);
-        fs::rename(&self.tmp_path, &self.path).map_err(|source| Error::Io {
+        fs::rename(&self.tmp_file.path, &self.path).map_err(|source| Error::Io {
             path: self.path.clone(),
             source,
         })?;
+        self.tmp_file.disarm();
         sync_parent(&self.path)?;
 
         Ok(TableMeta {
@@ -1193,6 +1218,24 @@ mod tests {
 
     fn base_writer(directory: &TempDir) -> TableWriter {
         TableWriter::create_base(directory.path(), "base.sst", 7, 2, "base-v1").unwrap()
+    }
+
+    #[test]
+    fn dropping_unfinished_writer_removes_its_temp_file() {
+        let directory = TempDir::new().unwrap();
+        let writer = TableWriter::create_patch(
+            directory.path(),
+            "patch-00000000000000000001.sst",
+            1,
+            0,
+            "patch-v1",
+        )
+        .unwrap();
+        let temp = directory.path().join("patch-00000000000000000001.sst.tmp");
+
+        assert!(temp.exists());
+        drop(writer);
+        assert!(!temp.exists());
     }
 
     #[test]

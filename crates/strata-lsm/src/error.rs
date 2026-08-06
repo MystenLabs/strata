@@ -54,6 +54,9 @@ pub enum Error {
     #[error("LSM LSN overflow")]
     LsnOverflow,
 
+    #[error("LSM table ID overflow")]
+    TableIdOverflow,
+
     #[error("invalid encoded record reference length {actual}, expected {expected}")]
     InvalidRecordRefEncoding { expected: usize, actual: usize },
 

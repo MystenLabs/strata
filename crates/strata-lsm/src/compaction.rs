@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     CompactionReservation, Error, GarbageRecord, Manifest, ManifestEdit, MergeOperator, Result,
-    TableMeta, TableReader, TableStore, TableWriter, table::TableCursor,
+    TableMeta, TableReader, TableStore, TableTarget, TableWriter, table::TableCursor,
 };
 
 /// Files reserved for one compaction and their complete key bounds.
@@ -318,13 +318,13 @@ pub fn merge_compaction(
 /// Writes a prepared compaction and returns its manifest edit and derived garbage records.
 ///
 /// `target_file_size` is a soft limit because one key is never split. `next_output` must return a
-/// unique table ID and relative path each time a new output file is needed. Finished files are
+/// a fresh allocator-owned target each time a new output file is needed. Finished files are
 /// synced, but this function does not publish the edit or delete input files.
 pub fn write_compaction(
     inputs: &CompactionInputs,
     merge: &dyn MergeOperator,
     target_file_size: u64,
-    mut next_output: impl FnMut() -> (u64, String),
+    mut next_output: impl FnMut() -> Result<TableTarget>,
 ) -> Result<(ManifestEdit, Vec<GarbageRecord>)> {
     if target_file_size == 0 {
         return Err(Error::InvalidTable(
@@ -347,7 +347,7 @@ pub fn write_compaction(
         merge,
         |key, key_prefix_len, value| {
             if writer.is_none() {
-                let (id, path) = next_output();
+                let (id, path) = next_output()?.into_base_parts()?;
                 writer = Some(TableWriter::create_base(
                     root,
                     path,
@@ -401,7 +401,7 @@ pub fn write_patch_compaction(
     inputs: &CompactionInputs,
     merge: &dyn MergeOperator,
     target_file_size: u64,
-    mut next_output: impl FnMut() -> (u64, String),
+    mut next_output: impl FnMut() -> Result<TableTarget>,
 ) -> Result<(ManifestEdit, Vec<GarbageRecord>)> {
     if target_file_size == 0 {
         return Err(Error::InvalidTable(
@@ -469,7 +469,7 @@ pub fn write_patch_compaction(
         })?;
 
         if writer.is_none() {
-            let (id, path) = next_output();
+            let (id, path) = next_output()?.into_patch_parts()?;
             writer = Some(TableWriter::create_patch(
                 root,
                 path,

@@ -2,7 +2,7 @@ use std::{num::NonZeroU32, path::Path, sync::Arc};
 
 use strata_lsm::{
     GarbageRecord, Manifest, ManifestEdit, MergeOperator, Result, Snapshot, StrataLsn, TableMeta,
-    TableStore, TableWriter, select_patch_compaction_inputs, write_patch_compaction,
+    TableStore, TableTarget, TableWriter, select_patch_compaction_inputs, write_patch_compaction,
 };
 use tempfile::TempDir;
 
@@ -61,8 +61,7 @@ fn partial_compaction_replaces_only_patch_files() {
         .unwrap();
 
     let (edit, garbage) =
-        write_patch_compaction(&inputs, &Append, u64::MAX, || (4, "merged.sst".to_owned()))
-            .unwrap();
+        write_patch_compaction(&inputs, &Append, u64::MAX, || Ok(TableTarget::patch(4))).unwrap();
 
     assert!(garbage.is_empty());
     assert_eq!(edit.add_base, Vec::new());

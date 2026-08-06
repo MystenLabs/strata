@@ -24,8 +24,8 @@ use std::{
 };
 
 use prometheus::{
-    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry, TextEncoder,
 };
 use rocksdb::{DB, Env, statistics::Ticker};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,15 @@ const DEFAULT_CONTROL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_CONTROLLER_DEBOUNCE_WINDOWS: usize = 3;
 const DEFAULT_WRITER_INCREASE_PERCENT: u64 = 25;
 const DEFAULT_WRITER_DECREASE_PERCENT: u64 = 25;
+const CONTROLLER_UNHEALTHY_REASONS: &[&str] = &[
+    "low_read_rate",
+    "high_read_latency",
+    "overdue_deletes",
+    "read_errors",
+    "correctness_errors",
+    "put_errors",
+    "delete_errors",
+];
 const DEFAULT_SPACE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_DELETED_SAMPLE_CAPACITY: usize = 1_000_000;
 const DEFAULT_STARTING_EPOCH: Epoch = 1;
@@ -615,6 +624,7 @@ struct HarnessMetrics {
     active_write_workers: IntGauge,
     client_load_active: IntGauge,
     controller_healthy: IntGauge,
+    controller_unhealthy: IntGaugeVec,
     controller_debounce_streak_windows: IntGauge,
     controller_read_p99_seconds: Gauge,
     controller_read_ops_per_second: Gauge,
@@ -738,6 +748,17 @@ impl HarnessMetrics {
                 600.0,
             ]),
         )?;
+        let controller_unhealthy = IntGaugeVec::new(
+            Opts::new(
+                "strata_realistic_bench_controller_unhealthy",
+                "One for each failed controller obligation in the latest control window.",
+            )
+            .const_label("engine", engine.as_str()),
+            &["reason"],
+        )?;
+        for reason in CONTROLLER_UNHEALTHY_REASONS {
+            controller_unhealthy.with_label_values(&[*reason]).set(0);
+        }
 
         macro_rules! int_gauge {
             ($name:literal, $help:literal) => {
@@ -787,6 +808,7 @@ impl HarnessMetrics {
                 "strata_realistic_bench_controller_healthy",
                 "One when the latest read/delete service window met its obligations."
             ),
+            controller_unhealthy,
             controller_debounce_streak_windows: int_gauge!(
                 "strata_realistic_bench_controller_debounce_streak_windows",
                 "Consecutive controller windows with the current health result since the last writer-count change."
@@ -873,6 +895,7 @@ impl HarnessMetrics {
         registry.register(Box::new(metrics.retired_payload_bytes.clone()))?;
         registry.register(Box::new(metrics.read_outcomes.clone()))?;
         registry.register(Box::new(metrics.correctness_errors.clone()))?;
+        registry.register(Box::new(metrics.controller_unhealthy.clone()))?;
         registry.register(Box::new(metrics.delete_due.clone()))?;
         registry.register(Box::new(metrics.delete_timely.clone()))?;
         registry.register(Box::new(metrics.delete_late.clone()))?;
@@ -1724,13 +1747,23 @@ fn run_controller(context: Arc<WorkloadContext>) {
             .oldest_overdue_seconds
             .set(backlog.oldest_lag.as_secs_f64());
 
-        let healthy = read_rate >= required_read_rate
-            && read_p99 <= context.config.read_p99_slo
-            && backlog.matured_overdue_keys == 0
-            && window.read_errors == 0
-            && window.correctness_errors == 0
-            && window.put_errors == 0
-            && window.delete_errors == 0;
+        let unhealthy = [
+            ("low_read_rate", read_rate < required_read_rate),
+            ("high_read_latency", read_p99 > context.config.read_p99_slo),
+            ("overdue_deletes", backlog.matured_overdue_keys != 0),
+            ("read_errors", window.read_errors != 0),
+            ("correctness_errors", window.correctness_errors != 0),
+            ("put_errors", window.put_errors != 0),
+            ("delete_errors", window.delete_errors != 0),
+        ];
+        for (reason, active) in unhealthy {
+            context
+                .metrics
+                .controller_unhealthy
+                .with_label_values(&[reason])
+                .set(i64::from(active));
+        }
+        let healthy = unhealthy.iter().all(|(_, active)| !active);
         context.metrics.controller_healthy.set(i64::from(healthy));
         let should_adjust = debounce.observe(healthy, context.config.controller_debounce_windows);
         context

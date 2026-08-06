@@ -3,8 +3,8 @@ use std::{num::NonZeroU32, path::Path, sync::Arc};
 use strata_core::{BlobKey, RecordRef, SegmentGcSummaryDelta};
 use strata_lsm::{
     GarbageEvent, GarbageRecord, Manifest, ManifestEdit, MergeOperator, Result, SegmentKey,
-    Snapshot, StrataLsn, TableMeta, TableReader, TableStore, TableWriter, select_compaction_inputs,
-    write_compaction,
+    Snapshot, StrataLsn, TableMeta, TableReader, TableStore, TableTarget, TableWriter,
+    select_compaction_inputs, write_compaction,
 };
 use tempfile::TempDir;
 
@@ -50,7 +50,7 @@ fn writes_split_outputs_and_returns_the_publishable_edit() {
         || {
             let id = next_id;
             next_id += 1;
-            (id, format!("output/{id}.sst"))
+            Ok(TableTarget::base(id))
         },
     )
     .unwrap();
@@ -107,10 +107,8 @@ fn preserves_explicit_key_prefixes() {
         .unwrap()
         .unwrap();
 
-    let (edit, _) = write_compaction(&inputs, &Apply, u64::MAX, || {
-        (10, "output/prefix.sst".to_owned())
-    })
-    .unwrap();
+    let (edit, _) =
+        write_compaction(&inputs, &Apply, u64::MAX, || Ok(TableTarget::base(10))).unwrap();
 
     let reader = TableReader::open_base(directory.path(), &edit.add_base[0], "base-v1").unwrap();
     let mut rows = Vec::new();

@@ -3,7 +3,10 @@ use std::{
     fs, mem,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use strata_core::RecordRef;
@@ -86,6 +89,69 @@ pub struct RolledMemtable {
     pub generation: u64,
 }
 
+/// One allocator-owned immutable-table identity and its canonical relative path.
+///
+/// Keeping these together prevents callers from reserving an ID and independently constructing a
+/// different or duplicate filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableTarget {
+    kind: TableTargetKind,
+    id: u64,
+    relative_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableTargetKind {
+    Base,
+    Patch,
+}
+
+impl TableTarget {
+    /// Creates the canonical target for a base table ID.
+    pub fn base(id: u64) -> Self {
+        Self {
+            kind: TableTargetKind::Base,
+            id,
+            relative_path: format!("base-{id:020}.sst"),
+        }
+    }
+
+    /// Creates the canonical target for a patch table ID.
+    pub fn patch(id: u64) -> Self {
+        Self {
+            kind: TableTargetKind::Patch,
+            id,
+            relative_path: format!("patch-{id:020}.sst"),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub fn into_base_parts(self) -> Result<(u64, String)> {
+        self.into_parts(TableTargetKind::Base)
+    }
+
+    pub fn into_patch_parts(self) -> Result<(u64, String)> {
+        self.into_parts(TableTargetKind::Patch)
+    }
+
+    fn into_parts(self, expected: TableTargetKind) -> Result<(u64, String)> {
+        if self.kind != expected {
+            return Err(Error::InvalidTable(format!(
+                "table target kind mismatch: expected {expected:?}, got {:?}",
+                self.kind
+            )));
+        }
+        Ok((self.id, self.relative_path))
+    }
+}
+
 /// Result of one visible logical write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteResult {
@@ -135,6 +201,7 @@ pub struct Lsm {
     max_frozen_generations: usize,
     halted: Mutex<Option<String>>,
     flush_lock: Mutex<()>,
+    next_table_id: AtomicU64,
 }
 
 impl Lsm {
@@ -217,6 +284,7 @@ impl Lsm {
             &mut partitions,
         )?;
 
+        let next_table_id = manifest.next_table_id;
         Ok(Self {
             tables,
             writes: Mutex::new(WriteState {
@@ -234,6 +302,7 @@ impl Lsm {
             max_frozen_generations: options.max_frozen_generations.get(),
             halted: Mutex::new(None),
             flush_lock: Mutex::new(()),
+            next_table_id: AtomicU64::new(next_table_id),
         })
     }
 
@@ -400,6 +469,39 @@ impl Lsm {
         Arc::clone(&lock(&self.memory).manifest)
     }
 
+    /// Allocates one patch-table identity and its canonical filesystem path.
+    pub fn allocate_patch_target(&self) -> Result<TableTarget> {
+        self.allocate_table_target(TableTargetKind::Patch)
+    }
+
+    /// Allocates one base-table identity and its canonical filesystem path.
+    pub fn allocate_base_target(&self) -> Result<TableTarget> {
+        self.allocate_table_target(TableTargetKind::Base)
+    }
+
+    fn allocate_table_target(&self, kind: TableTargetKind) -> Result<TableTarget> {
+        let manifest_floor = self.manifest().next_table_id;
+        let mut current = self.next_table_id.load(Ordering::Relaxed);
+        loop {
+            let id = current.max(manifest_floor);
+            let next = id.checked_add(1).ok_or(Error::TableIdOverflow)?;
+            match self.next_table_id.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(match kind {
+                        TableTargetKind::Base => TableTarget::base(id),
+                        TableTargetKind::Patch => TableTarget::patch(id),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Shared table store for compaction and obsolete-file cleanup.
     pub fn table_store(&self) -> Arc<TableStore> {
         Arc::clone(&self.tables)
@@ -447,8 +549,7 @@ impl Lsm {
     pub fn flush_one(
         &self,
         partition: u32,
-        id: u64,
-        relative_path: impl Into<String>,
+        target: TableTarget,
         publish: impl FnOnce(&ManifestEdit) -> Result<Manifest>,
     ) -> Result<Option<TableMeta>> {
         let _flush = lock(&self.flush_lock);
@@ -464,6 +565,7 @@ impl Lsm {
                 state.last_visible_lsn.unwrap_or_default(),
             )
         };
+        let (id, relative_path) = target.into_patch_parts()?;
         let meta = frozen.flush(
             self.tables.root(),
             relative_path,
@@ -1254,7 +1356,12 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU32, sync::Arc};
+    use std::{
+        collections::HashSet,
+        num::NonZeroU32,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use strata_core::RecordRef;
     use tempfile::TempDir;
@@ -1282,6 +1389,52 @@ mod tests {
             key: key.to_vec(),
             value: value.to_vec(),
         }
+    }
+
+    #[test]
+    fn one_lsm_allocates_unique_canonical_table_targets() {
+        let directory = TempDir::new().unwrap();
+        let lsm = open(&directory, Vec::new());
+        let barrier = Arc::new(Barrier::new(3));
+        let mut allocators = Vec::new();
+
+        for patch in [true, false] {
+            let lsm = Arc::clone(&lsm);
+            let barrier = Arc::clone(&barrier);
+            allocators.push(thread::spawn(move || {
+                barrier.wait();
+                (0..1_000)
+                    .map(|_| {
+                        if patch {
+                            lsm.allocate_patch_target().unwrap()
+                        } else {
+                            lsm.allocate_base_target().unwrap()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        barrier.wait();
+        let targets = allocators
+            .into_iter()
+            .flat_map(|allocator| allocator.join().unwrap())
+            .collect::<Vec<_>>();
+        let ids = targets.iter().map(TableTarget::id).collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), 2_000);
+        assert_eq!(ids.iter().copied().min(), Some(1));
+        assert_eq!(ids.iter().copied().max(), Some(2_000));
+        assert!(targets.iter().all(|target| {
+            target.relative_path() == format!("patch-{:020}.sst", target.id())
+                || target.relative_path() == format!("base-{:020}.sst", target.id())
+        }));
+    }
+
+    #[test]
+    fn table_targets_reject_the_wrong_writer_kind() {
+        assert!(TableTarget::patch(1).into_base_parts().is_err());
+        assert!(TableTarget::base(2).into_patch_parts().is_err());
     }
 
     #[test]

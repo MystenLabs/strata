@@ -126,17 +126,21 @@ impl RelocationStore {
         let table_store = self.lsm.table_store();
         let table_root = table_store.root();
         let mut tables = Vec::with_capacity(partitioned.len());
-        let mut next_table_id = manifest.next_table_id;
         for (partition, sorted) in partitioned {
-            if next_table_id == u64::MAX {
-                remove_prepared_tables(table_root, &tables);
-                return Err(Error::InvalidRelocation(
-                    "relocation table id overflow".to_owned(),
-                ));
-            }
-            let table_id = next_table_id;
-            next_table_id += 1;
-            let relative_path = format!("patch-{table_id:020}.sst");
+            let target = match self.lsm.allocate_patch_target() {
+                Ok(target) => target,
+                Err(error) => {
+                    remove_prepared_tables(table_root, &tables);
+                    return Err(error.into());
+                }
+            };
+            let (table_id, relative_path) = match target.into_patch_parts() {
+                Ok(parts) => parts,
+                Err(error) => {
+                    remove_prepared_tables(table_root, &tables);
+                    return Err(error.into());
+                }
+            };
             let tmp_path = table_root.join(format!("{relative_path}.tmp"));
             let table = match (|| -> strata_lsm::Result<TableMeta> {
                 let mut writer = TableWriter::create_patch(
