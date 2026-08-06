@@ -421,11 +421,11 @@ impl LsmCompactor {
     /// behind the latest epoch transition. For example, a base last merged at LSN 40 is selected
     /// after an epoch change at LSN 50 even when no user has written a patch over that key range.
     ///
-    /// The durability gate. Every input patch must have max_lsn <= published_lsn. Compaction is
-    /// about to emit garbage events describing retirements it discovers while folding; if it
-    /// folded rows that are not durably published yet, a crash could un-happen those rows while
-    /// the garbage describing their death survived — accounting for events that never occurred.
-    /// So unpublished patches simply wait for the next durability publication.
+    /// The durability gate. Compaction sees only the temporal patch prefix that is fully below
+    /// published_lsn. Newer patches stay live in the real manifest but are absent from the
+    /// selection view, so their key-range overlap cannot starve older durable patches. The merge
+    /// snapshot stops before the first excluded patch: compaction must not apply a global event
+    /// without seeing an earlier mutation held in a patch that straddles published_lsn.
     ///
     /// Two shapes of pass. Count pressure runs a *partial* pass: coalesce many small patches into
     /// fewer big ones — cheap, no relocation healing, no shard fencing. Byte pressure or the
@@ -468,7 +468,37 @@ impl LsmCompactor {
             .read()
             .expect("compaction admission lock poisoned");
         let manifest = lsm.manifest();
-        let partition_manifest = &manifest.partitions[&partition];
+        let published_lsn = self.index.get_published_lsn()?;
+        let mut compaction_manifest = (*manifest).clone();
+        let partition_patches = &compaction_manifest
+            .partitions
+            .get(&partition)
+            .expect("validated manifest contains every partition")
+            .patches;
+        let compact_through_lsn = partition_patches
+            .iter()
+            .filter(|patch| {
+                patch.max_lsn.expect("validated patch has a maximum LSN") > published_lsn
+            })
+            .map(|patch| {
+                patch
+                    .min_lsn
+                    .expect("validated patch has a minimum LSN")
+                    .saturating_sub(1)
+            })
+            .min()
+            .map_or(published_lsn, |before_pending| {
+                published_lsn.min(before_pending)
+            });
+        compaction_manifest
+            .partitions
+            .get_mut(&partition)
+            .expect("validated manifest contains every partition")
+            .patches
+            .retain(|patch| {
+                patch.max_lsn.expect("validated patch has a maximum LSN") <= compact_through_lsn
+            });
+        let partition_manifest = &compaction_manifest.partitions[&partition];
         let patches = &partition_manifest.patches;
         let patch_bytes = patches
             .iter()
@@ -479,20 +509,12 @@ impl LsmCompactor {
         {
             return Ok(());
         }
-        let published_lsn = self.index.get_published_lsn()?;
-        if patches
-            .iter()
-            .any(|table| table.max_lsn.is_none_or(|lsn| lsn > published_lsn))
-        {
-            return Ok(());
-        }
-
         // The LSM frontier proves that every earlier keyed mutation is represented in SSTs;
         // publication is the store-wide durability bound for RocksDB-only transitions.
         let materialized_through_lsn = manifest
             .materialized_through
             .unwrap_or_default()
-            .min(published_lsn);
+            .min(compact_through_lsn);
         let emit_garbage_from_lsn = self
             .index
             .get_blob_compaction_garbage_from_lsn()?
@@ -533,11 +555,11 @@ impl LsmCompactor {
         }
         let tables = lsm.table_store();
         let selected = if partial {
-            select_patch_compaction_inputs(&manifest, &tables, partition, patches)
+            select_patch_compaction_inputs(&compaction_manifest, &tables, partition, patches)
         } else if let Some(base) = stale_base {
-            select_base_compaction_inputs(&manifest, &tables, partition, base)
+            select_base_compaction_inputs(&compaction_manifest, &tables, partition, base)
         } else {
-            select_compaction_inputs(&manifest, &tables, partition, patches)
+            select_compaction_inputs(&compaction_manifest, &tables, partition, patches)
         };
         let Some(inputs) = selected? else {
             return Ok(());

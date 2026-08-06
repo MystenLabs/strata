@@ -12,6 +12,7 @@ use std::{
 use prometheus::Registry;
 use strata_core::{BlobLifecycle, EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcRecordRange};
 use strata_gc::{DestinationClass, GcAction, GcCopyRecord, GcPlanner, GcPlannerConfig, GcScenario};
+use strata_lsm::{TableWriter, encode_inline_value};
 use tempfile::tempdir;
 use typed_store::{
     DBMetrics,
@@ -19,7 +20,9 @@ use typed_store::{
 };
 
 use super::*;
-use crate::relocation::RelocationEntry;
+use crate::{
+    blob_lsm::BlobMutation, maintenance::publish_blob_lsm_edit, relocation::RelocationEntry,
+};
 
 mod garbage_log;
 
@@ -2950,6 +2953,86 @@ async fn put_overwrite_materializes_the_latest_lsm_version() {
     assert_eq!(latest.head_lsn, second_lsn);
     assert_eq!(first_record_ref.segment_id, FIRST_SEGMENT_ID);
     assert_eq!(latest.record_ref.segment_id, FIRST_SEGMENT_ID);
+}
+
+#[tokio::test]
+async fn main_compaction_does_not_wait_for_a_newer_overlapping_patch() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.gc_workers_enabled = false;
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
+    let store = try_open_standalone_store(cfg, metrics).unwrap();
+    let lsm = store.lsm().unwrap();
+
+    let compaction_guard = store
+        .compaction_admission_lock
+        .write()
+        .expect("compaction admission lock poisoned");
+    let value = encode_inline_value(
+        &BlobMutation::Tombstone {
+            shard: STANDALONE_SHARD,
+        }
+        .encode_inline()
+        .unwrap(),
+    );
+    let mut patches = Vec::new();
+    for lsn in 1..=9 {
+        let path = format!("test-patch-{lsn}.sst");
+        let mut writer =
+            TableWriter::create_patch(lsm.table_store().root(), path, lsn, 0, LSM_PATCH_FORMAT)
+                .unwrap();
+        writer.add_patch(b"same-key", lsn, &value).unwrap();
+        patches.push(writer.finish().unwrap());
+    }
+    let published = publish_blob_lsm_edit(
+        store.index(),
+        &ManifestEdit {
+            remove: Vec::new(),
+            add_base: Vec::new(),
+            add_patches: patches,
+            materialized_through: None,
+            wal_retained_from: None,
+        },
+    )
+    .unwrap();
+    lsm.install_manifest(published).unwrap();
+
+    let mut batch = store.index().batch();
+    store
+        .index()
+        .put_published_lsn_batch(&mut batch, 8)
+        .unwrap();
+    store.index().put_next_lsn_batch(&mut batch, 10).unwrap();
+    batch.write_with_sync(true).unwrap();
+    drop(compaction_guard);
+    store.lsm_compact_tx.as_ref().unwrap().send(()).unwrap();
+
+    let started = Instant::now();
+    loop {
+        let manifest = lsm.manifest();
+        let old_patches_remain = manifest.partitions[&0]
+            .patches
+            .iter()
+            .any(|patch| patch.relative_path == "test-patch-1.sst");
+        if histogram_sample_count(&registry, "strata_store_main_compaction_duration_seconds") >= 1
+            && !old_patches_remain
+        {
+            assert!(
+                manifest.partitions[&0]
+                    .patches
+                    .iter()
+                    .any(|patch| patch.relative_path == "test-patch-9.sst")
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "durable patches were not compacted past the newer overlapping patch"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[tokio::test]
