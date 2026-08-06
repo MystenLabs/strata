@@ -198,7 +198,6 @@ impl WriteCoordinator {
         loop {
             self.process_ready_durability();
             self.store_halt.check()?;
-            self.maybe_start_durability_publish(false)?;
             if unsealed_ingest_segment_count(&self.index)? < self.config.max_unsealed_segments {
                 if waiting {
                     self.metrics
@@ -207,6 +206,7 @@ impl WriteCoordinator {
                 }
                 return Ok(());
             }
+            self.maybe_start_durability_publish(false)?;
             if !waiting {
                 waiting = true;
                 self.metrics.start_seal_backpressure_wait();

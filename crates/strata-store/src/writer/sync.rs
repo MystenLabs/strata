@@ -191,10 +191,14 @@ impl WriteCoordinator {
         let age_due = self
             .oldest_unpublished_at
             .is_some_and(|started| started.elapsed() >= DURABILITY_PUBLISH_INTERVAL);
-        let pressure_due = self.wal.pending_bytes() >= DURABILITY_PUBLISH_WAL_BYTES
-            || self.pending_segment_bytes >= DURABILITY_PUBLISH_SEGMENT_BYTES;
+        let segment_pressure_due = self.pending_segment_bytes >= DURABILITY_PUBLISH_SEGMENT_BYTES;
+        let pressure_due =
+            self.wal.pending_bytes() >= DURABILITY_PUBLISH_WAL_BYTES || segment_pressure_due;
         if !force && !age_due && !pressure_due {
             return Ok(false);
+        }
+        if segment_pressure_due && self.segment.write_offset() > self.durable_offset {
+            self.process_segment_rollover()?;
         }
         Ok(self.start_durability_publish(force)?.is_some())
     }
@@ -291,16 +295,15 @@ impl WriteCoordinator {
                         });
                     }
                     state.durable_offset = state.durable_offset.max(segment.durable_offset);
-                    if state.state == SegmentFileState::Sealing {
-                        let sealed_before_lsn =
-                            segment
-                                .sealed_before_lsn
-                                .ok_or_else(|| Error::InvariantViolation {
-                                    reason: format!(
-                                        "sealing segment {} is missing its LSN boundary",
-                                        segment.segment_id
-                                    ),
-                                })?;
+                    if let Some(sealed_before_lsn) = segment.sealed_before_lsn {
+                        if state.state != SegmentFileState::Sealing {
+                            return Err(Error::InvariantViolation {
+                                reason: format!(
+                                    "segment {} was captured for sealing but is {:?}",
+                                    segment.segment_id, state.state
+                                ),
+                            });
+                        }
                         state.state = SegmentFileState::Sealed;
                         state.sealed_before_lsn = Some(sealed_before_lsn);
                         state.sealed_len = Some(segment.durable_offset);
@@ -438,7 +441,7 @@ impl WriteCoordinator {
             started,
         });
         if self.durability_in_flight_lsn.is_none()
-            && let Err(error) = self.maybe_start_durability_publish(true)
+            && let Err(error) = self.start_durability_publish(true)
         {
             self.halt_writer_error("start explicit durability publication", &error);
             self.fail_pending_sync_requests();

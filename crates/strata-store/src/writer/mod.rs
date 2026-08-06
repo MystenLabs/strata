@@ -83,8 +83,12 @@ impl WriteCoordinator {
         match self.finish_durability_publish(ready) {
             Ok((published_lsn, phases)) => {
                 self.complete_sync_requests(published_lsn, &phases);
-                let force = !self.pending_sync_requests.is_empty();
-                if let Err(error) = self.maybe_start_durability_publish(force) {
+                let result = if self.pending_sync_requests.is_empty() {
+                    self.maybe_start_durability_publish(false).map(|_| ())
+                } else {
+                    self.start_durability_publish(true).map(|_| ())
+                };
+                if let Err(error) = result {
                     self.halt_writer_error("start follow-up durability publication", &error);
                     self.fail_pending_sync_requests();
                 }

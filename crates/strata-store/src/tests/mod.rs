@@ -2793,6 +2793,7 @@ async fn sync_advances_durable_offset_after_segment_fsync() {
         .get_segment_state(FIRST_SEGMENT_ID)
         .unwrap()
         .unwrap();
+    assert_eq!(synced.state, SegmentFileState::Open);
     assert_eq!(synced.durable_offset, unsynced.write_offset);
     assert_eq!(synced.write_offset, unsynced.write_offset);
     assert_eq!(store.published_lsn().unwrap(), 1);
@@ -5100,14 +5101,20 @@ async fn rollover_switches_active_segment_and_durability_seals_old_segment() {
 }
 
 #[tokio::test]
-async fn asynchronous_durability_wait_does_not_block_following_write() {
+async fn segment_pressure_rolls_before_asynchronous_durability() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
-    cfg.max_unsealed_segments = 2;
+    cfg.max_unsealed_segments = 3;
     ensure_ingest_dir(&cfg).unwrap();
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     ensure_epoch_initialized(&index, cfg.starting_epoch).unwrap();
+    index
+        .put_shard_info(
+            STANDALONE_SHARD.id,
+            ShardInfo::active(STANDALONE_SHARD.generation),
+        )
+        .unwrap();
     let registry = Registry::new();
     let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
     let gc_concurrency = Arc::new(GcConcurrencyController::new(
@@ -5179,31 +5186,35 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
     };
 
     let (first_response_tx, first_response_rx) = mpsc::channel();
-    coordinator
-        .submit_batch(vec![BatchOp::IncrementEpoch], first_response_tx, None)
+    let (_, put_metrics) = coordinator
+        .submit_batch(
+            vec![BatchOp::Put {
+                shard_id: STANDALONE_SHARD.id,
+                key: BlobKey::new(b"durability-pressure".to_vec()).unwrap(),
+                payload: Arc::from(&b"payload"[..]),
+            }],
+            first_response_tx,
+            None,
+        )
         .unwrap();
     assert_eq!(
         first_response_rx.recv().unwrap().unwrap().last_lsn(),
         Some(1)
     );
-    coordinator.note_committed_write(0).unwrap();
-
-    coordinator.process_segment_rollover().unwrap();
-    assert_eq!(coordinator.pending_segment_syncs.len(), 1);
-    assert_eq!(coordinator.durability_in_flight_lsn, None);
+    let record_bytes = put_metrics[0].record_bytes;
+    coordinator.pending_segment_bytes = DURABILITY_PUBLISH_SEGMENT_BYTES - record_bytes;
+    coordinator.note_committed_write(record_bytes).unwrap();
+    assert!(coordinator.pending_segment_syncs.is_empty());
+    assert_eq!(coordinator.durability_in_flight_lsn, Some(1));
 
     let old_state = index.get_segment_state(1).unwrap().unwrap();
     assert_eq!(old_state.state, SegmentFileState::Sealing);
-    assert_eq!(old_state.write_offset, 0);
+    assert_eq!(old_state.write_offset, record_bytes);
     assert_eq!(old_state.sealed_before_lsn, Some(2));
     let new_state = index.get_segment_state(2).unwrap().unwrap();
     assert_eq!(new_state.state, SegmentFileState::Open);
     assert_eq!(index.get_segment_published_at_lsn(2).unwrap(), 2);
 
-    coordinator.pending_segment_bytes = DURABILITY_PUBLISH_SEGMENT_BYTES;
-    assert!(coordinator.maybe_start_durability_publish(false).unwrap());
-    assert!(coordinator.pending_segment_syncs.is_empty());
-    assert_eq!(coordinator.durability_in_flight_lsn, Some(1));
     let (second_response_tx, second_response_rx) = mpsc::channel();
     coordinator
         .submit_batch(vec![BatchOp::IncrementEpoch], second_response_tx, None)
@@ -5222,6 +5233,7 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
         coordinator.write_rx.recv_timeout(Duration::from_millis(50)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
+    coordinator.process_segment_rollover().unwrap();
     let sync_handle = thread::spawn(move || segment_syncer.run());
     coordinator.wait_for_seal_backlog_capacity().unwrap();
     assert_eq!(index.get_published_lsn().unwrap(), 1);
@@ -5229,6 +5241,10 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
     assert_eq!(
         index.get_segment_state(1).unwrap().unwrap().state,
         SegmentFileState::Sealed
+    );
+    assert_eq!(
+        index.get_segment_state(2).unwrap().unwrap().state,
+        SegmentFileState::Sealing
     );
     drop(coordinator);
     sync_handle.join().unwrap();
