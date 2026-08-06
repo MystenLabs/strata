@@ -3036,6 +3036,14 @@ async fn main_compaction_does_not_wait_for_a_newer_overlapping_patch() {
                     .iter()
                     .any(|patch| patch.relative_path == "test-patch-9.sst")
             );
+            assert_eq!(
+                gauge_value(&registry, "strata_store_main_minor_compaction_lsn"),
+                8
+            );
+            assert_eq!(
+                gauge_value(&registry, "strata_store_main_full_compaction_lsn"),
+                0
+            );
             break;
         }
         assert!(

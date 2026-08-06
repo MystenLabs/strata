@@ -36,6 +36,7 @@ use crate::{
     RELOCATION_LSM_MANIFEST, Result, StoreHalt, StrataStoreConfig, StrataStoreMetrics,
     blob_lsm::{BlobCompactionSnapshot, BlobMergeWithRelocations},
     gc::GcCommand,
+    metrics::MainCompactionKind,
     relocation::{RelocationCache, RelocationMerge, RelocationStore},
 };
 use strata_core::SegmentFileState;
@@ -674,6 +675,12 @@ impl LsmCompactor {
             })?;
         lsm.install_manifest(published)?;
         self.metrics.record_main_compaction(
+            if partial {
+                MainCompactionKind::Minor
+            } else {
+                MainCompactionKind::Full
+            },
+            compact_through_lsn,
             healed_references,
             input_bytes,
             output_bytes,

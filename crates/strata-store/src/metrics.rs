@@ -54,6 +54,8 @@ struct PrometheusMetrics {
     main_compaction_duration_seconds: Histogram,
     main_compaction_input_bytes_total: IntCounter,
     main_compaction_output_bytes_total: IntCounter,
+    main_minor_compaction_lsn: IntGauge,
+    main_full_compaction_lsn: IntGauge,
     relocation_compaction_entries_examined_total: IntCounter,
     relocation_compaction_entries_dropped_total: IntCounter,
     relocation_compaction_duration_seconds: Histogram,
@@ -309,6 +311,18 @@ impl StrataStoreMetrics {
                     &labels,
                     "main_compaction_output_bytes_total",
                     "Encoded main SST output bytes created by successful compactions; this is not a device I/O counter.",
+                )?,
+                main_minor_compaction_lsn: register_gauge(
+                    registry,
+                    &labels,
+                    "main_minor_compaction_lsn",
+                    "Highest durable LSN cutoff processed by a successful minor main LSM compaction in this process.",
+                )?,
+                main_full_compaction_lsn: register_gauge(
+                    registry,
+                    &labels,
+                    "main_full_compaction_lsn",
+                    "Highest durable LSN cutoff processed by a successful full main LSM compaction in this process.",
                 )?,
                 relocation_compaction_entries_examined_total: register_counter(
                     registry,
@@ -869,6 +883,8 @@ impl StrataStoreMetrics {
 
     pub(crate) fn record_main_compaction(
         &self,
+        kind: MainCompactionKind,
+        compacted_through_lsn: StrataLsn,
         healed: u64,
         input_bytes: u64,
         output_bytes: u64,
@@ -889,6 +905,11 @@ impl StrataStoreMetrics {
         metrics
             .main_compaction_output_bytes_total
             .inc_by(output_bytes);
+        let lsn = match kind {
+            MainCompactionKind::Minor => &metrics.main_minor_compaction_lsn,
+            MainCompactionKind::Full => &metrics.main_full_compaction_lsn,
+        };
+        lsn.set(lsn.get().max(to_i64(compacted_through_lsn)));
     }
 
     pub(crate) fn record_relocation_compaction(
@@ -1252,6 +1273,12 @@ pub(crate) struct PutMetric {
     pub record_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MainCompactionKind {
+    Minor,
+    Full,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GcKnownDelta {
     pub total_bytes: i128,
@@ -1482,7 +1509,16 @@ mod tests {
         metrics.record_relocation_lookup(Err(()), Duration::from_millis(1));
         metrics.record_relocation_cache_lookup(true);
         metrics.record_relocation_cache_lookup(false);
-        metrics.record_main_compaction(4, 2_000, 900, Duration::from_millis(2));
+        metrics.record_main_compaction(
+            MainCompactionKind::Full,
+            120,
+            4,
+            2_000,
+            900,
+            Duration::from_millis(2),
+        );
+        metrics.record_main_compaction(MainCompactionKind::Minor, 140, 0, 0, 0, Duration::ZERO);
+        metrics.record_main_compaction(MainCompactionKind::Minor, 130, 0, 0, 0, Duration::ZERO);
         metrics.record_relocation_compaction(10, 3, 1_000, 400, Duration::from_millis(3));
 
         for result in ["hit", "miss", "error"] {
@@ -1519,6 +1555,14 @@ mod tests {
         assert_eq!(
             metric_value(&registry, "strata_store_main_compaction_output_bytes_total"),
             900.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_main_minor_compaction_lsn"),
+            140.0
+        );
+        assert_eq!(
+            metric_value(&registry, "strata_store_main_full_compaction_lsn"),
+            120.0
         );
         assert_eq!(
             metric_value(
