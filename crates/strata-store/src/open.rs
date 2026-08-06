@@ -40,10 +40,7 @@ use crate::{
         recover_store_wal_prefix, recover_unsealed_segments,
     },
     relocation::{RelocationCache, RelocationEntry, RelocationStore},
-    seal::{
-        SealWorker, active_segment_durable_offset, enqueue_unsealed_segments_for_sealing,
-        verify_sealed_segments,
-    },
+    seal::{active_segment_durable_offset, seal_recovered_segments, verify_sealed_segments},
     segment_state::{
         SegmentAllocationTracker, publish_active_segment_state, unsealed_ingest_segment_count,
     },
@@ -111,8 +108,8 @@ impl StrataStore {
     /// 3. Sealed segments are only *verified*; they were declared immutable at seal time, so
     ///    anything wrong with them is an error, not something to repair silently.
     /// 4. Only then are the workers started. The LSM flusher publishes immutable memtables, a
-    ///    separate compactor merges durable tables, the sealer handles segment rollovers, and GC
-    ///    publishes relocation L0s on its independent path.
+    ///    separate compactor merges durable tables, and GC publishes relocation L0s on its
+    ///    independent path.
     ///
     /// Foreground segment/WAL state remains writer-owned; GC only shares the index, relocation
     /// LSM, and the small publication locks needed for atomic activation.
@@ -135,8 +132,9 @@ impl StrataStore {
             .get_current_epoch()?
             .ok_or(Error::EpochNotInitialized)?;
         cleanup_pending_gc_outputs(&config, &index)?;
-        verify_sealed_segments(&config, &index)?;
         let active_segment_id = choose_active_segment_id(&index)?;
+        seal_recovered_segments(&config, &index, active_segment_id, &metrics)?;
+        verify_sealed_segments(&config, &index)?;
         let segment_ids =
             SegmentIdAllocator::new(next_segment_id_after(&index, active_segment_id)?);
         let active_writer = open_active_writer(&config, active_segment_id)?;
@@ -172,7 +170,6 @@ impl StrataStore {
         metrics.set_gc_relocating_segments(gc_relocating_segment_count(&index)?);
         metrics.set_current_epoch(current_epoch);
         metrics.set_unsealed_segments(unsealed_ingest_segment_count(&index)?);
-        let (seal_tx, seal_rx) = mpsc::channel();
         let gc_publish_cleanup_lock = Arc::new(Mutex::new(()));
         let gc_wake_txs = Arc::new(Mutex::new(Vec::new()));
         let gc_claims = Arc::new(GcSourceClaims::default());
@@ -242,22 +239,8 @@ impl StrataStore {
             .name(format!("strata-garbage-sweeper-{}", config.namespace))
             .spawn(move || garbage_sweeper.run())
             .map_err(|source| Error::ThreadSpawn { source })?;
-        let seal_worker = SealWorker {
-            config: config.clone(),
-            index: index.clone(),
-            ingest_owner: INGEST_SEGMENT_OWNER,
-            seal_rx,
-            durability_publish_lock: Arc::clone(&durability_publish_lock),
-            metrics: metrics.clone(),
-            store_halt: store_halt.clone(),
-        };
-        let seal_handle = thread::Builder::new()
-            .name(format!("strata-sealer-{}", config.namespace))
-            .spawn(move || seal_worker.run())
-            .map_err(|source| Error::SealThreadSpawn { source })?;
-        enqueue_unsealed_segments_for_sealing(&index, active_segment_id, &seal_tx, &metrics)?;
-
         let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
+        let (durability_ready_tx, durability_ready_rx) = mpsc::channel();
         let reader_cache = Arc::new(SegmentReaderCache::new(
             config.segment_reader_cache_capacity,
         ));
@@ -277,6 +260,8 @@ impl StrataStore {
             segment_sync_tx,
             pending_segment_syncs: Vec::new(),
             internal_write_tx: write_tx.clone(),
+            durability_ready_tx,
+            durability_ready_rx,
             durability_in_flight_lsn: None,
             pending_sync_requests: Vec::new(),
             durability_publish_lock: Arc::clone(&durability_publish_lock),
@@ -293,7 +278,6 @@ impl StrataStore {
             pending_rollovers: Vec::new(),
             lsm_flush_tx: lsm_flush_tx.clone(),
             lsm_compact_tx: lsm_compact_tx.clone(),
-            seal_tx: seal_tx.clone(),
             write_rx,
             ingest_owner: INGEST_SEGMENT_OWNER,
             relocations: Arc::clone(&relocations),
@@ -388,8 +372,6 @@ impl StrataStore {
             lsm_flush_handle: Some(lsm_flush_handle),
             lsm_compact_handle: Some(lsm_compact_handle),
             lsm_sync_handles,
-            seal_tx: Some(seal_tx),
-            seal_handle: Some(seal_handle),
             garbage_sweep_tx: Some(garbage_sweep_tx),
             garbage_sweep_handle: Some(garbage_sweep_handle),
             gc_txs,
@@ -803,15 +785,12 @@ fn validate_config(config: &StrataStoreConfig) -> Result<()> {
         ));
     }
     // At least 2 because rollover inherently has two unsealed segments alive at once: the full
-    // one waiting on the sealer and the fresh one being written. A cap of 1 would deadlock the
+    // one awaiting durability and the fresh one being written. A cap of 1 would deadlock the
     // writer against its own rollover.
     if config.max_unsealed_segments < 2 {
         return Err(Error::InvalidConfig(
             "max_unsealed_segments must be at least 2",
         ));
-    }
-    if config.seal_worker_count == 0 {
-        return Err(Error::InvalidConfig("seal_worker_count must be non-zero"));
     }
     if config.gc_interval.is_zero() {
         return Err(Error::InvalidConfig("gc_interval must be non-zero"));

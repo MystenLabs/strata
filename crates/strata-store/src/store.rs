@@ -17,7 +17,7 @@ use crate::{
     AddShardRequest, BatchOp, BatchWriteRequest, BatchWriteResult, DropShardRequest, Error,
     ProfileRequest, Result, RolloverSegmentRequest, StoreSyncProfile, StoreWriteProfile,
     StrataBatch, StrataStore, StrataStoreConfig, StrataStoreMetrics, SyncRequest, WriteCommand,
-    gc::GcCommand, maintenance::flush_relocation_lsm, seal::SealCommand,
+    gc::GcCommand, maintenance::flush_relocation_lsm,
 };
 
 impl StrataStore {
@@ -419,12 +419,6 @@ impl Drop for StrataStore {
         }
         for sync_handle in self.lsm_sync_handles.drain(..) {
             let _ = sync_handle.join();
-        }
-        if let Some(seal_tx) = self.seal_tx.take() {
-            let _ = seal_tx.send(SealCommand::Shutdown);
-        }
-        if let Some(seal_handle) = self.seal_handle.take() {
-            let _ = seal_handle.join();
         }
     }
 }

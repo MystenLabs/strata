@@ -11,12 +11,7 @@ use strata_core::{BlobKey, Epoch, RecordRef, SegmentState, ShardId, ShardKey, St
 use strata_index::StrataIndex;
 use strata_lsm::Mutation as LsmMutation;
 
-use crate::{
-    DurabilityPublish, Error, Result, StrataStore, StrataStoreMetrics,
-    blob_lsm::BlobMutation,
-    partition::partition_for_key,
-    seal::{SealCommand, SegmentSealTask},
-};
+use crate::{Error, Result, StrataStore, blob_lsm::BlobMutation, partition::partition_for_key};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -26,7 +21,7 @@ pub(crate) enum WriteCommand {
     DropShard(DropShardRequest),
     RolloverSegment(RolloverSegmentRequest),
     Sync(SyncRequest),
-    DurabilityReady(Arc<DurabilityPublish>),
+    DurabilityReady,
     Shutdown,
 }
 
@@ -165,7 +160,6 @@ pub struct StoreWriteProfile {
     pub segment_capacity: Duration,
     pub segment_append: Duration,
     pub index_batch_commit: Duration,
-    pub rollover_post_commit: Duration,
     pub response_send: Duration,
     pub writer_total: Duration,
 }
@@ -384,7 +378,6 @@ pub(crate) struct PendingRollover {
     pub(crate) old_segment_state: SegmentState,
     pub(crate) new_segment_state: SegmentState,
     pub(crate) new_segment_published_at_lsn: StrataLsn,
-    pub(crate) seal_task: SegmentSealTask,
 }
 
 impl PendingRollover {
@@ -405,60 +398,5 @@ impl PendingRollover {
             self.new_segment_published_at_lsn,
         )?;
         Ok(())
-    }
-
-    /// Queues sealing only after the index commit that made the rollover visible.
-    ///
-    /// Failure mode avoided: if the sealer hashed and published an old segment before the
-    /// `Sealing` row committed, a crash could leave sealed bytes on disk while the index still
-    /// believes the segment is open and appendable.
-    pub(crate) fn run_post_commit(
-        self,
-        seal_tx: mpsc::Sender<SealCommand>,
-        metrics: StrataStoreMetrics,
-    ) {
-        seal_action(seal_tx, self.seal_task, metrics).run();
-    }
-}
-
-#[derive(Debug)]
-enum PostCommitAction {
-    EnqueueSeal {
-        seal_tx: mpsc::Sender<SealCommand>,
-        task: SegmentSealTask,
-        metrics: StrataStoreMetrics,
-    },
-}
-
-impl PostCommitAction {
-    /// Runs side effects that are safe only after the index batch has committed.
-    ///
-    /// These actions intentionally do not happen during batch assembly. For example, queuing a
-    /// seal before its metadata batch commits could expose a rollover whose index entry is not
-    /// visible yet.
-    fn run(self) {
-        match self {
-            Self::EnqueueSeal {
-                seal_tx,
-                task,
-                metrics,
-            } => {
-                if seal_tx.send(SealCommand::Seal(task)).is_ok() {
-                    metrics.record_seal_enqueued();
-                }
-            }
-        }
-    }
-}
-
-fn seal_action(
-    seal_tx: mpsc::Sender<SealCommand>,
-    task: SegmentSealTask,
-    metrics: StrataStoreMetrics,
-) -> PostCommitAction {
-    PostCommitAction::EnqueueSeal {
-        seal_tx,
-        task,
-        metrics,
     }
 }

@@ -34,10 +34,9 @@ use strata_core::{BlobKey, Epoch, SegmentFileState, SegmentId};
 use strata_store::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
-    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEAL_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlanner, GcPlannerConfig,
-    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
-    StrataStoreMetrics,
+    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES,
+    DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlanner, GcPlannerConfig, SealedSegmentIntegrityPolicy,
+    StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
 use typed_store::{
     DBMetrics, Map,
@@ -165,7 +164,6 @@ struct Config {
     queue_capacity: usize,
     max_unsealed_segments: usize,
     segment_max_bytes: u64,
-    seal_workers: usize,
     strata_gc: bool,
     relocation_profile_reads: usize,
     relocation_profile_timeout: Duration,
@@ -215,7 +213,6 @@ impl Config {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             max_unsealed_segments: DEFAULT_MAX_UNSEALED_SEGMENTS,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
-            seal_workers: DEFAULT_SEAL_WORKER_COUNT,
             strata_gc: true,
             relocation_profile_reads: DEFAULT_RELOCATION_PROFILE_READS,
             relocation_profile_timeout: DEFAULT_RELOCATION_PROFILE_TIMEOUT,
@@ -321,9 +318,6 @@ impl Config {
                 }
                 "--segment-max-bytes" => {
                     config.segment_max_bytes = parse_size(&next_value(&mut args, &arg)?)? as u64
-                }
-                "--seal-workers" => {
-                    config.seal_workers = parse_nonzero_usize(&next_value(&mut args, &arg)?)?
                 }
                 "--strata-gc" => config.strata_gc = parse_bool(&next_value(&mut args, &arg)?)?,
                 "--relocation-profile-reads" => {
@@ -458,7 +452,6 @@ impl Config {
             segment_max_bytes: self.segment_max_bytes,
             write_queue_capacity: self.queue_capacity,
             max_unsealed_segments: self.max_unsealed_segments,
-            seal_worker_count: self.seal_workers,
             segment_reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             lsm_partition_count: strata_store::DEFAULT_LSM_PARTITION_COUNT,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
@@ -2121,7 +2114,6 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     match config.engine {
         EngineKind::Strata => {
             println!("segment_max_bytes={}", config.segment_max_bytes);
-            println!("seal_workers={}", config.seal_workers);
             println!("strata_gc={}", config.strata_gc);
             println!(
                 "relocation_profile_reads={}",
@@ -3185,7 +3177,6 @@ strata:
   --queue-capacity <count>
   --max-unsealed-segments <count>
   --segment-max-bytes <size>
-  --seal-workers <count>
   --strata-gc <true|false>
   --relocation-profile-reads <count>    post-workload HDD relocation profile; disables background GC for deterministic setup
   --relocation-profile-timeout <time>   setup/healing deadline; default 10m

@@ -26,12 +26,6 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("failed to spawn seal worker: {source}")]
-    SealThreadSpawn {
-        #[source]
-        source: std::io::Error,
-    },
-
     #[error("index error: {0}")]
     Index(#[from] strata_index::Error),
 
@@ -87,9 +81,6 @@ pub enum Error {
 
     #[error("write coordinator dropped the response")]
     WriteResponseDropped,
-
-    #[error("seal queue is closed")]
-    SealQueueClosed,
 
     #[error("durability queue is closed")]
     DurabilityQueueClosed,

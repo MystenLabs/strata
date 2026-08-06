@@ -90,7 +90,6 @@ struct PrometheusMetrics {
     current_epoch: IntGauge,
     pending_lsn_count: IntGauge,
     unsealed_segments: IntGauge,
-    seal_enqueued_total: IntCounter,
     sealed_segments_total: IntCounter,
     seal_errors_total: IntCounter,
     seal_backpressure_waits_total: IntCounter,
@@ -527,12 +526,6 @@ impl StrataStoreMetrics {
                     &labels,
                     "unsealed_segments",
                     "Number of unsealed Strata segments.",
-                )?,
-                seal_enqueued_total: register_counter(
-                    registry,
-                    &labels,
-                    "seal_enqueued_total",
-                    "Total Strata segments enqueued for sealing.",
                 )?,
                 sealed_segments_total: register_counter(
                     registry,
@@ -1048,12 +1041,6 @@ impl StrataStoreMetrics {
     pub(crate) fn set_unsealed_segments(&self, count: usize) {
         if let Some(metrics) = &self.inner {
             metrics.unsealed_segments.set(to_i64(count as u64));
-        }
-    }
-
-    pub(crate) fn record_seal_enqueued(&self) {
-        if let Some(metrics) = &self.inner {
-            metrics.seal_enqueued_total.inc();
         }
     }
 

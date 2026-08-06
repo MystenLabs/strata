@@ -7,17 +7,19 @@
 //! state committed by newer writes.
 
 use std::{
+    fs,
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
 
-use strata_core::StoreCheckpoint;
+use strata_core::{SegmentFileState, StoreCheckpoint};
 
 use crate::{
     DURABILITY_PUBLISH_INTERVAL, DURABILITY_PUBLISH_SEGMENT_BYTES, DURABILITY_PUBLISH_WAL_BYTES,
     DurabilityPublish, Error, PendingSyncRequest, Result, SegmentSync, StoreSyncProfile,
     SyncRequest, WriteCommand, WriteCoordinator, file_sync::FileSyncTask,
     maintenance::publish_blob_lsm_edit, profile_phase, publish_segment_allocation_baseline,
+    seal::prepare_synced_seal, unsealed_ingest_segment_count,
 };
 
 impl DurabilityPublish {
@@ -48,9 +50,9 @@ impl DurabilityPublish {
                 *final_result = Some(Ok(self.file_sync_started.elapsed()));
             }
         }
-        let _ = self
-            .ready_tx
-            .send(WriteCommand::DurabilityReady(Arc::clone(self)));
+        if self.ready_tx.send(Arc::clone(self)).is_ok() {
+            let _ = self.wake_tx.try_send(WriteCommand::DurabilityReady);
+        }
     }
 }
 
@@ -84,15 +86,31 @@ impl WriteCoordinator {
         let active_segment_id = self.segment.segment_id();
         let active_segment_offset = self.segment.write_offset();
         let active_path = self.segment.path().to_path_buf();
-        let active_file = self.segment.clone_file_for_sync()?;
-        let active_completion = crate::file_sync::FileSyncCompletion::new();
         segments.push(SegmentSync {
             segment_id: active_segment_id,
+            path: active_path,
             durable_offset: active_segment_offset,
+            sealed_before_lsn: None,
+            sealed_sha256: Arc::new(std::sync::Mutex::new(None)),
             allocation_records: self.active_allocation_records,
             allocation_tracker: Arc::clone(&self.active_allocation_tracker),
-            completion: active_completion.clone(),
         });
+        let files = segments
+            .iter()
+            .map(|segment| {
+                if segment.segment_id == active_segment_id {
+                    return self.segment.clone_file_for_sync().map_err(Error::from);
+                }
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&segment.path)
+                    .map_err(|source| Error::Io {
+                        path: segment.path.clone(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let wal_position = self.wal.position();
         let wal_bytes = self.wal.pending_bytes();
         let segment_bytes = self.pending_segment_bytes;
@@ -109,18 +127,9 @@ impl WriteCoordinator {
             file_sync_started: Instant::now(),
             remaining_syncs: std::sync::atomic::AtomicUsize::new(remaining_syncs),
             file_sync_result: std::sync::Mutex::new(None),
-            ready_tx: self.internal_write_tx.clone(),
+            ready_tx: self.durability_ready_tx.clone(),
+            wake_tx: self.internal_write_tx.clone(),
         });
-
-        // Rolled segment syncs may already have completed. Their completion object delivers the
-        // stored result immediately; the active segment and WAL callbacks below remain outstanding,
-        // so the final notification still comes from a file-sync worker.
-        for segment in &publish.segments {
-            let publish = Arc::clone(&publish);
-            segment
-                .completion
-                .notify(move |result| publish.sync_finished(result));
-        }
 
         let wal_publish = Arc::clone(&publish);
         let queued_wal_position = self
@@ -133,12 +142,39 @@ impl WriteCoordinator {
                 ),
             });
         }
-        let worker_completion = active_completion;
-        self.segment_sync_tx
-            .send(FileSyncTask::new(active_path, active_file, move |result| {
-                worker_completion.complete(result);
-            }))
-            .map_err(|_| Error::FileSyncQueueClosed)?;
+        for (segment, file) in publish.segments.iter().zip(files) {
+            let publish = Arc::clone(&publish);
+            let config = self.config.clone();
+            let metrics = self.metrics.clone();
+            let segment_id = segment.segment_id;
+            let sealed_len = segment.durable_offset;
+            let sealed_before_lsn = segment.sealed_before_lsn;
+            let sealed_sha256 = Arc::clone(&segment.sealed_sha256);
+            let path = segment.path.clone();
+            let completion_path = path.clone();
+            self.segment_sync_tx
+                .send(FileSyncTask::new(path, file, move |result| {
+                    let result = result.and_then(|()| {
+                        if sealed_before_lsn.is_none() {
+                            return Ok(());
+                        }
+                        match prepare_synced_seal(&config, segment_id, &completion_path, sealed_len)
+                        {
+                            Ok(checksum) => {
+                                *sealed_sha256.lock().expect("seal checksum lock poisoned") =
+                                    checksum;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    });
+                    if sealed_before_lsn.is_some() && result.is_err() {
+                        metrics.record_seal_error();
+                    }
+                    publish.sync_finished(result);
+                }))
+                .map_err(|_| Error::FileSyncQueueClosed)?;
+        }
 
         self.wal.mark_pending_bytes_captured();
         self.pending_segment_bytes = 0;
@@ -255,6 +291,24 @@ impl WriteCoordinator {
                         });
                     }
                     state.durable_offset = state.durable_offset.max(segment.durable_offset);
+                    if state.state == SegmentFileState::Sealing {
+                        let sealed_before_lsn =
+                            segment
+                                .sealed_before_lsn
+                                .ok_or_else(|| Error::InvariantViolation {
+                                    reason: format!(
+                                        "sealing segment {} is missing its LSN boundary",
+                                        segment.segment_id
+                                    ),
+                                })?;
+                        state.state = SegmentFileState::Sealed;
+                        state.sealed_before_lsn = Some(sealed_before_lsn);
+                        state.sealed_len = Some(segment.durable_offset);
+                        state.sealed_sha256 = *segment
+                            .sealed_sha256
+                            .lock()
+                            .expect("seal checksum lock poisoned");
+                    }
                     self.index.put_segment_state_batch(&mut batch, &state)?;
 
                     let allocation_records = segment
@@ -299,6 +353,13 @@ impl WriteCoordinator {
         for (tracker, records) in allocation_marks {
             tracker.mark_published(records);
         }
+        for state in &states {
+            if state.state == SegmentFileState::Sealed {
+                self.metrics.record_segment_sealed();
+            }
+        }
+        self.metrics
+            .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
 
         profile_phase(
             Some(&mut phases),

@@ -1,5 +1,4 @@
 use std::{
-    cmp::Reverse,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     ops::Deref,
@@ -271,7 +270,6 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         segment_max_bytes: 1 << 20,
         write_queue_capacity: 128,
         max_unsealed_segments: 8,
-        seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
         segment_reader_cache_capacity: 16,
         lsm_partition_count: DEFAULT_LSM_PARTITION_COUNT,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
@@ -481,6 +479,7 @@ fn seal_first_segment(config: &StrataStoreConfig) -> SegmentState {
 
     store.put(&key_1, b"payload-a").unwrap();
     store.put(&key_2, b"payload-b").unwrap();
+    store.sync().unwrap();
 
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed)
 }
@@ -1383,7 +1382,7 @@ async fn epoch_change_is_published_by_the_store_checkpoint() {
     assert_eq!(store.published_lsn().unwrap(), epoch_lsn);
 }
 #[tokio::test]
-async fn explicit_active_segment_rollover_queues_the_current_tail_for_sealing() {
+async fn explicit_active_segment_rollover_seals_the_current_tail_through_durability() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"explicit-checkpoint".to_vec()).unwrap();
@@ -1403,6 +1402,16 @@ async fn explicit_active_segment_rollover_queues_the_current_tail_for_sealing() 
         .0;
 
     store.store.rollover_active_segment_for_sealing().unwrap();
+    assert_eq!(
+        store
+            .index()
+            .get_segment_state(old_segment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        SegmentFileState::Sealing
+    );
+    store.sync().unwrap();
     let sealed = wait_for_segment_state(store.index(), old_segment_id, SegmentFileState::Sealed);
     let summary = store
         .index()
@@ -2480,8 +2489,8 @@ async fn metrics_track_seal_backpressure_waits() {
         cfg.segment_max_bytes,
     )
     .unwrap();
-    let (seal_tx, _seal_rx) = mpsc::channel();
     let (write_tx, write_rx) = mpsc::sync_channel(1);
+    let (durability_ready_tx, durability_ready_rx) = mpsc::channel();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
     let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
@@ -2489,7 +2498,7 @@ async fn metrics_track_seal_backpressure_waits() {
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
-    let coordinator = WriteCoordinator {
+    let mut coordinator = WriteCoordinator {
         config: cfg.clone(),
         index: index.clone(),
         lsm,
@@ -2504,6 +2513,8 @@ async fn metrics_track_seal_backpressure_waits() {
         segment_sync_tx,
         pending_segment_syncs: Vec::new(),
         internal_write_tx: write_tx,
+        durability_ready_tx,
+        durability_ready_rx,
         durability_in_flight_lsn: None,
         pending_sync_requests: Vec::new(),
         durability_publish_lock: Arc::new(Mutex::new(())),
@@ -2520,7 +2531,6 @@ async fn metrics_track_seal_backpressure_waits() {
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
-        seal_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         relocations: open_relocation_lsm(
@@ -4897,84 +4907,32 @@ async fn unsealed_segment_count_includes_open_and_sealing_segments() {
 }
 
 #[tokio::test]
-async fn seal_publisher_waits_for_lowest_sealing_segment() {
+async fn recovery_seals_rolled_segments_before_starting_workers() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
+    ensure_ingest_dir(&cfg).unwrap();
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     put_test_segment_state(&index, 1, SegmentFileState::Sealing);
-    put_test_segment_state(&index, 2, SegmentFileState::Sealing);
-    let mut completed = BTreeMap::new();
-    let mut sealing = [Reverse(1), Reverse(2)].into_iter().collect();
-    let mut sealing_ids = [1, 2].into_iter().collect();
-    let durability_publish_lock = Arc::new(Mutex::new(()));
+    put_test_segment_state(&index, 2, SegmentFileState::Open);
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(segment_path(&cfg, 1))
+        .unwrap()
+        .write_all(&[0; 64])
+        .unwrap();
 
-    completed.insert(
-        2,
-        seal::CompletedSeal {
-            task: SegmentSealTask {
-                segment_id: 2,
-                sealed_len: 64,
-                sealed_before_lsn: 1,
-                allocation_records: 1,
-                allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
-            },
-            sealed_sha256: None,
-        },
-    );
-    seal::publish_ready_completed_seals(
-        &cfg,
-        &index,
-        INGEST_SEGMENT_OWNER,
-        &durability_publish_lock,
-        &StrataStoreMetrics::default(),
-        &mut completed,
-        &mut sealing,
-        &mut sealing_ids,
-    )
-    .unwrap();
-    assert_eq!(
-        index.get_segment_state(1).unwrap().unwrap().state,
-        SegmentFileState::Sealing
-    );
+    seal::seal_recovered_segments(&cfg, &index, 2, &StrataStoreMetrics::default()).unwrap();
+
+    let sealed = index.get_segment_state(1).unwrap().unwrap();
+    assert_eq!(sealed.state, SegmentFileState::Sealed);
+    assert_eq!(sealed.durable_offset, 64);
+    assert_eq!(sealed.sealed_len, Some(64));
     assert_eq!(
         index.get_segment_state(2).unwrap().unwrap().state,
-        SegmentFileState::Sealing
+        SegmentFileState::Open
     );
-
-    completed.insert(
-        1,
-        seal::CompletedSeal {
-            task: SegmentSealTask {
-                segment_id: 1,
-                sealed_len: 64,
-                sealed_before_lsn: 1,
-                allocation_records: 1,
-                allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
-            },
-            sealed_sha256: None,
-        },
-    );
-    seal::publish_ready_completed_seals(
-        &cfg,
-        &index,
-        INGEST_SEGMENT_OWNER,
-        &durability_publish_lock,
-        &StrataStoreMetrics::default(),
-        &mut completed,
-        &mut sealing,
-        &mut sealing_ids,
-    )
-    .unwrap();
-    assert_eq!(
-        index.get_segment_state(1).unwrap().unwrap().state,
-        SegmentFileState::Sealed
-    );
-    assert_eq!(
-        index.get_segment_state(2).unwrap().unwrap().state,
-        SegmentFileState::Sealed
-    );
-    assert!(completed.is_empty());
 }
 
 #[tokio::test]
@@ -5083,45 +5041,25 @@ async fn checksum_reopen_detects_sealed_segment_hash_mismatch() {
 }
 
 #[tokio::test]
-async fn seal_segment_reports_error_without_marking_failed() {
+async fn recovery_seal_error_leaves_segment_unsealed() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     put_test_segment_state(&index, 1, SegmentFileState::Sealing);
-    let (_seal_tx, seal_rx) = mpsc::channel();
-    let worker = SealWorker {
-        config: cfg,
-        index: index.clone(),
-        ingest_owner: INGEST_SEGMENT_OWNER,
-        seal_rx,
-        durability_publish_lock: Arc::new(Mutex::new(())),
-        metrics: StrataStoreMetrics::default(),
-        store_halt: StoreHalt::default(),
-    };
-
     assert!(
-        worker
-            .seal_segment(SegmentSealTask {
-                segment_id: 1,
-                sealed_len: 64,
-                sealed_before_lsn: 1,
-                allocation_records: 1,
-                allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
-            })
-            .is_err()
+        seal::seal_recovered_segments(&cfg, &index, 2, &StrataStoreMetrics::default()).is_err()
     );
     let state = index.get_segment_state(1).unwrap().unwrap();
     assert_eq!(state.state, SegmentFileState::Sealing);
 }
 
 #[tokio::test]
-async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
+async fn rollover_switches_active_segment_and_durability_seals_old_segment() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
-    cfg.seal_worker_count = 2;
     let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
@@ -5134,11 +5072,16 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
     assert_eq!(store.get(&key_1).unwrap(), Some(b"payload-a".to_vec()));
     assert_eq!(store.get(&key_2).unwrap(), Some(b"payload-b".to_vec()));
 
+    let sealing = store.index().get_segment_state(1).unwrap().unwrap();
+    assert_eq!(sealing.state, SegmentFileState::Sealing);
+    assert_eq!(store.published_lsn().unwrap(), 0);
+
+    store.sync().unwrap();
     let sealed = wait_for_segment_state(store.index(), 1, SegmentFileState::Sealed);
     assert_eq!(sealed.durable_offset, sealed.write_offset);
     assert_eq!(sealed.sealed_len, Some(sealed.write_offset));
     assert_eq!(sealed.sealed_sha256, None);
-    assert_eq!(store.published_lsn().unwrap(), 0);
+    assert_eq!(store.published_lsn().unwrap(), 2);
 
     let open = store.index().get_segment_state(2).unwrap().unwrap();
     assert_eq!(open.state, SegmentFileState::Open);
@@ -5154,16 +5097,14 @@ async fn rollover_switches_active_segment_and_seal_worker_seals_old_segment() {
         .map(|(segment_id, _)| segment_id)
         .collect::<Vec<_>>();
     assert_eq!(open_segment_ids, vec![2]);
-
-    store.sync().unwrap();
-    assert_eq!(store.published_lsn().unwrap(), 2);
 }
 
 #[tokio::test]
 async fn asynchronous_durability_wait_does_not_block_following_write() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
+    let mut cfg = config(dir.path(), "default");
+    cfg.max_unsealed_segments = 2;
     ensure_ingest_dir(&cfg).unwrap();
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     ensure_epoch_initialized(&index, cfg.starting_epoch).unwrap();
@@ -5185,10 +5126,10 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
     let (segment_sync_tx, segment_syncer) = file_sync_channel();
-    let (seal_tx, seal_rx) = mpsc::channel();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
     let (write_tx, write_rx) = mpsc::sync_channel(1);
+    let (durability_ready_tx, durability_ready_rx) = mpsc::channel();
 
     let mut coordinator = WriteCoordinator {
         config: cfg.clone(),
@@ -5205,6 +5146,8 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
         segment_sync_tx,
         pending_segment_syncs: Vec::new(),
         internal_write_tx: write_tx,
+        durability_ready_tx,
+        durability_ready_rx,
         durability_in_flight_lsn: None,
         pending_sync_requests: Vec::new(),
         durability_publish_lock: Arc::new(Mutex::new(())),
@@ -5221,7 +5164,6 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
-        seal_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         relocations: open_relocation_lsm(
@@ -5248,6 +5190,7 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
 
     coordinator.process_segment_rollover().unwrap();
     assert_eq!(coordinator.pending_segment_syncs.len(), 1);
+    assert_eq!(coordinator.durability_in_flight_lsn, None);
 
     let old_state = index.get_segment_state(1).unwrap().unwrap();
     assert_eq!(old_state.state, SegmentFileState::Sealing);
@@ -5256,17 +5199,11 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
     let new_state = index.get_segment_state(2).unwrap().unwrap();
     assert_eq!(new_state.state, SegmentFileState::Open);
     assert_eq!(index.get_segment_published_at_lsn(2).unwrap(), 2);
-    let SealCommand::Seal(task) = seal_rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
-        panic!("expected seal command");
-    };
-    assert_eq!(task.segment_id, 1);
-    assert_eq!(task.sealed_len, 0);
-    assert_eq!(task.sealed_before_lsn, 2);
-    assert_eq!(task.allocation_records, 0);
 
     coordinator.pending_segment_bytes = DURABILITY_PUBLISH_SEGMENT_BYTES;
     assert!(coordinator.maybe_start_durability_publish(false).unwrap());
     assert!(coordinator.pending_segment_syncs.is_empty());
+    assert_eq!(coordinator.durability_in_flight_lsn, Some(1));
     let (second_response_tx, second_response_rx) = mpsc::channel();
     coordinator
         .submit_batch(vec![BatchOp::IncrementEpoch], second_response_tx, None)
@@ -5279,23 +5216,20 @@ async fn asynchronous_durability_wait_does_not_block_following_write() {
             .last_lsn(),
         Some(2)
     );
-    // No segment file-sync worker is running yet: publication is pending, but the writer-side
-    // start and the following write returned instead of waiting behind the filesystem operation.
+    // The segment sync workers are not running yet. Publication is pending, but the following
+    // write still returns without waiting for physical I/O.
     assert!(matches!(
         coordinator.write_rx.recv_timeout(Duration::from_millis(50)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
     let sync_handle = thread::spawn(move || segment_syncer.run());
-    let WriteCommand::DurabilityReady(ready) = coordinator
-        .write_rx
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap()
-    else {
-        panic!("expected durability completion");
-    };
-    coordinator.finish_durability_publish(ready).unwrap();
+    coordinator.wait_for_seal_backlog_capacity().unwrap();
     assert_eq!(index.get_published_lsn().unwrap(), 1);
     assert_eq!(index.get_next_lsn().unwrap(), 3);
+    assert_eq!(
+        index.get_segment_state(1).unwrap().unwrap().state,
+        SegmentFileState::Sealed
+    );
     drop(coordinator);
     sync_handle.join().unwrap();
 }
@@ -5313,6 +5247,7 @@ async fn reopen_after_rollover_appends_to_highest_open_segment() {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         store.put(&key_1, b"payload-a").unwrap();
         store.put(&key_2, b"payload-b").unwrap();
+        store.sync().unwrap();
         wait_for_segment_state(store.index(), 1, SegmentFileState::Sealed);
     }
 

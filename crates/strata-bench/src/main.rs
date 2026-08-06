@@ -53,8 +53,8 @@ use strata_segment::SegmentWriter;
 use strata_store::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
-    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEAL_WORKER_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig, ReadOptions,
+    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES,
+    DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlannerConfig, ReadOptions,
     SealedSegmentIntegrityPolicy, StoreGetProfile, StrataRecoveryPolicy, StrataStore,
     StrataStoreConfig, StrataStoreMetrics,
 };
@@ -329,7 +329,6 @@ struct Config {
     queue_capacity: usize,
     max_unsealed_segments: usize,
     segment_max_bytes: u64,
-    seal_worker_count: usize,
     sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     reader_cache_capacity: usize,
     starting_epoch: Epoch,
@@ -394,7 +393,6 @@ impl Config {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             max_unsealed_segments: DEFAULT_MAX_UNSEALED_SEGMENTS,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
-            seal_worker_count: DEFAULT_SEAL_WORKER_COUNT,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
             starting_epoch: DEFAULT_STARTING_EPOCH,
@@ -487,10 +485,6 @@ impl Config {
                 "--segment-max-bytes" => {
                     config.segment_max_bytes =
                         parse_size(&next_value(&mut args, "--segment-max-bytes")?)? as u64
-                }
-                "--seal-workers" => {
-                    config.seal_worker_count =
-                        parse_nonzero_usize(&next_value(&mut args, "--seal-workers")?)?
                 }
                 "--sealed-integrity" => {
                     config.sealed_segment_integrity_policy =
@@ -835,7 +829,6 @@ impl Config {
             segment_max_bytes: self.segment_max_bytes,
             write_queue_capacity: self.queue_capacity,
             max_unsealed_segments: self.max_unsealed_segments,
-            seal_worker_count: self.seal_worker_count,
             segment_reader_cache_capacity: self.reader_cache_capacity,
             lsm_partition_count: strata_store::DEFAULT_LSM_PARTITION_COUNT,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
@@ -1125,7 +1118,6 @@ struct StoreWriteProfileSummary {
     segment_capacity: Duration,
     segment_append: Duration,
     index_batch_commit: Duration,
-    rollover_post_commit: Duration,
     response_send: Duration,
     writer_total: Duration,
 }
@@ -1140,7 +1132,6 @@ impl StoreWriteProfileSummary {
         self.segment_capacity += profile.segment_capacity;
         self.segment_append += profile.segment_append;
         self.index_batch_commit += profile.index_batch_commit;
-        self.rollover_post_commit += profile.rollover_post_commit;
         self.response_send += profile.response_send;
         self.writer_total += profile.writer_total;
     }
@@ -3638,7 +3629,6 @@ fn print_report(inputs: ReportInputs<'_>) -> Result<(), Box<dyn std::error::Erro
     println!("queue_capacity={}", config.queue_capacity);
     println!("max_unsealed_segments={}", config.max_unsealed_segments);
     println!("segment_max_bytes={}", config.segment_max_bytes);
-    println!("seal_workers={}", config.seal_worker_count);
     println!(
         "sealed_integrity={}",
         sealed_integrity_as_str(config.sealed_segment_integrity_policy)
@@ -4424,11 +4414,6 @@ fn print_store_write_profile(profile: &StoreWriteProfileSummary) {
         profile.count,
     );
     print_profile_duration(
-        "write_profile_rollover_post_commit",
-        profile.rollover_post_commit,
-        profile.count,
-    );
-    print_profile_duration(
         "write_profile_response_send",
         profile.response_send,
         profile.count,
@@ -4743,7 +4728,6 @@ options:
   --queue-capacity <count>
   --max-unsealed-segments <count>
   --segment-max-bytes <bytes|KiB|MiB|GiB>
-  --seal-workers <count>
   --sealed-integrity <metadata-only|checksum>
   --reader-cache-capacity <count>       cached segment readers; 0 disables
   --starting-epoch <epoch>
@@ -4963,8 +4947,6 @@ mod tests {
                 "7",
                 "--max-unsealed-segments",
                 "12",
-                "--seal-workers",
-                "3",
                 "--sealed-integrity",
                 "checksum",
             ]
@@ -4990,7 +4972,6 @@ mod tests {
         assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(config.metrics_drain_seconds, 7);
         assert_eq!(config.max_unsealed_segments, 12);
-        assert_eq!(config.seal_worker_count, 3);
         assert_eq!(config.reader_cache_capacity, 64_000);
         assert_eq!(
             config.sealed_segment_integrity_policy,

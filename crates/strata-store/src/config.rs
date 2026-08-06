@@ -17,7 +17,6 @@ pub const DEFAULT_GC_IO_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_GC_MIN_IO_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-pub const DEFAULT_SEAL_WORKER_COUNT: usize = 1;
 pub const DEFAULT_LSM_PARTITION_COUNT: u32 = 1;
 
 /// Runtime configuration for one Strata store namespace.
@@ -28,7 +27,6 @@ pub struct StrataStoreConfig {
     pub segment_max_bytes: u64,
     pub write_queue_capacity: usize,
     pub max_unsealed_segments: usize,
-    pub seal_worker_count: usize,
     pub segment_reader_cache_capacity: usize,
     /// Number of hash partitions shared by the main and relocation LSMs.
     ///

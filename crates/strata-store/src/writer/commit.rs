@@ -15,32 +15,12 @@ use crate::{
 };
 
 impl WriteCoordinator {
-    /// This is the main entry point for the write protocol. It receives the prepared client ops, a channel
-    /// to reply on and a profile to track the time taken and then drives a batch from vector of requests
-    /// to durably ordered visible writes. Let's walk through an example batch -
-    /// say [put("user:1", 2MB), increment_epoch, put("user:2", 1MB)]:
-    /// 1. Empyty batch short circuit. Zero ops mean immediately result with empty write result. No need to
-    /// burn any LSN.
-    /// 2. Prepare: It calls a `prepare_batch` which validates everything and assigns the batch a contiguous LSN range
-    ///  - our example gets LSNs 100, 101, 102. A failure here is sent back on response_tx as a normal error. Nothing
-    /// on disk changed yet.
-    /// 3. Segment append for puts: For each put, it first asks if the record fits in active segment. If not, it triggers
-    /// `rollover_active_segment` to swap in a fresh segment, then appends the payload bytes. After each append it checks
-    /// a paranoid invariant - the segment wrote the exact number of bytes prepare_batch predicted and updates the
-    /// in memory counters of the active segment - its `write_offset` and `min_lsn` and `max_lsn` bounds (so GC can later
-    /// discover which LSNs live in this segment without scanning it). It also counts records and bytes written. Our two
-    /// puts land as lsnS 100 and 102, the epoch change at 101 writes no data in segments at all.
-    /// 4. Store WAL encoding: Every op, including metadata ops like epoch change become exactly one WAL entry at its LSN.
-    /// Keyed ops (Put/Lifecycle/Tombstone) produce a blob mutation that goes two places - `lsm_writes` list and into the
-    /// WAL record. `IncrementEpoch` becomes a special epoch change entry in the WAL - there is no keyed blob mutation for it.
-    /// It is RocksDB only batch operation and its WAL record is a bare `StoreWALMutation::Epoch`.
-    /// 5. Durability ordering: The three storage systems are updated in a fixed order.
-    /// Segments, WAL and LSM are updated in that order. Finally, the metadata is committed in RocksDB in `commit_write_batch`.
-    /// Before that, `take_pending_rollovers` also adds any staged rollover metadata to the batch.
-    /// 6. Post commit: Only after the index batch commits, does it run `run_rollover_post_commit` (queue the old segment for sealing
-    /// ), wake th elsm flusher if the memtable rolled during step 5, refresh the metrics and send the result back to the client.
-    /// Worth noting throughout: After step 3, every error path calls `halt_submit_batch_failure` before replying. If the WAL
-    /// append succeeded but the index commit failed - the store freezes, and let crash recovery run repair.
+    /// Commits one foreground batch in segment, WAL, LSM, then RocksDB order.
+    ///
+    /// Preparation assigns a contiguous LSN range. Payload operations append to the active segment,
+    /// rolling it first when needed. Every operation is appended to the store WAL, keyed mutations
+    /// enter the LSM, and the RocksDB batch atomically publishes the logical metadata plus any
+    /// staged rollover rows. After physical writes begin, a failure halts the writer for recovery.
     pub(crate) fn submit_batch(
         &mut self,
         ops: Vec<BatchOp>,
@@ -203,7 +183,7 @@ impl WriteCoordinator {
             prepared.result.op_lsns.push(lsn);
         }
 
-        if let Err(error) = self.wal.append(&wal_entries).map_err(Error::from) {
+        if let Err(error) = self.wal.append(&wal_entries) {
             self.halt_submit_batch_failure(
                 "store WAL append",
                 &error,
@@ -249,11 +229,6 @@ impl WriteCoordinator {
             );
             return Err(());
         }
-        profile_phase(
-            profile.as_deref_mut(),
-            |profile, elapsed| profile.rollover_post_commit += elapsed,
-            || self.run_rollover_post_commit(pending_rollovers),
-        );
         self.request_lsm_flush(rolled_memtable);
         self.metrics.set_active_segment(
             self.active_segment_state.segment_id,
@@ -423,15 +398,16 @@ impl WriteCoordinator {
 
     /// Commits the index side of a prepared batch.
     ///
-    /// This assembles the rocksdb write batch and commits these changes as part of the single atomic write:
+    /// This assembles one atomic RocksDB write:
+    ///
     /// 1. Any pending rollover rows are part of the batch i.e. old segments flipped to `Sealing` state
-    /// and new segments are registered and published at LSN.
+    ///    and new segments are registered and published at LSN.
     /// 2. For epoch change, the `epoch_changes[lsn]` history row and the `current_epoch` pointer.
     /// 3. The updated active segment state row but only if op actually wrote payload bytes
     /// 4. `next_lsn = last committed lsn + 1`
-    /// A rollover segment that happens during this write (Segment A retired, segment B now active) stages
-    /// its metadata in `self.pending_rollovers` rather than committing immediately. It must be updated as
-    /// part of the single commit beucase if the commit fails we don't want to change the system state.
+    ///
+    /// A rollover during this write stages its metadata in `self.pending_rollovers`, so the active
+    /// segment change commits atomically with the records that reference it.
     fn commit_write_batch(
         &self,
         pending_rollovers: &[PendingRollover],

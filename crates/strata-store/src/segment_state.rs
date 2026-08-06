@@ -1,5 +1,5 @@
 //! Segment-state row construction and publication primitives shared by the open,
-//! recovery, seal, and write paths.
+//! recovery and write paths.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use strata_core::{
@@ -13,12 +13,11 @@ use crate::{
     layout::{relative_segment_path, segment_path},
 };
 
-/// In-memory allocation publication state shared by the active writer, durability checkpoints,
-/// and the sealer after a segment rolls.
+/// In-memory allocation publication state shared by the active writer and captured durability
+/// checkpoints.
 ///
-/// A durability checkpoint and sealing can finish in either order. Both carry a cumulative record
-/// count captured at their byte boundary; this tracker turns that count into a delta under the
-/// store's durability-publication lock so the GC baseline is applied exactly once.
+/// Each checkpoint carries a cumulative record count captured at its byte boundary. This tracker
+/// turns that count into a delta so the GC baseline is applied exactly once.
 #[derive(Debug, Default)]
 pub(crate) struct SegmentAllocationTracker {
     published_records: AtomicU64,
@@ -160,9 +159,9 @@ pub(crate) fn publish_segment_allocation_baseline(
     let mut summary = index
         .get_segment_gc_summary(segment_id)?
         .unwrap_or_default();
-    // Another publisher (normally the sealer racing an asynchronous durability checkpoint) may
-    // already have covered this exact or a later byte boundary. The cumulative record tracker lets
-    // the caller mark its captured count covered without applying a second GC delta.
+    // An earlier durability snapshot may already have covered this byte boundary. The cumulative
+    // record tracker lets the caller mark its captured count covered without applying a duplicate
+    // GC delta.
     if summary.total_bytes >= durable_bytes {
         return Ok(false);
     }

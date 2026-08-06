@@ -23,6 +23,7 @@ impl WriteCoordinator {
     /// Main compatibility loop for store metadata publication and administrative operations.
     pub(crate) fn run(mut self) {
         loop {
+            self.process_ready_durability();
             if self.next_maintenance_timeout().is_zero()
                 && let Err(error) = self.process_scheduled_maintenance()
             {
@@ -42,11 +43,11 @@ impl WriteCoordinator {
             if matches!(command, WriteCommand::Shutdown) {
                 break;
             }
-            if !matches!(command, WriteCommand::DurabilityReady(_)) {
+            if !matches!(command, WriteCommand::DurabilityReady) {
                 self.metrics.dequeue_write_command();
             }
             if let Some(error) = self.store_halt.error()
-                && !matches!(command, WriteCommand::DurabilityReady(_))
+                && !matches!(command, WriteCommand::DurabilityReady)
             {
                 Self::send_command_error(command, error);
                 continue;
@@ -68,37 +69,37 @@ impl WriteCoordinator {
                 WriteCommand::Sync(request) => {
                     self.process_sync(request);
                 }
-                WriteCommand::DurabilityReady(ready) => {
-                    match self.finish_durability_publish(ready) {
-                        Ok((published_lsn, phases)) => {
-                            self.complete_sync_requests(published_lsn, &phases);
-                            let force = !self.pending_sync_requests.is_empty();
-                            if let Err(error) = self.maybe_start_durability_publish(force) {
-                                self.halt_writer_error(
-                                    "start follow-up durability publication",
-                                    &error,
-                                );
-                                self.fail_pending_sync_requests();
-                            }
-                        }
-                        Err(error) => {
-                            self.metrics.record_sync(Err(()), Duration::ZERO);
-                            self.metrics.set_durability_pending(
-                                self.wal.pending_bytes(),
-                                self.pending_segment_bytes,
-                                false,
-                            );
-                            self.halt_writer_error("finish durability publication", &error);
-                            self.fail_pending_sync_requests();
-                        }
-                    }
-                }
+                WriteCommand::DurabilityReady => self.process_ready_durability(),
                 WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
             }
         }
-        // A completion callback may be waiting for capacity in the bounded public command queue.
-        // Dropping the receiver releases it immediately during shutdown.
         drop(self.write_rx);
+    }
+
+    fn process_ready_durability(&mut self) {
+        let Ok(ready) = self.durability_ready_rx.try_recv() else {
+            return;
+        };
+        match self.finish_durability_publish(ready) {
+            Ok((published_lsn, phases)) => {
+                self.complete_sync_requests(published_lsn, &phases);
+                let force = !self.pending_sync_requests.is_empty();
+                if let Err(error) = self.maybe_start_durability_publish(force) {
+                    self.halt_writer_error("start follow-up durability publication", &error);
+                    self.fail_pending_sync_requests();
+                }
+            }
+            Err(error) => {
+                self.metrics.record_sync(Err(()), Duration::ZERO);
+                self.metrics.set_durability_pending(
+                    self.wal.pending_bytes(),
+                    self.pending_segment_bytes,
+                    false,
+                );
+                self.halt_writer_error("finish durability publication", &error);
+                self.fail_pending_sync_requests();
+            }
+        }
     }
 
     fn next_maintenance_timeout(&self) -> Duration {
@@ -166,7 +167,7 @@ impl WriteCoordinator {
             WriteCommand::Sync(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
-            WriteCommand::DurabilityReady(_) => {}
+            WriteCommand::DurabilityReady => {}
             WriteCommand::Shutdown => {}
         }
     }

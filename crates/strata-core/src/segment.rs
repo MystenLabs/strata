@@ -624,8 +624,8 @@ pub enum SegmentFileState {
     /// The active ingest segment. New records may be appended, and only the durable prefix is
     /// guaranteed to survive a crash.
     Open,
-    /// An ingest segment that has stopped accepting appends and is waiting for the seal worker to
-    /// flush, checksum, and publish it as immutable.
+    /// An ingest segment that has stopped accepting appends and is waiting for durability
+    /// publication to flush, checksum, and publish it as immutable.
     Sealing,
     /// An immutable segment whose complete contents and sealed metadata are durable and readable.
     Sealed,

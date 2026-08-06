@@ -55,7 +55,8 @@
 //!   -> verify sealed segment files according to SealedSegmentIntegrityPolicy
 //!   -> load both LSM manifests, remove unpublished SSTs, and route the remaining store-WAL suffix
 //!   -> choose active segment
-//!   -> start memtable flush/compaction, garbage sweep, sealer, writer, and GC
+//!   -> synchronously seal recovered rolled segments
+//!   -> start memtable flush/compaction, garbage sweep, writer, and GC
 //! ```
 //!
 //! Crash model:
@@ -146,6 +147,7 @@ mod writer;
 
 use std::{
     num::NonZeroUsize,
+    path::PathBuf,
     sync::{
         Arc, Mutex, RwLock, Weak,
         atomic::{AtomicU64, AtomicUsize},
@@ -184,7 +186,7 @@ pub use config::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
     DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_LSM_PARTITION_COUNT,
-    DEFAULT_SEAL_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
     DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
 };
@@ -204,11 +206,6 @@ pub use read::{ReadOptions, StoreGetProfile};
 use reader_cache::SegmentReaderCache;
 pub use relocation::DEFAULT_RELOCATION_CACHE_ENTRIES;
 use relocation::{RelocationCache, RelocationStore};
-use seal::SealCommand;
-#[cfg(test)]
-use seal::SealWorker;
-#[cfg(test)]
-use seal::SegmentSealTask;
 pub use strata_gc::{GcPlanner, GcPlannerConfig};
 
 #[cfg(feature = "internal-profiling")]
@@ -232,8 +229,8 @@ use segment_state::{
 };
 
 const FIRST_SEGMENT_ID: SegmentId = 1;
-/// How long the writer naps while waiting for the sealer to drain its backlog. Short, because
-/// this sleep sits on the foreground put path during rollover backpressure.
+/// How long the writer naps while waiting for durability publication to drain rolled segments.
+/// Short, because this sleep sits on the foreground put path during rollover backpressure.
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
 const DURABILITY_PUBLISH_INTERVAL: Duration = Duration::from_secs(20 * 60);
 const DURABILITY_PUBLISH_WAL_BYTES: u64 = 64 * 1024 * 1024;
@@ -287,8 +284,6 @@ pub struct StrataStore {
     lsm_flush_handle: Option<JoinHandle<()>>,
     lsm_compact_handle: Option<JoinHandle<()>>,
     lsm_sync_handles: Vec<JoinHandle<()>>,
-    seal_tx: Option<mpsc::Sender<SealCommand>>,
-    seal_handle: Option<JoinHandle<()>>,
     garbage_sweep_tx: Option<mpsc::Sender<()>>,
     garbage_sweep_handle: Option<JoinHandle<()>>,
     pub(crate) gc_txs: Vec<mpsc::Sender<GcCommand>>,
@@ -353,6 +348,8 @@ struct WriteCoordinator {
     segment_sync_tx: FileSyncSender,
     pending_segment_syncs: Vec<SegmentSync>,
     internal_write_tx: mpsc::SyncSender<WriteCommand>,
+    durability_ready_tx: mpsc::Sender<Arc<DurabilityPublish>>,
+    durability_ready_rx: mpsc::Receiver<Arc<DurabilityPublish>>,
     durability_in_flight_lsn: Option<StrataLsn>,
     pending_sync_requests: Vec<PendingSyncRequest>,
     durability_publish_lock: Arc<Mutex<()>>,
@@ -369,7 +366,6 @@ struct WriteCoordinator {
     pending_rollovers: Vec<PendingRollover>,
     lsm_flush_tx: mpsc::Sender<()>,
     lsm_compact_tx: mpsc::Sender<()>,
-    seal_tx: mpsc::Sender<SealCommand>,
     write_rx: mpsc::Receiver<WriteCommand>,
     ingest_owner: SegmentOwner,
     relocations: Arc<RelocationStore>,
@@ -381,10 +377,12 @@ struct WriteCoordinator {
 #[derive(Clone, Debug)]
 struct SegmentSync {
     segment_id: SegmentId,
+    path: PathBuf,
     durable_offset: u64,
+    sealed_before_lsn: Option<StrataLsn>,
+    sealed_sha256: Arc<Mutex<Option<[u8; 32]>>>,
     allocation_records: u64,
     allocation_tracker: Arc<SegmentAllocationTracker>,
-    completion: file_sync::FileSyncCompletion,
 }
 
 struct PendingSyncRequest {
@@ -412,7 +410,8 @@ struct DurabilityPublish {
     file_sync_started: Instant,
     remaining_syncs: AtomicUsize,
     file_sync_result: Mutex<Option<Result<Duration>>>,
-    ready_tx: mpsc::SyncSender<WriteCommand>,
+    ready_tx: mpsc::Sender<Arc<DurabilityPublish>>,
+    wake_tx: mpsc::SyncSender<WriteCommand>,
 }
 
 #[cfg(test)]
