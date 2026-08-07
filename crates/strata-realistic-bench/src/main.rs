@@ -1239,11 +1239,14 @@ impl Model {
             self.live.push_back(record);
             return;
         }
+        // Parallel puts can be acknowledged slightly out of order. Those records still belong
+        // near the tail, so search backward instead of walking the entire live queue from the
+        // front while holding the shared model lock.
         let position = self
             .live
             .iter()
-            .position(|candidate| candidate.due_at > record.due_at)
-            .unwrap_or(self.live.len());
+            .rposition(|candidate| candidate.due_at <= record.due_at)
+            .map_or(0, |position| position + 1);
         self.live.insert(position, record);
     }
 
@@ -3422,6 +3425,42 @@ mod tests {
         assert_eq!(metrics.delete_due.get(), 1);
         model.finish_delete(claimed);
         assert_eq!(model.deleted.len(), 1);
+    }
+
+    #[test]
+    fn model_orders_out_of_order_put_acknowledgments() {
+        let registry = Registry::new();
+        let metrics =
+            HarnessMetrics::new(&registry, EngineKind::Strata).expect("metrics should register");
+        let written_at = Instant::now();
+        let mut model = Model::new(10);
+        for (key, retention) in [(1, 10), (3, 30), (2, 20)] {
+            model.push_live(Arc::new(KeyRecord::new(
+                make_key(key).expect("key should be valid"),
+                written_at,
+                Duration::from_secs(retention),
+            )));
+        }
+
+        assert_eq!(
+            model
+                .claim_due(written_at + Duration::from_secs(10), &metrics)
+                .expect("first key should be due")
+                .key,
+            make_key(1).expect("key should be valid")
+        );
+        assert!(
+            model
+                .claim_due(written_at + Duration::from_secs(19), &metrics)
+                .is_none()
+        );
+        assert_eq!(
+            model
+                .claim_due(written_at + Duration::from_secs(20), &metrics)
+                .expect("second key should be due")
+                .key,
+            make_key(2).expect("key should be valid")
+        );
     }
 
     #[test]
