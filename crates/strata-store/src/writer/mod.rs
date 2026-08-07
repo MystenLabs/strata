@@ -10,18 +10,23 @@ use std::{
 use strata_core::{ShardCleanupJob, ShardCleanupState, ShardId, ShardInfo, ShardKey, ShardState};
 
 use crate::{
-    AddShardRequest, BatchOp, BatchWriteRequest, DURABILITY_PUBLISH_INTERVAL, DropShardRequest,
-    Error, Result, SEGMENT_ROLLOVER_INTERVAL, SyncRequest, WriteCommand, WriteCoordinator,
-    wal::WalEntry, wal_format::StoreWalMutation,
+    AddShardRequest, BatchOp, DURABILITY_PUBLISH_INTERVAL, DropShardRequest, Error, Result,
+    SEGMENT_ROLLOVER_INTERVAL, SyncRequest, WriteCommand, WriteCoordinator, wal::WalEntry,
+    wal_format::StoreWalMutation,
 };
 
 mod commit;
 mod rollover;
 mod sync;
 
+const MAX_GROUPED_BATCHES: usize = 16;
+const MAX_GROUPED_OPERATIONS: usize = 256;
+const MAX_GROUPED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 impl WriteCoordinator {
     /// Main compatibility loop for store metadata publication and administrative operations.
     pub(crate) fn run(mut self) {
+        let mut deferred = None;
         loop {
             self.process_ready_durability();
             if self.next_maintenance_timeout().is_zero()
@@ -30,21 +35,26 @@ impl WriteCoordinator {
                 self.halt_writer_error("scheduled writer maintenance", &error);
             }
             let timeout = self.next_maintenance_timeout();
-            let command = match self.write_rx.recv_timeout(timeout) {
-                Ok(command) => command,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(error) = self.process_scheduled_maintenance() {
-                        self.halt_writer_error("scheduled writer maintenance", &error);
+            let command = match deferred.take() {
+                Some(command) => command,
+                None => match self.write_rx.recv_timeout(timeout) {
+                    Ok(command) => {
+                        if !matches!(command, WriteCommand::DurabilityReady) {
+                            self.metrics.dequeue_write_command();
+                        }
+                        command
                     }
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Err(error) = self.process_scheduled_maintenance() {
+                            self.halt_writer_error("scheduled writer maintenance", &error);
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                },
             };
             if matches!(command, WriteCommand::Shutdown) {
                 break;
-            }
-            if !matches!(command, WriteCommand::DurabilityReady) {
-                self.metrics.dequeue_write_command();
             }
             if let Some(error) = self.store_halt.error()
                 && !matches!(command, WriteCommand::DurabilityReady)
@@ -56,8 +66,58 @@ impl WriteCoordinator {
                 WriteCommand::AddShard(request) => {
                     self.process_add_shard(request);
                 }
-                WriteCommand::Batch(request) => {
-                    self.process_batch(request);
+                WriteCommand::Batch(first) => {
+                    let mut operation_count = first.ops.len();
+                    let mut payload_bytes = first
+                        .ops
+                        .iter()
+                        .filter_map(|op| match op {
+                            BatchOp::Put { payload, .. } => Some(payload.len()),
+                            _ => None,
+                        })
+                        .sum::<usize>();
+                    let mut requests = vec![first];
+
+                    while requests.len() < MAX_GROUPED_BATCHES {
+                        match self.write_rx.try_recv() {
+                            Ok(command) => {
+                                if !matches!(command, WriteCommand::DurabilityReady) {
+                                    self.metrics.dequeue_write_command();
+                                }
+                                match command {
+                                    WriteCommand::Batch(request) => {
+                                        let next_operations = request.ops.len();
+                                        let next_payload_bytes = request
+                                            .ops
+                                            .iter()
+                                            .filter_map(|op| match op {
+                                                BatchOp::Put { payload, .. } => Some(payload.len()),
+                                                _ => None,
+                                            })
+                                            .sum::<usize>();
+                                        if operation_count.saturating_add(next_operations)
+                                            > MAX_GROUPED_OPERATIONS
+                                            || payload_bytes.saturating_add(next_payload_bytes)
+                                                > MAX_GROUPED_PAYLOAD_BYTES
+                                        {
+                                            deferred = Some(WriteCommand::Batch(request));
+                                            break;
+                                        }
+                                        operation_count += next_operations;
+                                        payload_bytes += next_payload_bytes;
+                                        requests.push(request);
+                                    }
+                                    command => {
+                                        deferred = Some(command);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    self.process_batch_group(requests);
                 }
                 WriteCommand::DropShard(request) => {
                     self.process_drop_shard(request);
@@ -293,55 +353,6 @@ impl WriteCoordinator {
 
         self.metrics.set_next_lsn(next_lsn);
         Ok(())
-    }
-
-    /// Handles one client batch and records user visible put metrics.
-    ///
-    /// Metrics are recorded once per submitted put after the writer knows
-    /// whether the batch committed or was rejected during validation. Recording during append would
-    /// count a write as successful before the index commit that makes it visible.
-    fn process_batch(&mut self, request: BatchWriteRequest) {
-        let BatchWriteRequest {
-            ops,
-            response_tx,
-            profile: profile_request,
-        } = request;
-        let started = Instant::now();
-        let put_count = ops
-            .iter()
-            .filter(|op| matches!(op, BatchOp::Put { .. }))
-            .count();
-        let mut profile = profile_request.begin(started);
-        match self.submit_batch(ops, response_tx, profile.as_mut()) {
-            Ok((result, put_metrics)) => {
-                let segment_bytes = put_metrics.iter().fold(0_u64, |total, metric| {
-                    total.saturating_add(metric.record_bytes)
-                });
-                for metric in put_metrics {
-                    self.metrics.record_put(Ok(metric), started.elapsed());
-                }
-                if let Some(last_lsn) = result.last_lsn() {
-                    self.metrics.set_next_lsn(last_lsn.saturating_add(1));
-                }
-                if let Some(epoch) = result.last_epoch() {
-                    self.metrics.set_current_epoch(epoch);
-                }
-                if result.last_lsn().is_some()
-                    && let Err(error) = self.note_committed_write(segment_bytes)
-                {
-                    self.halt_writer_error("schedule batch durability", &error);
-                }
-            }
-            Err(()) => {
-                for _ in 0..put_count {
-                    self.metrics.record_put(Err(()), started.elapsed());
-                }
-            }
-        }
-        if let Some(mut profile) = profile {
-            profile.writer_total = started.elapsed();
-            profile_request.send(profile);
-        }
     }
 
     fn process_sync(&mut self, request: SyncRequest) {

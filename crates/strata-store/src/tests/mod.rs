@@ -5194,46 +5194,70 @@ async fn segment_pressure_rolls_before_asynchronous_durability() {
     };
 
     let (first_response_tx, first_response_rx) = mpsc::channel();
-    let (_, put_metrics) = coordinator
-        .submit_batch(
-            vec![BatchOp::Put {
+    let (invalid_response_tx, invalid_response_rx) = mpsc::channel();
+    let (epoch_response_tx, epoch_response_rx) = mpsc::channel();
+    coordinator.process_batch_group(vec![
+        BatchWriteRequest {
+            ops: vec![BatchOp::Put {
                 shard_id: STANDALONE_SHARD.id,
                 key: BlobKey::new(b"durability-pressure".to_vec()).unwrap(),
                 payload: Arc::from(&b"payload"[..]),
             }],
-            first_response_tx,
-            None,
-        )
-        .unwrap();
+            response_tx: first_response_tx,
+            profile: ProfileRequest::default(),
+        },
+        BatchWriteRequest {
+            ops: vec![BatchOp::SetBlobLifetime {
+                key: BlobKey::new(b"invalid-lifetime".to_vec()).unwrap(),
+                logical_end_epoch: cfg.starting_epoch,
+            }],
+            response_tx: invalid_response_tx,
+            profile: ProfileRequest::default(),
+        },
+        BatchWriteRequest {
+            ops: vec![BatchOp::IncrementEpoch],
+            response_tx: epoch_response_tx,
+            profile: ProfileRequest::default(),
+        },
+    ]);
     assert_eq!(
         first_response_rx.recv().unwrap().unwrap().last_lsn(),
         Some(1)
     );
-    let record_bytes = put_metrics[0].record_bytes;
+    assert!(matches!(
+        invalid_response_rx.recv().unwrap(),
+        Err(Error::InvalidBlobLifetime { .. })
+    ));
+    let epoch_result = epoch_response_rx.recv().unwrap().unwrap();
+    assert_eq!(epoch_result.last_lsn(), Some(2));
+    assert_eq!(epoch_result.last_epoch(), Some(cfg.starting_epoch + 1));
+    let record_bytes = coordinator.active_segment_state.write_offset;
     coordinator.pending_segment_bytes = DURABILITY_PUBLISH_SEGMENT_BYTES - record_bytes;
     coordinator.note_committed_write(record_bytes).unwrap();
     assert!(coordinator.pending_segment_syncs.is_empty());
-    assert_eq!(coordinator.durability_in_flight_lsn, Some(1));
+    assert_eq!(coordinator.durability_in_flight_lsn, Some(2));
 
     let old_state = index.get_segment_state(1).unwrap().unwrap();
     assert_eq!(old_state.state, SegmentFileState::Sealing);
     assert_eq!(old_state.write_offset, record_bytes);
-    assert_eq!(old_state.sealed_before_lsn, Some(2));
+    assert_eq!(old_state.sealed_before_lsn, Some(3));
     let new_state = index.get_segment_state(2).unwrap().unwrap();
     assert_eq!(new_state.state, SegmentFileState::Open);
-    assert_eq!(index.get_segment_published_at_lsn(2).unwrap(), 2);
+    assert_eq!(index.get_segment_published_at_lsn(2).unwrap(), 3);
 
     let (second_response_tx, second_response_rx) = mpsc::channel();
-    coordinator
-        .submit_batch(vec![BatchOp::IncrementEpoch], second_response_tx, None)
-        .unwrap();
+    coordinator.process_batch_group(vec![BatchWriteRequest {
+        ops: vec![BatchOp::IncrementEpoch],
+        response_tx: second_response_tx,
+        profile: ProfileRequest::default(),
+    }]);
     assert_eq!(
         second_response_rx
             .recv_timeout(Duration::from_millis(50))
             .unwrap()
             .unwrap()
             .last_lsn(),
-        Some(2)
+        Some(3)
     );
     // The segment sync workers are not running yet. Publication is pending, but the following
     // write still returns without waiting for physical I/O.
@@ -5244,8 +5268,8 @@ async fn segment_pressure_rolls_before_asynchronous_durability() {
     coordinator.process_segment_rollover().unwrap();
     let sync_handle = thread::spawn(move || segment_syncer.run());
     coordinator.wait_for_seal_backlog_capacity().unwrap();
-    assert_eq!(index.get_published_lsn().unwrap(), 1);
-    assert_eq!(index.get_next_lsn().unwrap(), 3);
+    assert_eq!(index.get_published_lsn().unwrap(), 2);
+    assert_eq!(index.get_next_lsn().unwrap(), 4);
     assert_eq!(
         index.get_segment_state(1).unwrap().unwrap().state,
         SegmentFileState::Sealed
