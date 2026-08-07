@@ -35,6 +35,11 @@ impl WriteCoordinator {
                 .iter()
                 .filter(|op| matches!(op, BatchOp::Put { .. }))
                 .count();
+            let delete_count = request
+                .ops
+                .iter()
+                .filter(|op| matches!(op, BatchOp::Tombstone { .. }))
+                .count();
             let mut profile = request.profile.begin(started);
             if request.ops.is_empty() {
                 let _ = profile_phase(
@@ -79,6 +84,9 @@ impl WriteCoordinator {
                     );
                     for _ in 0..put_count {
                         self.metrics.record_put(Err(()), started.elapsed());
+                    }
+                    for _ in 0..delete_count {
+                        self.metrics.record_delete(false, started.elapsed());
                     }
                     if let Some(mut profile) = profile {
                         profile.writer_total = started.elapsed();
@@ -257,6 +265,13 @@ impl WriteCoordinator {
                 segment_bytes = segment_bytes.saturating_add(metric.record_bytes);
                 self.metrics.record_put(Ok(metric), started.elapsed());
             }
+            for _ in prepared
+                .ops
+                .iter()
+                .filter(|op| matches!(op, PreparedBatchOp::Tombstone { .. }))
+            {
+                self.metrics.record_delete(true, started.elapsed());
+            }
             let _ = profile_phase(
                 profile.as_mut(),
                 |profile, elapsed| profile.response_send += elapsed,
@@ -297,6 +312,13 @@ impl WriteCoordinator {
                 .filter(|op| matches!(op, PreparedBatchOp::Put { .. }))
             {
                 self.metrics.record_put(Err(()), started.elapsed());
+            }
+            for _ in prepared
+                .ops
+                .iter()
+                .filter(|op| matches!(op, PreparedBatchOp::Tombstone { .. }))
+            {
+                self.metrics.record_delete(false, started.elapsed());
             }
             if let Some(mut profile) = profile {
                 profile.writer_total = started.elapsed();

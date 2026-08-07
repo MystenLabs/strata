@@ -34,6 +34,9 @@ struct PrometheusMetrics {
     put_duration_seconds: Histogram,
     put_payload_bytes_total: IntCounter,
     put_record_bytes_total: IntCounter,
+    delete_calls_total: IntCounter,
+    delete_errors_total: IntCounter,
+    delete_duration_seconds: Histogram,
     sync_calls_total: IntCounter,
     sync_errors_total: IntCounter,
     sync_duration_seconds: Histogram,
@@ -190,6 +193,24 @@ impl StrataStoreMetrics {
                     &labels,
                     "put_record_bytes_total",
                     "Total encoded record bytes written by Strata put calls.",
+                )?,
+                delete_calls_total: register_counter(
+                    registry,
+                    &labels,
+                    "delete_calls_total",
+                    "Total Strata delete calls.",
+                )?,
+                delete_errors_total: register_counter(
+                    registry,
+                    &labels,
+                    "delete_errors_total",
+                    "Total failed Strata delete calls.",
+                )?,
+                delete_duration_seconds: register_histogram(
+                    registry,
+                    &labels,
+                    "delete_duration_seconds",
+                    "Strata delete latency in seconds.",
                 )?,
                 sync_calls_total: register_counter(
                     registry,
@@ -808,6 +829,19 @@ impl StrataStoreMetrics {
                 metrics.put_record_bytes_total.inc_by(metric.record_bytes);
             }
             Err(()) => metrics.put_errors_total.inc(),
+        }
+    }
+
+    pub(crate) fn record_delete(&self, success: bool, elapsed: Duration) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics.delete_calls_total.inc();
+        metrics
+            .delete_duration_seconds
+            .observe(duration_seconds(elapsed));
+        if !success {
+            metrics.delete_errors_total.inc();
         }
     }
 

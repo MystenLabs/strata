@@ -2380,6 +2380,18 @@ async fn metrics_track_core_store_operations() {
             > counter_value(&registry, "strata_store_put_payload_bytes_total")
     );
     assert_eq!(
+        counter_value(&registry, "strata_store_delete_calls_total"),
+        1.0
+    );
+    assert_eq!(
+        counter_value(&registry, "strata_store_delete_errors_total"),
+        0.0
+    );
+    assert_eq!(
+        histogram_sample_count(&registry, "strata_store_delete_duration_seconds"),
+        1
+    );
+    assert_eq!(
         counter_value(&registry, "strata_store_sync_calls_total"),
         1.0
     );

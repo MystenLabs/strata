@@ -2,7 +2,8 @@
 //!
 //! Unlike the focused `strata-bench` cases, this harness keeps writes, age-based deletes, reads,
 //! reclamation, and storage pressure active at the same time. Read and delete service levels are
-//! obligations; an AIMD controller greedily raises write concurrency while those obligations hold.
+//! obligations. By default an AIMD controller greedily raises write concurrency while those
+//! obligations hold; `--put-ops-per-second` instead holds offered put load at a fixed global rate.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -151,6 +152,7 @@ struct Config {
     retention: Duration,
     cleanup_grace: Duration,
     payload_size: usize,
+    put_ops_per_second: u64,
     initial_write_workers: usize,
     min_write_workers: usize,
     max_write_workers: usize,
@@ -200,6 +202,7 @@ impl Config {
             retention: DEFAULT_RETENTION,
             cleanup_grace: DEFAULT_CLEANUP_GRACE,
             payload_size: DEFAULT_PAYLOAD_SIZE,
+            put_ops_per_second: 0,
             initial_write_workers: DEFAULT_INITIAL_WRITE_WORKERS,
             min_write_workers: DEFAULT_MIN_WRITE_WORKERS,
             max_write_workers: DEFAULT_MAX_WRITE_WORKERS,
@@ -255,6 +258,9 @@ impl Config {
                 }
                 "--payload-size" => {
                     config.payload_size = parse_size(&next_value(&mut args, &arg)?)?
+                }
+                "--put-ops-per-second" => {
+                    config.put_ops_per_second = parse_u64(&next_value(&mut args, &arg)?)?
                 }
                 "--initial-write-workers" => {
                     config.initial_write_workers =
@@ -622,6 +628,7 @@ struct HarnessMetrics {
     deleted_sample_keys: IntGauge,
     logical_live_bytes: IntGauge,
     active_write_workers: IntGauge,
+    target_put_ops_per_second: Gauge,
     client_load_active: IntGauge,
     controller_healthy: IntGauge,
     controller_unhealthy: IntGaugeVec,
@@ -798,7 +805,11 @@ impl HarnessMetrics {
             ),
             active_write_workers: int_gauge!(
                 "strata_realistic_bench_active_write_workers",
-                "Writer concurrency currently admitted by the controller."
+                "Active writer concurrency; fixed at the configured maximum when a put rate is set."
+            ),
+            target_put_ops_per_second: gauge!(
+                "strata_realistic_bench_target_put_ops_per_second",
+                "Configured global put rate; zero means AIMD-controlled unbounded puts."
             ),
             client_load_active: int_gauge!(
                 "strata_realistic_bench_client_load_active",
@@ -925,6 +936,7 @@ impl HarnessMetrics {
         for gauge in [
             &metrics.controller_read_p99_seconds,
             &metrics.controller_read_ops_per_second,
+            &metrics.target_put_ops_per_second,
             &metrics.oldest_overdue_seconds,
             &metrics.space_amplification,
         ] {
@@ -1387,14 +1399,43 @@ struct WorkloadContext {
     workload_stop: Arc<AtomicBool>,
     fatal: Arc<FatalState>,
     active_write_workers: Arc<AtomicUsize>,
+    next_put_at: Arc<Mutex<Instant>>,
     next_key_id: Arc<AtomicU64>,
 }
 
 fn run_writer(worker_index: usize, context: Arc<WorkloadContext>) {
+    let put_interval = (context.config.put_ops_per_second != 0).then(|| {
+        Duration::from_nanos(
+            1_000_000_000_u64
+                .checked_div(context.config.put_ops_per_second)
+                .unwrap_or(0)
+                .max(1),
+        )
+    });
     while !context.workload_stop.load(Ordering::Acquire) {
         if worker_index >= context.active_write_workers.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(10));
             continue;
+        }
+
+        if let Some(put_interval) = put_interval {
+            let scheduled_at = {
+                let mut next_put_at = context
+                    .next_put_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let scheduled_at = (*next_put_at).max(Instant::now());
+                *next_put_at = scheduled_at
+                    .checked_add(put_interval)
+                    .unwrap_or(scheduled_at);
+                scheduled_at
+            };
+            if sleep_until_stopped(
+                &context.workload_stop,
+                scheduled_at.saturating_duration_since(Instant::now()),
+            ) {
+                break;
+            }
         }
 
         let id = context.next_key_id.fetch_add(1, Ordering::Relaxed);
@@ -1700,10 +1741,6 @@ fn run_syncer(context: Arc<WorkloadContext>) {
 
 fn run_controller(context: Arc<WorkloadContext>) {
     let mut debounce = ControllerDebounce::default();
-    context
-        .metrics
-        .active_write_workers
-        .set(context.config.initial_write_workers as i64);
     while !context.workload_stop.load(Ordering::Acquire) {
         if sleep_until_stopped(&context.workload_stop, context.config.control_interval) {
             break;
@@ -1765,6 +1802,9 @@ fn run_controller(context: Arc<WorkloadContext>) {
         }
         let healthy = unhealthy.iter().all(|(_, active)| !active);
         context.metrics.controller_healthy.set(i64::from(healthy));
+        if context.config.put_ops_per_second != 0 {
+            continue;
+        }
         let should_adjust = debounce.observe(healthy, context.config.controller_debounce_windows);
         context
             .metrics
@@ -2108,6 +2148,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         config.cleanup_grace.as_secs_f64()
     );
     println!("payload_bytes={}", config.payload_size);
+    println!("put_target_ops_per_second={}", config.put_ops_per_second);
     println!(
         "write_workers_min_initial_max={},{},{}",
         config.min_write_workers, config.initial_write_workers, config.max_write_workers
@@ -2192,10 +2233,18 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let workload_stop = Arc::new(AtomicBool::new(false));
     let sampler_stop = Arc::new(AtomicBool::new(false));
     let fatal = Arc::new(FatalState::default());
-    let active_write_workers = Arc::new(AtomicUsize::new(config.initial_write_workers));
+    let initial_active_write_workers = if config.put_ops_per_second == 0 {
+        config.initial_write_workers
+    } else {
+        config.max_write_workers
+    };
+    let active_write_workers = Arc::new(AtomicUsize::new(initial_active_write_workers));
     metrics
         .active_write_workers
-        .set(config.initial_write_workers as i64);
+        .set(initial_active_write_workers as i64);
+    metrics
+        .target_put_ops_per_second
+        .set(config.put_ops_per_second as f64);
     let model = Arc::new(Mutex::new(Model::new(config.deleted_sample_capacity)));
     let context = Arc::new(WorkloadContext {
         config: Arc::clone(&config),
@@ -2206,6 +2255,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         workload_stop: Arc::clone(&workload_stop),
         fatal: Arc::clone(&fatal),
         active_write_workers: Arc::clone(&active_write_workers),
+        next_put_at: Arc::new(Mutex::new(Instant::now())),
         next_key_id: Arc::new(AtomicU64::new(0)),
     });
     metrics.client_load_active.set(1);
@@ -3185,6 +3235,7 @@ workload:
   --retention <duration>                 delete each key this long after put; default 5m
   --cleanup-grace <duration>             no-traffic reclamation window; default 5m
   --payload-size <bytes|KiB|MiB|GiB>     default 1MiB
+  --put-ops-per-second <count>           global put-rate target; 0 keeps AIMD control (default)
   --initial-write-workers <count>        default 1
   --min-write-workers <count>            default 1
   --max-write-workers <count>            default 64
@@ -3280,6 +3331,25 @@ mod tests {
         .expect("zero read rate should parse");
 
         assert_eq!(config.read_ops_per_second, 0);
+    }
+
+    #[test]
+    fn fixed_put_rate_parses() {
+        let config = Config::parse(
+            [
+                "--engine",
+                "strata",
+                "--root",
+                "/tmp/realistic",
+                "--put-ops-per-second",
+                "2000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("fixed put rate should parse");
+
+        assert_eq!(config.put_ops_per_second, 2_000);
     }
 
     #[test]
