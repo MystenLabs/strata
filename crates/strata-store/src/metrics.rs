@@ -28,6 +28,7 @@ struct PrometheusMetrics {
     queued_write_commands: IntGauge,
     write_queue_send_duration_seconds: Histogram,
     write_queue_send_errors_total: IntCounter,
+    requests_per_commit_group: Histogram,
     put_calls_total: IntCounter,
     put_errors_total: IntCounter,
     put_duration_seconds: Histogram,
@@ -152,6 +153,13 @@ impl StrataStoreMetrics {
                     &labels,
                     "write_queue_send_errors_total",
                     "Total failures while sending commands into the Strata write queue.",
+                )?,
+                requests_per_commit_group: register_histogram_with_buckets(
+                    registry,
+                    &labels,
+                    "requests_per_commit_group",
+                    "Successfully committed client batch requests per physical writer commit.",
+                    vec![1.0, 2.0, 4.0, 8.0, 16.0],
                 )?,
                 put_calls_total: register_counter(
                     registry,
@@ -777,6 +785,12 @@ impl StrataStoreMetrics {
             .observe(duration_seconds(elapsed));
         if !success {
             metrics.write_queue_send_errors_total.inc();
+        }
+    }
+
+    pub(crate) fn record_commit_group(&self, requests: usize) {
+        if let Some(metrics) = &self.inner {
+            metrics.requests_per_commit_group.observe(requests as f64);
         }
     }
 

@@ -231,6 +231,7 @@ impl WriteCoordinator {
             self.fail_batch_group(prepared_batches, started);
             return;
         }
+        self.metrics.record_commit_group(prepared_batches.len());
 
         self.request_lsm_flush(rolled_memtable);
         self.metrics.set_active_segment(

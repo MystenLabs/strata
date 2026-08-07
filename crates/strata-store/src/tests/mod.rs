@@ -351,6 +351,20 @@ fn histogram_sample_count(registry: &Registry, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("missing histogram metric {name}"))
 }
 
+fn histogram_sample_sum(registry: &Registry, name: &str) -> f64 {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family
+                .get_metric()
+                .first()
+                .map(|metric| metric.get_histogram().sample_sum())
+        })
+        .unwrap_or_else(|| panic!("missing histogram metric {name}"))
+}
+
 fn wait_for_segment_state(
     index: &StrataIndex,
     segment_id: SegmentId,
@@ -5231,6 +5245,14 @@ async fn segment_pressure_rolls_before_asynchronous_durability() {
     let epoch_result = epoch_response_rx.recv().unwrap().unwrap();
     assert_eq!(epoch_result.last_lsn(), Some(2));
     assert_eq!(epoch_result.last_epoch(), Some(cfg.starting_epoch + 1));
+    assert_eq!(
+        histogram_sample_count(&registry, "strata_store_requests_per_commit_group"),
+        1
+    );
+    assert_eq!(
+        histogram_sample_sum(&registry, "strata_store_requests_per_commit_group"),
+        2.0
+    );
     let record_bytes = coordinator.active_segment_state.write_offset;
     coordinator.pending_segment_bytes = DURABILITY_PUBLISH_SEGMENT_BYTES - record_bytes;
     coordinator.note_committed_write(record_bytes).unwrap();
