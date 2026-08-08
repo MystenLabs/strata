@@ -152,6 +152,13 @@ histogram_quantile(0.99,
 # Database space actually allocated on disk
 strata_realistic_bench_directory_allocated_bytes
 
+# Apparent bytes split into segment, Strata LSM table, RocksDB SST, and RocksDB blob files
+strata_realistic_bench_storage_file_apparent_bytes
+
+# Strata segment-file I/O MiB/s, including foreground and GC traffic
+rate(strata_store_segment_file_bytes_read_total[$__rate_interval]) / 1024 / 1024
+rate(strata_store_segment_file_bytes_written_total[$__rate_interval]) / 1024 / 1024
+
 # Logical/physical space amplification
 strata_realistic_bench_space_amplification_ratio
 ```

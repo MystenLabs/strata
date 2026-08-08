@@ -92,6 +92,8 @@ const DEFAULT_RELOCATION_PROFILE_READS: usize = 0;
 const DEFAULT_RELOCATION_PROFILE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ROCKSDB_CF_CLASS: &str = "rocksdb_blobdb";
 const KEY_PREFIX: &[u8] = b"realistic-key-";
+const STORAGE_FILE_TYPES: [&str; 4] =
+    ["segment", "strata_lsm_table", "rocksdb_sst", "rocksdb_blob"];
 
 fn main() {
     match Config::parse(env::args().skip(1)) {
@@ -640,12 +642,14 @@ struct HarnessMetrics {
     directory_apparent_bytes: IntGauge,
     directory_allocated_bytes: IntGauge,
     directory_files: IntGauge,
+    storage_file_apparent_bytes: IntGaugeVec,
     filesystem_available_bytes: IntGauge,
     filesystem_total_bytes: IntGauge,
     space_amplification: Gauge,
     space_sample_errors: IntCounter,
     blob_total_bytes: IntGauge,
     blob_garbage_bytes: IntGauge,
+    blob_file_bytes_read: IntGauge,
     blob_file_bytes_written: IntGauge,
     blob_gc_bytes_relocated: IntGauge,
     rocksdb_wal_bytes_written: IntGauge,
@@ -766,6 +770,19 @@ impl HarnessMetrics {
         for reason in CONTROLLER_UNHEALTHY_REASONS {
             controller_unhealthy.with_label_values(&[*reason]).set(0);
         }
+        let storage_file_apparent_bytes = IntGaugeVec::new(
+            Opts::new(
+                "strata_realistic_bench_storage_file_apparent_bytes",
+                "Apparent bytes in benchmark files classified by storage role.",
+            )
+            .const_label("engine", engine.as_str()),
+            &["file_type"],
+        )?;
+        for file_type in STORAGE_FILE_TYPES {
+            storage_file_apparent_bytes
+                .with_label_values(&[file_type])
+                .set(0);
+        }
 
         macro_rules! int_gauge {
             ($name:literal, $help:literal) => {
@@ -852,6 +869,7 @@ impl HarnessMetrics {
                 "strata_realistic_bench_directory_files",
                 "Files currently present under the benchmark database root."
             ),
+            storage_file_apparent_bytes,
             filesystem_available_bytes: int_gauge!(
                 "strata_realistic_bench_filesystem_available_bytes",
                 "Bytes available to an unprivileged process on the root filesystem."
@@ -878,6 +896,10 @@ impl HarnessMetrics {
             blob_garbage_bytes: int_gauge!(
                 "strata_realistic_bench_blobdb_live_garbage_bytes",
                 "RocksDB-reported garbage bytes in live blob files."
+            ),
+            blob_file_bytes_read: int_gauge!(
+                "strata_realistic_bench_blobdb_blob_file_bytes_read",
+                "Cumulative bytes read from BlobDB blob files."
             ),
             blob_file_bytes_written: int_gauge!(
                 "strata_realistic_bench_blobdb_blob_file_bytes_written",
@@ -927,6 +949,7 @@ impl HarnessMetrics {
             &metrics.filesystem_total_bytes,
             &metrics.blob_total_bytes,
             &metrics.blob_garbage_bytes,
+            &metrics.blob_file_bytes_read,
             &metrics.blob_file_bytes_written,
             &metrics.blob_gc_bytes_relocated,
             &metrics.rocksdb_wal_bytes_written,
@@ -943,6 +966,7 @@ impl HarnessMetrics {
             registry.register(Box::new(gauge.clone()))?;
         }
         registry.register(Box::new(metrics.space_sample_errors.clone()))?;
+        registry.register(Box::new(metrics.storage_file_apparent_bytes.clone()))?;
         Ok(metrics)
     }
 
@@ -1116,6 +1140,10 @@ impl BlobDbMetricsReporter {
             .name("realistic-blobdb-metrics".to_owned())
             .spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
+                    metrics.blob_file_bytes_read.set(saturating_i64(
+                        db.db_options()
+                            .get_ticker_count(Ticker::BlobDbBlobFileBytesRead),
+                    ));
                     metrics.blob_file_bytes_written.set(saturating_i64(
                         db.db_options()
                             .get_ticker_count(Ticker::BlobDbBlobFileBytesWritten),
@@ -1897,6 +1925,7 @@ struct SpaceSnapshot {
     files: u64,
     filesystem_available_bytes: u64,
     filesystem_total_bytes: u64,
+    storage_file_apparent_bytes: [u64; STORAGE_FILE_TYPES.len()],
 }
 
 impl SpaceSnapshot {
@@ -2039,6 +2068,10 @@ fn summarize_path(path: &Path, snapshot: &mut SpaceSnapshot) -> io::Result<()> {
     }
     if metadata.is_file() {
         snapshot.files = snapshot.files.saturating_add(1);
+        if let Some(file_type) = storage_file_type(path) {
+            snapshot.storage_file_apparent_bytes[file_type] =
+                snapshot.storage_file_apparent_bytes[file_type].saturating_add(metadata.len());
+        }
         return Ok(());
     }
     if metadata.is_dir() {
@@ -2056,6 +2089,23 @@ fn summarize_path(path: &Path, snapshot: &mut SpaceSnapshot) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn storage_file_type(path: &Path) -> Option<usize> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("data") => Some(0),
+        Some("sst") if is_strata_lsm_table(path) => Some(1),
+        Some("sst") => Some(2),
+        Some("blob") => Some(3),
+        _ => None,
+    }
+}
+
+fn is_strata_lsm_table(path: &Path) -> bool {
+    path.components().any(|component| {
+        let component = component.as_os_str();
+        component == "lsm" || component == "relocations"
+    })
 }
 
 #[cfg(unix)]
@@ -2094,6 +2144,15 @@ fn publish_space(snapshot: SpaceSnapshot, metrics: &HarnessMetrics) {
         .directory_allocated_bytes
         .set(saturating_i64(snapshot.allocated_bytes));
     metrics.directory_files.set(saturating_i64(snapshot.files));
+    for (file_type, bytes) in STORAGE_FILE_TYPES
+        .iter()
+        .zip(snapshot.storage_file_apparent_bytes)
+    {
+        metrics
+            .storage_file_apparent_bytes
+            .with_label_values(&[file_type])
+            .set(saturating_i64(bytes));
+    }
     metrics
         .filesystem_available_bytes
         .set(saturating_i64(snapshot.filesystem_available_bytes));
@@ -3285,6 +3344,31 @@ blobdb:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_storage_files_for_size_breakdown() {
+        assert_eq!(
+            storage_file_type(Path::new("realistic/ingest/1.data")),
+            Some(0)
+        );
+        assert_eq!(
+            storage_file_type(Path::new("realistic/lsm/tables/patch-1.sst")),
+            Some(1)
+        );
+        assert_eq!(
+            storage_file_type(Path::new("realistic/relocations/tables/base-1.sst")),
+            Some(1)
+        );
+        assert_eq!(
+            storage_file_type(Path::new("realistic/index/000001.sst")),
+            Some(2)
+        );
+        assert_eq!(
+            storage_file_type(Path::new("rocksdb-blobdb/000002.blob")),
+            Some(3)
+        );
+        assert_eq!(storage_file_type(Path::new("realistic/wal/1.log")), None);
+    }
 
     #[test]
     fn parses_minimal_configuration() {

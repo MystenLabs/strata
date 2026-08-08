@@ -8,7 +8,8 @@ use std::{
 
 use strata_core::{DecodedRecord, RecordRef, SegmentId};
 use strata_segment::{
-    RecordMetadata, SegmentPayloadStream, SegmentReadOptions, SegmentReadProfile, SegmentReader,
+    RecordMetadata, SegmentIoObserver, SegmentPayloadStream, SegmentReadOptions,
+    SegmentReadProfile, SegmentReader,
 };
 
 use crate::Result;
@@ -16,6 +17,7 @@ use crate::Result;
 #[derive(Debug)]
 pub(crate) struct SegmentReaderCache {
     capacity: usize,
+    io_observer: Arc<dyn SegmentIoObserver>,
     inner: Mutex<SegmentReaderCacheInner>,
 }
 
@@ -26,9 +28,10 @@ struct SegmentReaderCacheInner {
 }
 
 impl SegmentReaderCache {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize, io_observer: Arc<dyn SegmentIoObserver>) -> Self {
         Self {
             capacity,
+            io_observer,
             inner: Mutex::new(SegmentReaderCacheInner::default()),
         }
     }
@@ -53,7 +56,11 @@ impl SegmentReaderCache {
     ) -> Result<(DecodedRecord, SegmentReadProfile)> {
         if self.capacity == 0 {
             let started = Instant::now();
-            let mut reader = SegmentReader::open(path, record_ref.segment_id)?;
+            let mut reader = SegmentReader::open_with_io_observer(
+                path,
+                record_ref.segment_id,
+                Arc::clone(&self.io_observer),
+            )?;
             *reader_acquire = started.elapsed();
             return Ok(reader.read_record_profiled_with_options(record_ref, options)?);
         }
@@ -67,9 +74,10 @@ impl SegmentReaderCache {
             let reader = if let Some(reader) = inner.readers.get(&record_ref.segment_id) {
                 Arc::clone(reader)
             } else {
-                let reader = Arc::new(Mutex::new(SegmentReader::open(
+                let reader = Arc::new(Mutex::new(SegmentReader::open_with_io_observer(
                     path,
                     record_ref.segment_id,
+                    Arc::clone(&self.io_observer),
                 )?));
                 inner
                     .readers
@@ -138,7 +146,11 @@ impl SegmentReaderCache {
         read: impl FnOnce(&mut SegmentReader) -> strata_segment::Result<T>,
     ) -> Result<T> {
         if self.capacity == 0 {
-            let mut reader = SegmentReader::open(path, segment_id)?;
+            let mut reader = SegmentReader::open_with_io_observer(
+                path,
+                segment_id,
+                Arc::clone(&self.io_observer),
+            )?;
             return Ok(read(&mut reader)?);
         }
 
@@ -150,7 +162,11 @@ impl SegmentReaderCache {
             let reader = if let Some(reader) = inner.readers.get(&segment_id) {
                 Arc::clone(reader)
             } else {
-                let reader = Arc::new(Mutex::new(SegmentReader::open(path, segment_id)?));
+                let reader = Arc::new(Mutex::new(SegmentReader::open_with_io_observer(
+                    path,
+                    segment_id,
+                    Arc::clone(&self.io_observer),
+                )?));
                 inner.readers.insert(segment_id, Arc::clone(&reader));
                 reader
             };

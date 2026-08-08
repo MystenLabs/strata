@@ -5,6 +5,7 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +16,7 @@ use strata_core::{
 };
 use strata_gc::{DestinationClass, GcAction, GcCopyRecord, GcCopySelector, GcPlan, GcPlanner};
 use strata_index::StrataIndex;
-use strata_segment::SegmentWriter;
+use strata_segment::{SegmentIoObserver, SegmentWriter};
 
 use super::{
     GcExecutor, GcPrepublishedCopy, GcPrepublishedOutputSegment, GcPublishResult,
@@ -502,6 +503,7 @@ impl GcExecutor {
             &self.gc_io_limiter,
             staging_dir,
             self.config.segment_max_bytes,
+            Arc::new(self.metrics.clone()),
         );
 
         for segment_id in copy_source_segment_ids(plan) {
@@ -602,6 +604,8 @@ impl GcExecutor {
                 path: path.clone(),
                 source,
             })?;
+            self.metrics
+                .record_segment_file_read(FIXED_RECORD_HEADER_LEN as u64);
 
             let header =
                 DecodedRecord::peek_fixed_header(&fixed).map_err(strata_segment::Error::from)?;
@@ -653,6 +657,7 @@ impl GcExecutor {
                     path: path.clone(),
                     source,
                 })?;
+                self.metrics.record_segment_file_read(body.len() as u64);
             }
             let key = body.split_off(payload_len);
             let payload = body;
@@ -695,6 +700,7 @@ struct DestinationPlacement {
 /// the plan's prediction can be audited by validate_copied_bytes.
 struct GcStagingCopier<'a> {
     io_limiter: &'a GcIoLimiter,
+    io_observer: Arc<dyn SegmentIoObserver>,
     staging_dir: &'a Path,
     segment_max_bytes: u64,
     outputs: Vec<GcStagedOutputSegment>,
@@ -705,9 +711,15 @@ struct GcStagingCopier<'a> {
 }
 
 impl<'a> GcStagingCopier<'a> {
-    fn new(io_limiter: &'a GcIoLimiter, staging_dir: &'a Path, segment_max_bytes: u64) -> Self {
+    fn new(
+        io_limiter: &'a GcIoLimiter,
+        staging_dir: &'a Path,
+        segment_max_bytes: u64,
+        io_observer: Arc<dyn SegmentIoObserver>,
+    ) -> Self {
         Self {
             io_limiter,
+            io_observer,
             staging_dir,
             segment_max_bytes,
             outputs: Vec::new(),
@@ -733,6 +745,7 @@ impl<'a> GcStagingCopier<'a> {
                 self.next_staged_segment_id,
                 destination,
                 self.segment_max_bytes,
+                Arc::clone(&self.io_observer),
             )?;
             self.next_staged_segment_id = output.next_staged_segment_id;
             self.open_outputs.insert(destination, output);
@@ -748,6 +761,7 @@ impl<'a> GcStagingCopier<'a> {
             staging_dir: self.staging_dir,
             next_staged_segment_id: &mut self.next_staged_segment_id,
             segment_max_bytes: self.segment_max_bytes,
+            io_observer: Arc::clone(&self.io_observer),
         };
         let staged =
             append_gc_record_to_staged_output(&mut append_context, output, &record, payload)?;
@@ -781,6 +795,7 @@ impl<'a> GcStagingCopier<'a> {
 struct OpenStagedOutput {
     /// Segment writer for the temporary staging file.
     writer: SegmentWriter,
+    io_observer: Arc<dyn SegmentIoObserver>,
     /// Logical shard and destination class this output accepts.
     destination: DestinationPlacement,
     /// Final placement class to record if this output is published.
@@ -796,6 +811,7 @@ impl OpenStagedOutput {
         let path = self.writer.path().to_path_buf();
         io_limiter.acquire(sealed_len);
         let sealed_sha256 = sha256_file_prefix(&path, sealed_len)?;
+        self.io_observer.record_read(sealed_len);
         Ok(GcStagedOutputSegment {
             staged_segment_id: self.writer.segment_id(),
             shard: self.destination.shard,
@@ -814,13 +830,20 @@ fn create_staged_output(
     staged_segment_id: SegmentId,
     destination: DestinationPlacement,
     segment_max_bytes: u64,
+    io_observer: Arc<dyn SegmentIoObserver>,
 ) -> Result<OpenStagedOutput> {
     let placement_class = placement_class_for_destination(destination.class);
     let path = staging_dir.join(format!("{staged_segment_id:012}.data"));
-    let writer =
-        SegmentWriter::create(&path, staged_segment_id, placement_class, segment_max_bytes)?;
+    let writer = SegmentWriter::create_with_io_observer(
+        &path,
+        staged_segment_id,
+        placement_class,
+        segment_max_bytes,
+        Arc::clone(&io_observer),
+    )?;
     Ok(OpenStagedOutput {
         writer,
+        io_observer,
         destination,
         placement_class,
         next_staged_segment_id: staged_segment_id.saturating_add(1),
@@ -837,6 +860,7 @@ struct GcStagedOutputAppendContext<'a> {
     staging_dir: &'a Path,
     next_staged_segment_id: &'a mut SegmentId,
     segment_max_bytes: u64,
+    io_observer: Arc<dyn SegmentIoObserver>,
 }
 
 fn append_gc_record_to_staged_output(
@@ -857,6 +881,7 @@ fn append_gc_record_to_staged_output(
                 *context.next_staged_segment_id,
                 output.destination,
                 context.segment_max_bytes,
+                Arc::clone(&context.io_observer),
             )?;
             let finished = std::mem::replace(output, replacement).finish(context.io_limiter)?;
             context.finished_outputs.push(finished);

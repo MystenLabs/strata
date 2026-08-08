@@ -356,8 +356,8 @@
       },
       "targets": [
         {
-          "expr": "strata_realistic_bench_blobdb_total_blob_file_bytes{job=\"strata-bench\",engine=\"blobdb\"}",
-          "legendFormat": "total blob files",
+          "expr": "sum by (engine, file_type) (strata_realistic_bench_storage_file_apparent_bytes{job=\"strata-bench\",engine=~\"$engine\"})",
+          "legendFormat": "{{engine}} {{file_type}}",
           "range": true,
           "refId": "A"
         },
@@ -368,7 +368,48 @@
           "refId": "B"
         }
       ],
-      "title": "BlobDB Physical State",
+      "title": "Storage File Sizes by Type",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "MiBs" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 41 },
+      "id": 12,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(strata_store_segment_file_bytes_read_total{job=\"strata-bench\",store=\"strata\"}[$__rate_interval])) / 1024 / 1024",
+          "legendFormat": "strata segment read",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(strata_store_segment_file_bytes_written_total{job=\"strata-bench\",store=\"strata\"}[$__rate_interval])) / 1024 / 1024",
+          "legendFormat": "strata segment write",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(strata_realistic_bench_blobdb_blob_file_bytes_read{job=\"strata-bench\",engine=\"blobdb\"}[$__rate_interval])) / 1024 / 1024",
+          "legendFormat": "blobdb blob read",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(strata_realistic_bench_blobdb_blob_file_bytes_written{job=\"strata-bench\",engine=\"blobdb\"}[$__rate_interval])) / 1024 / 1024",
+          "legendFormat": "blobdb blob write",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Segment / Blob File I/O Throughput",
       "type": "timeseries"
     }
   ],

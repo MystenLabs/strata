@@ -5,7 +5,7 @@ use std::{
 
 use strata_core::{PlacementClass, SegmentId};
 
-use crate::{Error, Result, SegmentWriter};
+use crate::{Error, Result, SegmentIoObserver, SegmentWriter};
 
 /// Shared source of store-global segment ids.
 #[derive(Debug, Clone)]
@@ -38,6 +38,7 @@ pub struct SegmentFactory {
     ids: SegmentIdAllocator,
     placement_class: PlacementClass,
     max_size: u64,
+    io_observer: Option<Arc<dyn SegmentIoObserver>>,
 }
 
 impl SegmentFactory {
@@ -52,17 +53,28 @@ impl SegmentFactory {
             ids,
             placement_class,
             max_size,
+            io_observer: None,
         }
+    }
+
+    pub fn with_io_observer(mut self, io_observer: Arc<dyn SegmentIoObserver>) -> Self {
+        self.io_observer = Some(io_observer);
+        self
     }
 
     pub fn create(&self) -> Result<SegmentWriter> {
         let id = self.ids.allocate()?;
-        SegmentWriter::create(
-            self.directory.join(segment_file_name(id)),
-            id,
-            self.placement_class,
-            self.max_size,
-        )
+        let path = self.directory.join(segment_file_name(id));
+        match &self.io_observer {
+            Some(observer) => SegmentWriter::create_with_io_observer(
+                path,
+                id,
+                self.placement_class,
+                self.max_size,
+                Arc::clone(observer),
+            ),
+            None => SegmentWriter::create(path, id, self.placement_class, self.max_size),
+        }
     }
 }
 

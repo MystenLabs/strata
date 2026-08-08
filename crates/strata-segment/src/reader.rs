@@ -3,6 +3,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -17,7 +18,7 @@ use strata_core::{
     BlobKey, DecodedRecord, FIXED_RECORD_HEADER_LEN, RecordHeader, RecordRef, SegmentId,
 };
 
-use crate::{Error, Result, error::IoResultExt};
+use crate::{Error, Result, SegmentIoObserver, error::IoResultExt};
 
 /// Header and key trailer for one record, without payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,7 @@ pub struct SegmentPayloadStream {
     path: PathBuf,
     file: File,
     remaining: u64,
+    io_observer: Option<Arc<dyn SegmentIoObserver>>,
 }
 
 impl SegmentPayloadStream {
@@ -88,6 +90,9 @@ impl Read for SegmentPayloadStream {
             ));
         }
         self.remaining -= read as u64;
+        if let Some(observer) = &self.io_observer {
+            observer.record_read(read as u64);
+        }
         Ok(read)
     }
 }
@@ -98,10 +103,27 @@ pub struct SegmentReader {
     path: PathBuf,
     file: File,
     segment_id: SegmentId,
+    io_observer: Option<Arc<dyn SegmentIoObserver>>,
 }
 
 impl SegmentReader {
     pub fn open(path: impl AsRef<Path>, segment_id: SegmentId) -> Result<Self> {
+        Self::open_inner(path, segment_id, None)
+    }
+
+    pub fn open_with_io_observer(
+        path: impl AsRef<Path>,
+        segment_id: SegmentId,
+        io_observer: Arc<dyn SegmentIoObserver>,
+    ) -> Result<Self> {
+        Self::open_inner(path, segment_id, Some(io_observer))
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        segment_id: SegmentId,
+        io_observer: Option<Arc<dyn SegmentIoObserver>>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path).at_path(&path)?;
         advise_random_access(&file, &path)?;
@@ -109,6 +131,7 @@ impl SegmentReader {
             path,
             file,
             segment_id,
+            io_observer,
         })
     }
 
@@ -179,6 +202,7 @@ impl SegmentReader {
                 header.payload_offset(record_ref.offset)?,
                 &mut body,
             )?;
+            self.record_read(body.len() as u64);
         }
         if let Some(profile) = profile.as_deref_mut() {
             profile.record_body = started.elapsed();
@@ -221,6 +245,7 @@ impl SegmentReader {
         let mut payload = vec![0; usize::try_from(range_len).map_err(|_| Error::RangeOverflow)?];
         let offset = payload_range_offset(header, record_ref.offset, payload_range.start)?;
         read_exact_at(&mut self.file, &self.path, offset, &mut payload)?;
+        self.record_read(payload.len() as u64);
         Ok(payload)
     }
 
@@ -230,6 +255,7 @@ impl SegmentReader {
         let mut key = vec![0; key_len];
         let key_offset = header.key_offset(record_ref.offset)?;
         read_exact_at(&mut self.file, &self.path, key_offset, &mut key)?;
+        self.record_read(key.len() as u64);
         Ok(RecordMetadata {
             header,
             key: BlobKey::try_from(key).map_err(strata_core::Error::from)?,
@@ -253,6 +279,7 @@ impl SegmentReader {
             path: self.path.clone(),
             file,
             remaining: payload_range.end - payload_range.start,
+            io_observer: self.io_observer.clone(),
         })
     }
 
@@ -274,6 +301,7 @@ impl SegmentReader {
             path: self.path,
             file: self.file,
             remaining: payload_range.end - payload_range.start,
+            io_observer: self.io_observer,
         })
     }
 
@@ -294,6 +322,7 @@ impl SegmentReader {
 
         let mut fixed = [0; FIXED_RECORD_HEADER_LEN];
         read_exact_at(&mut self.file, &self.path, record_ref.offset, &mut fixed)?;
+        self.record_read(FIXED_RECORD_HEADER_LEN as u64);
         let header = DecodedRecord::peek_fixed_header(&fixed)?;
         validate_record_ref_len(record_ref, header)?;
         Ok((header, fixed))
@@ -305,6 +334,12 @@ impl SegmentReader {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn record_read(&self, bytes: u64) {
+        if let Some(observer) = &self.io_observer {
+            observer.record_read(bytes);
+        }
     }
 }
 

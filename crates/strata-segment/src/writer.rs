@@ -2,11 +2,12 @@ use std::{
     fs::{File, OpenOptions},
     io::{IoSlice, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use strata_core::{BlobKey, EncodedRecordParts, PlacementClass, RecordRef, SegmentId, ShardKey};
 
-use crate::{Error, Result, error::IoResultExt};
+use crate::{Error, Result, SegmentIoObserver, error::IoResultExt};
 
 /// Result of appending one record to a segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub struct SegmentWriter {
     write_offset: u64,
     max_size: u64,
     sealed: bool,
+    io_observer: Option<Arc<dyn SegmentIoObserver>>,
 }
 
 impl SegmentWriter {
@@ -33,6 +35,32 @@ impl SegmentWriter {
         segment_id: SegmentId,
         placement_class: PlacementClass,
         max_size: u64,
+    ) -> Result<Self> {
+        Self::create_inner(path, segment_id, placement_class, max_size, None)
+    }
+
+    pub fn create_with_io_observer(
+        path: impl AsRef<Path>,
+        segment_id: SegmentId,
+        placement_class: PlacementClass,
+        max_size: u64,
+        io_observer: Arc<dyn SegmentIoObserver>,
+    ) -> Result<Self> {
+        Self::create_inner(
+            path,
+            segment_id,
+            placement_class,
+            max_size,
+            Some(io_observer),
+        )
+    }
+
+    fn create_inner(
+        path: impl AsRef<Path>,
+        segment_id: SegmentId,
+        placement_class: PlacementClass,
+        max_size: u64,
+        io_observer: Option<Arc<dyn SegmentIoObserver>>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
@@ -50,6 +78,7 @@ impl SegmentWriter {
             write_offset: 0,
             max_size,
             sealed: false,
+            io_observer,
         })
     }
 
@@ -58,6 +87,32 @@ impl SegmentWriter {
         segment_id: SegmentId,
         placement_class: PlacementClass,
         max_size: u64,
+    ) -> Result<Self> {
+        Self::open_existing_inner(path, segment_id, placement_class, max_size, None)
+    }
+
+    pub fn open_existing_with_io_observer(
+        path: impl AsRef<Path>,
+        segment_id: SegmentId,
+        placement_class: PlacementClass,
+        max_size: u64,
+        io_observer: Arc<dyn SegmentIoObserver>,
+    ) -> Result<Self> {
+        Self::open_existing_inner(
+            path,
+            segment_id,
+            placement_class,
+            max_size,
+            Some(io_observer),
+        )
+    }
+
+    fn open_existing_inner(
+        path: impl AsRef<Path>,
+        segment_id: SegmentId,
+        placement_class: PlacementClass,
+        max_size: u64,
+        io_observer: Option<Arc<dyn SegmentIoObserver>>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
@@ -75,6 +130,7 @@ impl SegmentWriter {
             write_offset,
             max_size,
             sealed: false,
+            io_observer,
         })
     }
 
@@ -137,6 +193,9 @@ impl SegmentWriter {
             });
         }
         self.write_offset = attempted_size;
+        if let Some(observer) = &self.io_observer {
+            observer.record_write(record_len);
+        }
 
         Ok(AppendOutcome {
             record_ref: RecordRef {

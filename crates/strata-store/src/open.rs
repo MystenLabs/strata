@@ -17,7 +17,7 @@ use strata_index::StrataIndex;
 use strata_lsm::{
     Lsm, LsmOptions, Manifest as LsmManifest, MemtableRolloverPolicy, Mutation as LsmMutation,
 };
-use strata_segment::{SegmentFactory, SegmentIdAllocator, SegmentWriter};
+use strata_segment::{SegmentFactory, SegmentIdAllocator, SegmentIoObserver, SegmentWriter};
 
 use crate::{
     BLOB_LSM_MANIFEST, DEFAULT_RELOCATION_CACHE_ENTRIES, Error, FIRST_SEGMENT_ID, GcPlanner,
@@ -137,7 +137,9 @@ impl StrataStore {
         verify_sealed_segments(&config, &index)?;
         let segment_ids =
             SegmentIdAllocator::new(next_segment_id_after(&index, active_segment_id)?);
-        let active_writer = open_active_writer(&config, active_segment_id)?;
+        let segment_io_observer: Arc<dyn SegmentIoObserver> = Arc::new(metrics.clone());
+        let active_writer =
+            open_active_writer(&config, active_segment_id, Arc::clone(&segment_io_observer))?;
         let durable_offset = active_segment_durable_offset(&index, active_writer.segment_id())?;
         let next_lsn = index.get_next_lsn()?;
         let published_lsn = index.get_published_lsn()?;
@@ -241,6 +243,7 @@ impl StrataStore {
         let (durability_ready_tx, durability_ready_rx) = mpsc::channel();
         let reader_cache = Arc::new(SegmentReaderCache::new(
             config.segment_reader_cache_capacity,
+            Arc::clone(&segment_io_observer),
         ));
         let segment_sync_tx = store_wal.file_sync_sender();
         let coordinator = WriteCoordinator {
@@ -254,7 +257,8 @@ impl StrataStore {
                 segment_ids.clone(),
                 PlacementClass::Ingest,
                 config.segment_max_bytes,
-            ),
+            )
+            .with_io_observer(segment_io_observer),
             segment_sync_tx,
             pending_segment_syncs: Vec::new(),
             internal_write_tx: write_tx.clone(),
@@ -440,23 +444,26 @@ pub(crate) fn cleanup_retired_projection_dir(config: &StrataStoreConfig) -> Resu
 fn open_active_writer(
     config: &StrataStoreConfig,
     active_segment_id: SegmentId,
+    io_observer: Arc<dyn SegmentIoObserver>,
 ) -> Result<SegmentWriter> {
     ensure_ingest_dir(config)?;
 
     let active_path = segment_path(config, active_segment_id);
     if active_path.exists() {
-        Ok(SegmentWriter::open_existing(
+        Ok(SegmentWriter::open_existing_with_io_observer(
             &active_path,
             active_segment_id,
             PlacementClass::Ingest,
             config.segment_max_bytes,
+            io_observer,
         )?)
     } else {
-        Ok(SegmentWriter::create(
+        Ok(SegmentWriter::create_with_io_observer(
             &active_path,
             active_segment_id,
             PlacementClass::Ingest,
             config.segment_max_bytes,
+            io_observer,
         )?)
     }
 }

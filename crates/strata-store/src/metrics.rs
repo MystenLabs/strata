@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 use strata_core::{Epoch, SegmentGcSummary, SegmentId, StrataLsn};
+use strata_segment::SegmentIoObserver;
 
 #[cfg(feature = "internal-profiling")]
 use crate::StoreProfileSink;
@@ -34,6 +35,8 @@ struct PrometheusMetrics {
     put_duration_seconds: Histogram,
     put_payload_bytes_total: IntCounter,
     put_record_bytes_total: IntCounter,
+    segment_file_bytes_read_total: IntCounter,
+    segment_file_bytes_written_total: IntCounter,
     delete_calls_total: IntCounter,
     delete_errors_total: IntCounter,
     delete_duration_seconds: Histogram,
@@ -193,6 +196,18 @@ impl StrataStoreMetrics {
                     &labels,
                     "put_record_bytes_total",
                     "Total encoded record bytes written by Strata put calls.",
+                )?,
+                segment_file_bytes_read_total: register_counter(
+                    registry,
+                    &labels,
+                    "segment_file_bytes_read_total",
+                    "Total bytes successfully read from Strata segment files.",
+                )?,
+                segment_file_bytes_written_total: register_counter(
+                    registry,
+                    &labels,
+                    "segment_file_bytes_written_total",
+                    "Total bytes successfully appended to Strata segment files.",
                 )?,
                 delete_calls_total: register_counter(
                     registry,
@@ -883,6 +898,18 @@ impl StrataStoreMetrics {
         }
     }
 
+    pub(crate) fn record_segment_file_read(&self, bytes: u64) {
+        if let Some(metrics) = &self.inner {
+            metrics.segment_file_bytes_read_total.inc_by(bytes);
+        }
+    }
+
+    pub(crate) fn record_segment_file_write(&self, bytes: u64) {
+        if let Some(metrics) = &self.inner {
+            metrics.segment_file_bytes_written_total.inc_by(bytes);
+        }
+    }
+
     pub(crate) fn record_get(&self, result: Result<Option<u64>, ()>, elapsed: Duration) {
         let Some(metrics) = &self.inner else {
             return;
@@ -1312,6 +1339,16 @@ impl StrataStoreMetrics {
         if let Some(metrics) = &self.inner {
             metrics.gc_tuner_health_state.set(state);
         }
+    }
+}
+
+impl SegmentIoObserver for StrataStoreMetrics {
+    fn record_read(&self, bytes: u64) {
+        self.record_segment_file_read(bytes);
+    }
+
+    fn record_write(&self, bytes: u64) {
+        self.record_segment_file_write(bytes);
     }
 }
 

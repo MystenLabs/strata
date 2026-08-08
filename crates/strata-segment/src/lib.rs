@@ -17,12 +17,14 @@
 
 mod error;
 mod factory;
+mod io;
 mod reader;
 mod scanner;
 mod writer;
 
 pub use error::{Error, Result};
 pub use factory::{SegmentFactory, SegmentIdAllocator, segment_file_name, segment_path};
+pub use io::SegmentIoObserver;
 pub use reader::{
     RecordMetadata, SegmentPayloadStream, SegmentReadOptions, SegmentReadProfile, SegmentReader,
 };
