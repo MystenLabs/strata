@@ -84,6 +84,7 @@ const DEFAULT_ROCKSDB_BLOB_FILE_SIZE: u64 = 1 << 28;
 const DEFAULT_ROCKSDB_WRITE_BUFFER_SIZE: usize = 512 << 20;
 const DEFAULT_ROCKSDB_DB_WRITE_BUFFER_SIZE: usize = 1 << 30;
 const DEFAULT_ROCKSDB_MAX_WRITE_BUFFER_NUMBER: usize = 2;
+const DEFAULT_ROCKSDB_MAX_SUBCOMPACTIONS: usize = 1;
 const DEFAULT_ROCKSDB_HIGH_PRI_THREADS: usize = 4;
 const DEFAULT_ROCKSDB_LOW_PRI_THREADS: usize = 1;
 const DEFAULT_ROCKSDB_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
@@ -186,6 +187,7 @@ struct Config {
     rocksdb_db_write_buffer_size: usize,
     rocksdb_max_write_buffer_number: usize,
     rocksdb_max_background_flushes: Option<usize>,
+    rocksdb_max_subcompactions: usize,
     rocksdb_high_pri_threads: usize,
     rocksdb_low_pri_threads: usize,
     rocksdb_blob_gc: bool,
@@ -236,6 +238,7 @@ impl Config {
             rocksdb_db_write_buffer_size: DEFAULT_ROCKSDB_DB_WRITE_BUFFER_SIZE,
             rocksdb_max_write_buffer_number: DEFAULT_ROCKSDB_MAX_WRITE_BUFFER_NUMBER,
             rocksdb_max_background_flushes: None,
+            rocksdb_max_subcompactions: DEFAULT_ROCKSDB_MAX_SUBCOMPACTIONS,
             rocksdb_high_pri_threads: DEFAULT_ROCKSDB_HIGH_PRI_THREADS,
             rocksdb_low_pri_threads: DEFAULT_ROCKSDB_LOW_PRI_THREADS,
             rocksdb_blob_gc: true,
@@ -366,6 +369,10 @@ impl Config {
                     config.rocksdb_max_background_flushes =
                         Some(parse_nonzero_usize(&next_value(&mut args, &arg)?)?)
                 }
+                "--rocksdb-max-subcompactions" => {
+                    config.rocksdb_max_subcompactions =
+                        parse_nonzero_usize(&next_value(&mut args, &arg)?)?
+                }
                 "--rocksdb-high-pri-threads" => {
                     config.rocksdb_high_pri_threads =
                         parse_nonzero_usize(&next_value(&mut args, &arg)?)?
@@ -447,6 +454,9 @@ impl Config {
             .is_some_and(|flushes| flushes > i32::MAX as usize / 4)
         {
             return Err("--rocksdb-max-background-flushes must not exceed i32::MAX / 4".to_owned());
+        }
+        if self.rocksdb_max_subcompactions > u32::MAX as usize {
+            return Err("--rocksdb-max-subcompactions must not exceed u32::MAX".to_owned());
         }
         if self.rocksdb_high_pri_threads > i32::MAX as usize
             || self.rocksdb_low_pri_threads > i32::MAX as usize
@@ -1098,6 +1108,7 @@ fn open_engine(
                 // aggregate option avoids the legacy max-background-flushes compatibility path.
                 options.set_max_background_jobs((max_flushes * 4) as i32);
             }
+            options.set_max_subcompactions(config.rocksdb_max_subcompactions as u32);
             options.set_enable_blob_gc(config.rocksdb_blob_gc);
             options.set_blob_gc_age_cutoff(config.rocksdb_blob_gc_age_cutoff);
             options.set_blob_gc_force_threshold(config.rocksdb_blob_gc_force_threshold);
@@ -2282,6 +2293,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     .map_or_else(|| "default".to_owned(), |value| value.to_string())
             );
             println!(
+                "rocksdb_max_subcompactions={}",
+                config.rocksdb_max_subcompactions
+            );
+            println!(
                 "rocksdb_high_low_pri_threads={},{}",
                 config.rocksdb_high_pri_threads, config.rocksdb_low_pri_threads
             );
@@ -3334,6 +3349,7 @@ blobdb:
   --rocksdb-db-write-buffer-size <size>
   --rocksdb-max-write-buffer-number <count>
   --rocksdb-max-background-flushes <count>
+  --rocksdb-max-subcompactions <count>  default 1
   --rocksdb-high-pri-threads <count>
   --rocksdb-low-pri-threads <count>
   --rocksdb-blob-gc <true|false>
@@ -3383,6 +3399,26 @@ mod tests {
         assert_eq!(config.payload_size, 1 << 20);
         assert!(config.sync_interval.is_zero());
         assert_eq!(config.controller_debounce_windows, 3);
+        assert_eq!(config.rocksdb_max_subcompactions, 1);
+    }
+
+    #[test]
+    fn rocksdb_max_subcompactions_parses() {
+        let config = Config::parse(
+            [
+                "--engine",
+                "blobdb",
+                "--root",
+                "/tmp/realistic",
+                "--rocksdb-max-subcompactions",
+                "4",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("max subcompactions should parse");
+
+        assert_eq!(config.rocksdb_max_subcompactions, 4);
     }
 
     #[test]
