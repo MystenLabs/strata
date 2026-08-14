@@ -142,7 +142,7 @@ impl StrataStore {
             open_active_writer(&config, active_segment_id, Arc::clone(&segment_io_observer))?;
         let durable_offset = active_segment_durable_offset(&index, active_writer.segment_id())?;
         let next_lsn = index.get_next_lsn()?;
-        let published_lsn = index.get_published_lsn()?;
+        let published_lsn = index.get_committed_lsn()?;
         let active_segment_state = publish_active_segment_state(
             &config,
             &index,
@@ -262,21 +262,19 @@ impl StrataStore {
             segment_sync_tx,
             pending_segment_syncs: Vec::new(),
             internal_write_tx: write_tx.clone(),
-            durability_ready_tx,
-            durability_ready_rx,
-            durability_in_flight_lsn: None,
+            sync_done_tx: durability_ready_tx,
+            sync_done_rx: durability_ready_rx,
+            sync_and_commit_in_flight: None,
             pending_sync_requests: Vec::new(),
-            durability_publish_lock: Arc::clone(&durability_publish_lock),
+            commit_lock: Arc::clone(&durability_publish_lock),
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             active_segment_state,
             durable_offset,
             active_allocation_records: 0,
             active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
             pending_segment_bytes: 0,
-            oldest_unpublished_at: None,
-            last_durability_publish_at: Instant::now(),
-            last_segment_rollover_at: Instant::now(),
-            last_segment_rollover_next_lsn: next_lsn,
+            oldest_uncommitted_at: None,
+            last_committed_at: Instant::now(),
             pending_rollovers: Vec::new(),
             lsm_flush_tx: lsm_flush_tx.clone(),
             lsm_compact_tx: lsm_compact_tx.clone(),
@@ -537,7 +535,7 @@ pub(crate) fn open_store_wal(
         checkpoint.map_or(WalPosition::default(), |checkpoint| checkpoint.wal_position);
     // The physical checkpoint and PublishedLsn are committed in one RocksDB batch. There is no
     // second logical "checkpoint LSN" to reconcile during recovery.
-    let published_lsn = match index.get_published_lsn()? {
+    let committed_lsn = match index.get_committed_lsn()? {
         0 => None,
         lsn => Some(lsn),
     };
@@ -546,7 +544,7 @@ pub(crate) fn open_store_wal(
         config.namespace_dir().join("wal"),
         config.segment_max_bytes,
         checkpoint_position,
-        published_lsn,
+        committed_lsn,
         materialized_through,
         retained_from,
         last_lsn,
@@ -575,7 +573,7 @@ pub(crate) fn open_store_wal(
     Ok((wal, blob, relocations, sync_handles))
 }
 
-/// Returns the two store-wide facts needed to recover the foreground store WAL.
+/// Returns the two store wide facts needed to recover the foreground store WAL.
 ///
 /// Relocations are durable immutable L0 files and no longer consume this WAL. The retained file ID
 /// is store state; the blob-manifest value is read only to open databases created before that state

@@ -1,32 +1,37 @@
-//! Asynchronous durability publication.
+//! Asynchronous sync and commit workflow.
 //!
-//! The writer captures an immutable LSN/file boundary and queues the expensive file syncs, then
-//! immediately resumes foreground commits. File-sync callbacks count into one shared barrier; the
-//! last callback sends an internal writer command. The writer performs only the final state merge
-//! and synced RocksDB publication, which prevents a background publisher from overwriting segment
-//! state committed by newer writes.
+//! The writer captures an immutable LSN and file boundary and queues the expensive file syncs, then
+//! immediately resumes foreground commits. The last segment sync callback
+//! queues the captured WAL sync, and WAL sync completion hands the snapshot back to the writer. The
+//! writer performs only the final state merge and synced RocksDB publication, which prevents a
+//! background publisher from overwriting segment state committed by newer writes.
 
 use std::{
     fs,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
 use strata_core::{SegmentFileState, StoreCheckpoint};
 
 use crate::{
-    DURABILITY_PUBLISH_INTERVAL, DURABILITY_PUBLISH_SEGMENT_BYTES, DURABILITY_PUBLISH_WAL_BYTES,
-    DurabilityPublish, Error, PendingSyncRequest, Result, SegmentSync, StoreSyncProfile,
-    SyncRequest, WriteCommand, WriteCoordinator, file_sync::FileSyncTask,
-    maintenance::publish_blob_lsm_edit, profile_phase, publish_segment_allocation_baseline,
-    seal::prepare_synced_seal, unsealed_ingest_segment_count,
+    Error, PendingSyncRequest, Result, SYNC_AND_COMMIT_INTERVAL, SYNC_AND_COMMIT_SEGMENT_BYTES,
+    SYNC_AND_COMMIT_WAL_BYTES, SegmentSync, StoreSyncProfile, SyncAndCommit, SyncRequest,
+    WriteCommand, WriteCoordinator,
+    file_sync::{FileSyncSender, FileSyncTask},
+    maintenance::publish_blob_lsm_edit,
+    profile_phase, publish_segment_allocation_baseline,
+    seal::prepare_synced_seal,
+    unsealed_ingest_segment_count,
 };
 
-impl DurabilityPublish {
-    /// Called once by every captured segment sync and once by the WAL sync. The last callback
-    /// hands this same publication object back to the writer; no separate barrier/snapshot/ready
-    /// types are needed.
-    fn sync_finished(self: &Arc<Self>, result: Result<()>) {
+struct PendingWalSync {
+    remaining_segments: usize,
+    task: Option<FileSyncTask>,
+}
+
+impl SyncAndCommit {
+    fn record_sync_error(&self, result: Result<()>) {
         if let Err(error) = result {
             let mut final_result = self
                 .file_sync_result
@@ -36,11 +41,52 @@ impl DurabilityPublish {
                 *final_result = Some(Err(error));
             }
         }
-        let previous = self.remaining_syncs.fetch_sub(1, Ordering::AcqRel);
-        assert!(previous > 0, "durability sync completed too often");
-        if previous != 1 {
+    }
+
+    /// The last segment completion submits the WAL sync. A failed segment cancels the prepared
+    /// WAL task instead, so this durability cycle never syncs references to a failed segment.
+    fn on_segment_sync_finished(
+        self: &Arc<Self>,
+        result: Result<()>,
+        pending_wal_sync: &Mutex<PendingWalSync>,
+        wal_sync_tx: &FileSyncSender,
+    ) {
+        self.record_sync_error(result);
+        let wal_sync = {
+            let mut pending = pending_wal_sync
+                .lock()
+                .expect("pending WAL sync lock poisoned");
+            assert!(
+                pending.remaining_segments > 0,
+                "segment sync completed too often"
+            );
+            pending.remaining_segments -= 1;
+            if pending.remaining_segments != 0 {
+                return;
+            }
+            pending
+                .task
+                .take()
+                .expect("last segment completion has no WAL sync task")
+        };
+        if self
+            .file_sync_result
+            .lock()
+            .expect("durability file-sync result lock poisoned")
+            .is_some()
+        {
+            wal_sync.complete(Err(Error::InvariantViolation {
+                reason: "WAL sync cancelled after a segment sync failure".to_owned(),
+            }));
             return;
         }
+        if let Err(error) = wal_sync_tx.send(wal_sync) {
+            error.0.complete(Err(Error::FileSyncQueueClosed));
+        }
+    }
+
+    fn on_wal_sync_finished(self: &Arc<Self>, result: Result<()>) {
+        self.record_sync_error(result);
         {
             let mut final_result = self
                 .file_sync_result
@@ -50,33 +96,33 @@ impl DurabilityPublish {
                 *final_result = Some(Ok(self.file_sync_started.elapsed()));
             }
         }
-        if self.ready_tx.send(Arc::clone(self)).is_ok() {
-            let _ = self.wake_tx.try_send(WriteCommand::DurabilityReady);
+        if self.sync_done_tx.send(Arc::clone(self)).is_ok() {
+            let _ = self.wake_tx.try_send(WriteCommand::SyncDone);
         }
     }
 }
 
 impl WriteCoordinator {
-    /// Starts one durability publication without waiting for physical I/O.
+    /// Starts one sync and commit without waiting for physical I/O.
     ///
     /// Capturing happens on the writer thread, so `target_lsn`, the WAL position, segment offsets,
     /// and allocation counters describe one coherent prefix. Later writes may append to the same
     /// active files; syncing more bytes than the captured offsets is harmless because the metadata
     /// publication claims only this snapshot.
-    pub(crate) fn start_durability_publish(&mut self, force: bool) -> Result<Option<u64>> {
-        if let Some(target) = self.durability_in_flight_lsn {
+    pub(crate) fn start_sync_and_commit(&mut self, force: bool) -> Result<Option<u64>> {
+        if let Some(target) = self.sync_and_commit_in_flight {
             return Ok(Some(target));
         }
 
-        let target_lsn = self.index.get_next_lsn()?.saturating_sub(1);
-        let published_lsn = self.index.get_published_lsn()?;
-        if published_lsn > target_lsn {
+        let current_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        let committed_lsn = self.index.get_committed_lsn()?;
+        if committed_lsn > current_lsn {
             return Err(Error::InvariantViolation {
-                reason: format!("published LSN {published_lsn} follows committed LSN {target_lsn}"),
+                reason: format!("committed LSN {committed_lsn} follows target LSN {current_lsn}"),
             });
         }
-        if published_lsn == target_lsn && !force {
-            self.last_durability_publish_at = Instant::now();
+        if committed_lsn == current_lsn && !force {
+            self.last_committed_at = Instant::now();
             return Ok(None);
         }
 
@@ -114,9 +160,9 @@ impl WriteCoordinator {
         let wal_position = self.wal.position();
         let wal_bytes = self.wal.pending_bytes();
         let segment_bytes = self.pending_segment_bytes;
-        let remaining_syncs = segments.len() + 1;
-        let publish = Arc::new(DurabilityPublish {
-            target_lsn,
+        let segment_count = segments.len();
+        let sync_and_commit = Arc::new(SyncAndCommit {
+            target_lsn: current_lsn,
             wal_position,
             checkpoint_segment_id: active_segment_id,
             checkpoint_segment_offset: active_segment_offset,
@@ -125,25 +171,31 @@ impl WriteCoordinator {
             segment_bytes,
             started,
             file_sync_started: Instant::now(),
-            remaining_syncs: std::sync::atomic::AtomicUsize::new(remaining_syncs),
             file_sync_result: std::sync::Mutex::new(None),
-            ready_tx: self.durability_ready_tx.clone(),
+            sync_done_tx: self.sync_done_tx.clone(),
             wake_tx: self.internal_write_tx.clone(),
         });
 
-        let wal_publish = Arc::clone(&publish);
-        let queued_wal_position = self
+        let wal_publish = Arc::clone(&sync_and_commit);
+        let (captured_wal_position, wal_sync_task) = self
             .wal
-            .sync_with_notification(move |result| wal_publish.sync_finished(result))?;
-        if queued_wal_position != wal_position {
+            .sync_data(move |result| wal_publish.on_wal_sync_finished(result))?;
+        if captured_wal_position != wal_position {
             return Err(Error::InvariantViolation {
                 reason: format!(
-                    "queued WAL position {queued_wal_position:?} changed from captured position {wal_position:?}"
+                    "synced WAL position {captured_wal_position:?} changed from captured position {wal_position:?}"
                 ),
             });
         }
-        for (segment, file) in publish.segments.iter().zip(files) {
-            let publish = Arc::clone(&publish);
+        let pending_wal_sync = Arc::new(Mutex::new(PendingWalSync {
+            remaining_segments: segment_count,
+            task: Some(wal_sync_task),
+        }));
+        let wal_sync_tx = self.wal.file_sync_sender();
+        for (segment, file) in sync_and_commit.segments.iter().zip(files) {
+            let sync_and_commit = Arc::clone(&sync_and_commit);
+            let pending_wal_sync = Arc::clone(&pending_wal_sync);
+            let wal_sync_tx = wal_sync_tx.clone();
             let config = self.config.clone();
             let metrics = self.metrics.clone();
             let segment_id = segment.segment_id;
@@ -171,78 +223,79 @@ impl WriteCoordinator {
                     if sealed_before_lsn.is_some() && result.is_err() {
                         metrics.record_seal_error();
                     }
-                    publish.sync_finished(result);
+                    sync_and_commit.on_segment_sync_finished(
+                        result,
+                        &pending_wal_sync,
+                        &wal_sync_tx,
+                    );
                 }))
                 .map_err(|_| Error::FileSyncQueueClosed)?;
         }
 
         self.wal.mark_pending_bytes_captured();
         self.pending_segment_bytes = 0;
-        self.oldest_unpublished_at = None;
-        self.durability_in_flight_lsn = Some(target_lsn);
+        self.oldest_uncommitted_at = None;
+        self.sync_and_commit_in_flight = Some(current_lsn);
         self.metrics.set_durability_pending(0, 0, true);
-        Ok(Some(target_lsn))
+        Ok(Some(current_lsn))
     }
 
-    pub(crate) fn maybe_start_durability_publish(&mut self, force: bool) -> Result<bool> {
-        if self.durability_in_flight_lsn.is_some() {
+    pub(crate) fn maybe_start_sync_and_commit(&mut self, force: bool) -> Result<bool> {
+        if self.sync_and_commit_in_flight.is_some() {
             return Ok(false);
         }
         let age_due = self
-            .oldest_unpublished_at
-            .is_some_and(|started| started.elapsed() >= DURABILITY_PUBLISH_INTERVAL);
-        let segment_pressure_due = self.pending_segment_bytes >= DURABILITY_PUBLISH_SEGMENT_BYTES;
+            .oldest_uncommitted_at
+            .is_some_and(|started| started.elapsed() >= SYNC_AND_COMMIT_INTERVAL);
+        let segment_pressure_due = self.pending_segment_bytes >= SYNC_AND_COMMIT_SEGMENT_BYTES;
         let pressure_due =
-            self.wal.pending_bytes() >= DURABILITY_PUBLISH_WAL_BYTES || segment_pressure_due;
+            self.wal.pending_bytes() >= SYNC_AND_COMMIT_WAL_BYTES || segment_pressure_due;
         if !force && !age_due && !pressure_due {
             return Ok(false);
         }
-        if segment_pressure_due && self.segment.write_offset() > self.durable_offset {
-            self.process_segment_rollover()?;
-        }
-        Ok(self.start_durability_publish(force)?.is_some())
+        Ok(self.start_sync_and_commit(force)?.is_some())
     }
 
-    pub(crate) fn note_committed_write(&mut self, segment_bytes: u64) -> Result<()> {
+    pub(crate) fn note_uncommitted_write(&mut self, segment_bytes: u64) -> Result<()> {
         self.pending_segment_bytes = self.pending_segment_bytes.saturating_add(segment_bytes);
-        self.oldest_unpublished_at.get_or_insert_with(Instant::now);
+        self.oldest_uncommitted_at.get_or_insert_with(Instant::now);
         self.metrics.set_durability_pending(
             self.wal.pending_bytes(),
             self.pending_segment_bytes,
-            self.durability_in_flight_lsn.is_some(),
+            self.sync_and_commit_in_flight.is_some(),
         );
-        self.maybe_start_durability_publish(false)?;
+        self.maybe_start_sync_and_commit(false)?;
         Ok(())
     }
 
     /// Finishes the metadata half of a completed file sync on the serialized writer thread.
-    pub(crate) fn finish_durability_publish(
+    pub(crate) fn commit_after_sync(
         &mut self,
-        publish: Arc<DurabilityPublish>,
+        commit: Arc<SyncAndCommit>,
     ) -> Result<(u64, StoreSyncProfile)> {
-        let expected = self.durability_in_flight_lsn.take();
-        if expected != Some(publish.target_lsn) {
+        let expected = self.sync_and_commit_in_flight.take();
+        if expected != Some(commit.target_lsn) {
             return Err(Error::InvariantViolation {
                 reason: format!(
                     "durability completion for LSN {} does not match in-flight target {expected:?}",
-                    publish.target_lsn
+                    commit.target_lsn
                 ),
             });
         }
 
-        let file_sync_result = publish
+        let file_sync_result = commit
             .file_sync_result
             .lock()
-            .expect("durability file-sync result lock poisoned")
+            .expect("durability file sync result lock poisoned")
             .take()
             .expect("ready durability publication has no file-sync result");
         let mut phases = StoreSyncProfile {
             segment_sync: file_sync_result?,
             ..StoreSyncProfile::default()
         };
-        let publish_started = Instant::now();
-        let _publish_guard = self
-            .durability_publish_lock
+        let commit_started = Instant::now();
+        let _commit_guard = self
+            .commit_lock
             .lock()
             .expect("durability publish lock poisoned");
         // The relocation frontier must be sampled while holding the same lock used by GC
@@ -250,21 +303,21 @@ impl WriteCoordinator {
         // and activation row reached disk together.
         let durable_relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
 
-        let current_published_lsn = self.index.get_published_lsn()?;
-        if current_published_lsn > publish.target_lsn {
+        let current_committed_lsn = self.index.get_committed_lsn()?;
+        if current_committed_lsn > commit.target_lsn {
             return Err(Error::InvariantViolation {
                 reason: format!(
-                    "published LSN {current_published_lsn} follows completed durability target {}",
-                    publish.target_lsn
+                    "published LSN {current_committed_lsn} follows completed durability target {}",
+                    commit.target_lsn
                 ),
             });
         }
-        let committed_lsn = self.index.get_next_lsn()?.saturating_sub(1);
-        if publish.target_lsn > committed_lsn {
+        let current_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        if commit.target_lsn > current_lsn {
             return Err(Error::InvariantViolation {
                 reason: format!(
-                    "durability target {} follows committed LSN {committed_lsn}",
-                    publish.target_lsn
+                    "durability target {} follows current LSN {current_lsn}",
+                    commit.target_lsn
                 ),
             });
         }
@@ -274,9 +327,9 @@ impl WriteCoordinator {
             |profile, elapsed| profile.published_lsn_compute += elapsed,
             || {
                 let mut batch = self.index.batch();
-                let mut states = Vec::with_capacity(publish.segments.len());
-                let mut allocation_marks = Vec::with_capacity(publish.segments.len());
-                for segment in &publish.segments {
+                let mut states = Vec::with_capacity(commit.segments.len());
+                let mut allocation_marks = Vec::with_capacity(commit.segments.len());
+                for segment in &commit.segments {
                     let mut state = self
                         .index
                         .get_segment_state(segment.segment_id)?
@@ -331,13 +384,13 @@ impl WriteCoordinator {
                     states.push(state);
                 }
                 self.index
-                    .put_published_lsn_batch(&mut batch, publish.target_lsn)?;
+                    .put_commit_lsn_batch(&mut batch, commit.target_lsn)?;
                 self.index.put_store_checkpoint_batch(
                     &mut batch,
                     StoreCheckpoint {
-                        wal_position: publish.wal_position,
-                        active_segment_id: publish.checkpoint_segment_id,
-                        active_segment_offset: publish.checkpoint_segment_offset,
+                        wal_position: commit.wal_position,
+                        active_segment_id: commit.checkpoint_segment_id,
+                        active_segment_offset: commit.checkpoint_segment_offset,
                     },
                 )?;
                 Ok::<_, Error>((batch, states, allocation_marks))
@@ -377,31 +430,31 @@ impl WriteCoordinator {
                 }
                 self.durable_relocation_lsn
                     .fetch_max(durable_relocation_lsn, std::sync::atomic::Ordering::Release);
-                self.last_durability_publish_at = Instant::now();
+                self.last_committed_at = Instant::now();
                 self.metrics.set_active_segment(
                     self.active_segment_state.segment_id,
                     self.active_segment_state.write_offset,
                     self.durable_offset,
                 );
-                self.metrics.set_published_lsn(publish.target_lsn);
+                self.metrics.set_published_lsn(commit.target_lsn);
             },
         );
-        drop(_publish_guard);
+        drop(_commit_guard);
 
-        self.reclaim_store_wal(publish.target_lsn)?;
-        let elapsed = publish.started.elapsed();
-        self.metrics.record_sync(Ok(publish.segment_bytes), elapsed);
-        self.metrics.record_durability_wal_bytes(publish.wal_bytes);
+        self.reclaim_store_wal(commit.target_lsn)?;
+        let elapsed = commit.started.elapsed();
+        self.metrics.record_sync(Ok(commit.segment_bytes), elapsed);
+        self.metrics.record_durability_wal_bytes(commit.wal_bytes);
         self.metrics.set_durability_pending(
             self.wal.pending_bytes(),
             self.pending_segment_bytes,
             false,
         );
         self.gc_concurrency
-            .observe_sync(elapsed, publish.segment_bytes);
+            .observe_sync(elapsed, commit.segment_bytes);
         self.request_lsm_compaction();
-        phases.writer_total = publish_started.elapsed();
-        Ok((publish.target_lsn, phases))
+        phases.writer_total = commit_started.elapsed();
+        Ok((commit.target_lsn, phases))
     }
 
     pub(crate) fn enqueue_sync_request(&mut self, request: SyncRequest) {
@@ -418,7 +471,7 @@ impl WriteCoordinator {
                 return;
             }
         };
-        match self.index.get_published_lsn() {
+        match self.index.get_committed_lsn() {
             Ok(published) if published > target_lsn => {
                 let _ = response_tx.send(Err(Error::InvariantViolation {
                     reason: format!("published LSN {published} follows committed LSN {target_lsn}"),
@@ -431,7 +484,7 @@ impl WriteCoordinator {
                 return;
             }
         }
-        let needs_follow_up = self.durability_in_flight_lsn.is_some();
+        let needs_follow_up = self.sync_and_commit_in_flight.is_some();
         self.pending_sync_requests.push(PendingSyncRequest {
             target_lsn,
             needs_follow_up,
@@ -440,8 +493,8 @@ impl WriteCoordinator {
             profile,
             started,
         });
-        if self.durability_in_flight_lsn.is_none()
-            && let Err(error) = self.start_durability_publish(true)
+        if self.sync_and_commit_in_flight.is_none()
+            && let Err(error) = self.start_sync_and_commit(true)
         {
             self.halt_writer_error("start explicit durability publication", &error);
             self.fail_pending_sync_requests();
@@ -498,8 +551,11 @@ impl WriteCoordinator {
     }
 
     /// Advances the blob projection and reclaims complete WAL files no longer needed for replay.
-    fn reclaim_store_wal(&mut self, published_lsn: u64) -> Result<()> {
-        self.lsm.materialize_through(published_lsn, |edit| {
+    fn reclaim_store_wal(&mut self, committed_lsn: u64) -> Result<()> {
+        self.lsm.publish_pending_through(committed_lsn, |edit| {
+            publish_blob_lsm_edit(&self.index, edit)
+        })?;
+        self.lsm.materialize_through(committed_lsn, |edit| {
             publish_blob_lsm_edit(&self.index, edit)
         })?;
         let reclaim_through = self.lsm.manifest().materialized_through.unwrap_or_default();
@@ -520,5 +576,76 @@ impl WriteCoordinator {
         }
         self.wal.reclaim_through(reclaim_through)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::OpenOptions,
+        sync::{Arc, Mutex, mpsc},
+        time::{Duration, Instant},
+    };
+
+    use strata_core::WalPosition;
+    use tempfile::tempdir;
+
+    use super::{FileSyncTask, PendingWalSync};
+    use crate::{SyncAndCommit, WriteCommand};
+
+    #[test]
+    fn wal_sync_waits_for_all_segment_syncs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (wal_sync_tx, wal_sync_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let publish = Arc::new(SyncAndCommit {
+            target_lsn: 1,
+            wal_position: WalPosition::default(),
+            checkpoint_segment_id: 1,
+            checkpoint_segment_offset: 0,
+            segments: Vec::new(),
+            wal_bytes: 0,
+            segment_bytes: 0,
+            started: Instant::now(),
+            file_sync_started: Instant::now(),
+            file_sync_result: Mutex::new(None),
+            sync_done_tx: ready_tx,
+            wake_tx,
+        });
+        let wal_publish = Arc::clone(&publish);
+        let pending_wal_sync = Mutex::new(PendingWalSync {
+            remaining_segments: 2,
+            task: Some(FileSyncTask::new(path, file, move |result| {
+                wal_publish.on_wal_sync_finished(result);
+            })),
+        });
+
+        publish.on_segment_sync_finished(Ok(()), &pending_wal_sync, &wal_sync_tx);
+        assert!(matches!(
+            wal_sync_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        publish.on_segment_sync_finished(Ok(()), &pending_wal_sync, &wal_sync_tx);
+        let wal_sync = wal_sync_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        wal_sync.complete(Ok(()));
+        let ready = ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(Arc::ptr_eq(&ready, &publish));
+        assert!(matches!(
+            wake_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WriteCommand::SyncDone
+        ));
     }
 }

@@ -38,9 +38,6 @@ pub enum Error {
     #[error("file sync queue is closed")]
     FileSyncQueueClosed,
 
-    #[error("store WAL sync failed: {0}")]
-    WalSyncFailed(String),
-
     #[error("invalid store WAL: {0}")]
     InvalidWal(String),
 

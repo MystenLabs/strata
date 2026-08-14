@@ -15,9 +15,9 @@ use crate::STANDALONE_SHARD;
 
 use crate::{
     AddShardRequest, BatchOp, BatchWriteRequest, BatchWriteResult, DropShardRequest, Error,
-    ProfileRequest, Result, RolloverSegmentRequest, StoreSyncProfile, StoreWriteProfile,
-    StrataBatch, StrataStore, StrataStoreConfig, StrataStoreMetrics, SyncRequest, WriteCommand,
-    gc::GcCommand, maintenance::flush_relocation_lsm,
+    ProfileRequest, Result, StoreSyncProfile, StoreWriteProfile, StrataBatch, StrataStore,
+    StrataStoreConfig, StrataStoreMetrics, SyncRequest, WriteCommand, gc::GcCommand,
+    maintenance::flush_relocation_lsm,
 };
 
 impl StrataStore {
@@ -251,7 +251,7 @@ impl StrataStore {
 
     /// Makes everything written so far crash-safe. Writes are visible immediately but only
     /// durable after a sync — fsyncing per put would destroy throughput on spinning disks, so
-    /// durability is batched here. See `WriteCoordinator::start_durability_publish` for the
+    /// durability is batched here. See `WriteCoordinator::start_sync_and_commit` for the
     /// ordering invariant.
     pub fn sync(&self) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
@@ -265,24 +265,6 @@ impl StrataStore {
             .recv()
             .map_err(|_| Error::WriteResponseDropped)??;
         self.finish_sync_profile(profile_rx, queue_send)?;
-        Ok(())
-    }
-
-    /// Rolls the current ingest segment so all preceding writes can be sealed and considered by
-    /// retention organization or garbage collection.
-    ///
-    /// Production performs this rollover periodically. Administrative tools and benchmarks can
-    /// request it explicitly when they need a bounded active tail. This does not publish the WAL.
-    /// Returning means the rollover metadata is visible and sealing has been queued; callers that
-    /// require the sealed file should wait for the segment state to leave `Sealing`.
-    pub fn rollover_active_segment_for_sealing(&self) -> Result<()> {
-        let (response_tx, response_rx) = mpsc::channel();
-        self.send_write_command(WriteCommand::RolloverSegment(RolloverSegmentRequest {
-            response_tx,
-        }))?;
-        response_rx
-            .recv()
-            .map_err(|_| Error::WriteResponseDropped)??;
         Ok(())
     }
 
@@ -322,7 +304,7 @@ impl StrataStore {
     /// Every operation with `lsn <= published_lsn` survives a crash. This is the value callers
     /// (e.g. the Walrus event cursor) gate on before acknowledging work as done.
     pub fn published_lsn(&self) -> Result<StrataLsn> {
-        Ok(self.index.get_published_lsn()?)
+        Ok(self.index.get_committed_lsn()?)
     }
 
     /// Enqueues work for the writer and records queue metrics around the send.

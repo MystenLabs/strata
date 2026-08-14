@@ -1501,7 +1501,6 @@ fn run_store_delete(
         store.put(0, key, &payload)?;
     }
     store.sync()?;
-    store.rollover_active_segment_for_sealing()?;
     wait_for_strata_sealing(&store, config.delete_setup_timeout)?;
     wait_for_strata_lsm_materialization(&store, config.delete_setup_timeout)?;
 

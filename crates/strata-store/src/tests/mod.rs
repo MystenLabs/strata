@@ -678,7 +678,7 @@ async fn synced_store_checkpoint_reopens_the_existing_wal_prefix() {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         assert_eq!(store.put(&key_a, b"one").unwrap(), 1);
         store.sync().unwrap();
-        assert_eq!(store.index().get_published_lsn().unwrap(), 1);
+        assert_eq!(store.index().get_committed_lsn().unwrap(), 1);
         store.index().get_store_checkpoint().unwrap().unwrap()
     };
     assert_eq!(first_checkpoint.active_segment_id, FIRST_SEGMENT_ID);
@@ -692,7 +692,7 @@ async fn synced_store_checkpoint_reopens_the_existing_wal_prefix() {
         );
         assert_eq!(store.put(&key_b, b"two").unwrap(), 2);
         store.sync().unwrap();
-        assert_eq!(store.index().get_published_lsn().unwrap(), 2);
+        assert_eq!(store.index().get_committed_lsn().unwrap(), 2);
         store.index().get_store_checkpoint().unwrap().unwrap()
     };
 
@@ -837,7 +837,6 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .write_batch(0, &first_relocations)
         .unwrap();
     let first_wal_position = store_wal.sync().unwrap();
-    store_wal.wait_for_sync(first_wal_position).unwrap();
     let mut first_store_checkpoint = store.index().get_store_checkpoint().unwrap().unwrap();
     first_store_checkpoint.wal_position = first_wal_position;
     let mut segment_b_state = SegmentState {
@@ -885,7 +884,7 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .unwrap();
     store
         .index()
-        .put_published_lsn_batch(&mut batch, tombstone_lsn + 2)
+        .put_commit_lsn_batch(&mut batch, tombstone_lsn + 2)
         .unwrap();
     store
         .index()
@@ -957,7 +956,6 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .write_batch(0, &[final_relocation])
         .unwrap();
     let final_wal_position = store_wal.sync().unwrap();
-    store_wal.wait_for_sync(final_wal_position).unwrap();
     let mut final_store_checkpoint = store.index().get_store_checkpoint().unwrap().unwrap();
     final_store_checkpoint.wal_position = final_wal_position;
     let mut source_state = store
@@ -982,7 +980,7 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .unwrap();
     store
         .index()
-        .put_published_lsn_batch(&mut batch, tombstone_lsn + 3)
+        .put_commit_lsn_batch(&mut batch, tombstone_lsn + 3)
         .unwrap();
     store
         .index()
@@ -1121,8 +1119,7 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         ) > 0.0
     );
 
-    let wal_position = store_wal.sync().unwrap();
-    store_wal.wait_for_sync(wal_position).unwrap();
+    store_wal.sync().unwrap();
     drop(store_wal);
     for handle in store_wal_sync_handles {
         handle.join().unwrap();
@@ -1185,13 +1182,13 @@ async fn recovered_store_tail_promotes_the_matching_wal_tail() {
     assert_eq!(summary.live_ref_count, 2);
     store.sync().unwrap();
     let recovered = store.index().get_store_checkpoint().unwrap().unwrap();
-    assert_eq!(store.index().get_published_lsn().unwrap(), 2);
+    assert_eq!(store.index().get_committed_lsn().unwrap(), 2);
     assert!(recovered.wal_position.offset > first_checkpoint.wal_position.offset);
 
     assert_eq!(store.put(&key_c, b"three").unwrap(), 3);
     store.sync().unwrap();
     let advanced = store.index().get_store_checkpoint().unwrap().unwrap();
-    assert_eq!(store.index().get_published_lsn().unwrap(), 3);
+    assert_eq!(store.index().get_committed_lsn().unwrap(), 3);
     assert!(advanced.wal_position.offset > recovered.wal_position.offset);
 }
 #[tokio::test]
@@ -1395,62 +1392,6 @@ async fn epoch_change_is_published_by_the_store_checkpoint() {
 
     assert_eq!(store.published_lsn().unwrap(), epoch_lsn);
 }
-#[tokio::test]
-async fn explicit_active_segment_rollover_seals_the_current_tail_through_durability() {
-    init_typed_store_metrics();
-    let dir = tempdir().unwrap();
-    let key = BlobKey::new(b"explicit-checkpoint".to_vec()).unwrap();
-    let store =
-        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
-            .unwrap();
-
-    store.put(&key, b"payload").unwrap();
-    let record_ref = lsm_blob_ref(&store, &key);
-    let old_segment_id = store
-        .index()
-        .iter_segment_states()
-        .unwrap()
-        .into_iter()
-        .find(|(_, state)| state.state == SegmentFileState::Open)
-        .unwrap()
-        .0;
-
-    store.store.rollover_active_segment_for_sealing().unwrap();
-    assert_eq!(
-        store
-            .index()
-            .get_segment_state(old_segment_id)
-            .unwrap()
-            .unwrap()
-            .state,
-        SegmentFileState::Sealing
-    );
-    store.sync().unwrap();
-    let sealed = wait_for_segment_state(store.index(), old_segment_id, SegmentFileState::Sealed);
-    let summary = store
-        .index()
-        .get_segment_gc_summary(old_segment_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(summary.total_bytes, sealed.sealed_len.unwrap());
-    assert_eq!(summary.total_bytes, record_ref.len);
-    assert_eq!(summary.live_bytes, record_ref.len);
-    assert_eq!(summary.live_ref_count, 1);
-    assert_eq!(summary.unknown_lifetime_bytes, record_ref.len);
-    assert_eq!(summary.unknown_lifetime_ref_count, 1);
-    let new_segment_id = store
-        .index()
-        .iter_segment_states()
-        .unwrap()
-        .into_iter()
-        .find(|(_, state)| state.state == SegmentFileState::Open)
-        .unwrap()
-        .0;
-
-    assert_ne!(old_segment_id, new_segment_id);
-    assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
-}
-
 #[tokio::test]
 async fn sync_publishes_new_allocations_without_overwriting_garbage() {
     init_typed_store_metrics();
@@ -1660,9 +1601,9 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
     );
     assert!(store.store.get_from_shard(41, &key).is_err());
     assert_eq!(store.index().get_next_lsn().unwrap(), drop_lsn + 1);
-    assert!(store.index().get_published_lsn().unwrap() < drop_lsn);
+    assert!(store.index().get_committed_lsn().unwrap() < drop_lsn);
     store.sync().unwrap();
-    assert_eq!(store.index().get_published_lsn().unwrap(), drop_lsn);
+    assert_eq!(store.index().get_committed_lsn().unwrap(), drop_lsn);
     let job = store.index().get_shard_cleanup_job(shard).unwrap().unwrap();
     assert_eq!(job.drop_lsn, drop_lsn);
     assert_eq!(job.state, ShardCleanupState::ReadyForGc);
@@ -1824,7 +1765,7 @@ async fn reopen_finishes_durable_shard_drop_cleanup() {
         !retention_path.exists(),
         "job={:?} published_lsn={}",
         reopened.index().get_shard_cleanup_job(shard).unwrap(),
-        reopened.index().get_published_lsn().unwrap(),
+        reopened.index().get_committed_lsn().unwrap(),
     );
     let state = reopened
         .index()
@@ -1940,7 +1881,7 @@ async fn new_store_records_starting_epoch_as_lsn_zero_genesis() {
     assert_eq!(store.epoch_at_lsn(1).unwrap(), Some(42));
     assert_eq!(store.index().get_epoch_change(0).unwrap(), Some(42));
     assert_eq!(store.index().get_next_lsn().unwrap(), 1);
-    assert_eq!(store.index().get_published_lsn().unwrap(), 0);
+    assert_eq!(store.index().get_committed_lsn().unwrap(), 0);
     assert_eq!(
         store.index().get_shard_info(0).unwrap(),
         Some(ShardInfo::active(0))
@@ -2524,7 +2465,7 @@ async fn metrics_track_seal_backpressure_waits() {
     )
     .unwrap();
     let (write_tx, write_rx) = mpsc::sync_channel(1);
-    let (durability_ready_tx, durability_ready_rx) = mpsc::channel();
+    let (sync_done_tx, sync_done_rx) = mpsc::channel();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
     let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
@@ -2547,21 +2488,19 @@ async fn metrics_track_seal_backpressure_waits() {
         segment_sync_tx,
         pending_segment_syncs: Vec::new(),
         internal_write_tx: write_tx,
-        durability_ready_tx,
-        durability_ready_rx,
-        durability_in_flight_lsn: None,
+        sync_done_tx,
+        sync_done_rx,
+        sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
-        durability_publish_lock: Arc::new(Mutex::new(())),
+        commit_lock: Arc::new(Mutex::new(())),
         durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
         active_allocation_records: 0,
         active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
         pending_segment_bytes: 0,
-        oldest_unpublished_at: None,
-        last_durability_publish_at: Instant::now(),
-        last_segment_rollover_at: Instant::now(),
-        last_segment_rollover_next_lsn: index.get_next_lsn().unwrap(),
+        oldest_uncommitted_at: None,
+        last_committed_at: Instant::now(),
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
@@ -3045,10 +2984,7 @@ async fn main_compaction_does_not_wait_for_a_newer_overlapping_patch() {
     lsm.install_manifest(published).unwrap();
 
     let mut batch = store.index().batch();
-    store
-        .index()
-        .put_published_lsn_batch(&mut batch, 8)
-        .unwrap();
+    store.index().put_commit_lsn_batch(&mut batch, 8).unwrap();
     store.index().put_next_lsn_batch(&mut batch, 10).unwrap();
     batch.write_with_sync(true).unwrap();
     drop(compaction_guard);
@@ -5143,7 +5079,49 @@ async fn rollover_switches_active_segment_and_durability_seals_old_segment() {
 }
 
 #[tokio::test]
-async fn segment_pressure_rolls_before_asynchronous_durability() {
+async fn one_batch_can_publish_multiple_rollovers_without_staging_new_segment_states() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    let keys = [
+        BlobKey::new(b"blob-a".to_vec()).unwrap(),
+        BlobKey::new(b"blob-b".to_vec()).unwrap(),
+        BlobKey::new(b"blob-c".to_vec()).unwrap(),
+    ];
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    let mut batch = store.batch();
+    for key in &keys {
+        batch.put(
+            STANDALONE_SHARD.id,
+            key.clone(),
+            Arc::<[u8]>::from(&b"payload-a"[..]),
+        );
+    }
+    assert_eq!(batch.write().unwrap().op_lsns(), &[1, 2, 3]);
+
+    assert_eq!(lsm_blob_ref(&store, &keys[0]).segment_id, 1);
+    assert_eq!(lsm_blob_ref(&store, &keys[1]).segment_id, 2);
+    assert_eq!(lsm_blob_ref(&store, &keys[2]).segment_id, 3);
+    assert_eq!(
+        store.index().get_segment_state(1).unwrap().unwrap().state,
+        SegmentFileState::Sealing
+    );
+    assert_eq!(
+        store.index().get_segment_state(2).unwrap().unwrap().state,
+        SegmentFileState::Sealing
+    );
+    assert_eq!(
+        store.index().get_segment_state(3).unwrap().unwrap().state,
+        SegmentFileState::Open
+    );
+    assert_eq!(store.index().get_segment_published_at_lsn(2).unwrap(), 2);
+    assert_eq!(store.index().get_segment_published_at_lsn(3).unwrap(), 3);
+}
+
+#[tokio::test]
+async fn segment_pressure_syncs_active_segment_without_rollover() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -5178,7 +5156,7 @@ async fn segment_pressure_rolls_before_asynchronous_durability() {
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
     let (write_tx, write_rx) = mpsc::sync_channel(1);
-    let (durability_ready_tx, durability_ready_rx) = mpsc::channel();
+    let (sync_done_tx, sync_done_rx) = mpsc::channel();
 
     let mut coordinator = WriteCoordinator {
         config: cfg.clone(),
@@ -5195,21 +5173,19 @@ async fn segment_pressure_rolls_before_asynchronous_durability() {
         segment_sync_tx,
         pending_segment_syncs: Vec::new(),
         internal_write_tx: write_tx,
-        durability_ready_tx,
-        durability_ready_rx,
-        durability_in_flight_lsn: None,
+        sync_done_tx,
+        sync_done_rx,
+        sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
-        durability_publish_lock: Arc::new(Mutex::new(())),
+        commit_lock: Arc::new(Mutex::new(())),
         durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
         active_allocation_records: 0,
         active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
         pending_segment_bytes: 0,
-        oldest_unpublished_at: None,
-        last_durability_publish_at: Instant::now(),
-        last_segment_rollover_at: Instant::now() - SEGMENT_ROLLOVER_INTERVAL,
-        last_segment_rollover_next_lsn: 1,
+        oldest_uncommitted_at: None,
+        last_committed_at: Instant::now(),
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
@@ -5274,18 +5250,16 @@ async fn segment_pressure_rolls_before_asynchronous_durability() {
         2.0
     );
     let record_bytes = coordinator.active_segment_state.write_offset;
-    coordinator.pending_segment_bytes = DURABILITY_PUBLISH_SEGMENT_BYTES - record_bytes;
-    coordinator.note_committed_write(record_bytes).unwrap();
+    coordinator.pending_segment_bytes = SYNC_AND_COMMIT_SEGMENT_BYTES - record_bytes;
+    coordinator.note_uncommitted_write(record_bytes).unwrap();
     assert!(coordinator.pending_segment_syncs.is_empty());
-    assert_eq!(coordinator.durability_in_flight_lsn, Some(2));
+    assert_eq!(coordinator.sync_and_commit_in_flight, Some(2));
 
-    let old_state = index.get_segment_state(1).unwrap().unwrap();
-    assert_eq!(old_state.state, SegmentFileState::Sealing);
-    assert_eq!(old_state.write_offset, record_bytes);
-    assert_eq!(old_state.sealed_before_lsn, Some(3));
-    let new_state = index.get_segment_state(2).unwrap().unwrap();
-    assert_eq!(new_state.state, SegmentFileState::Open);
-    assert_eq!(index.get_segment_published_at_lsn(2).unwrap(), 3);
+    let active_state = index.get_segment_state(1).unwrap().unwrap();
+    assert_eq!(active_state.state, SegmentFileState::Open);
+    assert_eq!(active_state.write_offset, record_bytes);
+    assert_eq!(active_state.sealed_before_lsn, None);
+    assert_eq!(index.get_segment_state(2).unwrap(), None);
 
     let (second_response_tx, second_response_rx) = mpsc::channel();
     coordinator.process_batch_group(vec![BatchWriteRequest {
@@ -5307,19 +5281,18 @@ async fn segment_pressure_rolls_before_asynchronous_durability() {
         coordinator.write_rx.recv_timeout(Duration::from_millis(50)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
-    coordinator.process_segment_rollover().unwrap();
     let sync_handle = thread::spawn(move || segment_syncer.run());
-    coordinator.wait_for_seal_backlog_capacity().unwrap();
-    assert_eq!(index.get_published_lsn().unwrap(), 2);
+    let completed = coordinator
+        .sync_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    coordinator.commit_after_sync(completed).unwrap();
+    assert_eq!(index.get_committed_lsn().unwrap(), 2);
     assert_eq!(index.get_next_lsn().unwrap(), 4);
-    assert_eq!(
-        index.get_segment_state(1).unwrap().unwrap().state,
-        SegmentFileState::Sealed
-    );
-    assert_eq!(
-        index.get_segment_state(2).unwrap().unwrap().state,
-        SegmentFileState::Sealing
-    );
+    let synced_state = index.get_segment_state(1).unwrap().unwrap();
+    assert_eq!(synced_state.state, SegmentFileState::Open);
+    assert_eq!(synced_state.durable_offset, record_bytes);
+    assert_eq!(index.get_segment_state(2).unwrap(), None);
     drop(coordinator);
     sync_handle.join().unwrap();
 }

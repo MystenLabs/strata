@@ -200,7 +200,7 @@ pub(crate) fn recover_store_wal_prefix(
     metrics: &StrataStoreMetrics,
 ) -> Result<()> {
     let requested_lsn = index.get_next_lsn()?.checked_sub(1).filter(|lsn| *lsn != 0);
-    let published_lsn = index.get_published_lsn()?;
+    let published_lsn = index.get_committed_lsn()?;
     let published_target = (published_lsn != 0).then_some(published_lsn);
     let checkpoint = index.get_store_checkpoint()?;
     let (materialized_through, retained_from) = store_wal_recovery_state(config, index)?;
@@ -680,7 +680,7 @@ pub(crate) fn publish_recovered_store_checkpoint(
             ),
         });
     }
-    let current_published_lsn = index.get_published_lsn()?;
+    let current_published_lsn = index.get_committed_lsn()?;
     if current_published_lsn > recovered_lsn {
         return Err(Error::InvariantViolation {
             reason: format!(
@@ -690,7 +690,7 @@ pub(crate) fn publish_recovered_store_checkpoint(
     }
     let mut batch = index.batch();
     let published_lsn = recovered_lsn;
-    index.put_published_lsn_batch(&mut batch, published_lsn)?;
+    index.put_commit_lsn_batch(&mut batch, published_lsn)?;
     index.put_store_checkpoint_batch(&mut batch, checkpoint)?;
     batch
         .write_with_sync(true)

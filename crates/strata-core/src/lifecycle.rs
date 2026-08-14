@@ -210,7 +210,7 @@ impl BlobLifecycleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StoreStateKey {
     NextLsn,
-    PublishedLsn,
+    CommittedLsn,
     CurrentEpoch,
     /// Reserved legacy key. Kept in this position so persisted enum discriminants remain stable.
     LegacyProjectionFrontier,
@@ -232,7 +232,7 @@ pub enum StoreStateKey {
     /// Earlier transitions may already have terminal garbage materialized by an older release.
     /// Kept in its original enum position so the persisted discriminant remains stable.
     BlobCompactionGarbageFromLsn,
-    /// First store-WAL file that recovery must retain and validate.
+    /// First store WAL file that recovery must retain and validate.
     /// Appended here so every preceding persisted discriminant remains stable.
     StoreWalRetainedFrom,
     /// Highest Store LSN whose epoch transitions have been applied to every blob-LSM key range
@@ -254,11 +254,11 @@ pub struct WalPosition {
     pub offset: u64,
 }
 
-/// Physical coordinates associated atomically with RocksDB's `PublishedLsn`.
+/// Physical coordinates associated atomically with RocksDB's `CommitLsn`.
 ///
-/// For example, when `PublishedLsn = 42`, `wal_position` is the exact WAL prefix through LSN 42,
+/// For example, when `CommitLsn = 42`, `wal_position` is the exact WAL prefix through LSN 42,
 /// while `active_segment_id` and `active_segment_offset` identify the active payload prefix synced
-/// by that publication. The checkpoint deliberately has no LSN of its own: `PublishedLsn` is the
+/// by that publication. The checkpoint deliberately has no LSN of its own: `CommitLsn` is the
 /// store's single logical durability frontier. It says nothing about whether blob or relocation
 /// LSM memtables have been flushed to SSTs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

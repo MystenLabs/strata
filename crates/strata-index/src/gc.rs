@@ -31,7 +31,7 @@ impl StrataIndex {
         };
         let published_lsn = self
             .store_state
-            .get_with_snapshot(&snapshot, &StoreStateKey::PublishedLsn)?
+            .get_with_snapshot(&snapshot, &StoreStateKey::CommittedLsn)?
             .unwrap_or_default();
         let expiry_accounted_lsn = self
             .store_state

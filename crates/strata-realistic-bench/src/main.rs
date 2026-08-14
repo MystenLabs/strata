@@ -2641,8 +2641,6 @@ fn prepare_relocation_profile(
     let deadline = Instant::now() + timeout;
     store.sync()?;
     store.sync()?;
-    store.rollover_active_segment_for_sealing()?;
-    store.sync()?;
     thread::sleep(Duration::from_millis(2_500));
 
     // Let the normal one-second main-LSM roll/flush/compact loop drain user patches before GC.
@@ -2664,7 +2662,11 @@ fn prepare_relocation_profile(
                     .map(|partition| partition.patches.len())
             })
             .unwrap_or_default();
-        if sealed && patches == 0 {
+        if patches == 0 {
+            if !sealed {
+                println!("relocation_profile_status=no_naturally_sealed_segments");
+                return Ok(Vec::new());
+            }
             break;
         }
         if Instant::now() >= deadline {

@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use strata_core::{BlobKey, Epoch, RecordRef, SegmentState, ShardId, ShardKey, StrataLsn};
+use strata_core::{
+    BlobKey, Epoch, RecordRef, SegmentId, SegmentState, ShardId, ShardKey, StrataLsn,
+};
 use strata_index::StrataIndex;
 use strata_lsm::Mutation as LsmMutation;
 
@@ -19,9 +21,8 @@ pub(crate) enum WriteCommand {
     AddShard(AddShardRequest),
     Batch(BatchWriteRequest),
     DropShard(DropShardRequest),
-    RolloverSegment(RolloverSegmentRequest),
     Sync(SyncRequest),
-    DurabilityReady,
+    SyncDone,
     Shutdown,
 }
 
@@ -84,11 +85,6 @@ pub(crate) struct DropShardRequest {
 pub(crate) struct SyncRequest {
     pub(crate) response_tx: mpsc::Sender<Result<()>>,
     pub(crate) profile: ProfileRequest<StoreSyncProfile>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RolloverSegmentRequest {
-    pub(crate) response_tx: mpsc::Sender<Result<()>>,
 }
 
 #[derive(Debug)]
@@ -376,12 +372,13 @@ impl PreparedBatchOp {
 #[derive(Debug)]
 pub(crate) struct PendingRollover {
     pub(crate) old_segment_state: SegmentState,
-    pub(crate) new_segment_state: SegmentState,
-    pub(crate) new_segment_published_at_lsn: StrataLsn,
+    pub(crate) new_segment_id: SegmentId,
 }
 
 impl PendingRollover {
-    /// Adds the old-segment `Sealing` row and the new open segment row to a write batch.
+    /// Adds the old-segment `Sealing` row and the new segment's publication marker to a write
+    /// batch. The same batch writes the final active segment state; if another rollover followed
+    /// this one, that rollover writes this segment's `Sealing` state instead.
     ///
     /// Rollover metadata must commit atomically with the writer metadata batch that first publishes
     /// later segment or LSN state.
@@ -390,13 +387,17 @@ impl PendingRollover {
         index: &StrataIndex,
         batch: &mut typed_store::rocks::DBBatch,
     ) -> Result<()> {
+        let published_at_lsn =
+            self.old_segment_state
+                .sealed_before_lsn
+                .ok_or_else(|| Error::InvariantViolation {
+                    reason: format!(
+                        "rollover from segment {} has no sealed-before LSN",
+                        self.old_segment_state.segment_id
+                    ),
+                })?;
         index.put_segment_state_batch(batch, &self.old_segment_state)?;
-        index.put_segment_state_batch(batch, &self.new_segment_state)?;
-        index.put_segment_published_at_lsn_batch(
-            batch,
-            self.new_segment_state.segment_id,
-            self.new_segment_published_at_lsn,
-        )?;
+        index.put_segment_published_at_lsn_batch(batch, self.new_segment_id, published_at_lsn)?;
         Ok(())
     }
 }

@@ -148,11 +148,7 @@ mod writer;
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{
-        Arc, Mutex, RwLock, Weak,
-        atomic::{AtomicU64, AtomicUsize},
-        mpsc,
-    },
+    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -212,8 +208,7 @@ pub use strata_gc::{GcPlanner, GcPlannerConfig};
 pub use batch::StoreProfileSink;
 use batch::{
     AddShardRequest, BatchOp, BatchWriteRequest, DropShardRequest, PendingRollover, PreparedBatch,
-    PreparedBatchOp, ProfileRequest, RolloverSegmentRequest, SyncRequest, WriteCommand,
-    profile_phase,
+    PreparedBatchOp, ProfileRequest, SyncRequest, WriteCommand, profile_phase,
 };
 pub use batch::{BatchWriteResult, StoreSyncProfile, StoreWriteProfile, StrataBatch};
 use fs_util::{prune_empty_retention_dirs, segment_garbage_log_path, sync_parent_dir};
@@ -232,10 +227,9 @@ const FIRST_SEGMENT_ID: SegmentId = 1;
 /// How long the writer naps while waiting for durability publication to drain rolled segments.
 /// Short, because this sleep sits on the foreground put path during rollover backpressure.
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
-const DURABILITY_PUBLISH_INTERVAL: Duration = Duration::from_secs(20 * 60);
-const DURABILITY_PUBLISH_WAL_BYTES: u64 = 64 * 1024 * 1024;
-const DURABILITY_PUBLISH_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
-const SEGMENT_ROLLOVER_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const SYNC_AND_COMMIT_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const SYNC_AND_COMMIT_WAL_BYTES: u64 = 64 * 1024 * 1024;
+const SYNC_AND_COMMIT_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 const GARBAGE_LOG_HEAD: &str = "lsm-garbage";
 const GARBAGE_LOG_SWEEP_CURSOR: &str = "lsm-garbage-sweep";
 const GARBAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -348,21 +342,19 @@ struct WriteCoordinator {
     segment_sync_tx: FileSyncSender,
     pending_segment_syncs: Vec<SegmentSync>,
     internal_write_tx: mpsc::SyncSender<WriteCommand>,
-    durability_ready_tx: mpsc::Sender<Arc<DurabilityPublish>>,
-    durability_ready_rx: mpsc::Receiver<Arc<DurabilityPublish>>,
-    durability_in_flight_lsn: Option<StrataLsn>,
+    sync_done_tx: mpsc::Sender<Arc<SyncAndCommit>>,
+    sync_done_rx: mpsc::Receiver<Arc<SyncAndCommit>>,
+    sync_and_commit_in_flight: Option<StrataLsn>,
     pending_sync_requests: Vec<PendingSyncRequest>,
-    durability_publish_lock: Arc<Mutex<()>>,
+    commit_lock: Arc<Mutex<()>>,
     durable_relocation_lsn: Arc<AtomicU64>,
     active_segment_state: SegmentState,
     durable_offset: u64,
     active_allocation_records: u64,
     active_allocation_tracker: Arc<SegmentAllocationTracker>,
     pending_segment_bytes: u64,
-    oldest_unpublished_at: Option<Instant>,
-    last_durability_publish_at: Instant,
-    last_segment_rollover_at: Instant,
-    last_segment_rollover_next_lsn: StrataLsn,
+    oldest_uncommitted_at: Option<Instant>,
+    last_committed_at: Instant,
     pending_rollovers: Vec<PendingRollover>,
     lsm_flush_tx: mpsc::Sender<()>,
     lsm_compact_tx: mpsc::Sender<()>,
@@ -379,6 +371,8 @@ struct SegmentSync {
     segment_id: SegmentId,
     path: PathBuf,
     durable_offset: u64,
+    // Some vs None: Some means the segment is rolled over whereas active segment has no sealed_before_lsn.
+    // Other than that, this field has no special usage.
     sealed_before_lsn: Option<StrataLsn>,
     sealed_sha256: Arc<Mutex<Option<[u8; 32]>>>,
     allocation_records: u64,
@@ -398,7 +392,7 @@ struct PendingSyncRequest {
 }
 
 #[derive(Debug)]
-struct DurabilityPublish {
+struct SyncAndCommit {
     target_lsn: StrataLsn,
     wal_position: WalPosition,
     checkpoint_segment_id: SegmentId,
@@ -408,9 +402,11 @@ struct DurabilityPublish {
     segment_bytes: u64,
     started: Instant,
     file_sync_started: Instant,
-    remaining_syncs: AtomicUsize,
+    ///None: still syncing
+    ///Some(Err(error)): a sync failed
+    ///Some(Ok(duration)): all segment and WAL syncs completed in this duration
     file_sync_result: Mutex<Option<Result<Duration>>>,
-    ready_tx: mpsc::Sender<Arc<DurabilityPublish>>,
+    sync_done_tx: mpsc::Sender<Arc<SyncAndCommit>>,
     wake_tx: mpsc::SyncSender<WriteCommand>,
 }
 

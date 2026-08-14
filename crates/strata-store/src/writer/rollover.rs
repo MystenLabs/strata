@@ -1,4 +1,4 @@
-//! Active-segment rollover and unsealed-segment backpressure.
+//! Active-segment rollover and unsealed segment backpressure.
 //!
 //! Rollover installs a fresh active file and stages the old segment as `Sealing`. The next
 //! durability publication syncs the old file, verifies its final length, optionally hashes it,
@@ -43,70 +43,16 @@ impl WriteCoordinator {
         }
     }
 
-    /// The timer-path entry point: rolls a non-empty payload segment on its own cadence.
-    ///
-    /// The writer loop lands here when SEGMENT_ROLLOVER_INTERVAL expires, and the public
-    /// rollover_active_segment_for_sealing API arrives here too via the RolloverSegment command.
-    /// The cadence clock is reset before anything else, so even a failed attempt waits out a full
-    /// interval instead of retrying hot.
-    ///
-    /// Then the emptiness guard. next_lsn is read (it will become sealed_before_lsn if we do roll)
-    /// and compared against the value recorded at the end of the previous rollover. Bytes never
-    /// enter a segment without consuming an LSN, so an unchanged next_lsn proves the active
-    /// segment is still empty and the roll is skipped — without this, a completely idle store
-    /// would mint a fresh segment file every 20 minutes forever. The check is conservative in the
-    /// other direction: LSNs also advance for byte-free operations like tombstones and epoch
-    /// changes, so "next_lsn moved" does not strictly guarantee the segment grew, and that is
-    /// fine — the cost is an occasional near-empty rollover, not a correctness problem.
-    ///
-    /// A real roll performs the two metadata phases from the module doc back to back:
-    /// rollover_active_segment stages the swap (S30 out, S31 in, rows parked in
-    /// pending_rollovers); the staged rows are drained into a small dedicated index batch and
-    /// committed, because unlike the segment-full path there is no foreground batch coming to
-    /// carry them. If the commit fails, the rows are put back with restore_pending_rollovers — the
-    /// in-memory writer has already moved on and that swap cannot be undone.
-    ///
-    /// The batch is deliberately written without sync. The next ordinary durability publication
-    /// owns the segment and WAL syncs and makes these rows crash-durable.
-    pub(crate) fn process_segment_rollover(&mut self) -> Result<()> {
-        self.last_segment_rollover_at = Instant::now();
-        let sealed_before_lsn = self.index.get_next_lsn()?;
-        if sealed_before_lsn <= self.last_segment_rollover_next_lsn {
-            return Ok(());
-        }
-
-        self.rollover_active_segment(sealed_before_lsn)?;
-        let pending_rollovers = self.take_pending_rollovers();
-        let commit_result = (|| {
-            let mut batch = self.index.batch();
-            for rollover in &pending_rollovers {
-                rollover.apply_batch(&self.index, &mut batch)?;
-            }
-            batch.write().map_err(strata_index::Error::from)?;
-            Ok::<(), Error>(())
-        })();
-
-        match commit_result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.restore_pending_rollovers(pending_rollovers);
-                Err(error)
-            }
-        }
-    }
-
     /// Swaps the physical writer to a fresh segment and stages every metadata consequence in
     /// memory. It does not wait for durability or perform file I/O beyond creating the new file.
     ///
     /// Segment rollover is intentionally here, beside WAL ownership. The LSM sees only the
     /// `RecordRef` produced after this method installs the next segment.
     ///
-    /// Two callers, one meaning for the boundary LSN. The segment-full path (commit.rs) calls this
-    /// mid-batch with the LSN of the put that did not fit, and that put becomes the first record
-    /// of the new segment. The timer path passes the current next_lsn, which no record has used
-    /// yet. Either way `sealed_before_lsn` promises the same thing: every record in the closing
-    /// segment has an LSN strictly below it, and everything at or above it lives in a later
-    /// segment. In the example, S30 gets sealed_before_lsn 4200.
+    /// The segment-full path (commit.rs) calls this mid-batch with the LSN of the put that did not
+    /// fit, and that put becomes the first record of the new segment. Therefore
+    /// `sealed_before_lsn` promises that every record in the closing segment has a lower LSN and
+    /// everything at or above it lives in a later segment.
     ///
     /// The writer first waits for unsealed-segment capacity, verifies its physical offset against
     /// metadata, creates a strictly newer segment, and stages both metadata rows. It also records
@@ -159,8 +105,7 @@ impl WriteCoordinator {
 
         self.pending_rollovers.push(PendingRollover {
             old_segment_state: old_state,
-            new_segment_state: new_state.clone(),
-            new_segment_published_at_lsn: sealed_before_lsn,
+            new_segment_id,
         });
         self.pending_segment_syncs.push(pending_segment_sync);
         self.segment = next;
@@ -168,8 +113,6 @@ impl WriteCoordinator {
         self.active_allocation_tracker = Arc::new(SegmentAllocationTracker::default());
         self.active_segment_state = new_state;
         self.durable_offset = 0;
-        self.last_segment_rollover_at = Instant::now();
-        self.last_segment_rollover_next_lsn = sealed_before_lsn;
         self.metrics.set_active_segment(
             self.active_segment_state.segment_id,
             self.active_segment_state.write_offset,
@@ -196,7 +139,7 @@ impl WriteCoordinator {
         let started = Instant::now();
         let mut waiting = false;
         loop {
-            self.process_ready_durability();
+            self.process_sync_done();
             self.store_halt.check()?;
             if unsealed_ingest_segment_count(&self.index)? < self.config.max_unsealed_segments {
                 if waiting {
@@ -206,7 +149,7 @@ impl WriteCoordinator {
                 }
                 return Ok(());
             }
-            self.maybe_start_durability_publish(false)?;
+            self.maybe_start_sync_and_commit(false)?;
             if !waiting {
                 waiting = true;
                 self.metrics.start_seal_backpressure_wait();

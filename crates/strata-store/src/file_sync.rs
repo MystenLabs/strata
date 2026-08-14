@@ -35,6 +35,12 @@ impl FileSyncTask {
             completion: Box::new(completion),
         }
     }
+
+    /// Finishes a task without running its file sync when it cannot be submitted or a prerequisite
+    /// has already failed.
+    pub(crate) fn complete(self, result: Result<()>) {
+        (self.completion)(result);
+    }
 }
 
 impl fmt::Debug for FileSyncTask {

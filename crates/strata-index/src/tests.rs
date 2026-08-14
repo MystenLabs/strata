@@ -159,7 +159,7 @@ async fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
     };
     let mut batch = index.batch();
     index.put_current_epoch_batch(&mut batch, 10).unwrap();
-    index.put_published_lsn_batch(&mut batch, 7).unwrap();
+    index.put_commit_lsn_batch(&mut batch, 7).unwrap();
     index
         .put_shard_info_batch(
             &mut batch,
@@ -285,7 +285,7 @@ async fn store_frontiers_and_checkpoint_round_trip() {
     };
     let mut batch = index.batch();
     index.put_next_lsn_batch(&mut batch, 42).unwrap();
-    index.put_published_lsn_batch(&mut batch, 41).unwrap();
+    index.put_commit_lsn_batch(&mut batch, 41).unwrap();
     index
         .put_store_wal_retained_from_batch(&mut batch, 3)
         .unwrap();

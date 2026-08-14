@@ -10,10 +10,10 @@ impl StrataIndex {
         Ok(self.store_state.get(&StoreStateKey::NextLsn)?.unwrap_or(1))
     }
 
-    pub fn get_published_lsn(&self) -> Result<StrataLsn> {
+    pub fn get_committed_lsn(&self) -> Result<StrataLsn> {
         Ok(self
             .store_state
-            .get(&StoreStateKey::PublishedLsn)?
+            .get(&StoreStateKey::CommittedLsn)?
             .unwrap_or_default())
     }
 
@@ -78,7 +78,7 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn put_published_lsn_batch(
+    pub fn put_commit_lsn_batch(
         &self,
         batch: &mut DBBatch,
         published_lsn: StrataLsn,
@@ -86,7 +86,7 @@ impl StrataIndex {
         // Publication is the Store fence for foreground writes and blob-version compaction.
         batch.insert_batch(
             self.store_state(),
-            [(&StoreStateKey::PublishedLsn, &published_lsn)],
+            [(&StoreStateKey::CommittedLsn, &published_lsn)],
         )?;
         Ok(())
     }

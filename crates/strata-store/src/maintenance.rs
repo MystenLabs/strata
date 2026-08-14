@@ -273,14 +273,14 @@ impl LsmFlusher {
     /// Drains every frozen memtable into its own patch SST, then advances the materialized
     /// frontier.
     ///
-    /// Each flush_one writes and syncs one SST, then publishes the manifest edit through
-    /// publish_blob_lsm_edit (one synced RocksDB batch) — so a crash between flushes loses
-    /// nothing: flushed generations are durable, unflushed ones are still covered by the store
-    /// WAL. Afterwards materialize_through(published_lsn) advances the frontier across LSNs that
-    /// have no keyed rows at all (epoch changes, relocation-only stretches); without that hop,
-    /// one metadata-only LSN would pin store-WAL reclamation forever. The frontier is capped at
-    /// published_lsn because publication is the durability bound for RocksDB-only transitions.
+    /// Each flush writes and syncs one SST. A table beyond `committed_lsn` becomes an in-memory
+    /// pending table: readers use it immediately, but it does not enter the durable manifest until
+    /// a later WAL sync covers its `max_lsn`. A crash removes such an unreferenced table and replays
+    /// it from the WAL. Afterwards materialize_through(committed_lsn) advances the frontier across
+    /// LSNs that have no keyed rows at all (epoch changes, relocation-only stretches); without
+    /// that hop, one metadata-only LSN would pin store-WAL reclamation forever.
     fn flush_all(&self, lsm: &Lsm) -> Result<()> {
+        let committed_lsn = self.index.get_committed_lsn()?;
         loop {
             let mut flushed = false;
             let partition_count = lsm.manifest().partition_count;
@@ -290,7 +290,7 @@ impl LsmFlusher {
                 }
                 let target = lsm.allocate_patch_target()?;
                 flushed |= lsm
-                    .flush_one(partition, target, |edit| {
+                    .flush_one(partition, target, committed_lsn, |edit| {
                         publish_blob_lsm_edit(&self.index, edit)
                     })?
                     .is_some();
@@ -299,8 +299,7 @@ impl LsmFlusher {
                 break;
             }
         }
-        let published_lsn = self.index.get_published_lsn()?;
-        lsm.materialize_through(published_lsn, |edit| {
+        lsm.materialize_through(committed_lsn, |edit| {
             publish_blob_lsm_edit(&self.index, edit)
         })?;
         Ok(())
@@ -471,7 +470,7 @@ impl LsmCompactor {
             .read()
             .expect("compaction admission lock poisoned");
         let manifest = lsm.manifest();
-        let published_lsn = self.index.get_published_lsn()?;
+        let published_lsn = self.index.get_committed_lsn()?;
         let mut compaction_manifest = (*manifest).clone();
         let partition_patches = &compaction_manifest
             .partitions
@@ -782,6 +781,7 @@ pub(crate) fn flush_relocation_lsm(
     relocation_cache: &RelocationCache,
     metrics: &StrataStoreMetrics,
 ) -> Result<()> {
+    let publish_through = relocations.lsm().last_lsn()?.unwrap_or_default();
     loop {
         let mut flushed = false;
         let partition_count = relocations.lsm().manifest().partition_count;
@@ -789,7 +789,7 @@ pub(crate) fn flush_relocation_lsm(
             let target = relocations.lsm().allocate_patch_target()?;
             flushed |= relocations
                 .lsm()
-                .flush_one(partition, target, |edit| {
+                .flush_one(partition, target, publish_through, |edit| {
                     publish_relocation_lsm_edit(index, edit)
                 })?
                 .is_some();
@@ -800,7 +800,7 @@ pub(crate) fn flush_relocation_lsm(
     }
     relocations
         .lsm()
-        .materialize_through(relocations.lsm().last_lsn()?.unwrap_or_default(), |edit| {
+        .materialize_through(publish_through, |edit| {
             publish_relocation_lsm_edit(index, edit)
         })?;
 

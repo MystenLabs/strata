@@ -413,6 +413,20 @@ impl Snapshot {
     }
 
     pub(crate) fn get_parts(&self, partition: u32, key: &[u8]) -> Result<ReadParts> {
+        self.get_parts_through(partition, key, self.max_lsn)
+    }
+
+    /// Reads this captured file set through a caller-selected frontier.
+    ///
+    /// The replaceable engine view uses this when its manifest shape is still current but a batch
+    /// that was partially flushed under backpressure has since become atomically visible. Public
+    /// caller-held snapshots continue to use their immutable `self.max_lsn` through `get_parts`.
+    pub(crate) fn get_parts_through(
+        &self,
+        partition: u32,
+        key: &[u8],
+        max_lsn: StrataLsn,
+    ) -> Result<ReadParts> {
         let partition_manifest =
             self.full_manifest
                 .partitions
@@ -440,7 +454,7 @@ impl Snapshot {
         for (table, reader) in partition_manifest.patches.iter().zip(&readers.patches) {
             if key < table.first_key.as_slice()
                 || key > table.last_key.as_slice()
-                || table.min_lsn.is_some_and(|lsn| lsn > self.max_lsn)
+                || table.min_lsn.is_some_and(|lsn| lsn > max_lsn)
             {
                 continue;
             }
@@ -448,7 +462,7 @@ impl Snapshot {
                 reader
                     .get_patches(key)?
                     .into_iter()
-                    .filter(|(lsn, _)| *lsn <= self.max_lsn),
+                    .filter(|(lsn, _)| *lsn <= max_lsn),
             );
         }
 

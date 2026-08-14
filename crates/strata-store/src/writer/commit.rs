@@ -3,6 +3,25 @@
 //! One writer thread, one LSN sequence: prepare_batch reserves a contiguous range, so a batch's ops can never interleave with another writer's.
 //! Fixed publication order — segment bytes → store WAL → LSM memtable → RocksDB batch — and the RocksDB batch is the commit point.
 //! Committed ≠ durable: when the caller gets its LSN back, the write is visible and ordered, but only a later sync (or the periodic durability publish) makes it crash-proof. Callers needing durability gate on published_lsn() >= lsn
+//!
+//! This is a *group* commit path. The writer loop, on picking up one Batch command, greedily
+//! drains every further Batch already sitting in the queue (up to the grouped-operation and
+//! grouped-payload caps in mod.rs) and hands the whole vector here. The point is amortization:
+//! N waiting callers cost one store-WAL append, one blob-LSM write, and one RocksDB batch —
+//! instead of N of each — while each caller still gets its own response, its own LSNs, and its
+//! own metrics.
+//!
+//! Running example for everything below, two callers grouped together: batch X carries
+//! Put("foo") and IncrementEpoch, batch Y carries Put("bar"). next_lsn starts at 100, so X gets
+//! LSNs 100 and 101, Y gets 102, and the group commits next_lsn = 103. "foo" and "bar" land as
+//! bytes in the active segment; the epoch change is the one op kind that writes no payload.
+//!
+//! The failure philosophy has two tiers, split by whether physical work has started. During
+//! preparation a batch fails *alone*: its caller gets the error, the LSN cursor does not move,
+//! and the rest of the group proceeds as if it never existed. From the first segment append
+//! onward the group is one fate: any failure halts the writer (bytes and WAL entries may exist
+//! that metadata will never acknowledge — only recovery can reconcile that) and every caller in
+//! the group receives the halt.
 
 use std::time::Instant;
 
@@ -21,6 +40,51 @@ impl WriteCoordinator {
     /// rolling it first when needed. Every operation is appended to the store WAL, keyed mutations
     /// enter the LSM, and the RocksDB batch atomically publishes the logical metadata plus any
     /// staged rollover rows. After physical writes begin, a failure halts the writer for recovery.
+    ///
+    /// The walk through, in code order:
+    ///
+    /// Phase 1 — prepare, per batch, in arrival order. Empty batches are answered immediately with
+    /// a default result and never join the group. The first real batch reads next_lsn and
+    /// current_epoch from RocksDB once; every later batch threads the in-memory cursor forward, so
+    /// X consumes 100-101 and Y starts at 102 without touching the index again. A batch that fails
+    /// validation is rejected *individually* — its caller gets the error and its put/delete
+    /// metrics record failure — and, per the inline comment below, neither cursor advances, so the
+    /// surviving batches still receive a gap-free range. Nothing physical has happened yet, which
+    /// is what makes this per-batch isolation possible at all.
+    ///
+    /// Phase 2 — physical writes, one pass over every op of every surviving batch. A Put first
+    /// asks the active segment for capacity and, if the record does not fit, rolls the segment
+    /// mid-group with the put's own LSN as the boundary — the put then becomes the first record of
+    /// the new segment. The append is length-checked against what prepare_batch predicted (a
+    /// mismatch is an InvariantViolation: the encoder and the writer disagree about bytes already
+    /// on disk), the returned record_ref is backfilled into the prepared op for the LSM mutation
+    /// to reference, and the in-memory active-segment row advances: write_offset, and the min/max
+    /// LSN bounds GC later uses to reason about the segment without scanning it. Then, for every
+    /// op kind: exactly one store-WAL entry at its LSN, and for keyed ops (Put, SetBlobLifetime,
+    /// Tombstone) one blob-LSM mutation routed to its hash partition (partition_for_key over the
+    /// raw key — the same routing the relocation LSM must mirror). IncrementEpoch is the one
+    /// RocksDB-only op: a bare Epoch WAL entry, no LSM row. The phase ends with the two amortized
+    /// writes — one WAL append and one LSM write_batch for the entire group — and notes whether
+    /// the LSM rolled a memtable. `failure_context` is threaded through every step so a halt names
+    /// the exact sub-step that failed. Any error here is tier two: orphaned-byte accounting, halt,
+    /// and fail_batch_group for everyone.
+    ///
+    /// Phase 3 — the commit point. Pending rollovers are taken (a roll staged in phase 2 commits
+    /// exactly once, atomically with the records that already reference the new segment) and
+    /// commit_write_group writes the single RocksDB batch. Success makes every LSN in the group
+    /// visible at once; failure is fatal exactly like phase 2, because the WAL and LSM now hold
+    /// state the index refused to acknowledge.
+    ///
+    /// Phase 4 — post-commit bookkeeping, no failures left that can reject a caller. The LSM
+    /// flusher is nudged if a memtable rolled; gauges update (active segment, next_lsn = 103, and
+    /// the current epoch from the *last* batch that changed it). Only now are per-put and
+    /// per-tombstone success metrics recorded — recording during the append would count a write
+    /// as successful before the commit that makes it visible — and each caller receives its own
+    /// result with its own op LSNs. note_committed_write then accounts the group's segment bytes
+    /// as durability-pending and may immediately start an asynchronous durability publish if byte
+    /// or age pressure crossed a threshold: this is how "committed" writes stop being merely
+    /// visible and start becoming crash-proof without any caller asking. Profiles go out last,
+    /// stamped with the full writer-side elapsed time.
     pub(crate) fn process_batch_group(&mut self, requests: Vec<BatchWriteRequest>) {
         let started = Instant::now();
         let mut next_lsn = None;
@@ -278,7 +342,7 @@ impl WriteCoordinator {
                 || request.response_tx.send(Ok(prepared.result.clone())),
             );
         }
-        if let Err(error) = self.note_committed_write(segment_bytes) {
+        if let Err(error) = self.note_uncommitted_write(segment_bytes) {
             self.halt_writer_error("schedule grouped batch durability", &error);
         }
         for (request, _, profile) in prepared_batches {
@@ -289,6 +353,14 @@ impl WriteCoordinator {
         }
     }
 
+    /// Delivers the collective failure: every caller whose batch survived preparation gets the
+    /// same answer.
+    ///
+    /// By the time this runs the writer has already halted, so each response carries the stored
+    /// halt reason — the context string naming the exact sub-step that failed — rather than a
+    /// per-batch error; a generic StoreHalted stands in if the reason is somehow missing. Put and
+    /// tombstone metrics record failure for every op that had been promised, and profiles are
+    /// still delivered: the slow path stays observable precisely when observability matters most.
     fn fail_batch_group(
         &self,
         prepared_batches: Vec<(BatchWriteRequest, PreparedBatch, Option<StoreWriteProfile>)>,
@@ -327,6 +399,13 @@ impl WriteCoordinator {
         }
     }
 
+    /// Halts after a mid-group failure, first recording how many bytes were left orphaned.
+    ///
+    /// "Orphaned" means appended to the active segment during this group but never acknowledged
+    /// by a committed RocksDB batch — the index still ends before them. They are not a
+    /// correctness problem (recovery's unsealed-segment scan re-derives the true frontier and
+    /// discards them), but they are disk and recovery-time exposure, and the metric sizes exactly
+    /// that.
     fn halt_submit_batch_failure(
         &self,
         context: &str,
@@ -339,6 +418,9 @@ impl WriteCoordinator {
         self.halt_writer_error(context, error);
     }
 
+    /// Marks the store terminally failed, stamping the failing sub step into the reason every
+    /// later caller will see. There is no un-halt: the writer's in-memory view can no longer be
+    /// trusted to match disk, and only a restart's recovery may reconcile the two.
     pub(crate) fn halt_writer_error(&self, context: &str, error: &Error) {
         self.store_halt.halt(format!(
             "fatal strata writer error during {context}: {error}"
@@ -355,6 +437,13 @@ impl WriteCoordinator {
     /// `Tombstone`: just needs a shard resolved.
     /// `IncrementEpoch`: bumps the epoch in the current batch which means later ops in the same batch
     /// will see the new epoch.
+    ///
+    /// Group threading: the caller passes the group's running (next_lsn, current_epoch) cursor and
+    /// receives the advanced pair back — in the example, batch X takes (100, e) and returns
+    /// (102, e+1), which is exactly what batch Y is prepared with, so Y's ops see X's epoch bump
+    /// without any RocksDB read between them. Because this function touches no physical state, a
+    /// rejection costs nothing: the caller simply keeps its previous cursor values and the failed
+    /// batch leaves no trace in the LSN sequence.
     fn prepare_batch(
         &self,
         ops: Vec<BatchOp>,
@@ -479,13 +568,6 @@ impl WriteCoordinator {
         std::mem::take(&mut self.pending_rollovers)
     }
 
-    /// Restores rollover metadata when a non-foreground metadata publish fails before committing.
-    ///
-    /// Foreground batch failures after physical writer work starts are fatal instead.
-    pub(crate) fn restore_pending_rollovers(&mut self, pending_rollovers: Vec<PendingRollover>) {
-        self.pending_rollovers = pending_rollovers;
-    }
-
     /// Commits the index side of a group of prepared batches.
     ///
     /// This assembles one atomic RocksDB write:
@@ -498,6 +580,16 @@ impl WriteCoordinator {
     ///
     /// A rollover during this write stages its metadata in `self.pending_rollovers`, so the active
     /// segment change commits atomically with the records that reference it.
+    ///
+    /// Two details are easy to miss. The active-segment row is written only when some op actually
+    /// appended payload bytes (`wrote_payload`) — a group of pure metadata ops (epoch changes,
+    /// tombstones, lifetimes) must not churn the segment row, and in particular must not
+    /// re-publish min/max LSN bounds that did not move. And the batch is written *without* sync:
+    /// this is the commit point for visibility and ordering, not for durability — per the module
+    /// doc, crash-proofness arrives later via the pressure-driven durability publish, and callers
+    /// that need it gate on published_lsn. One batch for the whole group also means the group is
+    /// all-or-nothing at the metadata level: either every caller's LSNs exist in the index or
+    /// none do.
     fn commit_write_group<'a>(
         &self,
         pending_rollovers: &[PendingRollover],

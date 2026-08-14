@@ -393,7 +393,7 @@ fn validate_recovered_store(
         );
     }
 
-    assert_eq!(store.index().get_published_lsn().unwrap(), published_lsn);
+    assert_eq!(store.index().get_committed_lsn().unwrap(), published_lsn);
     assert!(store.index().get_next_lsn().unwrap() > published_lsn);
 
     validate_segment_states(&cfg, &store, fault);

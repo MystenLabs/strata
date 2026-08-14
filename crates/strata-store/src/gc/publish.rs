@@ -229,7 +229,7 @@ impl GcExecutor {
     ///
     /// The fence, not a sequence. Here is the biggest difference from a foreground write: a
     /// relocation is a physical publication, not a logical blob mutation, so GC allocates no new
-    /// foreground LSNs. Instead the current durable blob frontier — get_published_lsn(), 1000 in
+    /// foreground LSNs. Instead the current durable blob frontier — get_committed_lsn(), 1000 in
     /// the example — becomes the shared publish_lsn "fence" on every row, and
     /// assign_gc_publish_fence stamps each survivor with it while swapping T900 for S42 in its
     /// destination ref (payload_lsn, the LSN of the original write, is untouched forever).
@@ -383,7 +383,7 @@ impl GcExecutor {
         // Relocation is a physical publication, not a logical blob mutation. All rows in this L0
         // share the latest durable blob frontier as their logical ordering fence; the relocation
         // LSM assigns its own sequence to the immutable table below.
-        let publish_lsn = self.index.get_published_lsn()?;
+        let publish_lsn = self.index.get_committed_lsn()?;
         let published_records = match assign_gc_publish_fence(
             publish_lsn,
             &survivors,

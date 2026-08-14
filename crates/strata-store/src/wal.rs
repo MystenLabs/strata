@@ -1,11 +1,42 @@
 //! Store-owned rolling write-ahead log.
+//!
+//! This is the store's own operation log — not RocksDB's internal WAL. Every foreground
+//! operation (put, tombstone, lifetime, epoch change, shard drop) is appended here as one
+//! encoded StoreWalMutation at its LSN, in the fixed publication order the commit path
+//! enforces: segment bytes first, then this WAL, then the LSM memtable, then the RocksDB
+//! batch. At open, replaying the retained prefix is how both keyed LSM projections rebuild
+//! their memtables; after a crash, this log is the store's evidence of what happened since the
+//! last durability publish.
+//!
+//! The trust model is the same family as the garbage log — the WAL never believes its own file
+//! lengths, only the store checkpoint: a (file, offset) pair written atomically with
+//! PublishedLsn by a synced durability publish. But there is one deep difference, and it is why
+//! recovery here is an order of magnitude more involved: bytes past the checkpoint are *not*
+//! automatically garbage. The writer appends and commits in RocksDB before anything is fsynced,
+//! so a crash can leave the WAL tail holding complete frames for LSNs that RocksDB committed
+//! but never published. Store recovery picks the true final LSN, and this module either
+//! *promotes* a complete tail up to exactly that LSN — fsyncing it first, because nothing ever
+//! proved those bytes durable — or reports the tail unprovable so recovery rolls the store back
+//! instead. Promote or roll back, never guess: that split is the whole design.
+//!
+//! Durability is asynchronous by construction. `append` writes into the page cache, tracks
+//! pending bytes for the pressure trigger, and returns; `sync_data` captures the exact current
+//! position plus a task for the background file-sync worker, rolling oversized files at that
+//! same captured boundary. Rolled files are reclaimed once *both* LSM projections have
+//! materialized their contents into durable SSTs — the WAL prefix a projection might still
+//! replay is never deleted.
+//!
+//! Physical format, shared by every `wal-<id>.log` in the numbered chain: a 12-byte file header
+//! (magic `STRWAL01`, version), then frames. A frame is a 12-byte prefix (u64 payload length,
+//! u32 entry count), per entry a 12-byte header (u64 LSN, u32 payload length) followed by the
+//! payload, and a trailing 32-byte SHA-256 over all of it. One appended batch is one frame —
+//! never split across files — LSNs increase strictly across the entire log, and every durable
+//! position names an exact frame boundary.
 
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
 };
 
 use sha2::{Digest, Sha256};
@@ -25,6 +56,9 @@ const FILE_PREFIX: &str = "wal-";
 const FILE_SUFFIX: &str = ".log";
 
 /// One caller-encoded operation persisted in the WAL.
+///
+/// The payload is an encoded StoreWalMutation; this layer treats it as opaque bytes and cares
+/// only about the LSN, which must extend the log's strict order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalEntry {
     pub lsn: StrataLsn,
@@ -35,6 +69,12 @@ pub struct WalEntry {
 ///
 /// `committed` must come from the store checkpoint in RocksDB. Opening validates that prefix,
 /// truncates later bytes, and removes later WAL files.
+///
+/// The fields worth knowing: `last_lsn` is the strict-ordering gate every append must extend
+/// (learned by scanning at open, maintained in memory after); `pending_bytes` counts appended
+/// bytes not yet captured by a durability publish — the WAL half of the pressure that triggers
+/// the next one; `file_sync_tx` is the shared background sync-worker queue, so fsyncs never run
+/// on the writer thread.
 #[derive(Debug)]
 pub struct Wal {
     dir: PathBuf,
@@ -43,47 +83,8 @@ pub struct Wal {
     offset: u64,
     file: File,
     last_lsn: Option<StrataLsn>,
-    needs_dir_sync: bool,
     file_sync_tx: FileSyncSender,
-    sync_tracker: Arc<WalSyncTracker>,
     pending_bytes: u64,
-}
-
-#[derive(Debug)]
-struct WalSyncTracker {
-    state: Mutex<WalSyncState>,
-    changed: Condvar,
-}
-
-#[derive(Debug)]
-struct WalSyncState {
-    committed: WalPosition,
-    last_submitted: WalPosition,
-    next_ticket: u64,
-    next_commit: u64,
-    completed: BTreeMap<u64, WalSyncCompletion>,
-    notifications: Vec<WalSyncNotification>,
-    failure: Option<String>,
-}
-
-struct WalSyncNotification {
-    through_ticket: u64,
-    notify: Box<dyn FnOnce(Result<()>) + Send + 'static>,
-}
-
-impl std::fmt::Debug for WalSyncNotification {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("WalSyncNotification")
-            .field("through_ticket", &self.through_ticket)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug)]
-enum WalSyncCompletion {
-    Synced(WalPosition),
-    Failed(String),
 }
 
 impl Wal {
@@ -92,6 +93,12 @@ impl Wal {
     /// Store-level recovery uses this preflight to distinguish a complete buffered tail, which
     /// may be promoted, from an incomplete unpublished tail, which must be rolled back before the
     /// WAL is opened and truncated.
+    ///
+    /// It is deliberately a read-only twin of `recover`: the same validation gates, the same
+    /// recover_position walk, but no file is created, truncated, or deleted (only the directory
+    /// is ensured). That split gives store recovery a "look, decide, then touch" protocol — the
+    /// verdict on whether LSNs must be rolled back is reached *before* anything mutates, so a
+    /// WAL about to be judged incomplete is never modified by the inspection that judges it.
     pub fn validate_recovery_target(
         dir: impl AsRef<Path>,
         checkpoint: WalPosition,
@@ -124,17 +131,12 @@ impl Wal {
                 "materialized WAL lsn {materialized_through:?} follows recovered store lsn {last_lsn:?}"
             )));
         }
-        if checkpoint != WalPosition::default()
-            && retained_from > checkpoint.log_id
-            && !matches!(
-                (published_lsn, materialized_through),
-                (Some(checkpoint), Some(materialized)) if checkpoint <= materialized
-            )
-        {
-            return Err(Error::InvalidWal(
-                "retained WAL prefix is not covered by the materialized frontier".to_owned(),
-            ));
-        }
+        validate_reclaimed_checkpoint_covered(
+            checkpoint,
+            published_lsn,
+            materialized_through,
+            retained_from,
+        )?;
         let ids = log_ids(dir)?;
         if !ids.is_empty() && !ids.contains(&retained_from) {
             return Err(Error::InvalidWal(format!(
@@ -190,12 +192,28 @@ impl Wal {
     /// - `last_lsn`: final globally committed LSN selected by store recovery, normally
     ///   `next_lsn - 1`. Complete frames after `checkpoint` are preserved only through this LSN.
     /// - `file_sync_tx`: store-owned worker queue used by the returned WAL for later syncs.
+    ///
+    /// The narrative around that argument list, in code order. Validation first: `retained_from`
+    /// must be sane, neither frontier may sit ahead of the chosen `last_lsn`, a checkpoint whose
+    /// file was reclaimed is acceptable only when the materialized frontier covers PublishedLsn,
+    /// and the first retained file must actually exist. Then reclamation is *finished*: files
+    /// below `retained_from` were declared dead by a synced publish before the crash, and a
+    /// crash between that publish and the unlink leaves them on disk — recovery deletes them
+    /// now, the same publish-first/delete-second retry shape GC uses for its files. The legacy
+    /// escape hatch comes next: a store migrated from the shared-WAL era may have committed LSNs
+    /// but no WAL files at all, tolerated only when immutable tables cover the whole frontier —
+    /// a fresh file is created and `last_lsn` seeded so ordering resumes correctly. Otherwise
+    /// recover_position walks from the checkpoint toward `last_lsn`, and if it promoted anything
+    /// past the checkpoint, those files are fsynced (sync_logs_through) before the WAL opens:
+    /// promotion turns never-proven bytes into the committed prefix, so they must actually be
+    /// durable before the store builds on them. Finally `open` re-runs the strict prefix
+    /// validation at the recovered position and truncates everything beyond it.
     #[allow(clippy::too_many_arguments)]
     pub fn recover(
         dir: impl AsRef<Path>,
         max_file_bytes: u64,
         checkpoint: WalPosition,
-        published_lsn: Option<StrataLsn>,
+        committed_lsn: Option<StrataLsn>,
         materialized_through: Option<StrataLsn>,
         retained_from: u64,
         last_lsn: Option<StrataLsn>,
@@ -213,9 +231,9 @@ impl Wal {
                 "a reclaimed WAL prefix needs a materialized frontier".to_owned(),
             ));
         }
-        if published_lsn.is_some_and(|published| last_lsn.is_none_or(|last| published > last)) {
+        if committed_lsn.is_some_and(|committed| last_lsn.is_none_or(|last| committed > last)) {
             return Err(Error::InvalidWal(format!(
-                "published lsn {published_lsn:?} follows recovered store lsn {last_lsn:?}"
+                "published lsn {committed_lsn:?} follows recovered store lsn {last_lsn:?}"
             )));
         }
         if materialized_through
@@ -225,17 +243,12 @@ impl Wal {
                 "materialized WAL lsn {materialized_through:?} follows recovered store lsn {last_lsn:?}"
             )));
         }
-        if checkpoint != WalPosition::default()
-            && retained_from > checkpoint.log_id
-            && !matches!(
-                (published_lsn, materialized_through),
-                (Some(checkpoint), Some(materialized)) if checkpoint <= materialized
-            )
-        {
-            return Err(Error::InvalidWal(
-                "retained WAL prefix is not covered by the materialized frontier".to_owned(),
-            ));
-        }
+        validate_reclaimed_checkpoint_covered(
+            checkpoint,
+            committed_lsn,
+            materialized_through,
+            retained_from,
+        )?;
         let ids = log_ids(dir)?;
         if !ids.is_empty() && !ids.contains(&retained_from) {
             return Err(Error::InvalidWal(format!(
@@ -244,7 +257,7 @@ impl Wal {
         }
         remove_logs_before(dir, retained_from)?;
         if checkpoint == WalPosition::default()
-            && published_lsn.is_none()
+            && committed_lsn.is_none()
             && last_lsn.is_some()
             && log_ids(dir)?.is_empty()
         {
@@ -255,7 +268,7 @@ impl Wal {
         let recovered = recover_position(
             dir,
             checkpoint,
-            published_lsn,
+            committed_lsn,
             materialized_through,
             retained_from,
             last_lsn,
@@ -268,6 +281,21 @@ impl Wal {
         Ok(wal)
     }
 
+    /// Opens strictly at a committed position, trusting nothing else.
+    ///
+    /// The default position means a fresh WAL: every existing file is removed and file 1 is
+    /// created. Otherwise the committed prefix is re-proven end to end. Every retained file up
+    /// through the checkpoint's file must exist contiguously (a gap in the numbered chain is an
+    /// error, not something to skip), and each is scanned frame by frame — checksums verified,
+    /// strict LSN order enforced — through its full length, or for the checkpoint file through
+    /// exactly the committed offset, which must land on a frame boundary. That scan is also how
+    /// `last_lsn` is learned, so the very next append knows where strict ordering resumes. The
+    /// checkpoint file is then truncated to the committed offset (synced if it shrank) and every
+    /// later file is deleted.
+    ///
+    /// Note what this deliberately does not do: promote anything. `open` is the plain
+    /// "checkpoint is the whole truth" entry point, used directly when nothing beyond the
+    /// checkpoint should survive; judging and keeping a post-checkpoint tail is `recover`'s job.
     pub fn open(
         dir: impl AsRef<Path>,
         max_file_bytes: u64,
@@ -283,7 +311,6 @@ impl Wal {
 
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
-        let sync_tracker = Arc::new(WalSyncTracker::new(committed));
         if committed == WalPosition::default() {
             remove_logs_after(&dir, 0)?;
             let (file, offset) = create_log(&dir, 1)?;
@@ -294,9 +321,7 @@ impl Wal {
                 offset,
                 file,
                 last_lsn: None,
-                needs_dir_sync: true,
                 file_sync_tx,
-                sync_tracker,
                 pending_bytes: 0,
             });
         }
@@ -371,9 +396,7 @@ impl Wal {
             offset: committed.offset,
             file,
             last_lsn,
-            needs_dir_sync: false,
             file_sync_tx,
-            sync_tracker,
             pending_bytes: 0,
         })
     }
@@ -397,20 +420,24 @@ impl Wal {
 
     /// Appends one ordered batch.
     ///
-    /// The returned position is not durable until [`Self::committed_position`] reaches it.
-    /// Crossing the file-size limit queues the old file for syncing and immediately starts a new
-    /// one.
+    /// The returned position is not durable until the store publishes it in a synced checkpoint.
+    /// Rollover is deliberately left to [`Self::sync_data`], where the old file can be cut at the
+    /// same boundary that will be synced.
+    ///
+    /// The batch must be non-empty and strictly increasing, extending the log's `last_lsn` — the
+    /// group commit path guarantees that by construction, so the check exists to turn a broken
+    /// caller into an error before any byte moves. The frame goes into the page cache only, no
+    /// fsync happens here, which is what keeps commit latency flat, and `pending_bytes` grows by
+    /// the frame size to feed the durability-pressure trigger.
+    ///
+    /// A failed write is rolled back — the file truncated to the frame start and the cursor
+    /// reseated — so the in-memory offset and the file agree again and the error is clean. If
+    /// even the rollback fails, the compound WalAppendRollbackFailed reports both errors; the
+    /// writer halts on it, because a file whose tail no longer matches the tracked offset cannot
+    /// safely take another append.
     pub fn append(&mut self, entries: &[WalEntry]) -> Result<WalPosition> {
         validate_append(entries, self.last_lsn)?;
         let frame_len = encoded_frame_len(entries)?;
-        if self.offset > HEADER_LEN
-            && self
-                .offset
-                .checked_add(frame_len)
-                .is_none_or(|end| end > self.max_file_bytes)
-        {
-            self.roll()?;
-        }
         let new_offset = self
             .offset
             .checked_add(frame_len)
@@ -435,63 +462,67 @@ impl Wal {
         Ok(self.position())
     }
 
-    /// Queues a file sync and returns the position its completion will cover.
-    ///
-    /// The store must first sync any segment bytes referenced by the batch, then publish this
-    /// position after [`Self::committed_position`] reaches it.
+    /// Syncs the current WAL in tests that exercise the WAL without the store coordinator.
+    #[cfg(test)]
     pub fn sync(&mut self) -> Result<WalPosition> {
-        self.sync_inner(None)
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let (position, task) = self.sync_data(move |result| {
+            let _ = done_tx.send(result);
+        })?;
+        if let Err(error) = self.file_sync_tx.send(task) {
+            error.0.complete(Err(Error::FileSyncQueueClosed));
+        }
+        done_rx.recv().map_err(|_| Error::InvariantViolation {
+            reason: "WAL sync completion was dropped".to_owned(),
+        })??;
+        Ok(position)
     }
 
-    /// Queues a WAL sync and invokes `notify` after this ticket and every earlier ticket complete.
-    /// The notification is registered before task submission, so even an immediately completed
-    /// worker task cannot race past it.
-    pub(crate) fn sync_with_notification(
+    /// Cuts an oversized WAL and captures one sync task for the exact prefix written so far.
+    ///
+    /// The caller submits the returned task only after every segment referenced by this prefix is
+    /// durable. Rollover happens here instead of `append`, so it never starts an independent WAL
+    /// sync. The returned checkpoint points to the end of the captured file; later writes use the
+    /// new file when a rollover occurred.
+    ///
+    /// The mechanics behind those sentences: the current file handle is cloned and the position
+    /// captured *before* any roll, so the background task syncs exactly the bytes the returned
+    /// checkpoint describes even while later appends continue into a fresh file. Rolling only
+    /// here — never in `append` — means no file is ever left carrying bytes that no future sync
+    /// task will cover: whichever task captured a file also captured its final byte. The task's
+    /// completion callback additionally syncs the directory, which is what makes a freshly
+    /// rolled file's creation itself durable (create_log deliberately skips that fsync on the
+    /// hot path). And the segments-first ordering the first line demands is the store-wide rule:
+    /// payload bytes must be durable before the WAL that references them, so recovery can never
+    /// replay an entry whose bytes did not survive.
+    pub(crate) fn sync_data(
         &mut self,
         notify: impl FnOnce(Result<()>) + Send + 'static,
-    ) -> Result<WalPosition> {
-        self.sync_inner(Some(Box::new(notify)))
-    }
-
-    fn sync_inner(
-        &mut self,
-        notify: Option<Box<dyn FnOnce(Result<()>) + Send + 'static>>,
-    ) -> Result<WalPosition> {
+    ) -> Result<(WalPosition, FileSyncTask)> {
         let path = Self::path(&self.dir, self.log_id);
         let file = self
             .file
             .try_clone()
             .map_err(|source| io_error(&path, source))?;
         let position = self.position();
-        let ticket = self.sync_tracker.reserve(position)?;
-        if let Some(notify) = notify {
-            self.sync_tracker.notify_after(ticket, notify);
+        if self.offset >= self.max_file_bytes && self.offset > HEADER_LEN {
+            self.roll()?;
         }
-        let sync_tracker = Arc::clone(&self.sync_tracker);
-        let dir = self.needs_dir_sync.then(|| self.dir.clone());
-        if self
-            .file_sync_tx
-            .send(FileSyncTask::new(path, file, move |result| {
-                let result = result.and_then(|()| match dir {
-                    Some(dir) => sync_dir(&dir),
-                    None => Ok(()),
-                });
-                sync_tracker.complete(ticket, position, result);
-            }))
-            .is_err()
-        {
-            self.sync_tracker
-                .complete(ticket, position, Err(Error::FileSyncQueueClosed));
-            return Err(Error::FileSyncQueueClosed);
-        }
-        self.needs_dir_sync = false;
-        Ok(position)
+        let dir = self.dir.clone();
+        let task = FileSyncTask::new(path, file, move |result| {
+            notify(result.and_then(|()| sync_dir(&dir)));
+        });
+        Ok((position, task))
     }
 
+    /// Bytes appended since the last durability publish took ownership of the log — the WAL half
+    /// of the pressure signal that decides when the next asynchronous publish starts.
     pub(crate) fn pending_bytes(&self) -> u64 {
         self.pending_bytes
     }
 
+    /// Called when a durability publish captures everything appended so far; the pressure
+    /// counter restarts at zero for the next interval.
     pub(crate) fn mark_pending_bytes_captured(&mut self) {
         self.pending_bytes = 0;
     }
@@ -501,19 +532,16 @@ impl Wal {
         self.file_sync_tx.clone()
     }
 
-    /// Latest contiguous position whose queued file syncs have completed.
-    #[cfg(test)]
-    pub fn committed_position(&self) -> Result<WalPosition> {
-        self.sync_tracker.committed()
-    }
-
-    /// Waits until `position` is committed or an earlier sync fails.
-    #[cfg(test)]
-    pub fn wait_for_sync(&self, position: WalPosition) -> Result<()> {
-        self.sync_tracker.wait_for(position)
-    }
-
     /// Replays the current prefix in lsn order.
+    ///
+    /// This is how both keyed LSM projections rebuild their memtables at open: every retained
+    /// file is walked contiguously through the active position, and each entry is handed to
+    /// `apply` in strict LSN order. The walk enforces the same rules as recovery — a missing
+    /// file in the chain, a bad checksum, or an ordering violation is an error, never something
+    /// to read past. No filtering happens here: every entry in the prefix reaches `apply`, and
+    /// the consumer does the routing (open_store_wal seeds blob mutations into the LSM, hands
+    /// legacy relocation entries to relocation recovery, and skips epoch and shard-drop entries,
+    /// whose effects already live durably in RocksDB).
     pub fn replay(&self, mut apply: impl FnMut(&WalEntry) -> Result<()>) -> Result<()> {
         let ids = log_ids(&self.dir)?;
         let mut expected_id = ids.first().copied().ok_or_else(|| {
@@ -551,6 +579,15 @@ impl Wal {
     }
 
     /// Deletes complete rolled files whose final lsn is materialized in durable SST metadata.
+    ///
+    /// Only whole, already-rolled files are candidates — the active file never is. Files are
+    /// scanned oldest first and removed while their final LSN sits at or below `materialized`;
+    /// the walk stops at the first file that still holds unmaterialized entries, since LSNs only
+    /// grow and no later file can qualify either. `materialized` must be the *minimum* of the
+    /// blob and relocation frontiers: a WAL file may only vanish when no projection could ever
+    /// need to replay it again. The caller durably publishes the retained boundary
+    /// (retained_from_after) before invoking this, so a crash mid-unlink leaves only
+    /// officially-dead files that the next recovery finishes deleting.
     pub fn reclaim_through(&mut self, materialized: StrataLsn) -> Result<()> {
         let ids = log_ids(&self.dir)?;
         let mut expected_id = ids.first().copied().ok_or_else(|| {
@@ -590,6 +627,13 @@ impl Wal {
         Ok(())
     }
 
+    /// Computes the first WAL file id that must survive reclamation at this frontier — the
+    /// read-only twin of reclaim_through.
+    ///
+    /// The two exist as a pair so the store can follow the publish-first, delete-second
+    /// protocol: this function names the boundary, a synced RocksDB write makes it official, and
+    /// only then does reclaim_through unlink — the same crash-safe ordering GC uses before
+    /// removing its own files.
     pub fn retained_from_after(&self, materialized: StrataLsn) -> Result<u64> {
         let ids = log_ids(&self.dir)?;
         let mut expected_id = ids.first().copied().ok_or_else(|| {
@@ -620,8 +664,10 @@ impl Wal {
         Ok(self.log_id)
     }
 
+    /// Continues the chain in the next numbered file. The new file is written but not fsynced
+    /// here — sync_data's completion callback syncs the directory, and the file's own bytes are
+    /// covered by whichever sync task later captures it.
     fn roll(&mut self) -> Result<()> {
-        self.sync()?;
         let next_id = self
             .log_id
             .checked_add(1)
@@ -630,7 +676,6 @@ impl Wal {
         self.file = file;
         self.log_id = next_id;
         self.offset = offset;
-        self.needs_dir_sync = true;
         Ok(())
     }
 
@@ -641,135 +686,67 @@ impl Wal {
     }
 }
 
-impl WalSyncTracker {
-    fn new(committed: WalPosition) -> Self {
-        Self {
-            state: Mutex::new(WalSyncState {
-                committed,
-                last_submitted: committed,
-                next_ticket: 0,
-                next_commit: 0,
-                completed: BTreeMap::new(),
-                notifications: Vec::new(),
-                failure: None,
-            }),
-            changed: Condvar::new(),
-        }
+/// Finds the exact WAL position whose prefix ends at `last_lsn`, mutating nothing.
+///
+/// A running example for the walk: the checkpoint is (file 3, offset C) published beside
+/// PublishedLsn 500, and store recovery chose last_lsn 512 because RocksDB committed through
+/// 512 before the crash. The job is to prove the WAL really contains 501..=512 as complete
+/// frames and name the byte where 512 ends.
+///
+/// Step one: prove the checkpoint means what RocksDB says it means. The bytes up to the
+/// checkpoint are scanned and their final LSN must equal PublishedLsn — the two were written in
+/// one synced batch, so disagreement is corruption, never drift. Two legitimate shapes replace
+/// that scan. A checkpoint whose file was reclaimed (retained_from is past it) is believed on
+/// the strength of the materialized frontier covering PublishedLsn — the SSTs, not the WAL, are
+/// the evidence now, and replay will start at the first retained file. And a WAL whose first
+/// file starts exactly at a header-only checkpoint covers the legacy-migration case where
+/// history predates the operation WAL entirely.
+///
+/// Step two: if last_lsn equals PublishedLsn there is no tail to judge — the answer is the
+/// checkpoint itself (or the start of the first retained file when the checkpoint's file is
+/// gone). Otherwise walk frames forward from the checkpoint, enforcing strict LSN order,
+/// looking for the frame whose *last* entry is exactly 512. Landing on it returns the promoted
+/// position: everything through that byte becomes the new committed prefix. Overshooting means
+/// 512 is buried mid-frame — a frame is one atomic batch, and half of a batch cannot be kept —
+/// while running out of bytes means the tail never made it to disk. Both are errors rather than
+/// approximations, and the store's preflight turns them into a rollback decision instead:
+/// better to shorten history to what the WAL can prove than to invent a prefix it cannot.
+/// A checkpoint whose WAL file was already reclaimed is believable only with receipts.
+///
+/// `retained_from > checkpoint.log_id` means the file the checkpoint points into no longer
+/// exists — reclamation deleted it. That is legitimate exactly when the reclamation itself was
+/// legitimate: reclaim_through only deletes a file once every LSN in it lives on in durable
+/// SSTs. So recovery, unable to prove the checkpoint by scanning bytes that are gone, demands
+/// the receipts instead: the committed LSN the checkpoint was published with must be known, and
+/// the materialized frontier must have reached it. Example: checkpoint (file 3, offset C) with
+/// committed LSN 500, frontier at 520 → files 1..=4 legally reclaimed, retained_from = 5, and
+/// this passes because 500 <= 520. If the frontier were 480 — or unknown — the bytes for
+/// 481..=500 would exist nowhere, neither WAL nor SST, and recovery must refuse rather than
+/// trust a checkpoint nothing can prove.
+///
+/// Callers that pass this gate rely on recover_position's missing-checkpoint arm, which starts
+/// the replay walk at `retained_from` and takes the committed LSN on the frontier's authority.
+fn validate_reclaimed_checkpoint_covered(
+    checkpoint: WalPosition,
+    committed_lsn: Option<StrataLsn>,
+    materialized_through: Option<StrataLsn>,
+    retained_from: u64,
+) -> Result<()> {
+    let checkpoint_file_reclaimed =
+        checkpoint != WalPosition::default() && retained_from > checkpoint.log_id;
+    if !checkpoint_file_reclaimed {
+        return Ok(());
     }
-
-    fn reserve(&self, position: WalPosition) -> Result<u64> {
-        let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
-        if let Some(failure) = &state.failure {
-            return Err(Error::WalSyncFailed(failure.clone()));
-        }
-        if position < state.last_submitted {
-            return Err(Error::InvalidWal(
-                "WAL sync positions must not move backwards".to_owned(),
-            ));
-        }
-        let ticket = state.next_ticket;
-        state.next_ticket = state
-            .next_ticket
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidWal("WAL sync ticket overflow".to_owned()))?;
-        state.last_submitted = position;
-        Ok(ticket)
-    }
-
-    fn complete(&self, ticket: u64, position: WalPosition, result: Result<()>) {
-        let completion = match result {
-            Ok(()) => WalSyncCompletion::Synced(position),
-            Err(error) => WalSyncCompletion::Failed(error.to_string()),
-        };
-        let notifications = {
-            let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
-            state.completed.insert(ticket, completion);
-            loop {
-                let next_commit = state.next_commit;
-                let Some(completion) = state.completed.remove(&next_commit) else {
-                    break;
-                };
-                match completion {
-                    WalSyncCompletion::Synced(position) => {
-                        state.committed = position;
-                        state.next_commit += 1;
-                    }
-                    WalSyncCompletion::Failed(error) => {
-                        state.failure = Some(error);
-                        break;
-                    }
-                }
-            }
-            let failure = state.failure.clone();
-            let next_commit = state.next_commit;
-            let mut pending = Vec::new();
-            let mut ready = Vec::new();
-            for notification in std::mem::take(&mut state.notifications) {
-                if failure.is_some() || notification.through_ticket < next_commit {
-                    ready.push(notification);
-                } else {
-                    pending.push(notification);
-                }
-            }
-            state.notifications = pending;
-            (ready, failure)
-        };
-        self.changed.notify_all();
-        let (notifications, failure) = notifications;
-        for notification in notifications {
-            (notification.notify)(match &failure {
-                Some(failure) => Err(Error::WalSyncFailed(failure.clone())),
-                None => Ok(()),
-            });
-        }
-    }
-
-    fn notify_after(
-        &self,
-        through_ticket: u64,
-        notify: Box<dyn FnOnce(Result<()>) + Send + 'static>,
-    ) {
-        let immediate = {
-            let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
-            if let Some(failure) = &state.failure {
-                Some(Err(Error::WalSyncFailed(failure.clone())))
-            } else if through_ticket < state.next_commit {
-                Some(Ok(()))
-            } else {
-                state.notifications.push(WalSyncNotification {
-                    through_ticket,
-                    notify,
-                });
-                return;
-            }
-        };
-        notify(immediate.expect("immediate WAL notification missing"));
-    }
-
-    #[cfg(test)]
-    fn committed(&self) -> Result<WalPosition> {
-        let state = self.state.lock().expect("WAL sync tracker lock poisoned");
-        match &state.failure {
-            Some(failure) => Err(Error::WalSyncFailed(failure.clone())),
-            None => Ok(state.committed),
-        }
-    }
-
-    #[cfg(test)]
-    fn wait_for(&self, position: WalPosition) -> Result<()> {
-        let mut state = self.state.lock().expect("WAL sync tracker lock poisoned");
-        loop {
-            if let Some(failure) = &state.failure {
-                return Err(Error::WalSyncFailed(failure.clone()));
-            }
-            if state.committed >= position {
-                return Ok(());
-            }
-            state = self
-                .changed
-                .wait(state)
-                .expect("WAL sync tracker lock poisoned");
-        }
+    let frontier_covers_checkpoint = match (committed_lsn, materialized_through) {
+        (Some(committed), Some(materialized)) => committed <= materialized,
+        _ => false,
+    };
+    if frontier_covers_checkpoint {
+        Ok(())
+    } else {
+        Err(Error::InvalidWal(
+            "retained WAL prefix is not covered by the materialized frontier".to_owned(),
+        ))
     }
 }
 
@@ -907,6 +884,8 @@ fn recover_position(
     )))
 }
 
+/// Scans the contiguous file chain up to `position` and returns the last LSN it contains — the
+/// value that must match PublishedLsn for a checkpoint to be believed.
 fn lsn_through_position(dir: &Path, position: WalPosition) -> Result<Option<StrataLsn>> {
     if position == WalPosition::default() {
         return Ok(None);
@@ -957,6 +936,11 @@ fn lsn_through_position(dir: &Path, position: WalPosition) -> Result<Option<Stra
     Ok(last_lsn)
 }
 
+/// Fsyncs every file of a freshly promoted prefix, plus the directory.
+///
+/// Promotion elevates bytes that were never proven durable into the committed prefix, so
+/// recovery pays their fsync up front — the store must not build on a promoted LSN that a
+/// second crash could still take away.
 fn sync_logs_through(dir: &Path, position: WalPosition) -> Result<()> {
     for id in log_ids(dir)?
         .into_iter()
@@ -982,6 +966,8 @@ fn validate_position(position: WalPosition) -> Result<()> {
     }
 }
 
+/// Rejects empty batches and any LSN that fails to strictly extend the log — checked before a
+/// single byte is written, so a bad batch leaves the file untouched.
 fn validate_append(entries: &[WalEntry], previous: Option<StrataLsn>) -> Result<()> {
     if entries.is_empty() {
         return Err(Error::InvalidWal("cannot append an empty batch".to_owned()));
@@ -1016,6 +1002,9 @@ fn encoded_frame_len(entries: &[WalEntry]) -> Result<u64> {
         .ok_or_else(|| Error::InvalidWal("WAL frame is too large".to_owned()))
 }
 
+/// Writes one frame at the current position: prefix, entries, then the SHA-256 of everything
+/// before it. Checksum-last is the torn-write defense — a crash mid-frame leaves a checksum
+/// mismatch, which every reader treats as "the log ends here", never as data.
 fn write_frame(file: &mut File, entries: &[WalEntry], frame_len: u64) -> std::io::Result<()> {
     let payload_len = (frame_len - FRAME_OVERHEAD).to_le_bytes();
     let entry_count = (entries.len() as u32).to_le_bytes();
@@ -1037,6 +1026,10 @@ fn write_frame(file: &mut File, entries: &[WalEntry], frame_len: u64) -> std::io
     file.write_all(&checksum.finalize())
 }
 
+/// The strict reader for a range a committed position vouches for: walks frames from the header
+/// through exactly `through` (which must land on a frame boundary), verifying checksums and
+/// strict LSN order across the `previous` seam, feeding each entry to `apply`, and returning
+/// the final LSN so multi-file walks can chain the ordering check file to file.
 fn scan_log(
     path: &Path,
     through: u64,
@@ -1286,10 +1279,7 @@ mod tests {
     }
 
     fn sync_wal(wal: &mut Wal) -> WalPosition {
-        let position = wal.sync().unwrap();
-        wal.wait_for_sync(position).unwrap();
-        assert_eq!(wal.committed_position().unwrap(), position);
-        position
+        wal.sync().unwrap()
     }
 
     #[test]
@@ -1337,7 +1327,6 @@ mod tests {
 
         let wal = recover_wal(dir.path(), 1 << 20, checkpoint, Some(1), Some(2)).unwrap();
         assert_eq!(wal.position(), recovered);
-        assert_eq!(wal.committed_position().unwrap(), recovered);
         assert_eq!(wal.last_lsn(), Some(2));
         assert_eq!(
             replay(&wal),
@@ -1417,8 +1406,9 @@ mod tests {
 
         assert_eq!(wal.append(std::slice::from_ref(&first)).unwrap().log_id, 1);
         let committed = wal.append(std::slice::from_ref(&second)).unwrap();
-        assert_eq!(committed.log_id, 2);
+        assert_eq!(committed.log_id, 1);
         assert_eq!(sync_wal(&mut wal), committed);
+        assert_eq!(wal.position().log_id, 2);
         drop(wal);
 
         let wal = open_wal(dir.path(), max_file_bytes, committed).unwrap();
@@ -1538,9 +1528,9 @@ mod tests {
         let mut wal = open_wal(dir.path(), max_file_bytes, WalPosition::default()).unwrap();
 
         let committed = wal.append(&[first]).unwrap();
+        sync_wal(&mut wal);
         wal.append(&[entry(2, b"beta")]).unwrap();
         assert_eq!(wal.position().log_id, 2);
-        wal.wait_for_sync(committed).unwrap();
         drop(wal);
 
         let wal = open_wal(dir.path(), max_file_bytes, committed).unwrap();
@@ -1584,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn rollover_queues_sync_without_waiting_for_a_worker() {
+    fn sync_rolls_an_oversized_wal() {
         let dir = tempdir().unwrap();
         let first = entry(1, b"alpha");
         let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
@@ -1599,40 +1589,13 @@ mod tests {
 
         wal.append(&[first]).unwrap();
         wal.append(&[entry(2, b"beta")]).unwrap();
-        assert_eq!(wal.position().log_id, 2);
-        assert_eq!(wal.committed_position().unwrap(), WalPosition::default());
+        assert_eq!(wal.position().log_id, 1);
 
         let worker = thread::spawn(move || syncer.run());
         let committed = sync_wal(&mut wal);
+        assert_eq!(committed.log_id, 1);
+        assert_eq!(wal.position().log_id, 2);
         drop(wal);
         worker.join().unwrap();
-        assert_eq!(committed.log_id, 2);
-    }
-
-    #[test]
-    fn committed_position_waits_for_out_of_order_completions() {
-        let tracker = WalSyncTracker::new(WalPosition::default());
-        let (notify_tx, notify_rx) = std::sync::mpsc::channel();
-        let first = WalPosition {
-            log_id: 1,
-            offset: 100,
-        };
-        let second = WalPosition {
-            log_id: 2,
-            offset: 80,
-        };
-        let first_ticket = tracker.reserve(first).unwrap();
-        let second_ticket = tracker.reserve(second).unwrap();
-        tracker.notify_after(
-            second_ticket,
-            Box::new(move |result| notify_tx.send(result).unwrap()),
-        );
-
-        tracker.complete(second_ticket, second, Ok(()));
-        assert_eq!(tracker.committed().unwrap(), WalPosition::default());
-        assert!(notify_rx.try_recv().is_err());
-        tracker.complete(first_ticket, first, Ok(()));
-        assert_eq!(tracker.committed().unwrap(), second);
-        notify_rx.recv().unwrap().unwrap();
     }
 }

@@ -2,9 +2,9 @@
 
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Routes one logical blob key to its stable on-disk hash partition.
+/// Routes one logical blob key to its stable on disk hash partition.
 ///
-/// Both LSMs must hash exactly these bytes with this function. In particular, relocation-only
+/// Both LSMs must hash exactly these bytes with this function. In particular, relocation only
 /// suffixes such as shard and payload LSN are not part of routing, so main partition `p` can join
 /// only relocation partition `p` during compaction.
 pub(crate) fn partition_for_key(key: &[u8], partition_count: u32) -> u32 {

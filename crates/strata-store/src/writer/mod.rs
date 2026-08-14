@@ -10,9 +10,8 @@ use std::{
 use strata_core::{ShardCleanupJob, ShardCleanupState, ShardId, ShardInfo, ShardKey, ShardState};
 
 use crate::{
-    AddShardRequest, BatchOp, DURABILITY_PUBLISH_INTERVAL, DropShardRequest, Error, Result,
-    SEGMENT_ROLLOVER_INTERVAL, SyncRequest, WriteCommand, WriteCoordinator, wal::WalEntry,
-    wal_format::StoreWalMutation,
+    AddShardRequest, BatchOp, DropShardRequest, Error, Result, SYNC_AND_COMMIT_INTERVAL,
+    SyncRequest, WriteCommand, WriteCoordinator, wal::WalEntry, wal_format::StoreWalMutation,
 };
 
 mod commit;
@@ -28,7 +27,9 @@ impl WriteCoordinator {
     pub(crate) fn run(mut self) {
         let mut deferred = None;
         loop {
-            self.process_ready_durability();
+            // `durability_ready_rx` is a separate channel from `write_rx` to avoid being backpressured
+            // from the main channel.
+            self.process_sync_done();
             if self.next_maintenance_timeout().is_zero()
                 && let Err(error) = self.process_scheduled_maintenance()
             {
@@ -39,7 +40,7 @@ impl WriteCoordinator {
                 Some(command) => command,
                 None => match self.write_rx.recv_timeout(timeout) {
                     Ok(command) => {
-                        if !matches!(command, WriteCommand::DurabilityReady) {
+                        if !matches!(command, WriteCommand::SyncDone) {
                             self.metrics.dequeue_write_command();
                         }
                         command
@@ -57,7 +58,7 @@ impl WriteCoordinator {
                 break;
             }
             if let Some(error) = self.store_halt.error()
-                && !matches!(command, WriteCommand::DurabilityReady)
+                && !matches!(command, WriteCommand::SyncDone)
             {
                 Self::send_command_error(command, error);
                 continue;
@@ -81,7 +82,7 @@ impl WriteCoordinator {
                     while requests.len() < MAX_GROUPED_BATCHES {
                         match self.write_rx.try_recv() {
                             Ok(command) => {
-                                if !matches!(command, WriteCommand::DurabilityReady) {
+                                if !matches!(command, WriteCommand::SyncDone) {
                                     self.metrics.dequeue_write_command();
                                 }
                                 match command {
@@ -122,31 +123,27 @@ impl WriteCoordinator {
                 WriteCommand::DropShard(request) => {
                     self.process_drop_shard(request);
                 }
-                WriteCommand::RolloverSegment(request) => {
-                    let result = self.process_segment_rollover();
-                    let _ = request.response_tx.send(result);
-                }
                 WriteCommand::Sync(request) => {
                     self.process_sync(request);
                 }
-                WriteCommand::DurabilityReady => self.process_ready_durability(),
+                WriteCommand::SyncDone => self.process_sync_done(),
                 WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
             }
         }
         drop(self.write_rx);
     }
 
-    fn process_ready_durability(&mut self) {
-        let Ok(ready) = self.durability_ready_rx.try_recv() else {
+    fn process_sync_done(&mut self) {
+        let Ok(sync_and_commit) = self.sync_done_rx.try_recv() else {
             return;
         };
-        match self.finish_durability_publish(ready) {
+        match self.commit_after_sync(sync_and_commit) {
             Ok((published_lsn, phases)) => {
                 self.complete_sync_requests(published_lsn, &phases);
                 let result = if self.pending_sync_requests.is_empty() {
-                    self.maybe_start_durability_publish(false).map(|_| ())
+                    self.maybe_start_sync_and_commit(false).map(|_| ())
                 } else {
-                    self.start_durability_publish(true).map(|_| ())
+                    self.start_sync_and_commit(true).map(|_| ())
                 };
                 if let Err(error) = result {
                     self.halt_writer_error("start follow-up durability publication", &error);
@@ -167,51 +164,41 @@ impl WriteCoordinator {
     }
 
     fn next_maintenance_timeout(&self) -> Duration {
-        self.next_durability_publish_timeout()
-            .min(self.next_segment_rollover_timeout())
+        self.next_sync_and_commit_timeout()
     }
 
-    fn next_durability_publish_timeout(&self) -> Duration {
-        if self.durability_in_flight_lsn.is_some() {
-            return DURABILITY_PUBLISH_INTERVAL;
+    fn next_sync_and_commit_timeout(&self) -> Duration {
+        if self.sync_and_commit_in_flight.is_some() {
+            return SYNC_AND_COMMIT_INTERVAL;
         }
-        self.oldest_unpublished_at
-            .map_or(DURABILITY_PUBLISH_INTERVAL, |started| {
-                DURABILITY_PUBLISH_INTERVAL.saturating_sub(started.elapsed())
+        self.oldest_uncommitted_at
+            .map_or(SYNC_AND_COMMIT_INTERVAL, |started| {
+                SYNC_AND_COMMIT_INTERVAL.saturating_sub(started.elapsed())
             })
     }
 
-    fn next_segment_rollover_timeout(&self) -> Duration {
-        SEGMENT_ROLLOVER_INTERVAL.saturating_sub(self.last_segment_rollover_at.elapsed())
-    }
-
     fn process_scheduled_maintenance(&mut self) -> Result<()> {
-        // Rollover first when both clocks expire together. The following publication then fsyncs
-        // the store WAL and the RocksDB metadata that installed the replacement active segment.
-        if self.next_segment_rollover_timeout().is_zero() {
-            self.process_segment_rollover()?;
-        }
-        if self.next_durability_publish_timeout().is_zero() {
-            self.process_scheduled_durability_publish()?;
+        if self.next_sync_and_commit_timeout().is_zero() {
+            self.process_scheduled_sync_and_commit()?;
         }
         Ok(())
     }
 
-    fn process_scheduled_durability_publish(&mut self) -> Result<()> {
-        let committed_lsn = self.index.get_next_lsn()?.saturating_sub(1);
-        let published_lsn = self.index.get_published_lsn()?;
-        if published_lsn > committed_lsn {
+    fn process_scheduled_sync_and_commit(&mut self) -> Result<()> {
+        let current_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        let committed_lsn = self.index.get_committed_lsn()?;
+        if committed_lsn > current_lsn {
             return Err(Error::InvariantViolation {
                 reason: format!(
-                    "published LSN {published_lsn} follows committed LSN {committed_lsn}"
+                    "published LSN {committed_lsn} follows committed LSN {current_lsn}"
                 ),
             });
         }
-        if published_lsn == committed_lsn {
-            self.last_durability_publish_at = Instant::now();
+        if committed_lsn == current_lsn {
+            self.last_committed_at = Instant::now();
             return Ok(());
         }
-        self.maybe_start_durability_publish(true).map(|_| ())
+        self.maybe_start_sync_and_commit(true).map(|_| ())
     }
 
     fn send_command_error(command: WriteCommand, error: Error) {
@@ -225,13 +212,10 @@ impl WriteCoordinator {
             WriteCommand::DropShard(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
-            WriteCommand::RolloverSegment(request) => {
-                let _ = request.response_tx.send(Err(error));
-            }
             WriteCommand::Sync(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
-            WriteCommand::DurabilityReady => {}
+            WriteCommand::SyncDone => {}
             WriteCommand::Shutdown => {}
         }
     }
@@ -284,7 +268,7 @@ impl WriteCoordinator {
         let _ = request.response_tx.send(result);
         if committed
             && self.wal.pending_bytes() > pending_wal_bytes
-            && let Err(error) = self.note_committed_write(0)
+            && let Err(error) = self.note_uncommitted_write(0)
         {
             self.halt_writer_error("schedule shard-drop durability", &error);
         }
