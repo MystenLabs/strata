@@ -212,6 +212,7 @@ impl Wal {
     pub fn recover(
         dir: impl AsRef<Path>,
         max_file_bytes: u64,
+        // Wal and segment position corresponding to the latest committed LSN.
         checkpoint: WalPosition,
         committed_lsn: Option<StrataLsn>,
         materialized_through: Option<StrataLsn>,
@@ -688,13 +689,13 @@ impl Wal {
 
 /// Finds the exact WAL position whose prefix ends at `last_lsn`, mutating nothing.
 ///
-/// A running example for the walk: the checkpoint is (file 3, offset C) published beside
-/// PublishedLsn 500, and store recovery chose last_lsn 512 because RocksDB committed through
+/// A running example for the walk: the checkpoint is (file 3, offset C) committed beside
+/// committed_lsn 500, and store recovery chose last_lsn 512 because RocksDB wrote through
 /// 512 before the crash. The job is to prove the WAL really contains 501..=512 as complete
 /// frames and name the byte where 512 ends.
 ///
 /// Step one: prove the checkpoint means what RocksDB says it means. The bytes up to the
-/// checkpoint are scanned and their final LSN must equal PublishedLsn — the two were written in
+/// checkpoint are scanned and their final LSN must equal committed_lsn — the two were written in
 /// one synced batch, so disagreement is corruption, never drift. Two legitimate shapes replace
 /// that scan. A checkpoint whose file was reclaimed (retained_from is past it) is believed on
 /// the strength of the materialized frontier covering PublishedLsn — the SSTs, not the WAL, are
@@ -753,16 +754,16 @@ fn validate_reclaimed_checkpoint_covered(
 fn recover_position(
     dir: &Path,
     checkpoint: WalPosition,
-    published_lsn: Option<StrataLsn>,
+    committed_lsn: Option<StrataLsn>,
     materialized_through: Option<StrataLsn>,
     retained_from: u64,
     last_lsn: Option<StrataLsn>,
 ) -> Result<WalPosition> {
     fs::create_dir_all(dir).map_err(|source| io_error(dir, source))?;
     validate_position(checkpoint)?;
-    if published_lsn.is_some_and(|published| last_lsn.is_none_or(|last| published > last)) {
+    if committed_lsn.is_some_and(|committed| last_lsn.is_none_or(|last| committed > last)) {
         return Err(Error::InvalidWal(format!(
-            "published lsn {published_lsn:?} follows recovered store lsn {last_lsn:?}"
+            "published lsn {committed_lsn:?} follows recovered store lsn {last_lsn:?}"
         )));
     }
     if materialized_through
@@ -774,7 +775,7 @@ fn recover_position(
     }
 
     let ids = log_ids(dir)?;
-    let missing_checkpoint_is_materialized = match published_lsn {
+    let missing_checkpoint_is_materialized = match committed_lsn {
         Some(lsn) => {
             checkpoint != WalPosition::default()
                 && retained_from > checkpoint.log_id
@@ -786,20 +787,20 @@ fn recover_position(
                 && materialized_through.is_some()
         }
     };
-    let actual_published_lsn = if missing_checkpoint_is_materialized {
-        published_lsn
+    let actual_committed_lsn = if missing_checkpoint_is_materialized {
+        committed_lsn
     } else {
         lsn_through_position(dir, checkpoint)?
     };
-    let starts_after_materialized_checkpoint = actual_published_lsn.is_none()
-        && published_lsn.is_some()
+    let starts_after_materialized_checkpoint = actual_committed_lsn.is_none()
+        && committed_lsn.is_some()
         && checkpoint.offset == HEADER_LEN;
-    if actual_published_lsn != published_lsn && !starts_after_materialized_checkpoint {
+    if actual_committed_lsn != committed_lsn && !starts_after_materialized_checkpoint {
         return Err(Error::InvalidWal(format!(
-            "WAL bytes through the checkpoint end at {actual_published_lsn:?}, expected PublishedLsn {published_lsn:?}"
+            "WAL bytes through the checkpoint end at {actual_committed_lsn:?}, expected CommittedLsn {committed_lsn:?}"
         )));
     }
-    if last_lsn == published_lsn {
+    if last_lsn == committed_lsn {
         return if missing_checkpoint_is_materialized {
             Ok(WalPosition {
                 log_id: retained_from,
@@ -821,7 +822,7 @@ fn recover_position(
         checkpoint.log_id
     };
     let mut expected_id = first_id;
-    let mut previous = published_lsn;
+    let mut previous = committed_lsn;
 
     for id in ids.into_iter().filter(|id| *id >= first_id) {
         if id != expected_id {
