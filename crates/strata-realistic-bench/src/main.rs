@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -47,6 +47,9 @@ use typed_store::{
 const DEFAULT_NAMESPACE: &str = "realistic";
 const DEFAULT_DURATION: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_RETENTION: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_EPOCH_DURATION: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_FUTURE_EPOCHS: Epoch = 52;
+const DEFAULT_LIFETIME_SEED: u64 = 0x5eed_1eaf_cafe_f00d;
 const DEFAULT_CLEANUP_GRACE: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_PAYLOAD_SIZE: usize = 1 << 20;
 const DEFAULT_INITIAL_WRITE_WORKERS: usize = 1;
@@ -129,6 +132,29 @@ enum EngineKind {
     BlobDb,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifetimeMode {
+    Retention,
+    Epoch,
+}
+
+impl LifetimeMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "retention" | "manual-retention" => Ok(Self::Retention),
+            "epoch" | "epochs" | "epoch-lifetime" => Ok(Self::Epoch),
+            _ => Err(format!("unknown lifetime mode '{value}'")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::Epoch => "epoch",
+        }
+    }
+}
+
 impl EngineKind {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
@@ -152,7 +178,11 @@ struct Config {
     root_dir: PathBuf,
     namespace: String,
     duration: Duration,
+    lifetime_mode: LifetimeMode,
     retention: Duration,
+    epoch_duration: Duration,
+    future_epochs: Epoch,
+    lifetime_seed: u64,
     cleanup_grace: Duration,
     payload_size: usize,
     put_ops_per_second: u64,
@@ -203,7 +233,11 @@ impl Config {
             root_dir: PathBuf::new(),
             namespace: DEFAULT_NAMESPACE.to_owned(),
             duration: DEFAULT_DURATION,
+            lifetime_mode: LifetimeMode::Retention,
             retention: DEFAULT_RETENTION,
+            epoch_duration: DEFAULT_EPOCH_DURATION,
+            future_epochs: DEFAULT_FUTURE_EPOCHS,
+            lifetime_seed: DEFAULT_LIFETIME_SEED,
             cleanup_grace: DEFAULT_CLEANUP_GRACE,
             payload_size: DEFAULT_PAYLOAD_SIZE,
             put_ops_per_second: 0,
@@ -257,7 +291,19 @@ impl Config {
                 "--root" => config.root_dir = PathBuf::from(next_value(&mut args, &arg)?),
                 "--namespace" => config.namespace = next_value(&mut args, &arg)?,
                 "--duration" => config.duration = parse_duration(&next_value(&mut args, &arg)?)?,
+                "--lifetime-mode" => {
+                    config.lifetime_mode = LifetimeMode::parse(&next_value(&mut args, &arg)?)?
+                }
                 "--retention" => config.retention = parse_duration(&next_value(&mut args, &arg)?)?,
+                "--epoch-duration" => {
+                    config.epoch_duration = parse_duration(&next_value(&mut args, &arg)?)?
+                }
+                "--future-epochs" => {
+                    config.future_epochs = parse_u64(&next_value(&mut args, &arg)?)?
+                }
+                "--lifetime-seed" => {
+                    config.lifetime_seed = parse_u64(&next_value(&mut args, &arg)?)?
+                }
                 "--cleanup-grace" => {
                     config.cleanup_grace = parse_duration(&next_value(&mut args, &arg)?)?
                 }
@@ -416,6 +462,23 @@ impl Config {
         ] {
             if duration.is_zero() {
                 return Err(format!("{name} must be non-zero"));
+            }
+        }
+        if self.lifetime_mode == LifetimeMode::Epoch {
+            if self.epoch_duration.is_zero() {
+                return Err("--epoch-duration must be non-zero in epoch lifetime mode".to_owned());
+            }
+            if self.future_epochs == 0 {
+                return Err("--future-epochs must be non-zero in epoch lifetime mode".to_owned());
+            }
+            if self.future_epochs > 10_000 {
+                return Err("--future-epochs must not exceed 10000".to_owned());
+            }
+            if DEFAULT_STARTING_EPOCH
+                .checked_add(self.future_epochs)
+                .is_none()
+            {
+                return Err("--future-epochs overflows the epoch range".to_owned());
             }
         }
         if self.payload_size == 0 {
@@ -630,6 +693,8 @@ struct HarnessMetrics {
     operation_duration: HistogramVec,
     put_payload_bytes: IntCounter,
     retired_payload_bytes: IntCounter,
+    epoch_advances: IntCounter,
+    native_expirations: IntCounter,
     read_outcomes: IntCounterVec,
     correctness_errors: IntCounter,
     delete_due: IntCounter,
@@ -653,6 +718,9 @@ struct HarnessMetrics {
     directory_allocated_bytes: IntGauge,
     directory_files: IntGauge,
     storage_file_apparent_bytes: IntGaugeVec,
+    strata_exact_epoch_bytes: IntGauge,
+    strata_spillover_bytes: IntGauge,
+    strata_epoch_directories: IntGauge,
     filesystem_available_bytes: IntGauge,
     filesystem_total_bytes: IntGauge,
     space_amplification: Gauge,
@@ -718,7 +786,21 @@ impl HarnessMetrics {
         let retired_payload_bytes = IntCounter::with_opts(
             Opts::new(
                 "strata_realistic_bench_retired_payload_bytes_total",
-                "Logical payload bytes retired by successful due deletes.",
+                "Logical payload bytes retired by native expiry or successful due deletes.",
+            )
+            .const_label("engine", engine.as_str()),
+        )?;
+        let epoch_advances = IntCounter::with_opts(
+            Opts::new(
+                "strata_realistic_bench_epoch_advances_total",
+                "Logical epoch transitions completed by the benchmark.",
+            )
+            .const_label("engine", engine.as_str()),
+        )?;
+        let native_expirations = IntCounter::with_opts(
+            Opts::new(
+                "strata_realistic_bench_native_expirations_total",
+                "Keys retired by Strata epoch visibility without client tombstones.",
             )
             .const_label("engine", engine.as_str()),
         )?;
@@ -812,6 +894,8 @@ impl HarnessMetrics {
             operation_duration,
             put_payload_bytes,
             retired_payload_bytes,
+            epoch_advances,
+            native_expirations,
             read_outcomes,
             correctness_errors,
             delete_due,
@@ -880,6 +964,18 @@ impl HarnessMetrics {
                 "Files currently present under the benchmark database root."
             ),
             storage_file_apparent_bytes,
+            strata_exact_epoch_bytes: int_gauge!(
+                "strata_realistic_bench_strata_exact_epoch_bytes",
+                "Apparent bytes in Strata retention segments grouped into exact epoch directories."
+            ),
+            strata_spillover_bytes: int_gauge!(
+                "strata_realistic_bench_strata_spillover_bytes",
+                "Apparent bytes in Strata spillover retention segments."
+            ),
+            strata_epoch_directories: int_gauge!(
+                "strata_realistic_bench_strata_epoch_directories",
+                "Current number of Strata exact-epoch retention directories."
+            ),
             filesystem_available_bytes: int_gauge!(
                 "strata_realistic_bench_filesystem_available_bytes",
                 "Bytes available to an unprivileged process on the root filesystem."
@@ -936,6 +1032,8 @@ impl HarnessMetrics {
         registry.register(Box::new(metrics.operation_duration.clone()))?;
         registry.register(Box::new(metrics.put_payload_bytes.clone()))?;
         registry.register(Box::new(metrics.retired_payload_bytes.clone()))?;
+        registry.register(Box::new(metrics.epoch_advances.clone()))?;
+        registry.register(Box::new(metrics.native_expirations.clone()))?;
         registry.register(Box::new(metrics.read_outcomes.clone()))?;
         registry.register(Box::new(metrics.correctness_errors.clone()))?;
         registry.register(Box::new(metrics.controller_unhealthy.clone()))?;
@@ -955,6 +1053,9 @@ impl HarnessMetrics {
             &metrics.directory_apparent_bytes,
             &metrics.directory_allocated_bytes,
             &metrics.directory_files,
+            &metrics.strata_exact_epoch_bytes,
+            &metrics.strata_spillover_bytes,
+            &metrics.strata_epoch_directories,
             &metrics.filesystem_available_bytes,
             &metrics.filesystem_total_bytes,
             &metrics.blob_total_bytes,
@@ -995,10 +1096,11 @@ impl HarnessMetrics {
 }
 
 trait BenchEngine: Send + Sync {
-    fn put(&self, key: &BlobKey) -> Result<(), String>;
+    fn put(&self, key: &BlobKey, logical_end_epoch: Option<Epoch>) -> Result<(), String>;
     fn delete(&self, key: &BlobKey) -> Result<(), String>;
     fn get(&self, key: &BlobKey) -> Result<Option<Vec<u8>>, String>;
     fn sync(&self) -> Result<(), String>;
+    fn advance_epoch(&self, expected_epoch: Epoch) -> Result<(), String>;
 }
 
 struct StrataEngine {
@@ -1007,11 +1109,25 @@ struct StrataEngine {
 }
 
 impl BenchEngine for StrataEngine {
-    fn put(&self, key: &BlobKey) -> Result<(), String> {
-        self.store
-            .put_arc(0, key.clone(), Arc::clone(&self.payload))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+    fn put(&self, key: &BlobKey, logical_end_epoch: Option<Epoch>) -> Result<(), String> {
+        let Some(logical_end_epoch) = logical_end_epoch else {
+            return self
+                .store
+                .put_arc(0, key.clone(), Arc::clone(&self.payload))
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+        };
+
+        // Lifetime first is intentional: the following put inherits this still-live lifetime.
+        // Keeping both operations in one writer batch prevents an epoch advance or another
+        // mutation of this key from interleaving between the two LSNs.
+        let mut batch = self.store.batch();
+        batch.set_blob_lifetime(key.clone(), logical_end_epoch).put(
+            0,
+            key.clone(),
+            Arc::clone(&self.payload),
+        );
+        batch.write().map(|_| ()).map_err(|error| error.to_string())
     }
 
     fn delete(&self, key: &BlobKey) -> Result<(), String> {
@@ -1027,6 +1143,19 @@ impl BenchEngine for StrataEngine {
 
     fn sync(&self) -> Result<(), String> {
         self.store.sync().map_err(|error| error.to_string())
+    }
+
+    fn advance_epoch(&self, expected_epoch: Epoch) -> Result<(), String> {
+        let (epoch, _) = self
+            .store
+            .increment_epoch()
+            .map_err(|error| error.to_string())?;
+        if epoch != expected_epoch {
+            return Err(format!(
+                "Strata advanced to epoch {epoch}, expected {expected_epoch}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1046,7 +1175,7 @@ type OpenedEngine = (
 );
 
 impl BenchEngine for BlobDbEngine {
-    fn put(&self, key: &BlobKey) -> Result<(), String> {
+    fn put(&self, key: &BlobKey, _logical_end_epoch: Option<Epoch>) -> Result<(), String> {
         self.map
             .insert(key, &self.payload)
             .map_err(|error| error.to_string())
@@ -1067,6 +1196,12 @@ impl BenchEngine for BlobDbEngine {
         let db = standard_rocksdb(self.map.rocksdb.as_ref())
             .ok_or_else(|| "BlobDB benchmark requires standard RocksDB".to_owned())?;
         db.flush_wal(true).map_err(|error| error.to_string())
+    }
+
+    fn advance_epoch(&self, _expected_epoch: Epoch) -> Result<(), String> {
+        // BlobDB has no native epoch primitive. The harness's deterministic expiry queue is its
+        // logical clock; the deleters materialize each expiry as a point tombstone.
+        Ok(())
     }
 }
 
@@ -1210,16 +1345,34 @@ struct KeyRecord {
     key: BlobKey,
     written_at: Instant,
     due_at: Instant,
+    logical_end_epoch: Option<Epoch>,
     state: AtomicU8,
     due_counted: AtomicBool,
 }
 
 impl KeyRecord {
-    fn new(key: BlobKey, written_at: Instant, retention: Duration) -> Self {
+    fn with_retention(key: BlobKey, written_at: Instant, retention: Duration) -> Self {
         Self {
             key,
             written_at,
             due_at: written_at.checked_add(retention).unwrap_or(written_at),
+            logical_end_epoch: None,
+            state: AtomicU8::new(KEY_LIVE),
+            due_counted: AtomicBool::new(false),
+        }
+    }
+
+    fn with_epoch(
+        key: BlobKey,
+        written_at: Instant,
+        due_at: Instant,
+        logical_end_epoch: Epoch,
+    ) -> Self {
+        Self {
+            key,
+            written_at,
+            due_at,
+            logical_end_epoch: Some(logical_end_epoch),
             state: AtomicU8::new(KEY_LIVE),
             due_counted: AtomicBool::new(false),
         }
@@ -1289,14 +1442,58 @@ impl Model {
         self.live.insert(position, record);
     }
 
-    fn claim_due(&mut self, now: Instant, metrics: &HarnessMetrics) -> Option<Arc<KeyRecord>> {
-        let record = self.live.front().filter(|record| record.due_at <= now)?;
+    fn claim_due(
+        &mut self,
+        now: Instant,
+        current_epoch: Option<Epoch>,
+        metrics: &HarnessMetrics,
+    ) -> Option<Arc<KeyRecord>> {
+        let record = self.live.front().filter(|record| {
+            record.due_at <= now
+                && record
+                    .logical_end_epoch
+                    .is_none_or(|end_epoch| current_epoch.is_some_and(|epoch| end_epoch <= epoch))
+        })?;
         record.mark_due(metrics);
         let record = self.live.pop_front().expect("due key must remain at front");
         record.state.store(KEY_DELETING, Ordering::Release);
         self.deleting
             .insert(record.key.as_bytes().to_vec(), Arc::clone(&record));
         Some(record)
+    }
+
+    fn claim_native_expirations(
+        &mut self,
+        current_epoch: Epoch,
+        metrics: &HarnessMetrics,
+    ) -> Vec<Arc<KeyRecord>> {
+        let mut records = Vec::new();
+        while self
+            .live
+            .front()
+            .and_then(|record| record.logical_end_epoch)
+            .is_some_and(|end_epoch| end_epoch <= current_epoch)
+        {
+            let record = self
+                .live
+                .pop_front()
+                .expect("expired key must remain at front");
+            record.mark_due(metrics);
+            record.state.store(KEY_DELETING, Ordering::Release);
+            records.push(record);
+        }
+        records
+    }
+
+    fn finish_native_expirations(&mut self, records: Vec<Arc<KeyRecord>>) -> usize {
+        for record in records {
+            record.state.store(KEY_DELETED, Ordering::Release);
+            self.deleted.push_back(record);
+        }
+        while self.deleted.len() > self.deleted_sample_capacity {
+            self.deleted.pop_front();
+        }
+        self.deleted.len()
     }
 
     fn finish_delete(&mut self, record: Arc<KeyRecord>) {
@@ -1335,6 +1532,7 @@ impl Model {
     fn refresh_delete_backlog(
         &self,
         now: Instant,
+        current_epoch: Option<Epoch>,
         lag_slo: Duration,
         metrics: &HarnessMetrics,
     ) -> DeleteBacklog {
@@ -1345,7 +1543,11 @@ impl Model {
             .take_while(|record| record.due_at <= now)
             .chain(self.deleting.values())
         {
-            if record.due_at > now {
+            if record.due_at > now
+                || record
+                    .logical_end_epoch
+                    .is_some_and(|end_epoch| current_epoch.is_none_or(|epoch| end_epoch > epoch))
+            {
                 continue;
             }
             record.mark_due(metrics);
@@ -1417,6 +1619,73 @@ impl SplitMix64 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifetimeAssignment {
+    offset: Epoch,
+    logical_end_epoch: Epoch,
+    due_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EpochClock {
+    current_epoch: Epoch,
+    next_transition_at: Instant,
+}
+
+impl EpochClock {
+    fn assignment(&self, key_id: u64, config: &Config) -> LifetimeAssignment {
+        let mut rng = SplitMix64::new(
+            config
+                .lifetime_seed
+                .wrapping_add(key_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+        );
+        let offset = 1 + rng.next_u64() % config.future_epochs;
+        let logical_end_epoch = self.current_epoch.saturating_add(offset);
+        let intervals_after_next = u32::try_from(offset.saturating_sub(1))
+            .expect("validated future epoch count must fit u32");
+        let due_at = config
+            .epoch_duration
+            .checked_mul(intervals_after_next)
+            .and_then(|duration| self.next_transition_at.checked_add(duration))
+            .unwrap_or(self.next_transition_at);
+        LifetimeAssignment {
+            offset,
+            logical_end_epoch,
+            due_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LifetimeOffsetCounts {
+    counts: Vec<AtomicU64>,
+}
+
+impl LifetimeOffsetCounts {
+    fn new(future_epochs: Epoch) -> Self {
+        Self {
+            counts: (0..future_epochs).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record(&self, offset: Epoch) {
+        if let Some(count) = offset
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.counts.get(index))
+        {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u64> {
+        self.counts
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect()
+    }
+}
+
 fn make_key(id: u64) -> Result<BlobKey, String> {
     let mut bytes = Vec::with_capacity(KEY_PREFIX.len() + 20);
     bytes.extend_from_slice(KEY_PREFIX);
@@ -1443,6 +1712,9 @@ struct WorkloadContext {
     active_write_workers: Arc<AtomicUsize>,
     next_put_at: Arc<Mutex<Instant>>,
     next_key_id: Arc<AtomicU64>,
+    epoch_clock: Arc<RwLock<EpochClock>>,
+    current_epoch: Arc<AtomicU64>,
+    lifetime_offset_counts: Arc<LifetimeOffsetCounts>,
 }
 
 fn run_writer(worker_index: usize, context: Arc<WorkloadContext>) {
@@ -1491,13 +1763,27 @@ fn run_writer(worker_index: usize, context: Arc<WorkloadContext>) {
                 break;
             }
         };
+        // The read guard keeps the epoch transition from interleaving between lifetime selection,
+        // Strata's lifetime+put batch, and publication into the client reference model.
+        let epoch_guard = (context.config.lifetime_mode == LifetimeMode::Epoch).then(|| {
+            context
+                .epoch_clock
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let assignment = epoch_guard
+            .as_deref()
+            .map(|clock| clock.assignment(id, &context.config));
         context
             .metrics
             .operation_attempts
             .with_label_values(&["put"])
             .inc();
         let started = Instant::now();
-        match context.engine.put(&key) {
+        match context.engine.put(
+            &key,
+            assignment.map(|assignment| assignment.logical_end_epoch),
+        ) {
             Ok(()) => {
                 let acknowledged_at = Instant::now();
                 let elapsed = started.elapsed();
@@ -1512,15 +1798,25 @@ fn run_writer(worker_index: usize, context: Arc<WorkloadContext>) {
                     .metrics
                     .logical_live_bytes
                     .add(saturating_i64(context.config.payload_size as u64));
+                let record = match assignment {
+                    Some(assignment) => {
+                        context.lifetime_offset_counts.record(assignment.offset);
+                        KeyRecord::with_epoch(
+                            key,
+                            acknowledged_at,
+                            assignment.due_at,
+                            assignment.logical_end_epoch,
+                        )
+                    }
+                    None => {
+                        KeyRecord::with_retention(key, acknowledged_at, context.config.retention)
+                    }
+                };
                 context
                     .model
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push_live(Arc::new(KeyRecord::new(
-                        key,
-                        acknowledged_at,
-                        context.config.retention,
-                    )));
+                    .push_live(Arc::new(record));
             }
             Err(error) => {
                 let elapsed = started.elapsed();
@@ -1544,11 +1840,13 @@ fn run_writer(worker_index: usize, context: Arc<WorkloadContext>) {
 
 fn run_deleter(worker_index: usize, context: Arc<WorkloadContext>) {
     while !context.workload_stop.load(Ordering::Acquire) {
+        let current_epoch = (context.config.lifetime_mode == LifetimeMode::Epoch)
+            .then(|| context.current_epoch.load(Ordering::Acquire));
         let record = context
             .model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .claim_due(Instant::now(), &context.metrics);
+            .claim_due(Instant::now(), current_epoch, &context.metrics);
         let Some(record) = record else {
             thread::sleep(Duration::from_millis(2));
             continue;
@@ -1749,6 +2047,108 @@ fn run_reader(worker_index: usize, context: Arc<WorkloadContext>) {
     }
 }
 
+fn run_epoch_advancer(context: Arc<WorkloadContext>) {
+    debug_assert_eq!(context.config.lifetime_mode, LifetimeMode::Epoch);
+    while !context.workload_stop.load(Ordering::Acquire) {
+        let next_transition_at = context
+            .epoch_clock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next_transition_at;
+        if sleep_until_stopped(
+            &context.workload_stop,
+            next_transition_at.saturating_duration_since(Instant::now()),
+        ) {
+            break;
+        }
+
+        let mut clock = context
+            .epoch_clock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while Instant::now() >= clock.next_transition_at
+            && !context.workload_stop.load(Ordering::Acquire)
+        {
+            let scheduled_at = clock.next_transition_at;
+            let Some(next_epoch) = clock.current_epoch.checked_add(1) else {
+                context
+                    .fatal
+                    .set("epoch counter overflowed", &context.workload_stop);
+                return;
+            };
+
+            // Move native-expiring keys out of the live sample before Strata changes visibility.
+            // A reader that already sampled one sees KEY_DELETING and treats the miss as an epoch
+            // race. BlobDB leaves these records live until its manual deleters acknowledge them.
+            let native_expirations = if context.config.engine == EngineKind::Strata {
+                context
+                    .model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .claim_native_expirations(next_epoch, &context.metrics)
+            } else {
+                Vec::new()
+            };
+
+            context
+                .metrics
+                .operation_attempts
+                .with_label_values(&["epoch_advance"])
+                .inc();
+            let started = Instant::now();
+            if let Err(error) = context.engine.advance_epoch(next_epoch) {
+                context
+                    .metrics
+                    .record_operation("epoch_advance", started.elapsed(), false);
+                context.fatal.set(
+                    format!("advancing to epoch {next_epoch} failed: {error}"),
+                    &context.workload_stop,
+                );
+                return;
+            }
+            context
+                .metrics
+                .record_operation("epoch_advance", started.elapsed(), true);
+            context.metrics.epoch_advances.inc();
+            clock.current_epoch = next_epoch;
+            context.current_epoch.store(next_epoch, Ordering::Release);
+            clock.next_transition_at = scheduled_at
+                .checked_add(context.config.epoch_duration)
+                .unwrap_or_else(Instant::now);
+
+            let expired = native_expirations.len() as u64;
+            if expired > 0 {
+                let deleted_sample_keys = context
+                    .model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .finish_native_expirations(native_expirations);
+                let lag = Instant::now().saturating_duration_since(scheduled_at);
+                context.metrics.native_expirations.inc_by(expired);
+                context
+                    .metrics
+                    .retired_payload_bytes
+                    .inc_by(expired.saturating_mul(context.config.payload_size as u64));
+                context.metrics.live_keys.sub(saturating_i64(expired));
+                context.metrics.logical_live_bytes.sub(saturating_i64(
+                    expired.saturating_mul(context.config.payload_size as u64),
+                ));
+                context
+                    .metrics
+                    .deleted_sample_keys
+                    .set(saturating_i64(deleted_sample_keys as u64));
+                context.metrics.delete_lag.observe(lag.as_secs_f64());
+                context.metrics.delete_lag_latency.record(lag);
+                if lag <= context.config.delete_lag_slo {
+                    context.metrics.delete_timely.inc_by(expired);
+                } else {
+                    context.metrics.delete_late.inc_by(expired);
+                }
+            }
+        }
+    }
+}
+
 fn run_syncer(context: Arc<WorkloadContext>) {
     if context.config.sync_interval.is_zero() {
         return;
@@ -1800,12 +2200,15 @@ fn run_controller(context: Arc<WorkloadContext>) {
         let required_read_rate = context.config.read_ops_per_second as f64
             * context.config.read_attainment_percent
             / 100.0;
+        let current_epoch = (context.config.lifetime_mode == LifetimeMode::Epoch)
+            .then(|| context.current_epoch.load(Ordering::Acquire));
         let backlog = context
             .model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .refresh_delete_backlog(
                 Instant::now(),
+                current_epoch,
                 context.config.delete_lag_slo,
                 &context.metrics,
             );
@@ -1937,6 +2340,9 @@ struct SpaceSnapshot {
     filesystem_available_bytes: u64,
     filesystem_total_bytes: u64,
     storage_file_apparent_bytes: [u64; STORAGE_FILE_TYPES.len()],
+    strata_exact_epoch_bytes: u64,
+    strata_spillover_bytes: u64,
+    strata_epoch_directories: u64,
 }
 
 impl SpaceSnapshot {
@@ -2083,9 +2489,30 @@ fn summarize_path(path: &Path, snapshot: &mut SpaceSnapshot) -> io::Result<()> {
             snapshot.storage_file_apparent_bytes[file_type] =
                 snapshot.storage_file_apparent_bytes[file_type].saturating_add(metadata.len());
         }
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "data")
+        {
+            if path_has_component_prefix(path, "epoch-") {
+                snapshot.strata_exact_epoch_bytes = snapshot
+                    .strata_exact_epoch_bytes
+                    .saturating_add(metadata.len());
+            } else if path_has_component(path, "spillover") {
+                snapshot.strata_spillover_bytes = snapshot
+                    .strata_spillover_bytes
+                    .saturating_add(metadata.len());
+            }
+        }
         return Ok(());
     }
     if metadata.is_dir() {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("epoch-"))
+        {
+            snapshot.strata_epoch_directories = snapshot.strata_epoch_directories.saturating_add(1);
+        }
         let entries = match fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -2116,6 +2543,20 @@ fn is_strata_lsm_table(path: &Path) -> bool {
     path.components().any(|component| {
         let component = component.as_os_str();
         component == "lsm" || component == "relocations"
+    })
+}
+
+fn path_has_component(path: &Path, expected: &str) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == expected)
+}
+
+fn path_has_component_prefix(path: &Path, prefix: &str) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|component| component.starts_with(prefix))
     })
 }
 
@@ -2155,6 +2596,15 @@ fn publish_space(snapshot: SpaceSnapshot, metrics: &HarnessMetrics) {
         .directory_allocated_bytes
         .set(saturating_i64(snapshot.allocated_bytes));
     metrics.directory_files.set(saturating_i64(snapshot.files));
+    metrics
+        .strata_exact_epoch_bytes
+        .set(saturating_i64(snapshot.strata_exact_epoch_bytes));
+    metrics
+        .strata_spillover_bytes
+        .set(saturating_i64(snapshot.strata_spillover_bytes));
+    metrics
+        .strata_epoch_directories
+        .set(saturating_i64(snapshot.strata_epoch_directories));
     for (file_type, bytes) in STORAGE_FILE_TYPES
         .iter()
         .zip(snapshot.storage_file_apparent_bytes)
@@ -2215,7 +2665,20 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     println!("engine={}", config.engine.as_str());
     println!("root={}", config.root_dir.display());
     println!("duration_seconds={:.3}", config.duration.as_secs_f64());
-    println!("retention_seconds={:.3}", config.retention.as_secs_f64());
+    println!("lifetime_mode={}", config.lifetime_mode.as_str());
+    match config.lifetime_mode {
+        LifetimeMode::Retention => {
+            println!("retention_seconds={:.3}", config.retention.as_secs_f64());
+        }
+        LifetimeMode::Epoch => {
+            println!(
+                "epoch_duration_seconds={:.3}",
+                config.epoch_duration.as_secs_f64()
+            );
+            println!("future_epochs={}", config.future_epochs);
+            println!("lifetime_seed={}", config.lifetime_seed);
+        }
+    }
     println!(
         "cleanup_grace_seconds={:.3}",
         config.cleanup_grace.as_secs_f64()
@@ -2322,6 +2785,19 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     metrics
         .target_put_ops_per_second
         .set(config.put_ops_per_second as f64);
+    let workload_started_at = Instant::now();
+    let initial_epoch = match (&config.lifetime_mode, strata_store.as_deref()) {
+        (LifetimeMode::Epoch, Some(store)) => store.current_epoch()?,
+        _ => DEFAULT_STARTING_EPOCH,
+    };
+    let epoch_clock = Arc::new(RwLock::new(EpochClock {
+        current_epoch: initial_epoch,
+        next_transition_at: workload_started_at
+            .checked_add(config.epoch_duration)
+            .unwrap_or(workload_started_at),
+    }));
+    let current_epoch = Arc::new(AtomicU64::new(initial_epoch));
+    let lifetime_offset_counts = Arc::new(LifetimeOffsetCounts::new(config.future_epochs));
     let model = Arc::new(Mutex::new(Model::new(config.deleted_sample_capacity)));
     let context = Arc::new(WorkloadContext {
         config: Arc::clone(&config),
@@ -2332,8 +2808,11 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         workload_stop: Arc::clone(&workload_stop),
         fatal: Arc::clone(&fatal),
         active_write_workers: Arc::clone(&active_write_workers),
-        next_put_at: Arc::new(Mutex::new(Instant::now())),
+        next_put_at: Arc::new(Mutex::new(workload_started_at)),
         next_key_id: Arc::new(AtomicU64::new(0)),
+        epoch_clock: Arc::clone(&epoch_clock),
+        current_epoch: Arc::clone(&current_epoch),
+        lifetime_offset_counts: Arc::clone(&lifetime_offset_counts),
     });
     metrics.client_load_active.set(1);
 
@@ -2352,13 +2831,15 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 .spawn(move || run_writer(worker_index, worker_context))?,
         );
     }
-    for worker_index in 0..config.delete_workers {
-        let worker_context = Arc::clone(&context);
-        workers.push(
-            thread::Builder::new()
-                .name(format!("realistic-deleter-{worker_index}"))
-                .spawn(move || run_deleter(worker_index, worker_context))?,
-        );
+    if config.lifetime_mode == LifetimeMode::Retention || config.engine == EngineKind::BlobDb {
+        for worker_index in 0..config.delete_workers {
+            let worker_context = Arc::clone(&context);
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("realistic-deleter-{worker_index}"))
+                    .spawn(move || run_deleter(worker_index, worker_context))?,
+            );
+        }
     }
     if config.read_ops_per_second > 0 {
         for worker_index in 0..config.read_workers {
@@ -2378,6 +2859,14 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 .spawn(move || run_controller(worker_context))?,
         );
     }
+    if config.lifetime_mode == LifetimeMode::Epoch {
+        let worker_context = Arc::clone(&context);
+        workers.push(
+            thread::Builder::new()
+                .name("realistic-epoch-advancer".to_owned())
+                .spawn(move || run_epoch_advancer(worker_context))?,
+        );
+    }
     if !config.sync_interval.is_zero() {
         let worker_context = Arc::clone(&context);
         workers.push(
@@ -2387,7 +2876,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let started_at = Instant::now();
+    let started_at = workload_started_at;
     let deadline = started_at
         .checked_add(config.duration)
         .unwrap_or_else(Instant::now);
@@ -2407,13 +2896,20 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     let workload_elapsed = started_at.elapsed();
     let terminal_at = Instant::now();
+    let terminal_epoch = (config.lifetime_mode == LifetimeMode::Epoch)
+        .then(|| current_epoch.load(Ordering::Acquire));
     let (terminal_model, terminal_backlog) = {
         let model = model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             model.snapshot(terminal_at),
-            model.refresh_delete_backlog(terminal_at, config.delete_lag_slo, &metrics),
+            model.refresh_delete_backlog(
+                terminal_at,
+                terminal_epoch,
+                config.delete_lag_slo,
+                &metrics,
+            ),
         )
     };
     metrics
@@ -2452,6 +2948,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         terminal_backlog,
         terminal_space,
         grace_space,
+        &registry,
+        terminal_epoch,
+        &lifetime_offset_counts.snapshot(),
     );
     let profile_keys = if config.relocation_profile_reads > 0 && fatal.get().is_none() {
         prepare_relocation_profile(
@@ -2488,6 +2987,9 @@ fn print_scorecard(
     backlog: DeleteBacklog,
     terminal_space: SpaceSnapshot,
     grace_space: SpaceSnapshot,
+    registry: &Registry,
+    current_epoch: Option<Epoch>,
+    lifetime_offset_counts: &[u64],
 ) {
     let elapsed_seconds = workload_elapsed.as_secs_f64().max(f64::EPSILON);
     let puts = metrics
@@ -2535,6 +3037,7 @@ fn print_scorecard(
     let logical_live_bytes = model
         .live_keys
         .saturating_add(model.deleting_keys)
+        .saturating_sub(backlog.due_keys)
         .saturating_mul(config.payload_size as u64);
 
     println!("phase=scorecard");
@@ -2552,6 +3055,35 @@ fn print_scorecard(
         put_bytes as f64 / elapsed_seconds
     );
     println!("delete_ops={deletes}");
+    println!("manual_tombstone_ops={deletes}");
+    println!("native_expiration_ops={}", metrics.native_expirations.get());
+    println!("epoch_advances={}", metrics.epoch_advances.get());
+    if let Some(current_epoch) = current_epoch {
+        let epoch_advances = metrics.epoch_advances.get();
+        println!(
+            "lifetime_window_filled={}",
+            epoch_advances >= config.future_epochs
+        );
+        println!(
+            "steady_state_epoch_transitions={}",
+            epoch_advances.saturating_sub(config.future_epochs)
+        );
+        println!("current_epoch={current_epoch}");
+        let assignment_total = lifetime_offset_counts.iter().copied().sum::<u64>();
+        let assignment_min = lifetime_offset_counts.iter().copied().min().unwrap_or(0);
+        let assignment_max = lifetime_offset_counts.iter().copied().max().unwrap_or(0);
+        println!("lifetime_assignments={assignment_total}");
+        println!("lifetime_offset_min_assignments={assignment_min}");
+        println!("lifetime_offset_max_assignments={assignment_max}");
+        println!(
+            "lifetime_offset_assignments={}",
+            lifetime_offset_counts
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
     println!(
         "delete_ops_per_second={:.3}",
         deletes as f64 / elapsed_seconds
@@ -2614,6 +3146,18 @@ fn print_scorecard(
         terminal_space.amplification(logical_live_bytes)
     );
     println!(
+        "terminal_strata_exact_epoch_bytes={}",
+        terminal_space.strata_exact_epoch_bytes
+    );
+    println!(
+        "terminal_strata_spillover_bytes={}",
+        terminal_space.strata_spillover_bytes
+    );
+    println!(
+        "terminal_strata_epoch_directories={}",
+        terminal_space.strata_epoch_directories
+    );
+    println!(
         "post_grace_directory_allocated_bytes={}",
         grace_space.allocated_bytes
     );
@@ -2624,6 +3168,50 @@ fn print_scorecard(
     println!(
         "post_grace_space_amplification={:.6}",
         grace_space.amplification(logical_live_bytes)
+    );
+    println!(
+        "post_grace_strata_exact_epoch_bytes={}",
+        grace_space.strata_exact_epoch_bytes
+    );
+    println!(
+        "post_grace_strata_spillover_bytes={}",
+        grace_space.strata_spillover_bytes
+    );
+    println!(
+        "post_grace_strata_epoch_directories={}",
+        grace_space.strata_epoch_directories
+    );
+    println!(
+        "strata_gc_output_bytes={:.0}",
+        counter_metric(registry, "strata_store_gc_output_bytes_total")
+    );
+    println!(
+        "strata_gc_source_deleted_bytes={:.0}",
+        counter_metric(registry, "strata_store_gc_source_deleted_bytes_total")
+    );
+    println!(
+        "strata_gc_reclaimed_bytes={:.0}",
+        counter_metric(registry, "strata_store_gc_reclaimed_bytes_total")
+    );
+    println!(
+        "strata_segment_file_bytes_read={:.0}",
+        counter_metric(registry, "strata_store_segment_file_bytes_read_total")
+    );
+    println!(
+        "strata_segment_file_bytes_written={:.0}",
+        counter_metric(registry, "strata_store_segment_file_bytes_written_total")
+    );
+    println!(
+        "blobdb_blob_file_bytes_read={}",
+        metrics.blob_file_bytes_read.get()
+    );
+    println!(
+        "blobdb_blob_file_bytes_written={}",
+        metrics.blob_file_bytes_written.get()
+    );
+    println!(
+        "blobdb_gc_bytes_relocated={}",
+        metrics.blob_gc_bytes_relocated.get()
     );
     println!(
         "post_grace_filesystem_available_bytes={}",
@@ -3311,7 +3899,11 @@ required:
 
 workload:
   --duration <duration>                  write/read/delete phase; default 30m
-  --retention <duration>                 delete each key this long after put; default 5m
+  --lifetime-mode <retention|epoch>      default retention
+  --retention <duration>                 retention-mode age before tombstone; default 5m
+  --epoch-duration <duration>            epoch-mode cadence; default 5m
+  --future-epochs <count>                epoch-mode uniform future lifetime window; default 52
+  --lifetime-seed <u64>                  deterministic lifetime distribution seed
   --cleanup-grace <duration>             no-traffic reclamation window; default 5m
   --payload-size <bytes|KiB|MiB|GiB>     default 1MiB
   --put-ops-per-second <count>           global put-rate target; 0 keeps AIMD control (default)
@@ -3398,10 +3990,73 @@ mod tests {
         .expect("configuration should parse");
 
         assert_eq!(config.engine, EngineKind::BlobDb);
+        assert_eq!(config.lifetime_mode, LifetimeMode::Retention);
         assert_eq!(config.payload_size, 1 << 20);
         assert!(config.sync_interval.is_zero());
         assert_eq!(config.controller_debounce_windows, 3);
         assert_eq!(config.rocksdb_max_subcompactions, 1);
+    }
+
+    #[test]
+    fn parses_epoch_lifetime_configuration() {
+        let config = Config::parse(
+            [
+                "--engine",
+                "strata",
+                "--root",
+                "/tmp/realistic",
+                "--lifetime-mode",
+                "epoch",
+                "--epoch-duration",
+                "5m",
+                "--future-epochs",
+                "52",
+                "--lifetime-seed",
+                "7",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("epoch lifetime configuration should parse");
+
+        assert_eq!(config.lifetime_mode, LifetimeMode::Epoch);
+        assert_eq!(config.epoch_duration, Duration::from_secs(5 * 60));
+        assert_eq!(config.future_epochs, 52);
+        assert_eq!(config.lifetime_seed, 7);
+    }
+
+    #[test]
+    fn lifetime_assignment_is_deterministic_and_covers_future_window() {
+        let config = Config::parse(
+            [
+                "--engine",
+                "strata",
+                "--root",
+                "/tmp/realistic",
+                "--lifetime-mode",
+                "epoch",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("epoch lifetime configuration should parse");
+        let now = Instant::now();
+        let clock = EpochClock {
+            current_epoch: 10,
+            next_transition_at: now,
+        };
+        let mut counts = vec![0_u64; config.future_epochs as usize];
+        for key_id in 0..10_000 {
+            let assignment = clock.assignment(key_id, &config);
+            assert!((1..=config.future_epochs).contains(&assignment.offset));
+            assert_eq!(
+                assignment.logical_end_epoch,
+                clock.current_epoch + assignment.offset
+            );
+            assert_eq!(assignment, clock.assignment(key_id, &config));
+            counts[assignment.offset as usize - 1] += 1;
+        }
+        assert!(counts.into_iter().all(|count| count > 0));
     }
 
     #[test]
@@ -3528,7 +4183,7 @@ mod tests {
             HarnessMetrics::new(&registry, EngineKind::Strata).expect("metrics should register");
         let written_at = Instant::now();
         let mut model = Model::new(10);
-        let record = Arc::new(KeyRecord::new(
+        let record = Arc::new(KeyRecord::with_retention(
             make_key(7).expect("key should be valid"),
             written_at,
             Duration::from_secs(10),
@@ -3537,11 +4192,11 @@ mod tests {
 
         assert!(
             model
-                .claim_due(written_at + Duration::from_secs(9), &metrics)
+                .claim_due(written_at + Duration::from_secs(9), None, &metrics)
                 .is_none()
         );
         let claimed = model
-            .claim_due(written_at + Duration::from_secs(10), &metrics)
+            .claim_due(written_at + Duration::from_secs(10), None, &metrics)
             .expect("key should become due");
         assert!(Arc::ptr_eq(&record, &claimed));
         assert_eq!(metrics.delete_due.get(), 1);
@@ -3557,7 +4212,7 @@ mod tests {
         let written_at = Instant::now();
         let mut model = Model::new(10);
         for (key, retention) in [(1, 10), (3, 30), (2, 20)] {
-            model.push_live(Arc::new(KeyRecord::new(
+            model.push_live(Arc::new(KeyRecord::with_retention(
                 make_key(key).expect("key should be valid"),
                 written_at,
                 Duration::from_secs(retention),
@@ -3566,23 +4221,48 @@ mod tests {
 
         assert_eq!(
             model
-                .claim_due(written_at + Duration::from_secs(10), &metrics)
+                .claim_due(written_at + Duration::from_secs(10), None, &metrics)
                 .expect("first key should be due")
                 .key,
             make_key(1).expect("key should be valid")
         );
         assert!(
             model
-                .claim_due(written_at + Duration::from_secs(19), &metrics)
+                .claim_due(written_at + Duration::from_secs(19), None, &metrics)
                 .is_none()
         );
         assert_eq!(
             model
-                .claim_due(written_at + Duration::from_secs(20), &metrics)
+                .claim_due(written_at + Duration::from_secs(20), None, &metrics)
                 .expect("second key should be due")
                 .key,
             make_key(2).expect("key should be valid")
         );
+    }
+
+    #[test]
+    fn native_epoch_expiry_retires_only_reached_epochs() {
+        let registry = Registry::new();
+        let metrics =
+            HarnessMetrics::new(&registry, EngineKind::Strata).expect("metrics should register");
+        let written_at = Instant::now();
+        let mut model = Model::new(10);
+        for (key_id, end_epoch, due_after) in [(1, 2, 10), (2, 3, 20)] {
+            model.push_live(Arc::new(KeyRecord::with_epoch(
+                make_key(key_id).expect("key should be valid"),
+                written_at,
+                written_at + Duration::from_secs(due_after),
+                end_epoch,
+            )));
+        }
+
+        let expired = model.claim_native_expirations(2, &metrics);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].state.load(Ordering::Acquire), KEY_DELETING);
+        assert_eq!(model.finish_native_expirations(expired), 1);
+        assert_eq!(model.live.len(), 1);
+        assert_eq!(model.deleted.len(), 1);
+        assert_eq!(metrics.delete_due.get(), 1);
     }
 
     #[test]

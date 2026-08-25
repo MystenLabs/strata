@@ -4,7 +4,7 @@
 BlobDB. It is intentionally separate from `strata-bench`, whose cases isolate individual storage
 operations.
 
-The harness runs four roles concurrently:
+The default `--lifetime-mode retention` runs four roles concurrently:
 
 - writer threads greedily consume the remaining service budget; an AIMD controller raises their
   admitted concurrency while the read and delete obligations are healthy and cuts it when they are
@@ -15,6 +15,17 @@ The harness runs four roles concurrently:
   and deleted keys against the client reference model;
 - a sampler measures apparent database bytes, allocated filesystem blocks, file count, free
   filesystem space, and space amplification.
+
+`--lifetime-mode epoch` changes the lifecycle portion of the workload. Every successful put is
+assigned a deterministic uniformly random end epoch from the next `--future-epochs` epochs. The
+default is a five-minute epoch and a 52-epoch future window. Strata receives `SetBlobLifetime`
+followed by `Put` in one writer batch, then advances its native epoch at each boundary. BlobDB has
+no epoch primitive, so the harness advances an in-memory logical clock and its delete workers write
+one point tombstone per expired key. Strata writes no client tombstones in this mode.
+
+The BlobDB expiry queue is intentionally an optimistic lower bound: it lives in benchmark memory.
+A production implementation would persist an ordered expiry index and rebuild or recover it after a
+restart, adding metadata writes and recovery work that this benchmark does not charge to BlobDB.
 
 The workload stops at `--duration`. The harness takes a terminal space snapshot, then performs no
 more client reads, writes, deletes, or explicit syncs during `--cleanup-grace`. Internal GC and
@@ -27,9 +38,13 @@ Use the same workload flags for both engines and change only the root, metrics a
 engine-specific configuration. Run on an empty, dedicated filesystem directory. The harness
 refuses a non-empty `--root` so old files cannot contaminate the score.
 
-BlobDB uses typed-store, has WAL enabled, and uses RocksDB's normal `sync=false` writes. Strata also
-does not invoke `sync()` by default. `--sync-interval 0` is the default for both; choose the same
-non-zero interval only when explicit durability checkpoints are part of the experiment.
+BlobDB uses typed-store, has WAL enabled, and uses RocksDB's normal `sync=false` writes. The harness
+does not invoke either engine's explicit `sync()` API by default; `--sync-interval 0` means only
+that the harness-level sync loop is disabled and does not disable an engine's internal durability
+work. Match the effective durability policy, not merely this flag. In particular, a Strata build
+with a one-second internal durability interval is not durability-equivalent to BlobDB `sync=false`
+with `--sync-interval 0`; give BlobDB an equivalent WAL-sync cadence or expose and align both
+engines' internal policies before comparing throughput and tail latency.
 
 `qualified=true` requires all of the following at the terminal cutoff:
 
@@ -43,6 +58,20 @@ Compare accepted put bytes/second only among qualified runs. For similarly quali
 terminal and post-grace allocated bytes wins the space part of the comparison. Filesystem free bytes
 are reported as a sanity check, but directory allocated bytes are the comparable measure because
 other processes can change filesystem-wide free space.
+
+For epoch-lifetime runs, use a fixed `--put-ops-per-second` when comparing reclamation work. That
+gives both engines the same deterministic key/lifetime prefix instead of letting different maximum
+throughputs produce different datasets. A 52 × 5-minute future window takes 260 minutes to fill;
+therefore a 300-minute run contains only about 40 minutes of steady-state expiry. Use a longer run
+when steady-state behavior matters more than turnaround time. Cleanup grace intentionally stops the
+epoch clock as well as client traffic, so it measures reclamation of epochs that expired during the
+workload rather than expiring additional cohorts after load stops.
+
+Match `--segment-max-bytes` and `--rocksdb-blob-file-size`, or deliberately run a size matrix. With
+52 uniformly populated lifetimes, a 1 GiB Strata ingest segment contains about 20 MiB per epoch on
+average, above the default 8 MiB exact-epoch routing threshold. A 256 MiB segment contains only
+about 5 MiB per epoch and will legitimately route much more data to spillover, testing a different
+policy rather than the intended exact-epoch case.
 
 ## Example runs
 
@@ -125,6 +154,47 @@ Do not add `--rocksdb-max-background-flushes` unless that tuning is intentionall
 configuration under test. Supplying it sets RocksDB `max_background_jobs` to four times the value,
 matching RocksDB's derived flush allocation.
 
+## Epoch-lifetime comparison
+
+Use the same command for both engines, changing only `--engine`, `--root`, the metrics port, and
+engine-specific tuning. For example:
+
+```sh
+sudo target/release/strata-realistic-bench \
+  --engine strata \
+  --root /opt/benchmark/lifetime-strata \
+  --lifetime-mode epoch \
+  --epoch-duration 5m \
+  --future-epochs 52 \
+  --duration 300m \
+  --cleanup-grace 10m \
+  --payload-size 1MiB \
+  --put-ops-per-second 1 \
+  --initial-write-workers 1 \
+  --min-write-workers 1 \
+  --max-write-workers 64 \
+  --read-ops-per-second 1000 \
+  --delete-workers 8 \
+  --delete-lag-slo 30s \
+  --delete-timely-percent 99 \
+  --sync-interval 0 \
+  --segment-max-bytes 1GiB \
+  --strata-gc true \
+  --metrics-listen 0.0.0.0:9184
+```
+
+For BlobDB, use `--engine blobdb`, a fresh root, another metrics port, and the desired RocksDB
+options. Set `--rocksdb-blob-file-size 1GiB` to match the Strata segment size in this example.
+Its delete workers become the manual epoch-expiry service; the same workers are not started for
+Strata in epoch mode. One 1 MiB put per second writes roughly 18 GiB over 300 minutes; size the rate
+from the disk budget before starting a long run.
+
+The scorecard and Prometheus output include native expiration count versus manual tombstone count,
+actual lifetime assignments per future offset, Strata exact-epoch/spillover bytes and epoch-directory
+count, Strata GC copied/deleted/reclaimed bytes, BlobDB relocated blob bytes, and terminal/post-grace
+allocated space. These distinguish clean epoch placement from merely reaching a small final size by
+rewriting large amounts of live data.
+
 ## Prometheus metrics
 
 All client and filesystem metrics start with `strata_realistic_bench_` and carry an `engine` label.
@@ -134,8 +204,17 @@ The most important queries are:
 # Accepted logical write MiB/s
 rate(strata_realistic_bench_put_payload_bytes_total[$__rate_interval]) / 1024 / 1024
 
-# Logical bytes retired by timely/late tombstone acknowledgement, MiB/s
+# Logical bytes retired by native expiry or tombstone acknowledgement, MiB/s
 rate(strata_realistic_bench_retired_payload_bytes_total[$__rate_interval]) / 1024 / 1024
+
+# Native Strata expirations versus BlobDB manual tombstones
+rate(strata_realistic_bench_native_expirations_total[$__rate_interval])
+rate(strata_realistic_bench_operation_successes_total{operation="delete"}[$__rate_interval])
+
+# Strata epoch placement achieved on disk
+strata_realistic_bench_strata_exact_epoch_bytes
+strata_realistic_bench_strata_spillover_bytes
+strata_realistic_bench_strata_epoch_directories
 
 # Client operation rate
 sum by (engine, operation) (
@@ -158,6 +237,10 @@ strata_realistic_bench_storage_file_apparent_bytes
 # Strata segment-file I/O MiB/s, including foreground and GC traffic
 rate(strata_store_segment_file_bytes_read_total[$__rate_interval]) / 1024 / 1024
 rate(strata_store_segment_file_bytes_written_total[$__rate_interval]) / 1024 / 1024
+
+# Live bytes copied by each engine's GC
+rate(strata_store_gc_output_bytes_total[$__rate_interval]) / 1024 / 1024
+rate(strata_realistic_bench_blobdb_gc_bytes_relocated[$__rate_interval]) / 1024 / 1024
 
 # Logical/physical space amplification
 strata_realistic_bench_space_amplification_ratio

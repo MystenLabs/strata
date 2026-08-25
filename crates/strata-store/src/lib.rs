@@ -227,7 +227,7 @@ const FIRST_SEGMENT_ID: SegmentId = 1;
 /// How long the writer naps while waiting for durability publication to drain rolled segments.
 /// Short, because this sleep sits on the foreground put path during rollover backpressure.
 const SEAL_BACKLOG_WAIT: Duration = Duration::from_millis(10);
-const SYNC_AND_COMMIT_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const SYNC_AND_COMMIT_INTERVAL: Duration = Duration::from_secs(1);
 const SYNC_AND_COMMIT_WAL_BYTES: u64 = 64 * 1024 * 1024;
 const SYNC_AND_COMMIT_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 const GARBAGE_LOG_HEAD: &str = "lsm-garbage";
