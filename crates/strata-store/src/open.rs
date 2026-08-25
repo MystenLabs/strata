@@ -176,7 +176,8 @@ impl StrataStore {
         let gc_io_limiter = Arc::new(GcIoLimiter::new(config.gc_io_bytes_per_sec));
         let store_halt = StoreHalt::default();
         let compaction_admission_lock = Arc::new(RwLock::new(()));
-        let durability_publish_lock = Arc::new(Mutex::new(()));
+        let garbage_publish_lock = Arc::new(Mutex::new(()));
+        let relocation_durability_lock = Arc::new(Mutex::new(()));
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
             metrics.clone(),
@@ -194,7 +195,7 @@ impl StrataStore {
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             garbage_log_dir: garbage_log_dir(&config),
             compaction_admission_lock: Arc::clone(&compaction_admission_lock),
-            garbage_publish_lock: Arc::clone(&durability_publish_lock),
+            garbage_publish_lock: Arc::clone(&garbage_publish_lock),
             wake_rx: lsm_compact_rx,
             store_halt: store_halt.clone(),
             metrics: metrics.clone(),
@@ -229,7 +230,7 @@ impl StrataStore {
             index: index.clone(),
             global_log_dir: garbage_log_dir(&config),
             namespace_dir: config.namespace_dir(),
-            durability_publish_lock: Arc::clone(&durability_publish_lock),
+            garbage_publish_lock: Arc::clone(&garbage_publish_lock),
             relocations: Arc::downgrade(&relocations),
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             gc_txs: Arc::clone(&gc_wake_txs),
@@ -266,7 +267,7 @@ impl StrataStore {
             sync_done_rx: durability_ready_rx,
             sync_and_commit_in_flight: None,
             pending_sync_requests: Vec::new(),
-            commit_lock: Arc::clone(&durability_publish_lock),
+            relocation_durability_lock: Arc::clone(&relocation_durability_lock),
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             active_segment_state,
             durable_offset,
@@ -303,7 +304,8 @@ impl StrataStore {
                     config: config.clone(),
                     index: index.clone(),
                     publish_cleanup_lock: Arc::clone(&gc_publish_cleanup_lock),
-                    durability_publish_lock: Arc::clone(&durability_publish_lock),
+                    garbage_publish_lock: Arc::clone(&garbage_publish_lock),
+                    relocation_durability_lock: Arc::clone(&relocation_durability_lock),
                     compaction_admission_lock: Arc::clone(&compaction_admission_lock),
                     relocations: Arc::clone(&relocations),
                     relocation_cache: Arc::clone(&relocation_cache),
@@ -377,7 +379,8 @@ impl StrataStore {
             gc_txs,
             gc_handles,
             gc_publish_cleanup_lock,
-            durability_publish_lock,
+            garbage_publish_lock,
+            relocation_durability_lock,
             compaction_admission_lock,
             durable_relocation_lsn,
             gc_claims,

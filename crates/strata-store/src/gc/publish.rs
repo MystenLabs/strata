@@ -60,12 +60,12 @@ impl GcExecutor {
     /// bounded sweep owns the publication lock only for its own synced metadata batch. That sync
     /// also makes any earlier relocation activation durable.
     fn drain_gc_reconciliation_log(&self) -> Result<()> {
-        let durability_lock = Arc::clone(&self.durability_publish_lock);
+        let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
         loop {
             let (swept, relocation_lsn) = {
-                let _publish_guard = durability_lock
+                let _publish_guard = garbage_publish_lock
                     .lock()
-                    .expect("durability publication lock poisoned");
+                    .expect("garbage publication lock poisoned");
                 let relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
                 let swept = self.index.sweep_garbage_log(
                     garbage_log_dir(&self.config),
@@ -189,8 +189,8 @@ impl GcExecutor {
     ///
     /// 1. Write, fsync, and rename one relocation patch SST. It has an independent relocation-LSM
     ///    sequence; GC does not reserve foreground LSNs or touch the main WAL.
-    /// 2. Under the short durability-publication lock, atomically add that table to the relocation
-    ///    manifest and publish output/source/garbage metadata with an unsynced RocksDB batch.
+    /// 2. Under the garbage and relocation-durability locks, atomically add that table to the
+    ///    relocation manifest and publish output/source/garbage metadata with an unsynced batch.
     ///
     /// A crash before activation leaves an orphan SST that startup removes. A crash after activation
     /// can recover it because the SST was durable first. Source files remain protected until a later
@@ -259,10 +259,10 @@ impl GcExecutor {
     /// first, but it is inert — no manifest references it, no reader can see it, and a crash right
     /// now leaves an orphan that remove_orphan_tables deletes at the next open.
     ///
-    /// Part two: activation, under the durability publication lock. First the global garbage log
-    /// is opened at its last committed position (truncating any unpublished tail an earlier crash
-    /// left behind) and the sorted retirement frame for A@S7 and D@S7 is appended and synced.
-    /// Then one RocksDB batch assembles the entire publication: the manifest merge that adds the
+    /// Part two: activation. Under the garbage-publication lock, the global garbage log is opened
+    /// at its last committed position and the retirement frame is appended and synced. The
+    /// relocation-durability lock is then acquired before one RocksDB batch assembles the entire
+    /// publication: the manifest merge that adds the
     /// patch SST to the relocation manifest (the activation itself); S42's Sealed row, birth
     /// summary, segment-garbage-log position, and published_at_lsn of 1000 (what snapshot
     /// protection compares against); S7's GcRelocating row; the new global garbage-log head;
@@ -445,12 +445,13 @@ impl GcExecutor {
         }
         let (activation_sequence, relocation_edit) =
             self.relocations.prepare_l0(&relocation_entries)?;
-        let durability_publish_lock = Arc::clone(&self.durability_publish_lock);
+        let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
+        let relocation_durability_lock = Arc::clone(&self.relocation_durability_lock);
         let mut skipped_output_delta = GcKnownDelta::default();
         let commit_result = (|| {
-            let _publish_guard = durability_publish_lock
+            let _garbage_publish_guard = garbage_publish_lock
                 .lock()
-                .expect("durability publication lock poisoned");
+                .expect("garbage publication lock poisoned");
             let committed_garbage = self
                 .index
                 .get_garbage_log_position(GARBAGE_LOG_HEAD)?
@@ -464,6 +465,9 @@ impl GcExecutor {
             let garbage_position = garbage_log
                 .append(&relocation_garbage)
                 .map_err(Error::from)?;
+            let _relocation_durability_guard = relocation_durability_lock
+                .lock()
+                .expect("relocation durability lock poisoned");
 
             let mut batch = self.index.batch();
             self.index.merge_lsm_manifest_batch(
@@ -808,10 +812,10 @@ impl GcExecutor {
     /// - `durable_relocation_lsn` is the store-wide frontier meaning "every activation at or
     ///   below this sequence is provably on disk." It is seeded at open from the recovered
     ///   manifest (whatever the durable manifest already references is durable by definition) and
-    ///   advances only when someone samples the relocation LSM under the durability lock and then
-    ///   performs a *synced* RocksDB write — the garbage-log sweeper every second, and relocation
-    ///   compaction. The activation batch itself is deliberately unsynced; those later cumulative
-    ///   syncs are what harden it, for free (GarbageLogSweeper::drain has the ordering argument).
+    ///   advances only when someone samples the relocation LSM before a *synced* RocksDB write —
+    ///   foreground sync, the garbage-log sweeper, and relocation compaction. The activation batch
+    ///   itself is deliberately unsynced; those later cumulative syncs are what harden it, for free
+    ///   (GarbageLogSweeper::drain has the ordering argument).
     ///
     /// So the predicate is simply: activation 87 <= durable frontier. While that is false, the
     /// activation is *visible* — readers already resolve A and D to S42 — but not yet provably

@@ -10,7 +10,8 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::{unix::ffi::OsStrExt, unix::fs::MetadataExt};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    cmp::Ordering as CmpOrdering,
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
@@ -1348,6 +1349,7 @@ struct KeyRecord {
     logical_end_epoch: Option<Epoch>,
     state: AtomicU8,
     due_counted: AtomicBool,
+    sample_index: AtomicUsize,
 }
 
 impl KeyRecord {
@@ -1359,6 +1361,7 @@ impl KeyRecord {
             logical_end_epoch: None,
             state: AtomicU8::new(KEY_LIVE),
             due_counted: AtomicBool::new(false),
+            sample_index: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -1375,6 +1378,7 @@ impl KeyRecord {
             logical_end_epoch: Some(logical_end_epoch),
             state: AtomicU8::new(KEY_LIVE),
             due_counted: AtomicBool::new(false),
+            sample_index: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -1385,9 +1389,32 @@ impl KeyRecord {
     }
 }
 
+impl PartialEq for KeyRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.due_at == other.due_at && self.key == other.key
+    }
+}
+
+impl Eq for KeyRecord {}
+
+impl PartialOrd for KeyRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyRecord {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.due_at
+            .cmp(&other.due_at)
+            .then_with(|| self.key.as_bytes().cmp(other.key.as_bytes()))
+    }
+}
+
 #[derive(Debug, Default)]
 struct Model {
-    live: VecDeque<Arc<KeyRecord>>,
+    live: BTreeSet<Arc<KeyRecord>>,
+    live_sample: Vec<Arc<KeyRecord>>,
     deleting: HashMap<Vec<u8>, Arc<KeyRecord>>,
     deleted: VecDeque<Arc<KeyRecord>>,
     deleted_sample_capacity: usize,
@@ -1423,23 +1450,22 @@ impl Model {
     }
 
     fn push_live(&mut self, record: Arc<KeyRecord>) {
-        if self
-            .live
-            .back()
-            .is_none_or(|last| last.due_at <= record.due_at)
-        {
-            self.live.push_back(record);
-            return;
+        record
+            .sample_index
+            .store(self.live_sample.len(), Ordering::Relaxed);
+        self.live_sample.push(Arc::clone(&record));
+        self.live.insert(record);
+    }
+
+    fn pop_first_live(&mut self) -> Arc<KeyRecord> {
+        let record = self.live.pop_first().expect("live key must remain present");
+        let sample_index = record.sample_index.load(Ordering::Relaxed);
+        let sampled = self.live_sample.swap_remove(sample_index);
+        debug_assert!(Arc::ptr_eq(&record, &sampled));
+        if let Some(moved) = self.live_sample.get(sample_index) {
+            moved.sample_index.store(sample_index, Ordering::Relaxed);
         }
-        // Parallel puts can be acknowledged slightly out of order. Those records still belong
-        // near the tail, so search backward instead of walking the entire live queue from the
-        // front while holding the shared model lock.
-        let position = self
-            .live
-            .iter()
-            .rposition(|candidate| candidate.due_at <= record.due_at)
-            .map_or(0, |position| position + 1);
-        self.live.insert(position, record);
+        record
     }
 
     fn claim_due(
@@ -1448,14 +1474,14 @@ impl Model {
         current_epoch: Option<Epoch>,
         metrics: &HarnessMetrics,
     ) -> Option<Arc<KeyRecord>> {
-        let record = self.live.front().filter(|record| {
+        let record = self.live.first().filter(|record| {
             record.due_at <= now
                 && record
                     .logical_end_epoch
                     .is_none_or(|end_epoch| current_epoch.is_some_and(|epoch| end_epoch <= epoch))
         })?;
         record.mark_due(metrics);
-        let record = self.live.pop_front().expect("due key must remain at front");
+        let record = self.pop_first_live();
         record.state.store(KEY_DELETING, Ordering::Release);
         self.deleting
             .insert(record.key.as_bytes().to_vec(), Arc::clone(&record));
@@ -1470,14 +1496,11 @@ impl Model {
         let mut records = Vec::new();
         while self
             .live
-            .front()
+            .first()
             .and_then(|record| record.logical_end_epoch)
             .is_some_and(|end_epoch| end_epoch <= current_epoch)
         {
-            let record = self
-                .live
-                .pop_front()
-                .expect("expired key must remain at front");
+            let record = self.pop_first_live();
             record.mark_due(metrics);
             record.state.store(KEY_DELETING, Ordering::Release);
             records.push(record);
@@ -1510,22 +1533,31 @@ impl Model {
         prefer_deleted: bool,
         rng: &mut SplitMix64,
     ) -> Option<(Arc<KeyRecord>, ReadExpectation)> {
-        let choose = |records: &VecDeque<Arc<KeyRecord>>, rng: &mut SplitMix64| {
+        let choose_live = |rng: &mut SplitMix64| {
+            (!self.live_sample.is_empty()).then(|| {
+                let index = rng.next_u64() as usize % self.live_sample.len();
+                Arc::clone(
+                    self.live_sample
+                        .get(index)
+                        .expect("sample index must be in range"),
+                )
+            })
+        };
+        let choose_deleted = |rng: &mut SplitMix64| {
+            let records = &self.deleted;
             (!records.is_empty()).then(|| {
                 let index = rng.next_u64() as usize % records.len();
                 Arc::clone(records.get(index).expect("sample index must be in range"))
             })
         };
         if prefer_deleted {
-            choose(&self.deleted, rng)
+            choose_deleted(rng)
                 .map(|record| (record, ReadExpectation::Deleted))
-                .or_else(|| choose(&self.live, rng).map(|record| (record, ReadExpectation::Live)))
+                .or_else(|| choose_live(rng).map(|record| (record, ReadExpectation::Live)))
         } else {
-            choose(&self.live, rng)
+            choose_live(rng)
                 .map(|record| (record, ReadExpectation::Live))
-                .or_else(|| {
-                    choose(&self.deleted, rng).map(|record| (record, ReadExpectation::Deleted))
-                })
+                .or_else(|| choose_deleted(rng).map(|record| (record, ReadExpectation::Deleted)))
         }
     }
 
@@ -1568,7 +1600,7 @@ impl Model {
             deleted_sample_keys: self.deleted.len() as u64,
             oldest_live_age: self
                 .live
-                .front()
+                .first()
                 .map(|record| now.saturating_duration_since(record.written_at))
                 .unwrap_or_default(),
         }
@@ -4238,6 +4270,9 @@ mod tests {
                 .key,
             make_key(2).expect("key should be valid")
         );
+        assert_eq!(model.live.len(), 1);
+        assert_eq!(model.live_sample.len(), 1);
+        assert_eq!(model.live_sample[0].sample_index.load(Ordering::Relaxed), 0);
     }
 
     #[test]

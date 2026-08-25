@@ -68,7 +68,7 @@ impl GcExecutor {
     ///   `draining` reservation blocks *new* GC claims on these segments immediately, while
     ///   in-flight jobs that claimed them from an older snapshot are allowed to finish. A timeout
     ///   skips the job for this wake rather than stalling the worker; the next wake retries.
-    /// - Both the publish/cleanup lock and the durability-publication lock are held for the
+    /// - Both the publish/cleanup lock and the garbage-publication lock are held for the
     ///   removal itself: the first keeps GC prepublish from renaming a new output file into the
     ///   directory being removed, the second keeps garbage publication and sweeping from running
     ///   mid-erasure. The job is re-read under the locks — another worker may have finished it.
@@ -117,10 +117,10 @@ impl GcExecutor {
                 .publish_cleanup_lock
                 .lock()
                 .expect("gc publish/cleanup lock poisoned");
-            let _durability_publish_guard = self
-                .durability_publish_lock
+            let _garbage_publish_guard = self
+                .garbage_publish_lock
                 .lock()
-                .expect("durability publication lock poisoned");
+                .expect("garbage publication lock poisoned");
             let Some(current_job) = self.index.get_shard_cleanup_job(job.shard)? else {
                 continue;
             };

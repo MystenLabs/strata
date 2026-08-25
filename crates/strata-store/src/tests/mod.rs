@@ -1452,6 +1452,35 @@ async fn sync_publishes_new_allocations_without_overwriting_garbage() {
 }
 
 #[tokio::test]
+async fn foreground_sync_does_not_wait_for_garbage_publication() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let store = Arc::new(
+        StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap(),
+    );
+    let garbage_lock = Arc::clone(&store.garbage_publish_lock);
+    let garbage_guard = garbage_lock.lock().unwrap();
+
+    store
+        .put(
+            STANDALONE_SHARD.id,
+            &BlobKey::new(b"foreground-sync".to_vec()).unwrap(),
+            b"payload",
+        )
+        .unwrap();
+    let (result_tx, result_rx) = mpsc::channel();
+    let sync_store = Arc::clone(&store);
+    let handle = thread::spawn(move || result_tx.send(sync_store.sync()).unwrap());
+
+    let result = result_rx.recv_timeout(Duration::from_secs(2));
+    drop(garbage_guard);
+    handle.join().unwrap();
+    result
+        .expect("foreground sync waited for garbage publication")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn shard_drop_is_visible_immediately_and_durable_after_sync() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
@@ -2492,7 +2521,7 @@ async fn metrics_track_seal_backpressure_waits() {
         sync_done_rx,
         sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
-        commit_lock: Arc::new(Mutex::new(())),
+        relocation_durability_lock: Arc::new(Mutex::new(())),
         durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
@@ -4090,9 +4119,9 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
         let swept = {
             let _publish_guard = store
                 .store
-                .durability_publish_lock
+                .garbage_publish_lock
                 .lock()
-                .expect("durability publication lock poisoned");
+                .expect("garbage publication lock poisoned");
             store
                 .index()
                 .sweep_garbage_log(
@@ -5177,7 +5206,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
         sync_done_rx,
         sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
-        commit_lock: Arc::new(Mutex::new(())),
+        relocation_durability_lock: Arc::new(Mutex::new(())),
         durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,

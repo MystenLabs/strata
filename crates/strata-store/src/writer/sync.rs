@@ -295,9 +295,9 @@ impl WriteCoordinator {
         };
         let commit_started = Instant::now();
         let _commit_guard = self
-            .commit_lock
+            .relocation_durability_lock
             .lock()
-            .expect("durability publish lock poisoned");
+            .expect("relocation durability lock poisoned");
         // The relocation frontier must be sampled while holding the same lock used by GC
         // activation. The synced RocksDB write below then proves that every sampled manifest edit
         // and activation row reached disk together.

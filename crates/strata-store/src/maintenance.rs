@@ -58,7 +58,7 @@ pub(crate) struct GarbageLogSweeper {
     pub(crate) index: StrataIndex,
     pub(crate) global_log_dir: PathBuf,
     pub(crate) namespace_dir: PathBuf,
-    pub(crate) durability_publish_lock: Arc<Mutex<()>>,
+    pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
     pub(crate) relocations: Weak<RelocationStore>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) gc_txs: Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
@@ -99,7 +99,7 @@ impl GarbageLogSweeper {
     /// Sweeps bounded batches until the global log is drained, and doubles as the durability
     /// heartbeat for GC relocation activations.
     ///
-    /// Each iteration, under the durability-publication lock: first sample the relocation LSM's
+    /// Each iteration, under the garbage-publication lock: first sample the relocation LSM's
     /// last activation sequence, then run one bounded sweep. The sweep itself syncs each touched
     /// segment-local file and commits its cursor, positions, and summaries in one *synced* RocksDB
     /// batch. That sync is the whole trick: RocksDB WAL syncs are cumulative, so it also hardens
@@ -120,9 +120,9 @@ impl GarbageLogSweeper {
         loop {
             let (swept, relocation_lsn, expiry_frontier_advanced) = {
                 let _publish_guard = self
-                    .durability_publish_lock
+                    .garbage_publish_lock
                     .lock()
-                    .expect("durability publish lock poisoned");
+                    .expect("garbage publish lock poisoned");
                 let relocation_lsn = self
                     .relocations
                     .upgrade()
@@ -167,7 +167,7 @@ impl GarbageLogSweeper {
     /// sweep cursor. Publishing 120 in that state would let GC read old `live_bytes`. Requiring an
     /// empty global log before copying the manifest-derived bound closes that final gap.
     ///
-    /// The caller holds `durability_publish_lock`, which serializes all garbage-head publishers.
+    /// The caller holds `garbage_publish_lock`, which serializes all garbage-head publishers.
     fn refresh_expiry_accounting_frontier(&self) -> Result<bool> {
         let head = self
             .index
@@ -444,7 +444,7 @@ impl LsmCompactor {
     /// events the sweeper later folds into S7's overlay, which is how the GC planner ever learns
     /// S7 is worth collecting.
     ///
-    /// Publication. Under the garbage/durability publication lock: open the global garbage log at
+    /// Publication. Under the garbage-publication lock: open the global garbage log at
     /// its committed head, then publish_lsm_compaction appends the garbage frame (synced) and
     /// commits the manifest edit plus the frame's end position in one synced RocksDB batch —
     /// SSTs first became durable in write_compaction, so the manifest never references bytes that
