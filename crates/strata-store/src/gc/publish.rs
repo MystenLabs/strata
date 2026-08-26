@@ -848,13 +848,13 @@ impl GcExecutor {
 
     /// Rewrites a sealed segment's placement class without moving a single byte.
     ///
-    /// The motivating case: an ExactEpoch(50) segment reaches epoch 50, but its records were
-    /// extended and too many bytes are still live to copy out under the per-plan budget. The
-    /// planner demotes it to Spillover so it stops looking like "should have expired wholesale"
-    /// and is instead treated as an ordinary mixed-lifetime segment that fragmentation-driven
-    /// plans will chip away at. Only the durable label steering future planner decisions changes;
-    /// the file, its id, and its bytes stay put. Only Sealed segments qualify, a matching class is
-    /// a no-op, and the single-row change commits synced.
+    /// Two cases use this: an unknown-heavy ingest segment that would gain little from being
+    /// rewritten, and an ExactEpoch(50) segment whose records were extended and remain too live to
+    /// copy economically. The planner labels either one Spillover so fragmentation-driven plans
+    /// can handle it later. Only the durable label steering future planner decisions changes; the
+    /// file, its id, owner, path, and bytes stay put. Avoiding a physical rename also avoids a
+    /// second crash-consistency protocol for moving a file beside its metadata row. Only Sealed
+    /// segments qualify, a matching class is a no-op, and the single-row change commits synced.
     fn reclassify_gc_segment(
         &self,
         segment_id: SegmentId,

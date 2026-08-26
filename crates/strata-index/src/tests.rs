@@ -180,6 +180,7 @@ async fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
     let snapshot = index.build_gc_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.current_epoch, 10);
     assert_eq!(snapshot.expiry_accounted_epoch, None);
+    assert_eq!(snapshot.lifecycle_accounted_lsn, None);
     assert_eq!(snapshot.published_lsn, 7);
     assert_eq!(snapshot.segments.len(), 1);
     assert_eq!(snapshot.segments[0].state, live);
@@ -195,14 +196,9 @@ async fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
         .put_blob_expiry_accounted_lsn_batch(&mut batch, 5)
         .unwrap();
     batch.write().unwrap();
-    assert_eq!(
-        index
-            .build_gc_snapshot()
-            .unwrap()
-            .unwrap()
-            .expiry_accounted_epoch,
-        Some(9)
-    );
+    let snapshot = index.build_gc_snapshot().unwrap().unwrap();
+    assert_eq!(snapshot.expiry_accounted_epoch, Some(9));
+    assert_eq!(snapshot.lifecycle_accounted_lsn, Some(5));
 }
 
 #[tokio::test]

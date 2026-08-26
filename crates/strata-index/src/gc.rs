@@ -83,6 +83,7 @@ impl StrataIndex {
         Ok(Some(GcSnapshot {
             current_epoch,
             expiry_accounted_epoch,
+            lifecycle_accounted_lsn: expiry_accounted_lsn,
             published_lsn,
             segments,
         }))

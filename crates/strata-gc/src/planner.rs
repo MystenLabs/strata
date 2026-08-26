@@ -33,8 +33,9 @@ pub struct GcPlannerConfig {
     /// Minimum fraction of live bytes that must have useful retention value before L0 rewrites an
     /// ingest segment, in basis points.
     ///
-    /// Useful bytes are unknown-lifetime bytes plus known-lifetime buckets that are far enough from
-    /// expiry. This is a segment-level gate because current L0 execution full-drains the source.
+    /// Useful bytes are known-lifetime buckets that are far enough from expiry. Unknown-lifetime
+    /// bytes do not justify a rewrite: once their accounting is complete, an ingest segment below
+    /// this threshold is reclassified as spillover without copying it.
     pub min_l0_rewrite_useful_ratio_bps: u16,
     /// Minimum garbage bytes before a dead ref rewrite is worth considering.
     ///
@@ -111,6 +112,13 @@ pub struct GcSnapshot {
     /// bases have been swept, and prevents `ExactEpoch(50)` from being treated as expired merely
     /// because `current_epoch` reached 50 while its summary still calls all bytes live.
     pub expiry_accounted_epoch: Option<Epoch>,
+    /// Highest contiguous Store LSN whose blob mutations have passed through a complete merge and
+    /// whose resulting garbage records have reached the segment summaries in this snapshot.
+    ///
+    /// Known-lifetime ingest normally becomes eligible sooner, as soon as its summary has no
+    /// unknown-lifetime bytes. This frontier is the conservative fallback that eventually admits
+    /// segments containing records with genuinely unknown lifetimes.
+    pub lifecycle_accounted_lsn: Option<StrataLsn>,
     /// Highest contiguous LSN whose segment allocations are durable and published.
     ///
     /// A source segment whose `max_lsn` is above this frontier may contain refs that are still
@@ -272,8 +280,9 @@ pub enum GcAction {
     },
     /// Change placement metadata without copying bytes.
     ///
-    /// This is the conservative answer for an expired exact-epoch segment that remains too live to
-    /// rewrite economically. Metadata reclassification avoids forcing high write amplification.
+    /// This is the conservative answer for an ingest segment with too little useful lifetime
+    /// density, or an expired exact-epoch segment that remains too live to rewrite economically.
+    /// Metadata reclassification avoids forcing high write amplification.
     ReclassifySegment {
         /// Segment whose placement class should change.
         segment_id: SegmentId,
@@ -389,13 +398,23 @@ impl GcPlanner {
             .iter()
             .filter(|segment| segment.eligible_source(snapshot.published_lsn))
             .filter(|segment| segment.state.placement_class == PlacementClass::Ingest)
+            .filter(|segment| self.l0_lifetimes_accounted(snapshot, segment))
             .filter_map(|segment| {
                 let copied_bytes = segment.summary.live_bytes;
-                if copied_bytes > self.config.max_l0_copy_bytes_per_plan {
-                    return None;
-                }
                 let useful_bytes = self.l0_rewrite_useful_bytes(snapshot, segment);
                 if !self.l0_rewrite_is_useful(copied_bytes, useful_bytes) {
+                    return Some(GcPlan {
+                        scenario: GcScenario::L0Compaction,
+                        action: GcAction::ReclassifySegment {
+                            segment_id: segment.segment_id(),
+                            placement_class: PlacementClass::Spillover,
+                        },
+                        copied_bytes: 0,
+                        expected_reclaim_bytes: 0,
+                        score: i128::from(segment.summary.total_bytes),
+                    });
+                }
+                if copied_bytes > self.config.max_l0_copy_bytes_per_plan {
                     return None;
                 }
                 let routes = self.route_segment_live_bytes(snapshot, segment);
@@ -414,6 +433,16 @@ impl GcPlanner {
                 })
             })
             .collect()
+    }
+
+    fn l0_lifetimes_accounted(&self, snapshot: &GcSnapshot, segment: &SegmentSnapshot) -> bool {
+        segment.summary.unknown_lifetime_bytes == 0
+            || snapshot.lifecycle_accounted_lsn.is_some_and(|accounted| {
+                segment
+                    .state
+                    .max_lsn
+                    .is_none_or(|max_lsn| accounted >= max_lsn)
+            })
     }
 
     fn dead_ref_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
@@ -599,7 +628,7 @@ impl GcPlanner {
     }
 
     fn l0_rewrite_useful_bytes(&self, snapshot: &GcSnapshot, segment: &SegmentSnapshot) -> u64 {
-        let known_useful_bytes = segment
+        segment
             .summary
             .future_epoch_histogram
             .iter()
@@ -609,8 +638,7 @@ impl GcPlanner {
                     && self.l0_epoch_bucket_is_useful(snapshot.current_epoch, **epoch)
             })
             .map(|(_, bucket)| bucket.bytes)
-            .sum::<u64>();
-        known_useful_bytes.saturating_add(segment.summary.unknown_lifetime_bytes)
+            .sum()
     }
 
     fn l0_rewrite_is_useful(&self, live_bytes: u64, useful_bytes: u64) -> bool {
@@ -749,6 +777,7 @@ mod tests {
         GcSnapshot {
             current_epoch: 10,
             expiry_accounted_epoch: Some(10),
+            lifecycle_accounted_lsn: Some(10),
             published_lsn: 10,
             segments,
         }
@@ -833,10 +862,11 @@ mod tests {
     }
 
     #[test]
-    fn l0_unknown_lifetime_routes_to_spillover() {
+    fn l0_routes_small_accounted_unknown_tail_to_spillover() {
         let mut segment_summary = summary(200, 200, 0);
-        segment_summary.unknown_lifetime_bytes = 200;
-        segment_summary.unknown_lifetime_ref_count = 2;
+        add_epoch_bucket(&mut segment_summary, 20, 150, 3);
+        segment_summary.unknown_lifetime_bytes = 50;
+        segment_summary.unknown_lifetime_ref_count = 1;
         let plan = planner()
             .plan(&snapshot(vec![sealed_segment(
                 1,
@@ -849,8 +879,43 @@ mod tests {
         let GcAction::MoveLiveBytes { routes, .. } = &plan.action else {
             panic!("expected move action");
         };
-        assert_eq!(routes[0].destination_class, DestinationClass::Spillover);
-        assert_eq!(routes[0].end_epoch, None);
+        let unknown = routes
+            .iter()
+            .find(|route| route.end_epoch.is_none())
+            .unwrap();
+        assert_eq!(unknown.destination_class, DestinationClass::Spillover);
+    }
+
+    #[test]
+    fn l0_waits_for_lifetime_accounting_before_routing_unknown_bytes() {
+        let mut segment_summary = summary(200, 200, 0);
+        segment_summary.unknown_lifetime_bytes = 200;
+        segment_summary.unknown_lifetime_ref_count = 2;
+        let segment = sealed_segment(1, PlacementClass::Ingest, segment_summary);
+        let mut snapshot = snapshot(vec![segment]);
+
+        snapshot.lifecycle_accounted_lsn = Some(9);
+        assert!(planner().plan(&snapshot).is_none());
+
+        snapshot.lifecycle_accounted_lsn = Some(10);
+        assert_eq!(
+            planner().plan(&snapshot).unwrap().scenario,
+            GcScenario::L0Compaction
+        );
+    }
+
+    #[test]
+    fn l0_known_lifetimes_do_not_wait_for_full_accounting_frontier() {
+        let mut segment_summary = summary(200, 200, 0);
+        add_epoch_bucket(&mut segment_summary, 20, 200, 2);
+        let segment = sealed_segment(1, PlacementClass::Ingest, segment_summary);
+        let mut snapshot = snapshot(vec![segment]);
+        snapshot.lifecycle_accounted_lsn = None;
+
+        assert_eq!(
+            planner().plan(&snapshot).unwrap().scenario,
+            GcScenario::L0Compaction
+        );
     }
 
     #[test]
@@ -869,8 +934,7 @@ mod tests {
             max_join_sources: 4,
         });
         let mut segment_summary = summary(2_000, 1_500, 0);
-        segment_summary.unknown_lifetime_bytes = 1_500;
-        segment_summary.unknown_lifetime_ref_count = 1;
+        add_epoch_bucket(&mut segment_summary, 20, 1_500, 1);
         let plan = planner
             .plan(&snapshot(vec![sealed_segment(
                 1,
@@ -884,19 +948,24 @@ mod tests {
     }
 
     #[test]
-    fn l0_skips_segment_when_live_bytes_are_too_close_to_expiry() {
+    fn l0_reclassifies_segment_when_live_bytes_are_too_close_to_expiry() {
         let mut segment_summary = summary(1_000, 1_000, 0);
         add_epoch_bucket(&mut segment_summary, 11, 900, 9);
         add_epoch_bucket(&mut segment_summary, 20, 100, 1);
 
-        assert!(
+        assert_eq!(
             planner()
                 .plan(&snapshot(vec![sealed_segment(
                     1,
                     PlacementClass::Ingest,
                     segment_summary,
                 )]))
-                .is_none()
+                .unwrap()
+                .action,
+            GcAction::ReclassifySegment {
+                segment_id: 1,
+                placement_class: PlacementClass::Spillover,
+            }
         );
     }
 
@@ -916,19 +985,24 @@ mod tests {
     }
 
     #[test]
-    fn l0_skips_mixed_segment_to_avoid_moving_near_expiry_bytes() {
+    fn l0_reclassifies_mixed_segment_to_avoid_moving_near_expiry_bytes() {
         let mut segment_summary = summary(1_000, 1_000, 0);
         add_epoch_bucket(&mut segment_summary, 11, 300, 3);
         add_epoch_bucket(&mut segment_summary, 20, 700, 7);
 
-        assert!(
+        assert_eq!(
             planner()
                 .plan(&snapshot(vec![sealed_segment(
                     1,
                     PlacementClass::Ingest,
                     segment_summary,
                 )]))
-                .is_none()
+                .unwrap()
+                .action,
+            GcAction::ReclassifySegment {
+                segment_id: 1,
+                placement_class: PlacementClass::Spillover,
+            }
         );
     }
 
@@ -949,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn l0_counts_unknown_lifetime_bytes_as_useful() {
+    fn l0_reclassifies_accounted_unknown_lifetime_bytes_without_copying() {
         let mut segment_summary = summary(1_000, 1_000, 0);
         segment_summary.unknown_lifetime_bytes = 1_000;
         segment_summary.unknown_lifetime_ref_count = 10;
@@ -962,6 +1036,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.scenario, GcScenario::L0Compaction);
+        assert_eq!(plan.copied_bytes, 0);
+        assert_eq!(
+            plan.action,
+            GcAction::ReclassifySegment {
+                segment_id: 1,
+                placement_class: PlacementClass::Spillover,
+            }
+        );
     }
 
     #[test]
@@ -1071,6 +1153,7 @@ mod tests {
         let snapshot = GcSnapshot {
             current_epoch: 10,
             expiry_accounted_epoch: Some(10),
+            lifecycle_accounted_lsn: Some(10),
             published_lsn: 10,
             segments: vec![segment],
         };

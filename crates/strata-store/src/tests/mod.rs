@@ -3189,6 +3189,9 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
     let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
+    for key in [&key_a, &key_b, &key_c] {
+        store.set_blob_lifetime(key, 50).unwrap();
+    }
     store.put(&key_a, b"payload-a").unwrap();
     let lsn_b = store.put(&key_b, b"payload-b").unwrap();
     let lsn_c = store.put(&key_c, b"payload-c").unwrap();
@@ -3233,8 +3236,8 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
     assert_eq!(copied.outputs.len(), 1);
     assert_eq!(copied.copied_records.len(), 1);
     let output = &copied.outputs[0];
-    assert_eq!(output.destination_class, DestinationClass::Spillover);
-    assert_eq!(output.placement_class, PlacementClass::Spillover);
+    assert_eq!(output.destination_class, DestinationClass::ExactEpoch(50));
+    assert_eq!(output.placement_class, PlacementClass::ExactEpoch(50));
     assert_eq!(output.sealed_len, ref_b.len);
     assert!(output.path.exists());
 
@@ -3244,7 +3247,7 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
     assert_eq!(copied_record.source.from, ref_b);
     assert_eq!(
         copied_record.source.destination_class,
-        DestinationClass::Spillover
+        DestinationClass::ExactEpoch(50)
     );
     assert_eq!(copied_record.staged.segment_id, output.staged_segment_id);
     assert_eq!(copied_record.staged.offset, 0);
@@ -3271,6 +3274,9 @@ async fn gc_copy_uses_planning_snapshot_overlay_across_concurrent_retirement() {
     let key_d = BlobKey::new(b"blob-d".to_vec()).unwrap();
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
 
+    for key in [&key_a, &key_b, &key_c, &key_d] {
+        store.set_blob_lifetime(key, 50).unwrap();
+    }
     let lsn_a = store.put(&key_a, b"payload-a").unwrap();
     let lsn_b = store.put(&key_b, b"payload-b").unwrap();
     let lsn_c = store.put(&key_c, b"payload-c").unwrap();
@@ -3352,6 +3358,9 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
     let shard_a = store.add_shard(7).unwrap();
     let shard_b = store.add_shard(8).unwrap();
 
+    for key in [&key_a, &key_b, &key_c] {
+        store.set_blob_lifetime(key, 50).unwrap();
+    }
     let lsn_a = store.store.put(shard_a.id, &key_a, b"payload-a").unwrap();
     let lsn_b = store.store.put(shard_b.id, &key_b, b"payload-b").unwrap();
     let lsn_c = store.store.put(shard_a.id, &key_c, b"payload-c").unwrap();
@@ -3388,8 +3397,8 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
         BTreeSet::from([shard_a, shard_b])
     );
     for output in &copied.outputs {
-        assert_eq!(output.destination_class, DestinationClass::Spillover);
-        assert_eq!(output.placement_class, PlacementClass::Spillover);
+        assert_eq!(output.destination_class, DestinationClass::ExactEpoch(50));
+        assert_eq!(output.placement_class, PlacementClass::ExactEpoch(50));
         assert_eq!(output.sealed_len, TEST_RECORD_LEN);
     }
 
@@ -3402,7 +3411,7 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
         let expected_path = layout::retention_segment_path(
             store.config(),
             output.shard,
-            PlacementClass::Spillover,
+            PlacementClass::ExactEpoch(50),
             output.segment_id,
         );
         assert_eq!(output.path, expected_path);
@@ -3413,7 +3422,7 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
             .unwrap()
             .unwrap();
         assert_eq!(state.owner, SegmentOwner::Shard(output.shard));
-        assert_eq!(state.placement_class, PlacementClass::Spillover);
+        assert_eq!(state.placement_class, PlacementClass::ExactEpoch(50));
         assert_eq!(segment_state_path(store.config(), &state), output.path);
     }
 
@@ -3473,6 +3482,9 @@ async fn gc_publish_skips_copy_prepared_before_shard_drop() {
     let kept_key = BlobKey::new(b"keep-copy".to_vec()).unwrap();
     let rollover_key = BlobKey::new(b"roll-copy".to_vec()).unwrap();
 
+    for key in [&dropped_key, &kept_key, &rollover_key] {
+        store.set_blob_lifetime(key, 50).unwrap();
+    }
     store
         .store
         .put(dropped_shard.id, &dropped_key, b"payload-a")
@@ -3974,7 +3986,10 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
     let mut store = try_open_standalone_store(cfg, metrics).unwrap();
 
-    let lsn_a = store.put(&key_a, b"payload-a").unwrap();
+    let first_segment_published_lsn = store.set_blob_lifetime(&key_a, 50).unwrap();
+    store.set_blob_lifetime(&key_b, 50).unwrap();
+    store.set_blob_lifetime(&key_c, 50).unwrap();
+    store.put(&key_a, b"payload-a").unwrap();
     store.put(&key_b, b"payload-b").unwrap();
     store.put(&key_c, b"payload-c").unwrap();
     store.sync().unwrap();
@@ -4061,7 +4076,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
             .index()
             .get_segment_published_at_lsn(ref_b.segment_id)
             .unwrap(),
-        lsn_a
+        first_segment_published_lsn
     );
     assert_eq!(
         store
@@ -4092,7 +4107,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
             .unwrap()
             .unwrap()
             .placement_class,
-        PlacementClass::Spillover
+        PlacementClass::ExactEpoch(50)
     );
     assert_eq!(
         store
@@ -4173,7 +4188,10 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     );
     drop(snapshot);
 
-    let older_snapshot = store.store.live_snapshots.pin(lsn_a.saturating_sub(1));
+    let older_snapshot = store
+        .store
+        .live_snapshots
+        .pin(first_segment_published_lsn.saturating_sub(1));
     let prepared_delete = store.prepare_gc_plan(&planner).unwrap().unwrap();
     let copied_delete = store.copy_prepared_gc_plan(prepared_delete).unwrap();
     store.publish_prepared_gc_copy(copied_delete).unwrap();
@@ -4246,6 +4264,13 @@ async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
     wait_for_lsm_gc(&store, lsn_d);
+    let mut source_state = store
+        .index()
+        .get_segment_state(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    source_state.placement_class = PlacementClass::Spillover;
+    store.index().put_segment_state(&source_state).unwrap();
 
     let tombstone_lsn = store.tombstone(&key_a).unwrap();
     store.sync().unwrap();
@@ -4338,6 +4363,13 @@ async fn gc_publish_tombstoned_pending_copy_retires_destination_after_forwarding
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
     wait_for_lsm_gc(&store, lsn_c);
+    let mut source_state = store
+        .index()
+        .get_segment_state(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    source_state.placement_class = PlacementClass::Spillover;
+    store.index().put_segment_state(&source_state).unwrap();
 
     let ref_a = lsm_blob_ref(&store, &key_a);
     let ref_b = lsm_blob_ref(&store, &key_b);
@@ -4502,6 +4534,13 @@ async fn gc_publish_forwards_lagging_lifetime_then_retires_destination() {
     wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
     store.sync().unwrap();
     wait_for_lsm_gc(&store, lsn_c);
+    let mut source_state = store
+        .index()
+        .get_segment_state(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    source_state.placement_class = PlacementClass::Spillover;
+    store.index().put_segment_state(&source_state).unwrap();
 
     let ref_a = lsm_blob_ref(&store, &key_a);
     let ref_b = lsm_blob_ref(&store, &key_b);
