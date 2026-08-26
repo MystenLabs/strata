@@ -16,18 +16,26 @@ pub struct CompactionInputs {
     reservation: CompactionReservation,
 }
 
-/// Selects and reserves a key-complete set of files for full compaction.
+/// Selects and reserves one key-complete overlap component for full compaction.
 ///
-/// Selection closes transitively across both patch and base ranges. Every base row is therefore
-/// compacted with every live patch SST that might contain the same key. Returns `None` when another
-/// compaction already reserved any selected file.
+/// Selection starts from one patch and closes transitively across both patch and base ranges.
+/// Every base row is therefore compacted with every live patch SST that might contain the same
+/// key, without bridging disconnected components. Returns `None` when another compaction already
+/// reserved any selected file.
 pub fn select_compaction_inputs(
     manifest: &Manifest,
     tables: &Arc<TableStore>,
     partition: u32,
-    patches: &[TableMeta],
+    patch: &TableMeta,
 ) -> Result<Option<CompactionInputs>> {
-    select_inputs(manifest, tables, partition, patches, None, true)
+    select_inputs(
+        manifest,
+        tables,
+        partition,
+        std::slice::from_ref(patch),
+        None,
+        true,
+    )
 }
 
 /// Selects one base seed and the complete transitive set of files that can affect its keys.

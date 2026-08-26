@@ -561,7 +561,7 @@ impl LsmCompactor {
         } else if let Some(base) = stale_base {
             select_base_compaction_inputs(&compaction_manifest, &tables, partition, base)
         } else {
-            select_compaction_inputs(&compaction_manifest, &tables, partition, patches)
+            select_compaction_inputs(&compaction_manifest, &tables, partition, &patches[0])
         };
         let Some(inputs) = selected? else {
             return Ok(());
@@ -825,7 +825,7 @@ fn partition_needs_compaction(patches: &[TableMeta]) -> bool {
     patches.len() >= LSM_COMPACTION_PATCH_COUNT || patch_bytes >= LSM_COMPACTION_PATCH_BYTES
 }
 
-/// Rewrites the relocation LSM's base plus all patches into one fresh base table.
+/// Rewrites one overlap-connected relocation component into fresh base tables.
 ///
 /// The merge does two things per key identity: keep only the newest value (Replace — a record
 /// relocated twice keeps only its latest destination), and drop entries whose destination
@@ -870,8 +870,11 @@ fn compact_relocation_lsm_partition(
 ) -> Result<bool> {
     let manifest = relocations.lsm().manifest();
     let patches = &manifest.partitions[&partition].patches;
+    let Some(seed) = patches.first() else {
+        return Ok(false);
+    };
     let tables = relocations.lsm().table_store();
-    let Some(inputs) = select_compaction_inputs(&manifest, &tables, partition, patches)? else {
+    let Some(inputs) = select_compaction_inputs(&manifest, &tables, partition, seed)? else {
         return Ok(false);
     };
     let obsolete = inputs

@@ -54,7 +54,7 @@ fn streams_keys_and_patches_in_logical_order() {
     );
     let manifest = manifest(vec![base], vec![late.clone(), early, unrelated.clone()]);
     let files = Arc::new(TableStore::new(directory.path()));
-    let inputs = select_compaction_inputs(&manifest, &files, 0, &[late])
+    let inputs = select_compaction_inputs(&manifest, &files, 0, &late)
         .unwrap()
         .unwrap();
 
@@ -103,7 +103,7 @@ fn rejects_duplicate_patch_lsns_across_files() {
     let second = write_patch(directory.path(), "second.sst", 2, &[("a", 5, "second")]);
     let manifest = manifest(Vec::new(), vec![first.clone(), second]);
     let files = Arc::new(TableStore::new(directory.path()));
-    let inputs = select_compaction_inputs(&manifest, &files, 0, &[first])
+    let inputs = select_compaction_inputs(&manifest, &files, 0, &first)
         .unwrap()
         .unwrap();
 

@@ -38,7 +38,7 @@ fn writes_split_outputs_and_returns_the_publishable_edit() {
     let patch = write_patch(directory.path(), 2, &[("b", 2, "-2"), ("d", 3, "D")]);
     let manifest = manifest(base.clone(), patch.clone());
     let files = Arc::new(TableStore::new(directory.path()));
-    let inputs = select_compaction_inputs(&manifest, &files, 0, std::slice::from_ref(&patch))
+    let inputs = select_compaction_inputs(&manifest, &files, 0, &patch)
         .unwrap()
         .unwrap();
 
@@ -103,7 +103,7 @@ fn preserves_explicit_key_prefixes() {
     let patch = writer.finish().unwrap();
     let manifest = manifest(base, patch.clone());
     let files = Arc::new(TableStore::new(directory.path()));
-    let inputs = select_compaction_inputs(&manifest, &files, 0, &[patch])
+    let inputs = select_compaction_inputs(&manifest, &files, 0, &patch)
         .unwrap()
         .unwrap();
 

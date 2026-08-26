@@ -30,7 +30,7 @@ fn selects_the_overlap_closed_patch_set_and_relevant_base_files() {
 
     let directory = TempDir::new().unwrap();
     let files = Arc::new(TableStore::new(directory.path()));
-    let inputs = select_compaction_inputs(&manifest, &files, 0, std::slice::from_ref(&patch))
+    let inputs = select_compaction_inputs(&manifest, &files, 0, &patch)
         .unwrap()
         .unwrap();
 
@@ -43,14 +43,14 @@ fn selects_the_overlap_closed_patch_set_and_relevant_base_files() {
     assert!(files.is_pinned(&overlapping));
     assert!(!files.is_pinned(&separate));
     assert!(
-        select_compaction_inputs(&manifest, &files, 0, std::slice::from_ref(&patch))
+        select_compaction_inputs(&manifest, &files, 0, &patch)
             .unwrap()
             .is_none()
     );
 
     drop(inputs);
     assert!(
-        select_compaction_inputs(&manifest, &files, 0, &[patch])
+        select_compaction_inputs(&manifest, &files, 0, &patch)
             .unwrap()
             .is_some()
     );
@@ -86,7 +86,7 @@ fn full_selection_recloses_patches_after_the_base_range_expands() {
     assert!(!files.is_pinned(&extension));
     drop(patch_inputs);
 
-    let full_inputs = select_compaction_inputs(&manifest, &files, 0, std::slice::from_ref(&seed))
+    let full_inputs = select_compaction_inputs(&manifest, &files, 0, &seed)
         .unwrap()
         .unwrap();
     assert_eq!(full_inputs.base.as_slice(), std::slice::from_ref(&base));
@@ -100,6 +100,37 @@ fn full_selection_recloses_patches_after_the_base_range_expands() {
 }
 
 #[test]
+fn one_seed_does_not_bridge_a_disconnected_patch_across_an_unselected_base() {
+    let earlier_base = table(1, "earlier.sst", b"300000", b"449092", false);
+    let later_base = table(2, "later.sst", b"449102", b"997424", false);
+    let later_patch = table(3, "later-patch.sst", b"937068", b"938090", true);
+    let disconnected_patch = table(4, "disconnected.sst", b"1007655", b"1008677", true);
+    assert!(disconnected_patch.last_key < earlier_base.first_key);
+    let mut manifest =
+        Manifest::empty("base-v1", "patch-v1", std::num::NonZeroU32::new(1).unwrap());
+    manifest
+        .apply(&ManifestEdit {
+            remove: Vec::new(),
+            add_base: vec![earlier_base.clone(), later_base.clone()],
+            add_patches: vec![later_patch.clone(), disconnected_patch.clone()],
+            materialized_through: None,
+            wal_retained_from: None,
+        })
+        .unwrap();
+
+    let directory = TempDir::new().unwrap();
+    let files = Arc::new(TableStore::new(directory.path()));
+    let inputs = select_compaction_inputs(&manifest, &files, 0, &later_patch)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(inputs.base, [later_base]);
+    assert_eq!(inputs.patches, [later_patch]);
+    assert!(!files.is_pinned(&earlier_base));
+    assert!(!files.is_pinned(&disconnected_patch));
+}
+
+#[test]
 fn rejects_a_patch_that_is_not_live() {
     let manifest = Manifest::empty("base-v1", "patch-v1", std::num::NonZeroU32::new(1).unwrap());
     let directory = TempDir::new().unwrap();
@@ -108,7 +139,7 @@ fn rejects_a_patch_that_is_not_live() {
         &manifest,
         &files,
         0,
-        &[table(1, "stale.sst", b"a", b"z", true)],
+        &table(1, "stale.sst", b"a", b"z", true),
     )
     .err()
     .unwrap();

@@ -4,7 +4,7 @@ use strata_core::{BlobKey, RecordRef, SegmentGcSummaryDelta};
 use strata_index::StrataIndex;
 use strata_lsm::{
     GarbageEvent, GarbageLog, GarbageLogPosition, GarbageRecord, Manifest, ManifestEdit,
-    MergeOperator, Result, SegmentKey, StrataLsn, TableStore, TableWriter,
+    MergeOperator, Result, SegmentKey, StrataLsn, TableStore, TableTarget, TableWriter,
     select_compaction_inputs, write_compaction,
 };
 use tempfile::TempDir;
@@ -68,13 +68,11 @@ async fn compaction_garbage_records_are_synced_before_the_manifest_is_published(
     batch.write_with_sync(true).unwrap();
 
     let files = Arc::new(TableStore::new(&lsm_path));
-    let inputs = select_compaction_inputs(&manifest, &files, 0, &[patch])
+    let inputs = select_compaction_inputs(&manifest, &files, 0, &patch)
         .unwrap()
         .unwrap();
-    let (edit, records) = write_compaction(&inputs, &Replace, 1024 * 1024, || {
-        (3, "compacted.sst".to_owned())
-    })
-    .unwrap();
+    let (edit, records) =
+        write_compaction(&inputs, &Replace, 1024 * 1024, || Ok(TableTarget::base(3))).unwrap();
     assert_eq!(records, [garbage_record(b"key", 10, b"new")]);
 
     // A tiny soft limit makes the next frame roll, which lets recovery prove it was unpublished.
@@ -99,7 +97,7 @@ async fn compaction_garbage_records_are_synced_before_the_manifest_is_published(
     assert_eq!(reopened_manifest.generation, 2);
     assert_eq!(
         reopened_manifest.partitions[&0].base[0].relative_path,
-        "compacted.sst"
+        "base-00000000000000000003.sst"
     );
     assert!(reopened_manifest.partitions[&0].patches.is_empty());
 
