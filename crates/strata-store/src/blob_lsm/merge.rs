@@ -1,8 +1,11 @@
 //! The two LSM merge-operator entry points for Store blob state.
 
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use super::format::{BlobMutation, BlobMutationWithLSN, BlobState, invalid};
@@ -136,6 +139,28 @@ impl MergeOperator for BlobMergeWithRelocations {
         emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
         let relocations = self.relocations_for_key(key)?;
+        // Remember relocations whose old physical ref entered this merge. If that ref disappears,
+        // the destination was born dead and needs its own terminal event. An already-healed input
+        // is retired by the normal blob mutation below and must not be retired a second time.
+        let mut input_record_refs = BTreeMap::new();
+        if !relocations.is_empty() {
+            if let Some(base) = base {
+                let StoredValue::Inline(bytes) = decode_value(base)? else {
+                    return Err(invalid("materialized blob state cannot be segment-backed"));
+                };
+                for (shard, version) in BlobState::decode(bytes)?.versions {
+                    input_record_refs.insert((shard, version.lsn), version.record_ref);
+                }
+            }
+            for mutation in decode_patches(patches)? {
+                if let BlobMutation::Put {
+                    shard, record_ref, ..
+                } = mutation.mutation
+                {
+                    input_record_refs.insert((shard, mutation.lsn), record_ref);
+                }
+            }
+        }
         let Some(value) = BlobMerge.merge(key, base, patches, emit)? else {
             return Ok(None);
         };
@@ -171,7 +196,11 @@ impl MergeOperator for BlobMergeWithRelocations {
                         )?;
                     }
                 }
-            } else if relocation.publish_lsn <= self.snapshot.materialized_through_lsn {
+            } else if relocation.publish_lsn <= self.snapshot.materialized_through_lsn
+                && input_record_refs
+                    .get(&(relocation.shard, relocation.payload_lsn))
+                    .is_some_and(|record_ref| *record_ref != relocation.to)
+            {
                 // GC may conservatively publish a copy whose tombstone, overwrite, or expiry had
                 // not reached the garbage log yet. Once a complete blob compaction proves that the
                 // payload identity is absent, retire the physical destination created by GC.

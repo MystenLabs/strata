@@ -4484,7 +4484,7 @@ async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
 }
 
 #[tokio::test]
-async fn gc_publish_forwards_lagging_lifetime_after_compaction() {
+async fn gc_publish_forwards_lagging_lifetime_then_retires_destination() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -4563,6 +4563,16 @@ async fn gc_publish_forwards_lagging_lifetime_after_compaction() {
             && entry.lifecycle.logical_end_epoch == 50
     }));
     assert_eq!(lsm_blob_ref(&store, &key_b), destination);
+
+    let tombstone_lsn = store.tombstone(&key_b).unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, tombstone_lsn);
+    let destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(gc_ranges_contain(&destination_overlay.retired, destination));
+    assert!(destination_overlay.lifetimes.is_empty());
+    assert_eq!(destination_overlay.summary.live_bytes, 0);
+    assert_eq!(destination_overlay.summary.live_ref_count, 0);
+    assert_eq!(destination_overlay.summary.retired_bytes, destination.len);
 }
 #[tokio::test]
 async fn blob_lsm_retire_removes_lifetime_hint() {
