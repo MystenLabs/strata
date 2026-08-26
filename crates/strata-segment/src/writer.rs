@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use sha2::{Digest, Sha256};
 use strata_core::{BlobKey, EncodedRecordParts, PlacementClass, RecordRef, SegmentId, ShardKey};
 
 use crate::{Error, Result, SegmentIoObserver, error::IoResultExt};
@@ -27,6 +28,7 @@ pub struct SegmentWriter {
     max_size: u64,
     sealed: bool,
     io_observer: Option<Arc<dyn SegmentIoObserver>>,
+    sha256: Option<Sha256>,
 }
 
 impl SegmentWriter {
@@ -36,7 +38,7 @@ impl SegmentWriter {
         placement_class: PlacementClass,
         max_size: u64,
     ) -> Result<Self> {
-        Self::create_inner(path, segment_id, placement_class, max_size, None)
+        Self::create_inner(path, segment_id, placement_class, max_size, None, false)
     }
 
     pub fn create_with_io_observer(
@@ -52,6 +54,24 @@ impl SegmentWriter {
             placement_class,
             max_size,
             Some(io_observer),
+            false,
+        )
+    }
+
+    pub fn create_checksummed_with_io_observer(
+        path: impl AsRef<Path>,
+        segment_id: SegmentId,
+        placement_class: PlacementClass,
+        max_size: u64,
+        io_observer: Arc<dyn SegmentIoObserver>,
+    ) -> Result<Self> {
+        Self::create_inner(
+            path,
+            segment_id,
+            placement_class,
+            max_size,
+            Some(io_observer),
+            true,
         )
     }
 
@@ -61,6 +81,7 @@ impl SegmentWriter {
         placement_class: PlacementClass,
         max_size: u64,
         io_observer: Option<Arc<dyn SegmentIoObserver>>,
+        checksum_enabled: bool,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
@@ -79,6 +100,7 @@ impl SegmentWriter {
             max_size,
             sealed: false,
             io_observer,
+            sha256: checksum_enabled.then(Sha256::new),
         })
     }
 
@@ -131,6 +153,7 @@ impl SegmentWriter {
             max_size,
             sealed: false,
             io_observer,
+            sha256: None,
         })
     }
 
@@ -192,6 +215,11 @@ impl SegmentWriter {
                 source: write_error,
             });
         }
+        if let Some(sha256) = &mut self.sha256 {
+            sha256.update(&encoded_record.header);
+            sha256.update(encoded_record.payload);
+            sha256.update(encoded_record.key);
+        }
         self.write_offset = attempted_size;
         if let Some(observer) = &self.io_observer {
             observer.record_write(record_len);
@@ -237,6 +265,12 @@ impl SegmentWriter {
         Ok(self.write_offset)
     }
 
+    pub fn seal_with_sha256(&mut self) -> Result<(u64, [u8; 32])> {
+        let sealed_len = self.seal()?;
+        let sha256 = self.sha256.as_ref().ok_or(Error::ChecksumNotEnabled)?;
+        Ok((sealed_len, sha256.clone().finalize().into()))
+    }
+
     pub fn write_offset(&self) -> u64 {
         self.write_offset
     }
@@ -277,13 +311,25 @@ fn write_all_vectored(file: &mut File, mut bufs: &mut [IoSlice<'_>]) -> std::io:
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek, Write};
+    use std::{
+        io::{Seek, Write},
+        sync::Arc,
+    };
 
+    use sha2::{Digest, Sha256};
     use strata_core::{BlobKey, PlacementClass};
     use tempfile::tempdir;
 
     use super::SegmentWriter;
-    use crate::Error;
+    use crate::{Error, SegmentIoObserver};
+
+    #[derive(Debug)]
+    struct NoopIoObserver;
+
+    impl SegmentIoObserver for NoopIoObserver {
+        fn record_read(&self, _bytes: u64) {}
+        fn record_write(&self, _bytes: u64) {}
+    }
 
     #[test]
     fn rollback_failed_append_truncates_and_repositions_writer() {
@@ -316,5 +362,29 @@ mod tests {
             Err(Error::SegmentFull { .. })
         ));
         assert_eq!(writer.write_offset(), 0);
+    }
+
+    #[test]
+    fn checksummed_writer_returns_digest_without_rereading() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("000001.data");
+        let key = BlobKey::new(b"alpha".to_vec()).unwrap();
+        let mut writer = SegmentWriter::create_checksummed_with_io_observer(
+            &path,
+            1,
+            PlacementClass::Ingest,
+            1 << 20,
+            Arc::new(NoopIoObserver),
+        )
+        .unwrap();
+
+        writer.append(&key, 0, b"first").unwrap();
+        writer.append(&key, 1, b"second").unwrap();
+        let (sealed_len, actual) = writer.seal_with_sha256().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+
+        assert_eq!(sealed_len, bytes.len() as u64);
+        assert_eq!(actual, expected);
     }
 }

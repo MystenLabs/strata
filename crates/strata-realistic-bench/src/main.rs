@@ -34,11 +34,11 @@ use serde::{Deserialize, Serialize};
 use serde_with::{Bytes, serde_as};
 use strata_core::{BlobKey, Epoch, SegmentFileState, SegmentId};
 use strata_store::{
-    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
-    DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
-    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_SEGMENT_MAX_BYTES,
-    DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlanner, GcPlannerConfig, SealedSegmentIntegrityPolicy,
-    StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
+    DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
+    DEFAULT_GC_SYNC_IMPACT_THRESHOLD, DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT,
+    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, GcPlanner, GcPlannerConfig,
+    SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStore, StrataStoreConfig,
+    StrataStoreMetrics,
 };
 use typed_store::{
     DBMetrics, Map,
@@ -78,6 +78,7 @@ const CONTROLLER_UNHEALTHY_REASONS: &[&str] = &[
     "delete_errors",
 ];
 const DEFAULT_SPACE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+const STRATA_GC_IO_BYTES_PER_SEC: u64 = 1 << 30;
 const DEFAULT_DELETED_SAMPLE_CAPACITY: usize = 1_000_000;
 const DEFAULT_STARTING_EPOCH: Epoch = 1;
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -553,7 +554,7 @@ impl Config {
             gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
             gc_tuning_window_cycles: DEFAULT_GC_TUNING_WINDOW_CYCLES,
             gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
-            gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
+            gc_io_bytes_per_sec: STRATA_GC_IO_BYTES_PER_SEC,
             gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
             gc_planner_config: if self.relocation_profile_reads == 0 {
                 GcPlannerConfig::default()

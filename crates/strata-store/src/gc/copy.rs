@@ -26,9 +26,7 @@ use super::{
 use crate::{
     Error, GcIoLimiter, Result,
     layout::{retention_segment_path, segment_path, segment_state_path},
-    prune_empty_retention_dirs,
-    seal::sha256_file_prefix,
-    segment_garbage_log_path,
+    prune_empty_retention_dirs, segment_garbage_log_path,
     shard_gc::{remove_shard_retention_generation, shard_generation_is_obsolete},
     sync_parent_dir,
 };
@@ -781,7 +779,7 @@ impl<'a> GcStagingCopier<'a> {
     /// source position — so every attempt over the same inputs hands publication the same shape.
     fn finish(mut self) -> Result<(Vec<GcStagedOutputSegment>, Vec<GcStagedCopiedRecord>)> {
         for (_, output) in self.open_outputs {
-            self.outputs.push(output.finish(self.io_limiter)?);
+            self.outputs.push(output.finish()?);
         }
         self.outputs.sort_by_key(|output| output.staged_segment_id);
         self.copied_records
@@ -795,7 +793,6 @@ impl<'a> GcStagingCopier<'a> {
 struct OpenStagedOutput {
     /// Segment writer for the temporary staging file.
     writer: SegmentWriter,
-    io_observer: Arc<dyn SegmentIoObserver>,
     /// Logical shard and destination class this output accepts.
     destination: DestinationPlacement,
     /// Final placement class to record if this output is published.
@@ -805,13 +802,10 @@ struct OpenStagedOutput {
 }
 
 impl OpenStagedOutput {
-    /// Seals the temporary file and records the digest needed for final segment metadata.
-    fn finish(mut self, io_limiter: &GcIoLimiter) -> Result<GcStagedOutputSegment> {
-        let sealed_len = self.writer.seal()?;
+    /// Seals the temporary file and returns the digest accumulated while writing it.
+    fn finish(mut self) -> Result<GcStagedOutputSegment> {
+        let (sealed_len, sealed_sha256) = self.writer.seal_with_sha256()?;
         let path = self.writer.path().to_path_buf();
-        io_limiter.acquire(sealed_len);
-        let sealed_sha256 = sha256_file_prefix(&path, sealed_len)?;
-        self.io_observer.record_read(sealed_len);
         Ok(GcStagedOutputSegment {
             staged_segment_id: self.writer.segment_id(),
             shard: self.destination.shard,
@@ -834,16 +828,15 @@ fn create_staged_output(
 ) -> Result<OpenStagedOutput> {
     let placement_class = placement_class_for_destination(destination.class);
     let path = staging_dir.join(format!("{staged_segment_id:012}.data"));
-    let writer = SegmentWriter::create_with_io_observer(
+    let writer = SegmentWriter::create_checksummed_with_io_observer(
         &path,
         staged_segment_id,
         placement_class,
         segment_max_bytes,
-        Arc::clone(&io_observer),
+        io_observer,
     )?;
     Ok(OpenStagedOutput {
         writer,
-        io_observer,
         destination,
         placement_class,
         next_staged_segment_id: staged_segment_id.saturating_add(1),
@@ -883,7 +876,7 @@ fn append_gc_record_to_staged_output(
                 context.segment_max_bytes,
                 Arc::clone(&context.io_observer),
             )?;
-            let finished = std::mem::replace(output, replacement).finish(context.io_limiter)?;
+            let finished = std::mem::replace(output, replacement).finish()?;
             context.finished_outputs.push(finished);
             *context.next_staged_segment_id = output.next_staged_segment_id;
             let outcome = output.writer.append_for_shard(

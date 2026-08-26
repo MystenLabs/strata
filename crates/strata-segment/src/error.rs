@@ -62,6 +62,9 @@ pub enum Error {
 
     #[error("segment would exceed max size: max={max_size}, attempted={attempted_size}")]
     SegmentFull { max_size: u64, attempted_size: u64 },
+
+    #[error("segment writer was not created with SHA-256 enabled")]
+    ChecksumNotEnabled,
 }
 
 pub(crate) trait IoResultExt<T> {

@@ -8065,6 +8065,7 @@ name = "strata-segment"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sha2 0.10.9",
  "strata-core",
  "tempfile",
  "thiserror 2.0.18",
