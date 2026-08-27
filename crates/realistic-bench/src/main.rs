@@ -68,6 +68,7 @@ const DEFAULT_CONTROL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_CONTROLLER_DEBOUNCE_WINDOWS: usize = 3;
 const DEFAULT_WRITER_INCREASE_PERCENT: u64 = 25;
 const DEFAULT_WRITER_DECREASE_PERCENT: u64 = 25;
+const NATIVE_EXPIRATION_CLEANUP_BATCH_SIZE: usize = 256;
 const CONTROLLER_UNHEALTHY_REASONS: &[&str] = &[
     "low_read_rate",
     "high_read_latency",
@@ -1460,13 +1461,18 @@ impl Model {
 
     fn pop_first_live(&mut self) -> Arc<KeyRecord> {
         let record = self.live.pop_first().expect("live key must remain present");
+        self.remove_live_sample(&record);
+        record
+    }
+
+    fn remove_live_sample(&mut self, record: &Arc<KeyRecord>) {
         let sample_index = record.sample_index.load(Ordering::Relaxed);
         let sampled = self.live_sample.swap_remove(sample_index);
         debug_assert!(Arc::ptr_eq(&record, &sampled));
+        record.sample_index.store(usize::MAX, Ordering::Relaxed);
         if let Some(moved) = self.live_sample.get(sample_index) {
             moved.sample_index.store(sample_index, Ordering::Relaxed);
         }
-        record
     }
 
     fn claim_due(
@@ -1489,30 +1495,43 @@ impl Model {
         Some(record)
     }
 
-    fn claim_native_expirations(
-        &mut self,
-        current_epoch: Epoch,
-        metrics: &HarnessMetrics,
-    ) -> Vec<Arc<KeyRecord>> {
-        let mut records = Vec::new();
-        while self
+    /// Detaches the due prefix from the ordered live set without rewriting the sampling vector.
+    ///
+    /// Epoch writers are fenced while this runs, so no new record at or below `current_epoch` can
+    /// appear. The returned records remain in `live_sample` temporarily and are marked deleting by
+    /// the caller before the store epoch advances. Readers already holding one therefore classify
+    /// a post-advance miss as a deletion race. Removing the sample entries can then be chunked
+    /// outside the epoch fence instead of pausing every writer for the whole cleanup.
+    fn detach_native_expirations(&mut self, current_epoch: Epoch) -> BTreeSet<Arc<KeyRecord>> {
+        let first_retained = self
             .live
-            .first()
-            .and_then(|record| record.logical_end_epoch)
-            .is_some_and(|end_epoch| end_epoch <= current_epoch)
-        {
-            let record = self.pop_first_live();
-            record.mark_due(metrics);
-            record.state.store(KEY_DELETING, Ordering::Release);
-            records.push(record);
-        }
-        records
+            .iter()
+            .find(|record| {
+                !record
+                    .logical_end_epoch
+                    .is_some_and(|end_epoch| end_epoch <= current_epoch)
+            })
+            .cloned();
+        let expired = match first_retained {
+            Some(first_retained) => {
+                let retained = self.live.split_off(&first_retained);
+                std::mem::replace(&mut self.live, retained)
+            }
+            None => std::mem::take(&mut self.live),
+        };
+        debug_assert!(expired.iter().all(|record| {
+            record
+                .logical_end_epoch
+                .is_some_and(|end_epoch| end_epoch <= current_epoch)
+        }));
+        expired
     }
 
-    fn finish_native_expirations(&mut self, records: Vec<Arc<KeyRecord>>) -> usize {
+    fn finish_native_expirations(&mut self, records: &[Arc<KeyRecord>]) -> usize {
         for record in records {
+            self.remove_live_sample(record);
             record.state.store(KEY_DELETED, Ordering::Release);
-            self.deleted.push_back(record);
+            self.deleted.push_back(Arc::clone(record));
         }
         while self.deleted.len() > self.deleted_sample_capacity {
             self.deleted.pop_front();
@@ -2095,13 +2114,16 @@ fn run_epoch_advancer(context: Arc<WorkloadContext>) {
             break;
         }
 
-        let mut clock = context
-            .epoch_clock
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while Instant::now() >= clock.next_transition_at
-            && !context.workload_stop.load(Ordering::Acquire)
-        {
+        let transition = {
+            let mut clock = context
+                .epoch_clock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if Instant::now() < clock.next_transition_at
+                || context.workload_stop.load(Ordering::Acquire)
+            {
+                continue;
+            }
             let scheduled_at = clock.next_transition_at;
             let Some(next_epoch) = clock.current_epoch.checked_add(1) else {
                 context
@@ -2110,18 +2132,22 @@ fn run_epoch_advancer(context: Arc<WorkloadContext>) {
                 return;
             };
 
-            // Move native-expiring keys out of the live sample before Strata changes visibility.
-            // A reader that already sampled one sees KEY_DELETING and treats the miss as an epoch
-            // race. BlobDB leaves these records live until its manual deleters acknowledge them.
+            // Fence native-expiring keys before Strata changes visibility. A reader that samples
+            // one before the chunked sample cleanup sees KEY_DELETING and treats the miss as an
+            // epoch race. BlobDB leaves these records live until its manual deleters acknowledge
+            // them.
             let native_expirations = if context.config.engine == EngineKind::Strata {
                 context
                     .model
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .claim_native_expirations(next_epoch, &context.metrics)
+                    .detach_native_expirations(next_epoch)
             } else {
-                Vec::new()
+                BTreeSet::new()
             };
+            for record in &native_expirations {
+                record.state.store(KEY_DELETING, Ordering::Release);
+            }
 
             context
                 .metrics
@@ -2148,35 +2174,45 @@ fn run_epoch_advancer(context: Arc<WorkloadContext>) {
             clock.next_transition_at = scheduled_at
                 .checked_add(context.config.epoch_duration)
                 .unwrap_or_else(Instant::now);
+            (scheduled_at, native_expirations)
+        };
 
-            let expired = native_expirations.len() as u64;
-            if expired > 0 {
-                let deleted_sample_keys = context
+        let (scheduled_at, native_expirations) = transition;
+        let expired = native_expirations.len() as u64;
+        if expired > 0 {
+            let native_expirations = native_expirations.into_iter().collect::<Vec<_>>();
+            for record in &native_expirations {
+                record.mark_due(&context.metrics);
+            }
+            let mut deleted_sample_keys = 0;
+            for records in native_expirations.chunks(NATIVE_EXPIRATION_CLEANUP_BATCH_SIZE) {
+                deleted_sample_keys = context
                     .model
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .finish_native_expirations(native_expirations);
-                let lag = Instant::now().saturating_duration_since(scheduled_at);
-                context.metrics.native_expirations.inc_by(expired);
-                context
-                    .metrics
-                    .retired_payload_bytes
-                    .inc_by(expired.saturating_mul(context.config.payload_size as u64));
-                context.metrics.live_keys.sub(saturating_i64(expired));
-                context.metrics.logical_live_bytes.sub(saturating_i64(
-                    expired.saturating_mul(context.config.payload_size as u64),
-                ));
-                context
-                    .metrics
-                    .deleted_sample_keys
-                    .set(saturating_i64(deleted_sample_keys as u64));
-                context.metrics.delete_lag.observe(lag.as_secs_f64());
-                context.metrics.delete_lag_latency.record(lag);
-                if lag <= context.config.delete_lag_slo {
-                    context.metrics.delete_timely.inc_by(expired);
-                } else {
-                    context.metrics.delete_late.inc_by(expired);
-                }
+                    .finish_native_expirations(records);
+                thread::yield_now();
+            }
+            let lag = Instant::now().saturating_duration_since(scheduled_at);
+            context.metrics.native_expirations.inc_by(expired);
+            context
+                .metrics
+                .retired_payload_bytes
+                .inc_by(expired.saturating_mul(context.config.payload_size as u64));
+            context.metrics.live_keys.sub(saturating_i64(expired));
+            context.metrics.logical_live_bytes.sub(saturating_i64(
+                expired.saturating_mul(context.config.payload_size as u64),
+            ));
+            context
+                .metrics
+                .deleted_sample_keys
+                .set(saturating_i64(deleted_sample_keys as u64));
+            context.metrics.delete_lag.observe(lag.as_secs_f64());
+            context.metrics.delete_lag_latency.record(lag);
+            if lag <= context.config.delete_lag_slo {
+                context.metrics.delete_timely.inc_by(expired);
+            } else {
+                context.metrics.delete_late.inc_by(expired);
             }
         }
     }
@@ -4292,11 +4328,25 @@ mod tests {
             )));
         }
 
-        let expired = model.claim_native_expirations(2, &metrics);
+        let expired = model.detach_native_expirations(2);
+        for record in &expired {
+            record.mark_due(&metrics);
+            record.state.store(KEY_DELETING, Ordering::Release);
+        }
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].state.load(Ordering::Acquire), KEY_DELETING);
-        assert_eq!(model.finish_native_expirations(expired), 1);
+        assert_eq!(
+            expired
+                .first()
+                .expect("one record should expire")
+                .state
+                .load(Ordering::Acquire),
+            KEY_DELETING
+        );
+        let expired = expired.into_iter().collect::<Vec<_>>();
+        assert_eq!(model.live_sample.len(), 2);
+        assert_eq!(model.finish_native_expirations(&expired), 1);
         assert_eq!(model.live.len(), 1);
+        assert_eq!(model.live_sample.len(), 1);
         assert_eq!(model.deleted.len(), 1);
         assert_eq!(metrics.delete_due.get(), 1);
     }
