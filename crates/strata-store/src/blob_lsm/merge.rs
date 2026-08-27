@@ -53,7 +53,7 @@ impl MergeOperator for BlobMerge {
         patches: &[(StrataLsn, &[u8])],
         emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
-        partial_merge_blob(key, patches, None, emit)
+        partial_merge_blob(key, patches, None, &[], emit)
     }
 }
 
@@ -61,10 +61,11 @@ fn partial_merge_blob(
     key: &[u8],
     patches: &[(StrataLsn, &[u8])],
     snapshot: Option<&BlobCompactionSnapshot>,
+    relocations: &[RelocationEntry],
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<Option<Vec<u8>>> {
     let decoded = decode_patches(patches)?;
-    let mutations = reduce_patch_mutations(key, decoded.clone(), snapshot, emit)?;
+    let mutations = reduce_patch_mutations(key, decoded.clone(), snapshot, relocations, emit)?;
     if patches.len() < 2 && mutations == decoded {
         return Ok(None);
     }
@@ -229,7 +230,8 @@ impl MergeOperator for BlobMergeWithRelocations {
         patches: &[(StrataLsn, &[u8])],
         emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
-        partial_merge_blob(key, patches, Some(&self.snapshot), emit)
+        let relocations = self.relocations_for_key(key)?;
+        partial_merge_blob(key, patches, Some(&self.snapshot), &relocations, emit)
     }
 }
 

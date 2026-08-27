@@ -2,15 +2,17 @@
 
 use std::collections::BTreeMap;
 
-use strata_core::{BlobLifecycle, GarbageEvent};
+use strata_core::{BlobKey, BlobLifecycle, GarbageEvent};
 use strata_lsm::{MergeOperator, StoredValue, decode_value, encode_inline_value};
 
 use crate::blob_lsm::format::BlobMutationWithLSN;
 use crate::blob_lsm::merge::decode_patches;
+use crate::blob_lsm::reduce::reduce_patch_mutations;
 use crate::blob_lsm::{
     BlobCompactionSnapshot, BlobLifetime, BlobMerge, BlobMergeWithRelocations, BlobMutation,
     BlobState, BlobVersion,
 };
+use crate::relocation::RelocationEntry;
 
 use super::{
     aggregate_garbage_deltas, assert_functionally_equivalent_garbage, inline_patch, merge,
@@ -160,6 +162,68 @@ fn partial_merge_publishes_patch_local_lifetime_for_surviving_put() {
     from_batch_garbage.extend(partial_garbage);
     assert_eq!(from_batch_state, direct.0);
     assert_functionally_equivalent_garbage(&from_batch_garbage, &direct.1);
+}
+
+#[test]
+fn partial_merge_expiry_targets_relocated_destination() {
+    let shard = shard(1, 1);
+    let source = record(2, 20);
+    let destination = record(9, 90);
+    let patches = [
+        (
+            1,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 10,
+                current_epoch: 5,
+            }),
+        ),
+        (2, put_patch(shard, 5, source)),
+    ];
+    let borrowed = patches
+        .iter()
+        .map(|(lsn, value)| (*lsn, value.as_slice()))
+        .collect::<Vec<_>>();
+    let mutations = decode_patches(&borrowed).unwrap();
+    let relocation = RelocationEntry {
+        key: BlobKey::new(b"blob".to_vec()).unwrap(),
+        shard,
+        payload_lsn: 2,
+        publish_lsn: 6,
+        to: destination,
+    };
+    let snapshot = BlobCompactionSnapshot {
+        materialized_through_lsn: 5,
+        emit_garbage_from_lsn: 0,
+        epoch_changes: vec![(0, 5), (5, 10)],
+        ..BlobCompactionSnapshot::default()
+    };
+    let mut garbage = Vec::new();
+
+    let reduced = reduce_patch_mutations(
+        b"blob",
+        mutations,
+        Some(&snapshot),
+        &[relocation],
+        &mut |record| {
+            garbage.push(record);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(reduced.len(), 1);
+    assert!(matches!(
+        reduced[0].mutation,
+        BlobMutation::SetLifetime { .. }
+    ));
+    assert_eq!(garbage.len(), 1);
+    assert_eq!(garbage[0].lsn, 6);
+    assert_eq!(
+        garbage[0].event,
+        GarbageEvent::Expired {
+            record: destination
+        }
+    );
 }
 
 #[test]

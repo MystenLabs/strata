@@ -581,31 +581,31 @@ impl LsmCompactor {
             epoch_changes,
             ..BlobCompactionSnapshot::default()
         };
+        let relocation_max_lsn = self
+            .relocations
+            .upgrade()
+            .map(|relocations| relocations.lsm().last_lsn())
+            .transpose()?
+            .flatten()
+            .unwrap_or_default();
+        let relocation_scan = match relocation_max_lsn {
+            max_lsn if max_lsn != 0 => self
+                .relocations
+                .upgrade()
+                .map(|relocations| {
+                    relocations.scan(partition, &inputs.first_key, &inputs.last_key, max_lsn)
+                })
+                .transpose()?,
+            _ => None,
+        };
         let (edit, garbage, healed_references) = if partial {
-            let merge = BlobMergeWithRelocations::new(None, epoch_snapshot);
+            let merge = BlobMergeWithRelocations::new(relocation_scan, epoch_snapshot);
             let (edit, garbage) =
                 write_patch_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
                     lsm.allocate_patch_target()
                 })?;
             (edit, garbage, 0)
         } else {
-            let relocation_max_lsn = self
-                .relocations
-                .upgrade()
-                .map(|relocations| relocations.lsm().last_lsn())
-                .transpose()?
-                .flatten()
-                .unwrap_or_default();
-            let relocation_scan = match relocation_max_lsn {
-                max_lsn if max_lsn != 0 => self
-                    .relocations
-                    .upgrade()
-                    .map(|relocations| {
-                        relocations.scan(partition, &inputs.first_key, &inputs.last_key, max_lsn)
-                    })
-                    .transpose()?,
-                _ => None,
-            };
             let snapshot = BlobCompactionSnapshot {
                 shard_infos: self.index.iter_shards()?.into_iter().collect(),
                 shard_drop_lsns: self

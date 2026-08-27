@@ -8,6 +8,7 @@ use strata_lsm::{GarbageRecord, Result, StrataLsn};
 use super::format::{BlobMutation, BlobMutationWithLSN, BlobVersion};
 use super::garbage::{emit_lifetime_change, terminal_garbage_record};
 use super::snapshot::BlobCompactionSnapshot;
+use crate::relocation::RelocationEntry;
 
 #[derive(Debug, Clone, Copy)]
 struct PatchLifecycleHint {
@@ -153,6 +154,7 @@ pub(crate) fn reduce_patch_mutations(
     key: &[u8],
     mutations: Vec<BlobMutationWithLSN>,
     snapshot: Option<&BlobCompactionSnapshot>,
+    relocations: &[RelocationEntry],
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<Vec<BlobMutationWithLSN>> {
     let mut buckets = BTreeMap::<ShardKey, PatchBucket>::new();
@@ -165,7 +167,15 @@ pub(crate) fn reduce_patch_mutations(
                 epoch,
                 emit_garbage,
             } => {
-                change_patch_epoch(key, lsn, epoch, emit_garbage, &mut buckets, emit)?;
+                change_patch_epoch(
+                    key,
+                    lsn,
+                    epoch,
+                    emit_garbage,
+                    &mut buckets,
+                    relocations,
+                    emit,
+                )?;
                 if current_lifetime.is_some_and(|hint| hint.lifecycle.logical_end_epoch <= epoch) {
                     // Future mutations start a new bucket generation and do not inherit an expired
                     // lifetime. The SetLifetime remains in the output as a base barrier.
@@ -201,6 +211,7 @@ pub(crate) fn reduce_patch_mutations(
                     },
                     lsn,
                     &mut buckets,
+                    relocations,
                     emit,
                 )?;
             }
@@ -238,6 +249,7 @@ pub(crate) fn reduce_patch_mutations(
                     },
                     lsn,
                     &mut buckets,
+                    relocations,
                     emit,
                 )?;
             }
@@ -250,14 +262,16 @@ pub(crate) fn reduce_patch_mutations(
             keep[index] = true;
         }
     }
-    for bucket in buckets.values() {
+    for (&shard, bucket) in &buckets {
         keep[bucket.mutation_index] = true;
         if let (Some(version), Some(hint)) = (bucket.put, bucket.lifecycle_hint) {
             // The hint LSN deliberately precedes the Put. Both mutations are durable before this
             // partial compaction can publish, while the distinct position lets a later full merge
             // restate or correct an extension count at the Put LSN without creating a conflicting
             // garbage-log event.
-            emit_lifetime_change(key, hint.lsn, version, None, Some(hint.lifecycle), emit)?;
+            let (version, event_lsn) =
+                resolve_event_version(key, shard, version, hint.lsn, relocations);
+            emit_lifetime_change(key, event_lsn, version, None, Some(hint.lifecycle), emit)?;
         }
     }
     Ok(mutations
@@ -273,14 +287,16 @@ fn replace_patch_bucket(
     next: PatchBucket,
     lsn: StrataLsn,
     buckets: &mut BTreeMap<ShardKey, PatchBucket>,
+    relocations: &[RelocationEntry],
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<()> {
     if let Some(previous) = buckets.insert(shard, next)
         && let Some(version) = previous.put
     {
+        let (version, event_lsn) = resolve_event_version(key, shard, version, lsn, relocations);
         emit(terminal_garbage_record(
             key,
-            lsn,
+            event_lsn,
             version.record_ref,
             None,
             GarbageEvent::Retired {
@@ -297,6 +313,7 @@ fn change_patch_epoch(
     epoch: Epoch,
     emit_garbage: bool,
     buckets: &mut BTreeMap<ShardKey, PatchBucket>,
+    relocations: &[RelocationEntry],
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<()> {
     let expired_shards = buckets
@@ -314,9 +331,11 @@ fn change_patch_epoch(
             .remove(&shard)
             .expect("expired shard was collected from its bucket");
         if emit_garbage && let Some(version) = bucket.put {
+            let (version, event_lsn) =
+                resolve_event_version(key, shard, version, transition_lsn, relocations);
             emit(terminal_garbage_record(
                 key,
-                transition_lsn,
+                event_lsn,
                 version.record_ref,
                 None,
                 GarbageEvent::Expired {
@@ -326,4 +345,24 @@ fn change_patch_epoch(
         }
     }
     Ok(())
+}
+
+fn resolve_event_version(
+    key: &[u8],
+    shard: ShardKey,
+    mut version: BlobVersion,
+    mut event_lsn: StrataLsn,
+    relocations: &[RelocationEntry],
+) -> (BlobVersion, StrataLsn) {
+    // Partial reduction may remove the last main-LSM evidence for this payload. Redirect its
+    // physical event before that happens so a relocated destination cannot remain live forever.
+    if let Some(relocation) = relocations.iter().find(|relocation| {
+        relocation.key.as_bytes() == key
+            && relocation.shard == shard
+            && relocation.payload_lsn == version.lsn
+    }) {
+        version.record_ref = relocation.to;
+        event_lsn = event_lsn.max(relocation.publish_lsn);
+    }
+    (version, event_lsn)
 }
