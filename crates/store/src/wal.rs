@@ -1,0 +1,1602 @@
+//! Store-owned rolling write-ahead log.
+//!
+//! This is the store's own operation log — not RocksDB's internal WAL. Every foreground
+//! operation (put, tombstone, lifetime, epoch change, shard drop) is appended here as one
+//! encoded StoreWalMutation at its LSN, in the fixed publication order the commit path
+//! enforces: segment bytes first, then this WAL, then the LSM memtable, then the RocksDB
+//! batch. At open, replaying the retained prefix is how both keyed LSM projections rebuild
+//! their memtables; after a crash, this log is the store's evidence of what happened since the
+//! last durability publish.
+//!
+//! The trust model is the same family as the garbage log — the WAL never believes its own file
+//! lengths, only the store checkpoint: a (file, offset) pair written atomically with
+//! PublishedLsn by a synced durability publish. But there is one deep difference, and it is why
+//! recovery here is an order of magnitude more involved: bytes past the checkpoint are *not*
+//! automatically garbage. The writer appends and commits in RocksDB before anything is fsynced,
+//! so a crash can leave the WAL tail holding complete frames for LSNs that RocksDB committed
+//! but never published. Store recovery picks the true final LSN, and this module either
+//! *promotes* a complete tail up to exactly that LSN — fsyncing it first, because nothing ever
+//! proved those bytes durable — or reports the tail unprovable so recovery rolls the store back
+//! instead. Promote or roll back, never guess: that split is the whole design.
+//!
+//! Durability is asynchronous by construction. `append` writes into the page cache, tracks
+//! pending bytes for the pressure trigger, and returns; `sync_data` captures the exact current
+//! position plus a task for the background file-sync worker, rolling oversized files at that
+//! same captured boundary. Rolled files are reclaimed once *both* LSM projections have
+//! materialized their contents into durable SSTs — the WAL prefix a projection might still
+//! replay is never deleted.
+//!
+//! Physical format, shared by every `wal-<id>.log` in the numbered chain: a 12-byte file header
+//! (magic `STRWAL01`, version), then frames. A frame is a 12-byte prefix (u64 payload length,
+//! u32 entry count), per entry a 12-byte header (u64 LSN, u32 payload length) followed by the
+//! payload, and a trailing 32-byte SHA-256 over all of it. One appended batch is one frame —
+//! never split across files — LSNs increase strictly across the entire log, and every durable
+//! position names an exact frame boundary.
+
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+
+use sha2::{Digest, Sha256};
+
+use core_types::{StrataLsn, WalPosition};
+
+use crate::{Error, Result, file_sync::FileSyncSender, file_sync::FileSyncTask};
+
+const MAGIC: &[u8; 8] = b"STRWAL01";
+const VERSION: u32 = 2;
+const HEADER_LEN: u64 = 12;
+const FRAME_PREFIX_LEN: u64 = 12;
+const FRAME_CHECKSUM_LEN: u64 = 32;
+const FRAME_OVERHEAD: u64 = FRAME_PREFIX_LEN + FRAME_CHECKSUM_LEN;
+const ENTRY_HEADER_LEN: u64 = 12;
+const FILE_PREFIX: &str = "wal-";
+const FILE_SUFFIX: &str = ".log";
+
+/// One caller-encoded operation persisted in the WAL.
+///
+/// The payload is an encoded StoreWalMutation; this layer treats it as opaque bytes and cares
+/// only about the LSN, which must extend the log's strict order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalEntry {
+    pub lsn: StrataLsn,
+    pub payload: Vec<u8>,
+}
+
+/// Rolling WAL writer.
+///
+/// `committed` must come from the store checkpoint in RocksDB. Opening validates that prefix,
+/// truncates later bytes, and removes later WAL files.
+///
+/// The fields worth knowing: `last_lsn` is the strict-ordering gate every append must extend
+/// (learned by scanning at open, maintained in memory after); `pending_bytes` counts appended
+/// bytes not yet captured by a durability publish — the WAL half of the pressure that triggers
+/// the next one; `file_sync_tx` is the shared background sync-worker queue, so fsyncs never run
+/// on the writer thread.
+#[derive(Debug)]
+pub struct Wal {
+    dir: PathBuf,
+    max_file_bytes: u64,
+    log_id: u64,
+    offset: u64,
+    file: File,
+    last_lsn: Option<StrataLsn>,
+    file_sync_tx: FileSyncSender,
+    pending_bytes: u64,
+}
+
+impl Wal {
+    /// Validates that recovery can reopen the WAL at `last_lsn` without truncating any files.
+    ///
+    /// Store-level recovery uses this preflight to distinguish a complete buffered tail, which
+    /// may be promoted, from an incomplete unpublished tail, which must be rolled back before the
+    /// WAL is opened and truncated.
+    ///
+    /// It is deliberately a read-only twin of `recover`: the same validation gates, the same
+    /// recover_position walk, but no file is created, truncated, or deleted (only the directory
+    /// is ensured). That split gives store recovery a "look, decide, then touch" protocol — the
+    /// verdict on whether LSNs must be rolled back is reached *before* anything mutates, so a
+    /// WAL about to be judged incomplete is never modified by the inspection that judges it.
+    pub fn validate_recovery_target(
+        dir: impl AsRef<Path>,
+        checkpoint: WalPosition,
+        published_lsn: Option<StrataLsn>,
+        materialized_through: Option<StrataLsn>,
+        retained_from: u64,
+        last_lsn: Option<StrataLsn>,
+    ) -> Result<()> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir).map_err(|source| io_error(dir, source))?;
+        if retained_from == 0 {
+            return Err(Error::InvalidWal(
+                "first retained WAL file must be non-zero".to_owned(),
+            ));
+        }
+        if retained_from > 1 && materialized_through.is_none() {
+            return Err(Error::InvalidWal(
+                "a reclaimed WAL prefix needs a materialized frontier".to_owned(),
+            ));
+        }
+        if published_lsn.is_some_and(|published| last_lsn.is_none_or(|last| published > last)) {
+            return Err(Error::InvalidWal(format!(
+                "published lsn {published_lsn:?} follows recovered store lsn {last_lsn:?}"
+            )));
+        }
+        if materialized_through
+            .is_some_and(|materialized| last_lsn.is_none_or(|last| materialized > last))
+        {
+            return Err(Error::InvalidWal(format!(
+                "materialized WAL lsn {materialized_through:?} follows recovered store lsn {last_lsn:?}"
+            )));
+        }
+        validate_reclaimed_checkpoint_covered(
+            checkpoint,
+            published_lsn,
+            materialized_through,
+            retained_from,
+        )?;
+        let ids = log_ids(dir)?;
+        if !ids.is_empty() && !ids.contains(&retained_from) {
+            return Err(Error::InvalidWal(format!(
+                "first retained WAL file {retained_from} does not exist"
+            )));
+        }
+        if checkpoint == WalPosition::default()
+            && published_lsn.is_none()
+            && last_lsn.is_some()
+            && ids.is_empty()
+        {
+            if materialized_through
+                .zip(last_lsn)
+                .is_some_and(|(materialized, last)| materialized >= last)
+            {
+                // Legacy state may predate the operation WAL only when immutable tables cover the
+                // requested store frontier.
+                return Ok(());
+            }
+            return Err(Error::InvalidWal(format!(
+                "WAL is missing before recovered store lsn {last_lsn:?}"
+            )));
+        }
+        recover_position(
+            dir,
+            checkpoint,
+            published_lsn,
+            materialized_through,
+            retained_from,
+            last_lsn,
+        )
+        .map(|_| ())
+    }
+
+    /// Reopens the WAL at `last_lsn`, preserving complete frames after the durable checkpoint.
+    ///
+    /// The checkpoint prefix is validated strictly. Recovery only promotes a tail when it reaches
+    /// the exact requested lsn at a frame boundary.
+    ///
+    /// # Arguments
+    ///
+    /// - `dir`: directory containing `wal-<log_id>.log` files.
+    /// - `max_file_bytes`: soft rollover size for subsequent appends; one complete batch may exceed
+    ///   it.
+    /// - `checkpoint`: exact WAL file and byte offset covered by the RocksDB store checkpoint.
+    /// - `published_lsn`: canonical store `PublishedLsn` atomically associated with
+    ///   `checkpoint`, or `None` for an empty WAL. The checkpoint has no separate LSN frontier.
+    /// - `materialized_through`: store-wide replay-safe LSN. This is
+    ///   `min(blob_lsm.materialized_through, relocation_lsm.materialized_through)`, not either
+    ///   projection's frontier by itself. For example, blob=100 and relocation=80 means 80.
+    /// - `retained_from`: first WAL file ID that must exist. Files with smaller IDs were
+    ///   intentionally reclaimed only after `materialized_through` made them unnecessary.
+    /// - `last_lsn`: final globally committed LSN selected by store recovery, normally
+    ///   `next_lsn - 1`. Complete frames after `checkpoint` are preserved only through this LSN.
+    /// - `file_sync_tx`: store-owned worker queue used by the returned WAL for later syncs.
+    ///
+    /// The narrative around that argument list, in code order. Validation first: `retained_from`
+    /// must be sane, neither frontier may sit ahead of the chosen `last_lsn`, a checkpoint whose
+    /// file was reclaimed is acceptable only when the materialized frontier covers PublishedLsn,
+    /// and the first retained file must actually exist. Then reclamation is *finished*: files
+    /// below `retained_from` were declared dead by a synced publish before the crash, and a
+    /// crash between that publish and the unlink leaves them on disk — recovery deletes them
+    /// now, the same publish-first/delete-second retry shape GC uses for its files. The legacy
+    /// escape hatch comes next: a store migrated from the shared-WAL era may have committed LSNs
+    /// but no WAL files at all, tolerated only when immutable tables cover the whole frontier —
+    /// a fresh file is created and `last_lsn` seeded so ordering resumes correctly. Otherwise
+    /// recover_position walks from the checkpoint toward `last_lsn`, and if it promoted anything
+    /// past the checkpoint, those files are fsynced (sync_logs_through) before the WAL opens:
+    /// promotion turns never-proven bytes into the committed prefix, so they must actually be
+    /// durable before the store builds on them. Finally `open` re-runs the strict prefix
+    /// validation at the recovered position and truncates everything beyond it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover(
+        dir: impl AsRef<Path>,
+        max_file_bytes: u64,
+        // Wal and segment position corresponding to the latest committed LSN.
+        checkpoint: WalPosition,
+        committed_lsn: Option<StrataLsn>,
+        materialized_through: Option<StrataLsn>,
+        retained_from: u64,
+        last_lsn: Option<StrataLsn>,
+        file_sync_tx: FileSyncSender,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir).map_err(|source| io_error(dir, source))?;
+        if retained_from == 0 {
+            return Err(Error::InvalidWal(
+                "first retained WAL file must be non-zero".to_owned(),
+            ));
+        }
+        if retained_from > 1 && materialized_through.is_none() {
+            return Err(Error::InvalidWal(
+                "a reclaimed WAL prefix needs a materialized frontier".to_owned(),
+            ));
+        }
+        if committed_lsn.is_some_and(|committed| last_lsn.is_none_or(|last| committed > last)) {
+            return Err(Error::InvalidWal(format!(
+                "published lsn {committed_lsn:?} follows recovered store lsn {last_lsn:?}"
+            )));
+        }
+        if materialized_through
+            .is_some_and(|materialized| last_lsn.is_none_or(|last| materialized > last))
+        {
+            return Err(Error::InvalidWal(format!(
+                "materialized WAL lsn {materialized_through:?} follows recovered store lsn {last_lsn:?}"
+            )));
+        }
+        validate_reclaimed_checkpoint_covered(
+            checkpoint,
+            committed_lsn,
+            materialized_through,
+            retained_from,
+        )?;
+        let ids = log_ids(dir)?;
+        if !ids.is_empty() && !ids.contains(&retained_from) {
+            return Err(Error::InvalidWal(format!(
+                "first retained WAL file {retained_from} does not exist"
+            )));
+        }
+        remove_logs_before(dir, retained_from)?;
+        if checkpoint == WalPosition::default()
+            && committed_lsn.is_none()
+            && last_lsn.is_some()
+            && log_ids(dir)?.is_empty()
+        {
+            let mut wal = Self::open(dir, max_file_bytes, checkpoint, file_sync_tx)?;
+            wal.last_lsn = last_lsn;
+            return Ok(wal);
+        }
+        let recovered = recover_position(
+            dir,
+            checkpoint,
+            committed_lsn,
+            materialized_through,
+            retained_from,
+            last_lsn,
+        )?;
+        if recovered != checkpoint {
+            sync_logs_through(dir, recovered)?;
+        }
+        let mut wal = Self::open(dir, max_file_bytes, recovered, file_sync_tx)?;
+        wal.last_lsn = last_lsn;
+        Ok(wal)
+    }
+
+    /// Opens strictly at a committed position, trusting nothing else.
+    ///
+    /// The default position means a fresh WAL: every existing file is removed and file 1 is
+    /// created. Otherwise the committed prefix is re-proven end to end. Every retained file up
+    /// through the checkpoint's file must exist contiguously (a gap in the numbered chain is an
+    /// error, not something to skip), and each is scanned frame by frame — checksums verified,
+    /// strict LSN order enforced — through its full length, or for the checkpoint file through
+    /// exactly the committed offset, which must land on a frame boundary. That scan is also how
+    /// `last_lsn` is learned, so the very next append knows where strict ordering resumes. The
+    /// checkpoint file is then truncated to the committed offset (synced if it shrank) and every
+    /// later file is deleted.
+    ///
+    /// Note what this deliberately does not do: promote anything. `open` is the plain
+    /// "checkpoint is the whole truth" entry point, used directly when nothing beyond the
+    /// checkpoint should survive; judging and keeping a post-checkpoint tail is `recover`'s job.
+    pub fn open(
+        dir: impl AsRef<Path>,
+        max_file_bytes: u64,
+        committed: WalPosition,
+        file_sync_tx: FileSyncSender,
+    ) -> Result<Self> {
+        if max_file_bytes == 0 {
+            return Err(Error::InvalidWal(
+                "maximum WAL file size must be non-zero".to_owned(),
+            ));
+        }
+        validate_position(committed)?;
+
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        if committed == WalPosition::default() {
+            remove_logs_after(&dir, 0)?;
+            let (file, offset) = create_log(&dir, 1)?;
+            return Ok(Self {
+                dir,
+                max_file_bytes,
+                log_id: 1,
+                offset,
+                file,
+                last_lsn: None,
+                file_sync_tx,
+                pending_bytes: 0,
+            });
+        }
+
+        let ids = log_ids(&dir)?;
+        let mut expected_id = ids.first().copied().ok_or_else(|| {
+            Error::InvalidWal(format!(
+                "committed WAL file {} does not exist",
+                committed.log_id
+            ))
+        })?;
+        if expected_id > committed.log_id {
+            return Err(Error::InvalidWal(format!(
+                "committed WAL file {} does not exist",
+                committed.log_id
+            )));
+        }
+        let mut last_lsn = None;
+        let mut ignore = |_: &WalEntry| Ok(());
+        for id in ids.into_iter().take_while(|id| *id <= committed.log_id) {
+            if id != expected_id {
+                return Err(Error::InvalidWal(format!(
+                    "missing WAL file {expected_id} before committed file {}",
+                    committed.log_id
+                )));
+            }
+            let path = Self::path(&dir, id);
+            let through = if id == committed.log_id {
+                committed.offset
+            } else {
+                File::open(&path)
+                    .and_then(|file| file.metadata())
+                    .map_err(|source| io_error(&path, source))?
+                    .len()
+            };
+            last_lsn = scan_log(&path, through, last_lsn, &mut ignore)?;
+            expected_id = expected_id
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+        }
+        if expected_id != committed.log_id.saturating_add(1) {
+            return Err(Error::InvalidWal(format!(
+                "committed WAL file {} does not exist",
+                committed.log_id
+            )));
+        }
+
+        let path = Self::path(&dir, committed.log_id);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| io_error(&path, source))?;
+        if file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?
+            .len()
+            != committed.offset
+        {
+            file.set_len(committed.offset)
+                .map_err(|source| io_error(&path, source))?;
+            file.sync_data().map_err(|source| io_error(&path, source))?;
+        }
+        file.seek(SeekFrom::Start(committed.offset))
+            .map_err(|source| io_error(&path, source))?;
+        remove_logs_after(&dir, committed.log_id)?;
+
+        Ok(Self {
+            dir,
+            max_file_bytes,
+            log_id: committed.log_id,
+            offset: committed.offset,
+            file,
+            last_lsn,
+            file_sync_tx,
+            pending_bytes: 0,
+        })
+    }
+
+    pub fn path(dir: impl AsRef<Path>, log_id: u64) -> PathBuf {
+        dir.as_ref()
+            .join(format!("{FILE_PREFIX}{log_id:020}{FILE_SUFFIX}"))
+    }
+
+    pub fn position(&self) -> WalPosition {
+        WalPosition {
+            log_id: self.log_id,
+            offset: self.offset,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn last_lsn(&self) -> Option<StrataLsn> {
+        self.last_lsn
+    }
+
+    /// Appends one ordered batch.
+    ///
+    /// The returned position is not durable until the store publishes it in a synced checkpoint.
+    /// Rollover is deliberately left to [`Self::sync_data`], where the old file can be cut at the
+    /// same boundary that will be synced.
+    ///
+    /// The batch must be non-empty and strictly increasing, extending the log's `last_lsn` — the
+    /// group commit path guarantees that by construction, so the check exists to turn a broken
+    /// caller into an error before any byte moves. The frame goes into the page cache only, no
+    /// fsync happens here, which is what keeps commit latency flat, and `pending_bytes` grows by
+    /// the frame size to feed the durability-pressure trigger.
+    ///
+    /// A failed write is rolled back — the file truncated to the frame start and the cursor
+    /// reseated — so the in-memory offset and the file agree again and the error is clean. If
+    /// even the rollback fails, the compound WalAppendRollbackFailed reports both errors; the
+    /// writer halts on it, because a file whose tail no longer matches the tracked offset cannot
+    /// safely take another append.
+    pub fn append(&mut self, entries: &[WalEntry]) -> Result<WalPosition> {
+        validate_append(entries, self.last_lsn)?;
+        let frame_len = encoded_frame_len(entries)?;
+        let new_offset = self
+            .offset
+            .checked_add(frame_len)
+            .ok_or_else(|| Error::InvalidWal("WAL offset overflow".to_owned()))?;
+
+        let path = Self::path(&self.dir, self.log_id);
+        let frame_start = self.offset;
+        if let Err(write_error) = write_frame(&mut self.file, entries, frame_len) {
+            if let Err(rollback_error) = self.rollback(frame_start) {
+                return Err(Error::WalAppendRollbackFailed {
+                    path,
+                    offset: frame_start,
+                    write_error,
+                    rollback_error,
+                });
+            }
+            return Err(io_error(&path, write_error));
+        }
+        self.offset = new_offset;
+        self.last_lsn = entries.last().map(|entry| entry.lsn);
+        self.pending_bytes = self.pending_bytes.saturating_add(frame_len);
+        Ok(self.position())
+    }
+
+    /// Syncs the current WAL in tests that exercise the WAL without the store coordinator.
+    #[cfg(test)]
+    pub fn sync(&mut self) -> Result<WalPosition> {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let (position, task) = self.sync_data(move |result| {
+            let _ = done_tx.send(result);
+        })?;
+        if let Err(error) = self.file_sync_tx.send(task) {
+            error.0.complete(Err(Error::FileSyncQueueClosed));
+        }
+        done_rx.recv().map_err(|_| Error::InvariantViolation {
+            reason: "WAL sync completion was dropped".to_owned(),
+        })??;
+        Ok(position)
+    }
+
+    /// Cuts an oversized WAL and captures one sync task for the exact prefix written so far.
+    ///
+    /// The caller submits the returned task only after every segment referenced by this prefix is
+    /// durable. Rollover happens here instead of `append`, so it never starts an independent WAL
+    /// sync. The returned checkpoint points to the end of the captured file; later writes use the
+    /// new file when a rollover occurred.
+    ///
+    /// The mechanics behind those sentences: the current file handle is cloned and the position
+    /// captured *before* any roll, so the background task syncs exactly the bytes the returned
+    /// checkpoint describes even while later appends continue into a fresh file. Rolling only
+    /// here — never in `append` — means no file is ever left carrying bytes that no future sync
+    /// task will cover: whichever task captured a file also captured its final byte. The task's
+    /// completion callback additionally syncs the directory, which is what makes a freshly
+    /// rolled file's creation itself durable (create_log deliberately skips that fsync on the
+    /// hot path). And the segments-first ordering the first line demands is the store-wide rule:
+    /// payload bytes must be durable before the WAL that references them, so recovery can never
+    /// replay an entry whose bytes did not survive.
+    pub(crate) fn sync_data(
+        &mut self,
+        notify: impl FnOnce(Result<()>) + Send + 'static,
+    ) -> Result<(WalPosition, FileSyncTask)> {
+        let path = Self::path(&self.dir, self.log_id);
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|source| io_error(&path, source))?;
+        let position = self.position();
+        if self.offset >= self.max_file_bytes && self.offset > HEADER_LEN {
+            self.roll()?;
+        }
+        let dir = self.dir.clone();
+        let task = FileSyncTask::new(path, file, move |result| {
+            notify(result.and_then(|()| sync_dir(&dir)));
+        });
+        Ok((position, task))
+    }
+
+    /// Bytes appended since the last durability publish took ownership of the log — the WAL half
+    /// of the pressure signal that decides when the next asynchronous publish starts.
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.pending_bytes
+    }
+
+    /// Called when a durability publish captures everything appended so far; the pressure
+    /// counter restarts at zero for the next interval.
+    pub(crate) fn mark_pending_bytes_captured(&mut self) {
+        self.pending_bytes = 0;
+    }
+
+    /// Clones the store-owned file-sync queue for other immutable store files.
+    pub(crate) fn file_sync_sender(&self) -> FileSyncSender {
+        self.file_sync_tx.clone()
+    }
+
+    /// Replays the current prefix in lsn order.
+    ///
+    /// This is how both keyed LSM projections rebuild their memtables at open: every retained
+    /// file is walked contiguously through the active position, and each entry is handed to
+    /// `apply` in strict LSN order. The walk enforces the same rules as recovery — a missing
+    /// file in the chain, a bad checksum, or an ordering violation is an error, never something
+    /// to read past. No filtering happens here: every entry in the prefix reaches `apply`, and
+    /// the consumer does the routing (open_store_wal seeds blob mutations into the LSM, hands
+    /// legacy relocation entries to relocation recovery, and skips epoch and shard-drop entries,
+    /// whose effects already live durably in RocksDB).
+    pub fn replay(&self, mut apply: impl FnMut(&WalEntry) -> Result<()>) -> Result<()> {
+        let ids = log_ids(&self.dir)?;
+        let mut expected_id = ids.first().copied().ok_or_else(|| {
+            Error::InvalidWal(format!("active WAL file {} does not exist", self.log_id))
+        })?;
+        let mut last_lsn = None;
+        for id in ids.into_iter().take_while(|id| *id <= self.log_id) {
+            if id != expected_id {
+                return Err(Error::InvalidWal(format!(
+                    "missing WAL file {expected_id} before active file {}",
+                    self.log_id
+                )));
+            }
+            let path = Self::path(&self.dir, id);
+            let through = if id == self.log_id {
+                self.offset
+            } else {
+                File::open(&path)
+                    .and_then(|file| file.metadata())
+                    .map_err(|source| io_error(&path, source))?
+                    .len()
+            };
+            last_lsn = scan_log(&path, through, last_lsn, &mut apply)?;
+            expected_id = expected_id
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+        }
+        if expected_id != self.log_id.saturating_add(1) {
+            return Err(Error::InvalidWal(format!(
+                "active WAL file {} does not exist",
+                self.log_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Deletes complete rolled files whose final lsn is materialized in durable SST metadata.
+    ///
+    /// Only whole, already-rolled files are candidates — the active file never is. Files are
+    /// scanned oldest first and removed while their final LSN sits at or below `materialized`;
+    /// the walk stops at the first file that still holds unmaterialized entries, since LSNs only
+    /// grow and no later file can qualify either. `materialized` must be the *minimum* of the
+    /// blob and relocation frontiers: a WAL file may only vanish when no projection could ever
+    /// need to replay it again. The caller durably publishes the retained boundary
+    /// (retained_from_after) before invoking this, so a crash mid-unlink leaves only
+    /// officially-dead files that the next recovery finishes deleting.
+    pub fn reclaim_through(&mut self, materialized: StrataLsn) -> Result<()> {
+        let ids = log_ids(&self.dir)?;
+        let mut expected_id = ids.first().copied().ok_or_else(|| {
+            Error::InvalidWal(format!("active WAL file {} does not exist", self.log_id))
+        })?;
+        let mut previous = None;
+        let mut remove = Vec::new();
+        let mut ignore = |_: &WalEntry| Ok(());
+        for id in ids.into_iter().take_while(|id| *id < self.log_id) {
+            if id != expected_id {
+                return Err(Error::InvalidWal(format!(
+                    "missing WAL file {expected_id} before active file {}",
+                    self.log_id
+                )));
+            }
+            let path = Self::path(&self.dir, id);
+            let file_len = File::open(&path)
+                .and_then(|file| file.metadata())
+                .map_err(|source| io_error(&path, source))?
+                .len();
+            previous = scan_log(&path, file_len, previous, &mut ignore)?;
+            if previous.is_some_and(|lsn| lsn <= materialized) {
+                remove.push(path);
+            } else {
+                break;
+            }
+            expected_id = expected_id
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+        }
+        for path in &remove {
+            fs::remove_file(path).map_err(|source| io_error(path, source))?;
+        }
+        if !remove.is_empty() {
+            sync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// Computes the first WAL file id that must survive reclamation at this frontier — the
+    /// read-only twin of reclaim_through.
+    ///
+    /// The two exist as a pair so the store can follow the publish-first, delete-second
+    /// protocol: this function names the boundary, a synced RocksDB write makes it official, and
+    /// only then does reclaim_through unlink — the same crash-safe ordering GC uses before
+    /// removing its own files.
+    pub fn retained_from_after(&self, materialized: StrataLsn) -> Result<u64> {
+        let ids = log_ids(&self.dir)?;
+        let mut expected_id = ids.first().copied().ok_or_else(|| {
+            Error::InvalidWal(format!("active WAL file {} does not exist", self.log_id))
+        })?;
+        let mut previous = None;
+        let mut ignore = |_: &WalEntry| Ok(());
+        for id in ids.into_iter().take_while(|id| *id < self.log_id) {
+            if id != expected_id {
+                return Err(Error::InvalidWal(format!(
+                    "missing WAL file {expected_id} before active file {}",
+                    self.log_id
+                )));
+            }
+            let path = Self::path(&self.dir, id);
+            let file_len = File::open(&path)
+                .and_then(|file| file.metadata())
+                .map_err(|source| io_error(&path, source))?
+                .len();
+            previous = scan_log(&path, file_len, previous, &mut ignore)?;
+            if previous.is_none_or(|lsn| lsn > materialized) {
+                return Ok(id);
+            }
+            expected_id = expected_id
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+        }
+        Ok(self.log_id)
+    }
+
+    /// Continues the chain in the next numbered file. The new file is written but not fsynced
+    /// here — sync_data's completion callback syncs the directory, and the file's own bytes are
+    /// covered by whichever sync task later captures it.
+    fn roll(&mut self) -> Result<()> {
+        let next_id = self
+            .log_id
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+        let (file, offset) = create_log(&self.dir, next_id)?;
+        self.file = file;
+        self.log_id = next_id;
+        self.offset = offset;
+        Ok(())
+    }
+
+    fn rollback(&mut self, offset: u64) -> std::io::Result<()> {
+        self.file.set_len(offset)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        Ok(())
+    }
+}
+
+/// Finds the exact WAL position whose prefix ends at `last_lsn`, mutating nothing.
+///
+/// A running example for the walk: the checkpoint is (file 3, offset C) committed beside
+/// committed_lsn 500, and store recovery chose last_lsn 512 because RocksDB wrote through
+/// 512 before the crash. The job is to prove the WAL really contains 501..=512 as complete
+/// frames and name the byte where 512 ends.
+///
+/// Step one: prove the checkpoint means what RocksDB says it means. The bytes up to the
+/// checkpoint are scanned and their final LSN must equal committed_lsn — the two were written in
+/// one synced batch, so disagreement is corruption, never drift. Two legitimate shapes replace
+/// that scan. A checkpoint whose file was reclaimed (retained_from is past it) is believed on
+/// the strength of the materialized frontier covering PublishedLsn — the SSTs, not the WAL, are
+/// the evidence now, and replay will start at the first retained file. And a WAL whose first
+/// file starts exactly at a header-only checkpoint covers the legacy-migration case where
+/// history predates the operation WAL entirely.
+///
+/// Step two: if last_lsn equals PublishedLsn there is no tail to judge — the answer is the
+/// checkpoint itself (or the start of the first retained file when the checkpoint's file is
+/// gone). Otherwise walk frames forward from the checkpoint, enforcing strict LSN order,
+/// looking for the frame whose *last* entry is exactly 512. Landing on it returns the promoted
+/// position: everything through that byte becomes the new committed prefix. Overshooting means
+/// 512 is buried mid-frame — a frame is one atomic batch, and half of a batch cannot be kept —
+/// while running out of bytes means the tail never made it to disk. Both are errors rather than
+/// approximations, and the store's preflight turns them into a rollback decision instead:
+/// better to shorten history to what the WAL can prove than to invent a prefix it cannot.
+/// A checkpoint whose WAL file was already reclaimed is believable only with receipts.
+///
+/// `retained_from > checkpoint.log_id` means the file the checkpoint points into no longer
+/// exists — reclamation deleted it. That is legitimate exactly when the reclamation itself was
+/// legitimate: reclaim_through only deletes a file once every LSN in it lives on in durable
+/// SSTs. So recovery, unable to prove the checkpoint by scanning bytes that are gone, demands
+/// the receipts instead: the committed LSN the checkpoint was published with must be known, and
+/// the materialized frontier must have reached it. Example: checkpoint (file 3, offset C) with
+/// committed LSN 500, frontier at 520 → files 1..=4 legally reclaimed, retained_from = 5, and
+/// this passes because 500 <= 520. If the frontier were 480 — or unknown — the bytes for
+/// 481..=500 would exist nowhere, neither WAL nor SST, and recovery must refuse rather than
+/// trust a checkpoint nothing can prove.
+///
+/// Callers that pass this gate rely on recover_position's missing-checkpoint arm, which starts
+/// the replay walk at `retained_from` and takes the committed LSN on the frontier's authority.
+fn validate_reclaimed_checkpoint_covered(
+    checkpoint: WalPosition,
+    committed_lsn: Option<StrataLsn>,
+    materialized_through: Option<StrataLsn>,
+    retained_from: u64,
+) -> Result<()> {
+    let checkpoint_file_reclaimed =
+        checkpoint != WalPosition::default() && retained_from > checkpoint.log_id;
+    if !checkpoint_file_reclaimed {
+        return Ok(());
+    }
+    let frontier_covers_checkpoint = match (committed_lsn, materialized_through) {
+        (Some(committed), Some(materialized)) => committed <= materialized,
+        _ => false,
+    };
+    if frontier_covers_checkpoint {
+        Ok(())
+    } else {
+        Err(Error::InvalidWal(
+            "retained WAL prefix is not covered by the materialized frontier".to_owned(),
+        ))
+    }
+}
+
+fn recover_position(
+    dir: &Path,
+    checkpoint: WalPosition,
+    committed_lsn: Option<StrataLsn>,
+    materialized_through: Option<StrataLsn>,
+    retained_from: u64,
+    last_lsn: Option<StrataLsn>,
+) -> Result<WalPosition> {
+    fs::create_dir_all(dir).map_err(|source| io_error(dir, source))?;
+    validate_position(checkpoint)?;
+    if committed_lsn.is_some_and(|committed| last_lsn.is_none_or(|last| committed > last)) {
+        return Err(Error::InvalidWal(format!(
+            "published lsn {committed_lsn:?} follows recovered store lsn {last_lsn:?}"
+        )));
+    }
+    if materialized_through
+        .is_some_and(|materialized| last_lsn.is_none_or(|last| materialized > last))
+    {
+        return Err(Error::InvalidWal(format!(
+            "materialized WAL lsn {materialized_through:?} follows recovered store lsn {last_lsn:?}"
+        )));
+    }
+
+    let ids = log_ids(dir)?;
+    let missing_checkpoint_is_materialized = match committed_lsn {
+        Some(lsn) => {
+            checkpoint != WalPosition::default()
+                && retained_from > checkpoint.log_id
+                && materialized_through.is_some_and(|materialized| materialized >= lsn)
+        }
+        None => {
+            checkpoint == WalPosition::default()
+                && retained_from > 1
+                && materialized_through.is_some()
+        }
+    };
+    let actual_committed_lsn = if missing_checkpoint_is_materialized {
+        committed_lsn
+    } else {
+        lsn_through_position(dir, checkpoint)?
+    };
+    let starts_after_materialized_checkpoint = actual_committed_lsn.is_none()
+        && committed_lsn.is_some()
+        && checkpoint.offset == HEADER_LEN;
+    if actual_committed_lsn != committed_lsn && !starts_after_materialized_checkpoint {
+        return Err(Error::InvalidWal(format!(
+            "WAL bytes through the checkpoint end at {actual_committed_lsn:?}, expected CommittedLsn {committed_lsn:?}"
+        )));
+    }
+    if last_lsn == committed_lsn {
+        return if missing_checkpoint_is_materialized {
+            Ok(WalPosition {
+                log_id: retained_from,
+                offset: HEADER_LEN,
+            })
+        } else {
+            Ok(checkpoint)
+        };
+    }
+    let target = last_lsn.ok_or_else(|| {
+        Error::InvalidWal("WAL recovery target cannot precede its checkpoint".to_owned())
+    })?;
+
+    let first_id = if missing_checkpoint_is_materialized {
+        retained_from
+    } else if checkpoint == WalPosition::default() {
+        1
+    } else {
+        checkpoint.log_id
+    };
+    let mut expected_id = first_id;
+    let mut previous = committed_lsn;
+
+    for id in ids.into_iter().filter(|id| *id >= first_id) {
+        if id != expected_id {
+            return Err(Error::InvalidWal(format!(
+                "missing WAL file {expected_id} while recovering through {target:?}"
+            )));
+        }
+        let path = Wal::path(dir, id);
+        let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?
+            .len();
+        read_header(&mut file, &path)?;
+        let mut offset = if !missing_checkpoint_is_materialized
+            && checkpoint != WalPosition::default()
+            && id == checkpoint.log_id
+        {
+            checkpoint.offset
+        } else {
+            HEADER_LEN
+        };
+
+        while offset < file_len {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|source| io_error(&path, source))?;
+            let (entries, end) = read_frame(&mut file, &path, offset, file_len)?;
+            if entries.is_empty() {
+                return Err(corrupt(&path, "empty WAL frame"));
+            }
+            for entry in &entries {
+                if previous.is_some_and(|previous| entry.lsn <= previous) {
+                    return Err(corrupt(&path, "entries are not strictly ordered by lsn"));
+                }
+                previous = Some(entry.lsn);
+            }
+
+            let frame_last = entries.last().expect("non-empty frame").lsn;
+            if frame_last > target {
+                let reason = if entries.iter().any(|entry| entry.lsn == target) {
+                    format!("recovery target {target:?} is not a WAL frame boundary")
+                } else {
+                    format!("WAL skips recovery target {target:?}")
+                };
+                return Err(Error::InvalidWal(reason));
+            }
+            offset = end;
+            if frame_last == target {
+                return Ok(WalPosition { log_id: id, offset });
+            }
+        }
+
+        expected_id = expected_id
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+    }
+
+    Err(Error::InvalidWal(format!(
+        "WAL ends at {previous:?} before recovered store lsn {target:?}"
+    )))
+}
+
+/// Scans the contiguous file chain up to `position` and returns the last LSN it contains — the
+/// value that must match PublishedLsn for a checkpoint to be believed.
+fn lsn_through_position(dir: &Path, position: WalPosition) -> Result<Option<StrataLsn>> {
+    if position == WalPosition::default() {
+        return Ok(None);
+    }
+
+    let ids = log_ids(dir)?;
+    let mut expected_id = ids.first().copied().ok_or_else(|| {
+        Error::InvalidWal(format!(
+            "checkpoint WAL file {} does not exist",
+            position.log_id
+        ))
+    })?;
+    if expected_id > position.log_id {
+        return Err(Error::InvalidWal(format!(
+            "checkpoint WAL file {} does not exist",
+            position.log_id
+        )));
+    }
+    let mut last_lsn = None;
+    let mut ignore = |_: &WalEntry| Ok(());
+    for id in ids.into_iter().take_while(|id| *id <= position.log_id) {
+        if id != expected_id {
+            return Err(Error::InvalidWal(format!(
+                "missing WAL file {expected_id} before checkpoint file {}",
+                position.log_id
+            )));
+        }
+        let path = Wal::path(dir, id);
+        let through = if id == position.log_id {
+            position.offset
+        } else {
+            File::open(&path)
+                .and_then(|file| file.metadata())
+                .map_err(|source| io_error(&path, source))?
+                .len()
+        };
+        last_lsn = scan_log(&path, through, last_lsn, &mut ignore)?;
+        expected_id = expected_id
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+    }
+    if expected_id != position.log_id.saturating_add(1) {
+        return Err(Error::InvalidWal(format!(
+            "checkpoint WAL file {} does not exist",
+            position.log_id
+        )));
+    }
+    Ok(last_lsn)
+}
+
+/// Fsyncs every file of a freshly promoted prefix, plus the directory.
+///
+/// Promotion elevates bytes that were never proven durable into the committed prefix, so
+/// recovery pays their fsync up front — the store must not build on a promoted LSN that a
+/// second crash could still take away.
+fn sync_logs_through(dir: &Path, position: WalPosition) -> Result<()> {
+    for id in log_ids(dir)?
+        .into_iter()
+        .take_while(|id| *id <= position.log_id)
+    {
+        let path = Wal::path(dir, id);
+        File::open(&path)
+            .and_then(|file| file.sync_data())
+            .map_err(|source| io_error(&path, source))?;
+    }
+    sync_dir(dir)
+}
+
+fn validate_position(position: WalPosition) -> Result<()> {
+    if position == WalPosition::default() || (position.log_id > 0 && position.offset >= HEADER_LEN)
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidWal(format!(
+            "invalid WAL position ({}, {})",
+            position.log_id, position.offset
+        )))
+    }
+}
+
+/// Rejects empty batches and any LSN that fails to strictly extend the log — checked before a
+/// single byte is written, so a bad batch leaves the file untouched.
+fn validate_append(entries: &[WalEntry], previous: Option<StrataLsn>) -> Result<()> {
+    if entries.is_empty() {
+        return Err(Error::InvalidWal("cannot append an empty batch".to_owned()));
+    }
+    let mut previous = previous;
+    for entry in entries {
+        if let Some(previous) = previous
+            && entry.lsn <= previous
+        {
+            return Err(Error::WalLsnOutOfOrder {
+                previous,
+                next: entry.lsn,
+            });
+        }
+        previous = Some(entry.lsn);
+    }
+    Ok(())
+}
+
+fn encoded_frame_len(entries: &[WalEntry]) -> Result<u64> {
+    u32::try_from(entries.len())
+        .map_err(|_| Error::InvalidWal("WAL frame has too many entries".to_owned()))?;
+    let payload_len = entries.iter().try_fold(0u64, |len, entry| {
+        u32::try_from(entry.payload.len())
+            .map_err(|_| Error::InvalidWal("WAL entry is too large".to_owned()))?;
+        len.checked_add(ENTRY_HEADER_LEN)
+            .and_then(|len| len.checked_add(entry.payload.len() as u64))
+            .ok_or_else(|| Error::InvalidWal("WAL frame is too large".to_owned()))
+    })?;
+    payload_len
+        .checked_add(FRAME_OVERHEAD)
+        .ok_or_else(|| Error::InvalidWal("WAL frame is too large".to_owned()))
+}
+
+/// Writes one frame at the current position: prefix, entries, then the SHA-256 of everything
+/// before it. Checksum-last is the torn-write defense — a crash mid-frame leaves a checksum
+/// mismatch, which every reader treats as "the log ends here", never as data.
+fn write_frame(file: &mut File, entries: &[WalEntry], frame_len: u64) -> std::io::Result<()> {
+    let payload_len = (frame_len - FRAME_OVERHEAD).to_le_bytes();
+    let entry_count = (entries.len() as u32).to_le_bytes();
+    let mut checksum = Sha256::new();
+    checksum.update(payload_len);
+    checksum.update(entry_count);
+    file.write_all(&payload_len)?;
+    file.write_all(&entry_count)?;
+
+    for entry in entries {
+        let mut header = [0; ENTRY_HEADER_LEN as usize];
+        header[..8].copy_from_slice(&entry.lsn.to_le_bytes());
+        header[8..].copy_from_slice(&(entry.payload.len() as u32).to_le_bytes());
+        checksum.update(header);
+        checksum.update(&entry.payload);
+        file.write_all(&header)?;
+        file.write_all(&entry.payload)?;
+    }
+    file.write_all(&checksum.finalize())
+}
+
+/// The strict reader for a range a committed position vouches for: walks frames from the header
+/// through exactly `through` (which must land on a frame boundary), verifying checksums and
+/// strict LSN order across the `previous` seam, feeding each entry to `apply`, and returning
+/// the final LSN so multi-file walks can chain the ordering check file to file.
+fn scan_log(
+    path: &Path,
+    through: u64,
+    mut previous: Option<StrataLsn>,
+    apply: &mut dyn FnMut(&WalEntry) -> Result<()>,
+) -> Result<Option<StrataLsn>> {
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| io_error(path, source))?
+        .len();
+    if through < HEADER_LEN || through > file_len {
+        return Err(corrupt(path, "committed position is outside the file"));
+    }
+    read_header(&mut file, path)?;
+    let mut offset = HEADER_LEN;
+    while offset < through {
+        let (entries, end) = read_frame(&mut file, path, offset, through)?;
+        if entries.is_empty() {
+            return Err(corrupt(path, "empty WAL frame"));
+        }
+        for entry in &entries {
+            if previous.is_some_and(|previous| entry.lsn <= previous) {
+                return Err(corrupt(path, "entries are not strictly ordered by lsn"));
+            }
+            apply(entry)?;
+            previous = Some(entry.lsn);
+        }
+        offset = end;
+    }
+    if offset != through {
+        return Err(corrupt(path, "committed position is not a frame boundary"));
+    }
+    Ok(previous)
+}
+
+fn read_frame(
+    file: &mut File,
+    path: &Path,
+    offset: u64,
+    through: u64,
+) -> Result<(Vec<WalEntry>, u64)> {
+    let mut prefix = [0; FRAME_PREFIX_LEN as usize];
+    file.read_exact(&mut prefix)
+        .map_err(|_| corrupt(path, "truncated frame prefix"))?;
+    let payload_len = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+    let entry_count = u32::from_le_bytes(prefix[8..].try_into().unwrap());
+    let end = offset
+        .checked_add(FRAME_OVERHEAD)
+        .and_then(|end| end.checked_add(payload_len))
+        .ok_or_else(|| corrupt(path, "frame length overflows"))?;
+    if end > through {
+        return Err(corrupt(path, "frame extends beyond committed position"));
+    }
+    if u64::from(entry_count).saturating_mul(ENTRY_HEADER_LEN) > payload_len {
+        return Err(corrupt(path, "invalid frame entry count"));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(prefix);
+    let mut remaining = payload_len;
+    let mut entries = Vec::with_capacity(entry_count as usize);
+    for _ in 0..entry_count {
+        let mut header = [0; ENTRY_HEADER_LEN as usize];
+        file.read_exact(&mut header)
+            .map_err(|_| corrupt(path, "truncated entry header"))?;
+        hasher.update(header);
+        remaining -= ENTRY_HEADER_LEN;
+
+        let payload_len = u32::from_le_bytes(header[8..].try_into().unwrap()) as u64;
+        if payload_len > remaining {
+            return Err(corrupt(path, "entry extends beyond frame"));
+        }
+        let mut payload =
+            vec![0; usize::try_from(payload_len).map_err(|_| corrupt(path, "entry is too large"))?];
+        file.read_exact(&mut payload)
+            .map_err(|_| corrupt(path, "truncated entry payload"))?;
+        hasher.update(&payload);
+        remaining -= payload_len;
+        entries.push(WalEntry {
+            lsn: u64::from_le_bytes(header[..8].try_into().unwrap()),
+            payload,
+        });
+    }
+    if remaining != 0 {
+        return Err(corrupt(path, "frame has trailing payload bytes"));
+    }
+
+    let mut stored_checksum = [0; FRAME_CHECKSUM_LEN as usize];
+    file.read_exact(&mut stored_checksum)
+        .map_err(|_| corrupt(path, "truncated frame checksum"))?;
+    if stored_checksum != hasher.finalize().as_slice() {
+        return Err(corrupt(path, "frame checksum mismatch"));
+    }
+    Ok((entries, end))
+}
+
+fn read_header(reader: &mut impl Read, path: &Path) -> Result<()> {
+    let mut header = [0; HEADER_LEN as usize];
+    if reader.read_exact(&mut header).is_err()
+        || &header[..8] != MAGIC
+        || u32::from_le_bytes(header[8..].try_into().unwrap()) != VERSION
+    {
+        return Err(corrupt(path, "invalid header"));
+    }
+    Ok(())
+}
+
+fn create_log(dir: &Path, log_id: u64) -> Result<(File, u64)> {
+    let path = Wal::path(dir, log_id);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| io_error(&path, source))?;
+    file.write_all(MAGIC)
+        .and_then(|_| file.write_all(&VERSION.to_le_bytes()))
+        .map_err(|source| io_error(&path, source))?;
+    Ok((file, HEADER_LEN))
+}
+
+fn log_ids(dir: &Path) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|source| io_error(dir, source))? {
+        let entry = entry.map_err(|source| io_error(dir, source))?;
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix(FILE_PREFIX))
+            .and_then(|name| name.strip_suffix(FILE_SUFFIX))
+            .and_then(|id| id.parse().ok())
+        else {
+            continue;
+        };
+        ids.push(id);
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+fn remove_logs_after(dir: &Path, log_id: u64) -> Result<()> {
+    let mut removed = false;
+    for id in log_ids(dir)?
+        .into_iter()
+        .filter(|candidate| log_id == 0 || *candidate > log_id)
+    {
+        let path = Wal::path(dir, id);
+        fs::remove_file(&path).map_err(|source| io_error(&path, source))?;
+        removed = true;
+    }
+    if removed {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+fn remove_logs_before(dir: &Path, log_id: u64) -> Result<()> {
+    let mut removed = false;
+    for id in log_ids(dir)?
+        .into_iter()
+        .filter(|candidate| *candidate < log_id)
+    {
+        let path = Wal::path(dir, id);
+        fs::remove_file(&path).map_err(|source| io_error(&path, source))?;
+        removed = true;
+    }
+    if removed {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| io_error(dir, source))
+}
+
+fn io_error(path: &Path, source: std::io::Error) -> Error {
+    Error::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn corrupt(path: &Path, reason: impl Into<String>) -> Error {
+    Error::CorruptWal {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Seek, Write},
+        thread,
+    };
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn entry(sequence: u64, payload: &[u8]) -> WalEntry {
+        WalEntry {
+            lsn: sequence,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn open_wal(path: &Path, max_file_bytes: u64, committed: WalPosition) -> Result<Wal> {
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
+        thread::spawn(move || syncer.run());
+        Wal::open(path, max_file_bytes, committed, file_sync_tx)
+    }
+
+    fn recover_wal(
+        path: &Path,
+        max_file_bytes: u64,
+        checkpoint: WalPosition,
+        published_lsn: Option<StrataLsn>,
+        last_lsn: Option<StrataLsn>,
+    ) -> Result<Wal> {
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
+        thread::spawn(move || syncer.run());
+        Wal::recover(
+            path,
+            max_file_bytes,
+            checkpoint,
+            published_lsn,
+            None,
+            1,
+            last_lsn,
+            file_sync_tx,
+        )
+    }
+
+    fn replay(wal: &Wal) -> Vec<WalEntry> {
+        let mut entries = Vec::new();
+        wal.replay(|entry| {
+            entries.push(entry.clone());
+            Ok(())
+        })
+        .unwrap();
+        entries
+    }
+
+    fn sync_wal(wal: &mut Wal) -> WalPosition {
+        wal.sync().unwrap()
+    }
+
+    #[test]
+    fn synced_entries_replay_from_the_committed_position() {
+        let dir = tempdir().unwrap();
+        let entries = vec![entry(1, b"put"), entry(2, b"")];
+        let mut wal = open_wal(dir.path(), 1 << 20, WalPosition::default()).unwrap();
+
+        let appended = wal.append(&entries).unwrap();
+        assert_eq!(sync_wal(&mut wal), appended);
+        drop(wal);
+
+        let wal = open_wal(dir.path(), 1 << 20, appended).unwrap();
+        assert_eq!(replay(&wal), entries);
+    }
+
+    #[test]
+    fn reopen_discards_an_unpublished_tail() {
+        let dir = tempdir().unwrap();
+        let mut wal = open_wal(dir.path(), 1 << 20, WalPosition::default()).unwrap();
+        wal.append(&[entry(1, b"committed")]).unwrap();
+        let committed = sync_wal(&mut wal);
+        wal.append(&[entry(2, b"unpublished")]).unwrap();
+        assert!(wal.position().offset > committed.offset);
+        drop(wal);
+
+        let wal = open_wal(dir.path(), 1 << 20, committed).unwrap();
+        assert_eq!(replay(&wal), vec![entry(1, b"committed")]);
+        assert_eq!(
+            fs::metadata(Wal::path(dir.path(), committed.log_id))
+                .unwrap()
+                .len(),
+            committed.offset
+        );
+    }
+
+    #[test]
+    fn recovery_promotes_a_complete_tail_through_the_requested_lsn() {
+        let dir = tempdir().unwrap();
+        let mut wal = open_wal(dir.path(), 1 << 20, WalPosition::default()).unwrap();
+        wal.append(&[entry(1, b"checkpoint")]).unwrap();
+        let checkpoint = sync_wal(&mut wal);
+        let recovered = wal.append(&[entry(2, b"recover")]).unwrap();
+        drop(wal);
+
+        let wal = recover_wal(dir.path(), 1 << 20, checkpoint, Some(1), Some(2)).unwrap();
+        assert_eq!(wal.position(), recovered);
+        assert_eq!(wal.last_lsn(), Some(2));
+        assert_eq!(
+            replay(&wal),
+            vec![entry(1, b"checkpoint"), entry(2, b"recover")]
+        );
+    }
+
+    #[test]
+    fn recovery_can_start_a_wal_after_materialized_legacy_state() {
+        let dir = tempdir().unwrap();
+        let lsn = 7;
+        let wal =
+            recover_wal(dir.path(), 1 << 20, WalPosition::default(), None, Some(lsn)).unwrap();
+        let checkpoint = wal.position();
+        assert_eq!(checkpoint.offset, HEADER_LEN);
+        assert_eq!(wal.last_lsn(), Some(lsn));
+        assert!(replay(&wal).is_empty());
+        drop(wal);
+
+        let mut wal = recover_wal(dir.path(), 1 << 20, checkpoint, Some(lsn), Some(lsn)).unwrap();
+        assert_eq!(wal.last_lsn(), Some(lsn));
+        wal.append(&[entry(8, b"next")]).unwrap();
+    }
+
+    #[test]
+    fn recovery_discards_complete_frames_after_the_requested_lsn() {
+        let dir = tempdir().unwrap();
+        let mut wal = open_wal(dir.path(), 1 << 20, WalPosition::default()).unwrap();
+        wal.append(&[entry(1, b"checkpoint")]).unwrap();
+        let checkpoint = sync_wal(&mut wal);
+        let recovered = wal.append(&[entry(2, b"recover")]).unwrap();
+        wal.append(&[entry(3, b"unpublished")]).unwrap();
+        drop(wal);
+
+        let wal = recover_wal(dir.path(), 1 << 20, checkpoint, Some(1), Some(2)).unwrap();
+        assert_eq!(wal.position(), recovered);
+        assert_eq!(
+            replay(&wal),
+            vec![entry(1, b"checkpoint"), entry(2, b"recover")]
+        );
+        assert_eq!(
+            fs::metadata(Wal::path(dir.path(), recovered.log_id))
+                .unwrap()
+                .len(),
+            recovered.offset
+        );
+    }
+
+    #[test]
+    fn corruption_inside_the_committed_prefix_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut wal = open_wal(dir.path(), 1 << 20, WalPosition::default()).unwrap();
+        wal.append(&[entry(1, b"alpha")]).unwrap();
+        let committed = sync_wal(&mut wal);
+        drop(wal);
+
+        let path = Wal::path(dir.path(), committed.log_id);
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(HEADER_LEN + FRAME_PREFIX_LEN))
+            .unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.sync_data().unwrap();
+
+        assert!(matches!(
+            open_wal(dir.path(), 1 << 20, committed),
+            Err(Error::CorruptWal { .. })
+        ));
+    }
+
+    #[test]
+    fn rolls_between_batches_and_replays_across_files() {
+        let dir = tempdir().unwrap();
+        let first = entry(1, b"alpha");
+        let second = entry(2, b"beta");
+        let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
+        let mut wal = open_wal(dir.path(), max_file_bytes, WalPosition::default()).unwrap();
+
+        assert_eq!(wal.append(std::slice::from_ref(&first)).unwrap().log_id, 1);
+        let committed = wal.append(std::slice::from_ref(&second)).unwrap();
+        assert_eq!(committed.log_id, 1);
+        assert_eq!(sync_wal(&mut wal), committed);
+        assert_eq!(wal.position().log_id, 2);
+        drop(wal);
+
+        let wal = open_wal(dir.path(), max_file_bytes, committed).unwrap();
+        assert_eq!(replay(&wal), vec![first, second]);
+    }
+
+    #[test]
+    fn recovery_starts_after_a_materialized_wal_prefix() {
+        let dir = tempdir().unwrap();
+        let first = entry(1, b"alpha");
+        let second = entry(2, b"beta");
+        let first_lsn = first.lsn;
+        let second_lsn = second.lsn;
+        let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
+        let mut wal = open_wal(dir.path(), max_file_bytes, WalPosition::default()).unwrap();
+
+        let checkpoint = wal.append(&[first]).unwrap();
+        sync_wal(&mut wal);
+        let recovered = wal.append(std::slice::from_ref(&second)).unwrap();
+        sync_wal(&mut wal);
+        wal.reclaim_through(first_lsn).unwrap();
+        assert!(!Wal::path(dir.path(), checkpoint.log_id).exists());
+        assert!(Wal::path(dir.path(), recovered.log_id).exists());
+        drop(wal);
+
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
+        thread::spawn(move || syncer.run());
+        let wal = Wal::recover(
+            dir.path(),
+            max_file_bytes,
+            checkpoint,
+            Some(first_lsn),
+            Some(first_lsn),
+            2,
+            Some(second_lsn),
+            file_sync_tx,
+        )
+        .unwrap();
+        assert_eq!(wal.position(), recovered);
+        assert_eq!(wal.last_lsn(), Some(second_lsn));
+        assert_eq!(replay(&wal), vec![second]);
+    }
+
+    #[test]
+    fn recovery_finishes_reclamation_published_before_delete() {
+        let dir = tempdir().unwrap();
+        let first = entry(1, b"alpha");
+        let second = entry(2, b"beta");
+        let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
+        let mut wal = open_wal(dir.path(), max_file_bytes, WalPosition::default()).unwrap();
+
+        let checkpoint = wal.append(std::slice::from_ref(&first)).unwrap();
+        sync_wal(&mut wal);
+        let recovered = wal.append(std::slice::from_ref(&second)).unwrap();
+        sync_wal(&mut wal);
+        drop(wal);
+        assert!(Wal::path(dir.path(), 1).exists());
+
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
+        thread::spawn(move || syncer.run());
+        let wal = Wal::recover(
+            dir.path(),
+            max_file_bytes,
+            checkpoint,
+            Some(first.lsn),
+            Some(first.lsn),
+            2,
+            Some(second.lsn),
+            file_sync_tx,
+        )
+        .unwrap();
+        assert_eq!(wal.position(), recovered);
+        assert!(!Wal::path(dir.path(), 1).exists());
+        assert_eq!(replay(&wal), vec![second]);
+    }
+
+    #[test]
+    fn recovery_rejects_a_missing_first_retained_wal() {
+        let dir = tempdir().unwrap();
+        let first = entry(1, b"alpha");
+        let second = entry(2, b"beta");
+        let third = entry(3, b"gamma");
+        let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
+        let mut wal = open_wal(dir.path(), max_file_bytes, WalPosition::default()).unwrap();
+
+        let checkpoint = wal.append(std::slice::from_ref(&first)).unwrap();
+        sync_wal(&mut wal);
+        wal.append(std::slice::from_ref(&second)).unwrap();
+        wal.append(std::slice::from_ref(&third)).unwrap();
+        sync_wal(&mut wal);
+        wal.reclaim_through(first.lsn).unwrap();
+        drop(wal);
+        fs::remove_file(Wal::path(dir.path(), 2)).unwrap();
+
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
+        thread::spawn(move || syncer.run());
+        assert!(matches!(
+            Wal::recover(
+                dir.path(),
+                max_file_bytes,
+                checkpoint,
+                Some(first.lsn),
+                Some(first.lsn),
+                2,
+                Some(third.lsn),
+                file_sync_tx,
+            ),
+            Err(Error::InvalidWal(_))
+        ));
+    }
+
+    #[test]
+    fn reopening_an_older_position_removes_later_rollovers() {
+        let dir = tempdir().unwrap();
+        let first = entry(1, b"alpha");
+        let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
+        let mut wal = open_wal(dir.path(), max_file_bytes, WalPosition::default()).unwrap();
+
+        let committed = wal.append(&[first]).unwrap();
+        sync_wal(&mut wal);
+        wal.append(&[entry(2, b"beta")]).unwrap();
+        assert_eq!(wal.position().log_id, 2);
+        drop(wal);
+
+        let wal = open_wal(dir.path(), max_file_bytes, committed).unwrap();
+        assert_eq!(wal.position(), committed);
+        assert!(!Wal::path(dir.path(), 2).exists());
+    }
+
+    #[test]
+    fn rejects_out_of_order_lsns_without_mutation() {
+        let dir = tempdir().unwrap();
+        let mut wal = open_wal(dir.path(), 1 << 20, WalPosition::default()).unwrap();
+        wal.append(&[entry(2, b"first")]).unwrap();
+        let before = wal.position();
+
+        assert!(matches!(
+            wal.append(&[entry(1, b"late")]),
+            Err(Error::WalLsnOutOfOrder { .. })
+        ));
+        assert_eq!(wal.position(), before);
+    }
+
+    #[test]
+    fn committed_position_must_end_on_a_frame_boundary() {
+        let dir = tempdir().unwrap();
+        let mut wal = open_wal(dir.path(), 1 << 20, WalPosition::default()).unwrap();
+        wal.append(&[entry(1, b"alpha")]).unwrap();
+        let committed = sync_wal(&mut wal);
+        drop(wal);
+
+        assert!(matches!(
+            open_wal(
+                dir.path(),
+                1 << 20,
+                WalPosition {
+                    offset: committed.offset - 1,
+                    ..committed
+                }
+            ),
+            Err(Error::CorruptWal { .. })
+        ));
+    }
+
+    #[test]
+    fn sync_rolls_an_oversized_wal() {
+        let dir = tempdir().unwrap();
+        let first = entry(1, b"alpha");
+        let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
+        let (file_sync_tx, syncer) = crate::file_sync_channel();
+        let mut wal = Wal::open(
+            dir.path(),
+            max_file_bytes,
+            WalPosition::default(),
+            file_sync_tx,
+        )
+        .unwrap();
+
+        wal.append(&[first]).unwrap();
+        wal.append(&[entry(2, b"beta")]).unwrap();
+        assert_eq!(wal.position().log_id, 1);
+
+        let worker = thread::spawn(move || syncer.run());
+        let committed = sync_wal(&mut wal);
+        assert_eq!(committed.log_id, 1);
+        assert_eq!(wal.position().log_id, 2);
+        drop(wal);
+        worker.join().unwrap();
+    }
+}

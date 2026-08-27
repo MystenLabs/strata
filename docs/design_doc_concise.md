@@ -6,10 +6,10 @@ Strata is an append-only blob storage engine with payload bytes outside RocksDB 
 
 Core crates:
 
-- `strata-core`: stable record, key, lifecycle, segment, and LSN types.
-- `strata-segment`: blocking append/read/scan for segment `.data` files.
-- `strata-index`: RocksDB-backed metadata index.
-- `strata-store`: high-level store protocol and workers.
+- `core`: stable record, key, lifecycle, segment, and LSN types.
+- `segment`: blocking append/read/scan for segment `.data` files.
+- `index`: RocksDB-backed metadata index.
+- `store`: high-level store protocol and workers.
 - `strata-accounting-index`: file-backed LSM for accounting/GC-derived state.
 
 Physical namespace layout:

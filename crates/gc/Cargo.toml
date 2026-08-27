@@ -1,0 +1,12 @@
+[package]
+name = "gc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "gc_planner"
+
+[dependencies]
+core.workspace = true

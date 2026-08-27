@@ -7,23 +7,23 @@ repository.workspace = true
 
 [features]
 default = []
-internal-profiling = ["strata-store/internal-profiling"]
+internal-profiling = ["store/internal-profiling"]
 
 [dependencies]
-strata-core.workspace = true
-strata-store.workspace = true
+core.workspace = true
+store.workspace = true
 
 [workspace]
 members = [
     ".",
-    "crates/strata-bench",
-    "crates/strata-realistic-bench",
-    "crates/strata-core",
-    "crates/strata-gc",
-    "crates/strata-index",
-    "crates/strata-lsm",
-    "crates/strata-segment",
-    "crates/strata-store",
+    "crates/bench",
+    "crates/core",
+    "crates/gc",
+    "crates/index",
+    "crates/lsm",
+    "crates/realistic-bench",
+    "crates/segment",
+    "crates/store",
 ]
 resolver = "3"
 
@@ -40,12 +40,12 @@ rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "mu
 serde = { version = "1", features = ["derive"] }
 serde_with = "3.20"
 sha2 = "0.10"
-strata-core = { path = "crates/strata-core" }
-strata-gc = { path = "crates/strata-gc" }
-strata-index = { path = "crates/strata-index" }
-strata-lsm = { path = "crates/strata-lsm" }
-strata-segment = { path = "crates/strata-segment" }
-strata-store = { path = "crates/strata-store" }
+core = { path = "crates/core" }
+gc = { path = "crates/gc" }
+index = { path = "crates/index" }
+lsm = { path = "crates/lsm" }
+segment = { path = "crates/segment" }
+store = { path = "crates/store" }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }

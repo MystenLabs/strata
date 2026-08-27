@@ -358,7 +358,7 @@ These approaches are compatible. Even with relocation manifests, the healer shou
 
 ## Local Code Pointer
 
-Current Strata GC publish TODO: `crates/strata-store/src/lib.rs`, `submit_gc_publish`.
+Current Strata GC publish TODO: `crates/store/src/lib.rs`, `submit_gc_publish`.
 # Historical Segment Relocation Manifest Proposal
 
 > This proposal predates the implemented relocation LSM. References to the separate accounting

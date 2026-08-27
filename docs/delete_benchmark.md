@@ -42,7 +42,7 @@ Run engines one at a time against fresh roots with the same payload, key count, 
 sync cadence, duration, and sample times.
 
 ```shell
-cargo run -p strata-bench --release -- \
+cargo run -p bench --release -- \
   --case store-delete \
   --root /benchmark/strata-delete-idle \
   --ops 100000 \
@@ -57,7 +57,7 @@ cargo run -p strata-bench --release -- \
   --sync-every 1000 \
   --metrics-drain-seconds 0
 
-cargo run -p strata-bench --release -- \
+cargo run -p bench --release -- \
   --case rocksdb-blobdb-delete \
   --root /benchmark/blobdb-delete-idle \
   --ops 100000 \
