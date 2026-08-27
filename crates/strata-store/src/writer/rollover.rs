@@ -11,7 +11,6 @@ use strata_core::{SegmentFileState, StrataLsn};
 use crate::{
     Error, PendingRollover, Result, SEAL_BACKLOG_WAIT, SegmentSync, WriteCoordinator,
     active_segment_state_from_path, segment_state::SegmentAllocationTracker,
-    unsealed_ingest_segment_count,
 };
 
 impl WriteCoordinator {
@@ -113,6 +112,8 @@ impl WriteCoordinator {
         self.active_allocation_tracker = Arc::new(SegmentAllocationTracker::default());
         self.active_segment_state = new_state;
         self.durable_offset = 0;
+        self.unsealed_segments += 1;
+        self.metrics.set_unsealed_segments(self.unsealed_segments);
         self.metrics.set_active_segment(
             self.active_segment_state.segment_id,
             self.active_segment_state.write_offset,
@@ -125,11 +126,11 @@ impl WriteCoordinator {
     /// instead of accumulating unbounded unsealed segments. Unsealed segments are the expensive
     /// thing at restart, so the cap directly bounds worst-case recovery time.
     ///
-    /// The mechanism is plain polling. Each iteration counts the ingest segments still Open or
-    /// Sealing in the index; a count under config.max_unsealed_segments means there is room for
-    /// one more and the wait (if any) ends. Otherwise the writer naps SEAL_BACKLOG_WAIT (10 ms —
-    /// short on purpose, because this sleep can sit directly on a foreground put that triggered a
-    /// segment-full rollover) and counts again until durability seals a rolled segment.
+    /// The writer maintains the number of ingest segments still Open or Sealing. A count under
+    /// config.max_unsealed_segments means there is room for one more and the wait (if any) ends.
+    /// Otherwise the writer naps SEAL_BACKLOG_WAIT (10 ms — short on purpose, because this sleep
+    /// can sit directly on a foreground put that triggered a segment-full rollover) until a
+    /// durability completion seals a rolled segment.
     ///
     /// The first blocked iteration raises two flags exactly once: a metrics timer measuring how
     /// long the writer stays blocked, and the GC tuner's seal-backpressure bit. Foreground writes
@@ -141,7 +142,7 @@ impl WriteCoordinator {
         loop {
             self.process_sync_done();
             self.store_halt.check()?;
-            if unsealed_ingest_segment_count(&self.index)? < self.config.max_unsealed_segments {
+            if self.unsealed_segments < self.config.max_unsealed_segments {
                 if waiting {
                     self.metrics
                         .finish_seal_backpressure_wait(started.elapsed());

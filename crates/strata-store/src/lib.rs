@@ -354,6 +354,7 @@ struct WriteCoordinator {
     active_allocation_records: u64,
     active_allocation_tracker: Arc<SegmentAllocationTracker>,
     pending_segment_bytes: u64,
+    unsealed_segments: usize,
     oldest_uncommitted_at: Option<Instant>,
     last_committed_at: Instant,
     pending_rollovers: Vec<PendingRollover>,

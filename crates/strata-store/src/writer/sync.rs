@@ -22,7 +22,6 @@ use crate::{
     maintenance::publish_blob_lsm_edit,
     profile_phase, publish_segment_allocation_baseline,
     seal::prepare_synced_seal,
-    unsealed_ingest_segment_count,
 };
 
 struct PendingWalSync {
@@ -409,13 +408,23 @@ impl WriteCoordinator {
         for (tracker, records) in allocation_marks {
             tracker.mark_published(records);
         }
-        for state in &states {
-            if state.state == SegmentFileState::Sealed {
-                self.metrics.record_segment_sealed();
-            }
+        let sealed_segments = states
+            .iter()
+            .filter(|state| state.state == SegmentFileState::Sealed)
+            .count();
+        for _ in 0..sealed_segments {
+            self.metrics.record_segment_sealed();
         }
-        self.metrics
-            .set_unsealed_segments(unsealed_ingest_segment_count(&self.index)?);
+        self.unsealed_segments = self
+            .unsealed_segments
+            .checked_sub(sealed_segments)
+            .ok_or_else(|| Error::InvariantViolation {
+                reason: format!(
+                    "sealed {sealed_segments} segments with only {} unsealed",
+                    self.unsealed_segments
+                ),
+            })?;
+        self.metrics.set_unsealed_segments(self.unsealed_segments);
 
         profile_phase(
             Some(&mut phases),

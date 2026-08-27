@@ -2479,6 +2479,16 @@ async fn metrics_track_seal_backpressure_waits() {
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
     put_test_segment_state(&index, 1, SegmentFileState::Sealing);
     put_test_segment_state(&index, 2, SegmentFileState::Open);
+    let sealing_path = segment_path(&cfg, 1);
+    drop(
+        SegmentWriter::create(
+            &sealing_path,
+            1,
+            PlacementClass::Ingest,
+            cfg.segment_max_bytes,
+        )
+        .unwrap(),
+    );
 
     let registry = Registry::new();
     let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
@@ -2528,6 +2538,7 @@ async fn metrics_track_seal_backpressure_waits() {
         active_allocation_records: 0,
         active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
         pending_segment_bytes: 0,
+        unsealed_segments: 2,
         oldest_uncommitted_at: None,
         last_committed_at: Instant::now(),
         pending_rollovers: Vec::new(),
@@ -2547,13 +2558,18 @@ async fn metrics_track_seal_backpressure_waits() {
         metrics,
     };
 
-    let unblocker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        put_test_segment_state(&index, 1, SegmentFileState::Sealed);
+    coordinator.pending_segment_syncs.push(SegmentSync {
+        segment_id: 1,
+        path: sealing_path,
+        durable_offset: 0,
+        sealed_before_lsn: Some(1),
+        sealed_sha256: Arc::new(Mutex::new(None)),
+        allocation_records: 0,
+        allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
     });
+    coordinator.start_sync_and_commit(true).unwrap();
 
     coordinator.wait_for_seal_backlog_capacity().unwrap();
-    unblocker.join().unwrap();
 
     assert_eq!(
         counter_value(&registry, "strata_store_seal_backpressure_waits_total"),
@@ -5119,10 +5135,16 @@ async fn rollover_switches_active_segment_and_durability_seals_old_segment() {
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
     let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
-    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
+    let store = try_open_standalone_store(cfg, metrics).unwrap();
+
+    assert_eq!(gauge_value(&registry, "strata_store_unsealed_segments"), 1);
 
     store.put(&key_1, b"payload-a").unwrap();
     store.put(&key_2, b"payload-b").unwrap();
+
+    assert_eq!(gauge_value(&registry, "strata_store_unsealed_segments"), 2);
 
     assert_eq!(lsm_blob_ref(&store, &key_1).segment_id, 1);
     assert_eq!(lsm_blob_ref(&store, &key_2).segment_id, 2);
@@ -5139,6 +5161,7 @@ async fn rollover_switches_active_segment_and_durability_seals_old_segment() {
     assert_eq!(sealed.sealed_len, Some(sealed.write_offset));
     assert_eq!(sealed.sealed_sha256, None);
     assert_eq!(store.published_lsn().unwrap(), 2);
+    assert_eq!(gauge_value(&registry, "strata_store_unsealed_segments"), 1);
 
     let open = store.index().get_segment_state(2).unwrap().unwrap();
     assert_eq!(open.state, SegmentFileState::Open);
@@ -5262,6 +5285,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
         active_allocation_records: 0,
         active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
         pending_segment_bytes: 0,
+        unsealed_segments: 1,
         oldest_uncommitted_at: None,
         last_committed_at: Instant::now(),
         pending_rollovers: Vec::new(),

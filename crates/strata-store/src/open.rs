@@ -169,7 +169,8 @@ impl StrataStore {
         metrics.initialize_gc_known(&gc_known_summary(&index)?);
         metrics.set_gc_relocating_segments(gc_relocating_segment_count(&index)?);
         metrics.set_current_epoch(current_epoch);
-        metrics.set_unsealed_segments(unsealed_ingest_segment_count(&index)?);
+        let unsealed_segments = unsealed_ingest_segment_count(&index)?;
+        metrics.set_unsealed_segments(unsealed_segments);
         let gc_publish_cleanup_lock = Arc::new(Mutex::new(()));
         let gc_wake_txs = Arc::new(Mutex::new(Vec::new()));
         let gc_claims = Arc::new(GcSourceClaims::default());
@@ -274,6 +275,7 @@ impl StrataStore {
             active_allocation_records: 0,
             active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
             pending_segment_bytes: 0,
+            unsealed_segments,
             oldest_uncommitted_at: None,
             last_committed_at: Instant::now(),
             pending_rollovers: Vec::new(),
