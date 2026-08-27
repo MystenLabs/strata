@@ -2,12 +2,18 @@
 
 use std::collections::BTreeMap;
 
-use strata_core::{Epoch, GarbageEvent, ShardKey};
+use strata_core::{BlobLifecycle, Epoch, GarbageEvent, ShardKey};
 use strata_lsm::{GarbageRecord, Result, StrataLsn};
 
 use super::format::{BlobMutation, BlobMutationWithLSN, BlobVersion};
-use super::garbage::terminal_garbage_record;
+use super::garbage::{emit_lifetime_change, terminal_garbage_record};
 use super::snapshot::BlobCompactionSnapshot;
+
+#[derive(Debug, Clone, Copy)]
+struct PatchLifecycleHint {
+    lsn: StrataLsn,
+    lifecycle: BlobLifecycle,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct PatchBucket {
@@ -16,6 +22,9 @@ struct PatchBucket {
     put: Option<BlobVersion>,
     // `None` means the patch does not prove a lifetime for this bucket.
     logical_end_epoch: Option<Epoch>,
+    // A patch-local lifetime established before this Put and unchanged afterwards. Partial
+    // compaction can publish this as an early GC routing hint without consulting the base.
+    lifecycle_hint: Option<PatchLifecycleHint>,
 }
 
 enum PatchEvent {
@@ -147,7 +156,7 @@ pub(crate) fn reduce_patch_mutations(
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<Vec<BlobMutationWithLSN>> {
     let mut buckets = BTreeMap::<ShardKey, PatchBucket>::new();
-    let mut current_lifetime = None::<Epoch>;
+    let mut current_lifetime = None::<PatchLifecycleHint>;
     for event in merge_patch_events(&mutations, snapshot) {
         let mutation_index = match event {
             PatchEvent::Mutation(mutation_index) => mutation_index,
@@ -157,7 +166,7 @@ pub(crate) fn reduce_patch_mutations(
                 emit_garbage,
             } => {
                 change_patch_epoch(key, lsn, epoch, emit_garbage, &mut buckets, emit)?;
-                if current_lifetime.is_some_and(|logical_end_epoch| logical_end_epoch <= epoch) {
+                if current_lifetime.is_some_and(|hint| hint.lifecycle.logical_end_epoch <= epoch) {
                     // Future mutations start a new bucket generation and do not inherit an expired
                     // lifetime. The SetLifetime remains in the output as a base barrier.
                     current_lifetime = None;
@@ -178,15 +187,17 @@ pub(crate) fn reduce_patch_mutations(
                     write_epoch,
                     record_ref,
                 };
-                let logical_end_epoch =
-                    current_lifetime.filter(|logical_end_epoch| *logical_end_epoch > write_epoch);
+                let lifecycle_hint =
+                    current_lifetime.filter(|hint| hint.lifecycle.logical_end_epoch > write_epoch);
                 replace_patch_bucket(
                     key,
                     shard,
                     PatchBucket {
                         mutation_index,
                         put: Some(version),
-                        logical_end_epoch,
+                        logical_end_epoch: lifecycle_hint
+                            .map(|hint| hint.lifecycle.logical_end_epoch),
+                        lifecycle_hint,
                     },
                     lsn,
                     &mut buckets,
@@ -194,11 +205,24 @@ pub(crate) fn reduce_patch_mutations(
                 )?;
             }
             BlobMutation::SetLifetime {
-                logical_end_epoch, ..
+                logical_end_epoch,
+                current_epoch,
             } => {
-                current_lifetime = Some(logical_end_epoch);
+                let extension_count = current_lifetime
+                    .filter(|hint| hint.lifecycle.logical_end_epoch > current_epoch)
+                    .map_or(0, |hint| hint.lifecycle.extension_count.saturating_add(1));
+                current_lifetime = Some(PatchLifecycleHint {
+                    lsn,
+                    lifecycle: BlobLifecycle {
+                        logical_end_epoch,
+                        extension_count,
+                    },
+                });
                 for bucket in buckets.values_mut() {
                     bucket.logical_end_epoch = Some(logical_end_epoch);
+                    // A lifetime changed after this Put. Full compaction must resolve its exact
+                    // extension count before GC receives the new routing hint.
+                    bucket.lifecycle_hint = None;
                 }
             }
             BlobMutation::Tombstone { shard } => {
@@ -208,7 +232,9 @@ pub(crate) fn reduce_patch_mutations(
                     PatchBucket {
                         mutation_index,
                         put: None,
-                        logical_end_epoch: current_lifetime,
+                        logical_end_epoch: current_lifetime
+                            .map(|hint| hint.lifecycle.logical_end_epoch),
+                        lifecycle_hint: None,
                     },
                     lsn,
                     &mut buckets,
@@ -226,6 +252,13 @@ pub(crate) fn reduce_patch_mutations(
     }
     for bucket in buckets.values() {
         keep[bucket.mutation_index] = true;
+        if let (Some(version), Some(hint)) = (bucket.put, bucket.lifecycle_hint) {
+            // The hint LSN deliberately precedes the Put. Both mutations are durable before this
+            // partial compaction can publish, while the distinct position lets a later full merge
+            // restate or correct an extension count at the Put LSN without creating a conflicting
+            // garbage-log event.
+            emit_lifetime_change(key, hint.lsn, version, None, Some(hint.lifecycle), emit)?;
+        }
     }
     Ok(mutations
         .into_iter()

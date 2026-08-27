@@ -125,6 +125,44 @@ fn partial_merge_preserves_lifetimes_without_expiring_puts() {
 }
 
 #[test]
+fn partial_merge_publishes_patch_local_lifetime_for_surviving_put() {
+    let shard = shard(1, 1);
+    let record = record(2, 20);
+    let patches = [
+        (
+            1,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 10,
+                current_epoch: 5,
+            }),
+        ),
+        (2, put_patch(shard, 5, record)),
+    ];
+
+    let (batched, partial_garbage) =
+        partial_merge_with_snapshot(&patches, BlobCompactionSnapshot::default());
+
+    assert_eq!(partial_garbage.len(), 1);
+    assert_eq!(partial_garbage[0].lsn, 1);
+    assert_eq!(
+        partial_garbage[0].event,
+        GarbageEvent::SetLifecycle {
+            record,
+            lifecycle: Some(BlobLifecycle {
+                logical_end_epoch: 10,
+                extension_count: 0,
+            }),
+        }
+    );
+
+    let direct = merge(&patches);
+    let (from_batch_state, mut from_batch_garbage) = merge(&[(2, batched)]);
+    from_batch_garbage.extend(partial_garbage);
+    assert_eq!(from_batch_state, direct.0);
+    assert_functionally_equivalent_garbage(&from_batch_garbage, &direct.1);
+}
+
+#[test]
 fn partial_merge_expires_patch_puts_before_and_after_a_lifetime() {
     let shard_a = shard(1, 1);
     let shard_b = shard(2, 1);
@@ -231,9 +269,20 @@ fn partial_merge_starts_a_new_bucket_after_lifetime_expiry() {
             mutation: BlobMutation::Put { record_ref, .. },
         } if record_ref == surviving
     ));
-    assert_eq!(garbage.len(), 1);
-    assert_eq!(garbage[0].lsn, 3);
-    assert_eq!(garbage[0].event, GarbageEvent::Expired { record: expired });
+    assert!(garbage.iter().any(|record| {
+        record.lsn == 3 && record.event == GarbageEvent::Expired { record: expired }
+    }));
+    assert!(garbage.iter().any(|record| {
+        record.lsn == 4
+            && record.event
+                == GarbageEvent::SetLifecycle {
+                    record: surviving,
+                    lifecycle: Some(BlobLifecycle {
+                        logical_end_epoch: 10,
+                        extension_count: 0,
+                    }),
+                }
+    }));
 }
 
 #[test]
@@ -395,7 +444,23 @@ fn partial_merge_does_not_expire_beyond_the_materialized_frontier() {
             mutation: BlobMutation::Put { record_ref, .. },
         } if record_ref == record
     ));
-    assert!(garbage.is_empty());
+    assert!(
+        garbage
+            .iter()
+            .all(|record| !matches!(record.event, GarbageEvent::Expired { .. }))
+    );
+    assert_eq!(garbage.len(), 1);
+    assert_eq!(garbage[0].lsn, 1);
+    assert_eq!(
+        garbage[0].event,
+        GarbageEvent::SetLifecycle {
+            record,
+            lifecycle: Some(BlobLifecycle {
+                logical_end_epoch: 10,
+                extension_count: 0,
+            }),
+        }
+    );
 }
 
 #[test]

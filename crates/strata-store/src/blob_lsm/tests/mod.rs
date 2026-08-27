@@ -3,7 +3,11 @@
 //! The child modules mirror the source split: `codec` covers `format`, `full_merge` covers
 //! `state`, `partial_merge` covers `reduce`, and `compaction` covers snapshot-driven pruning.
 
-use strata_core::{Epoch, RecordRef, SegmentGcSummaryDelta, ShardKey};
+use std::collections::BTreeMap;
+
+use strata_core::{
+    BlobLifecycle, Epoch, GarbageEvent, RecordRef, SegmentGcSummaryDelta, SegmentKey, ShardKey,
+};
 use strata_lsm::{
     GarbageRecord, MergeOperator, StoredValue, StrataLsn, decode_value, encode_blob_value,
     encode_inline_value,
@@ -106,22 +110,36 @@ fn aggregate_garbage_deltas(records: &[GarbageRecord]) -> SegmentGcSummaryDelta 
 }
 
 fn assert_functionally_equivalent_garbage(left: &[GarbageRecord], right: &[GarbageRecord]) {
-    let left = aggregate_garbage_deltas(left);
-    let right = aggregate_garbage_deltas(right);
-    assert_eq!(left.total_bytes, right.total_bytes);
-    assert_eq!(left.live_bytes, right.live_bytes);
-    assert_eq!(
-        left.retired_bytes + left.expired_bytes,
-        right.retired_bytes + right.expired_bytes
-    );
-    assert_eq!(left.live_ref_count, right.live_ref_count);
-    assert_eq!(left.unknown_lifetime_bytes, right.unknown_lifetime_bytes);
-    assert_eq!(
-        left.unknown_lifetime_ref_count,
-        right.unknown_lifetime_ref_count
-    );
-    assert_eq!(left.epoch_bytes, right.epoch_bytes);
-    assert_eq!(left.epoch_refs, right.epoch_refs);
+    assert_eq!(garbage_facts(left), garbage_facts(right));
+}
+
+fn garbage_facts(
+    records: &[GarbageRecord],
+) -> BTreeMap<(SegmentKey, u64, u64), (bool, Option<BlobLifecycle>)> {
+    let mut facts = BTreeMap::new();
+    for record in records {
+        let physical = record.event.record();
+        let fact = facts
+            .entry((record.key.clone(), physical.offset, physical.len))
+            .or_insert((false, None));
+        match record.event {
+            GarbageEvent::Retired { .. } | GarbageEvent::Expired { .. } => fact.0 = true,
+            GarbageEvent::SetLifecycle { lifecycle, .. } => {
+                if fact.1.is_none_or(|(lsn, _)| record.lsn > lsn) {
+                    fact.1 = Some((record.lsn, lifecycle));
+                }
+            }
+        }
+    }
+    facts
+        .into_iter()
+        .map(|(record, (terminal, lifecycle))| {
+            let lifecycle = (!terminal)
+                .then(|| lifecycle.and_then(|(_, lifecycle)| lifecycle))
+                .flatten();
+            (record, (terminal, lifecycle))
+        })
+        .collect()
 }
 
 fn compact_state(
