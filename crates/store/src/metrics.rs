@@ -1,7 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use core_types::{Epoch, SegmentGcSummary, SegmentId, StrataLsn};
-use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+use prometheus::{
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
+};
 use segment::SegmentIoObserver;
 
 #[cfg(feature = "internal-profiling")]
@@ -11,6 +13,11 @@ use crate::{StoreSyncProfile, StoreWriteProfile};
 const OPERATION_LATENCY_BUCKETS: &[f64] = &[
     0.000_001, 0.000_005, 0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001,
     0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0,
+];
+
+const SYNC_PHASE_DURATION_BUCKETS: &[f64] = &[
+    0.000_001, 0.000_005, 0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001,
+    0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
 const COMPACTION_DURATION_BUCKETS: &[f64] = &[
@@ -43,6 +50,7 @@ struct PrometheusMetrics {
     sync_calls_total: IntCounter,
     sync_errors_total: IntCounter,
     sync_duration_seconds: Histogram,
+    sync_phase_duration_seconds: HistogramVec,
     sync_bytes_total: IntCounter,
     durability_wal_bytes_total: IntCounter,
     durability_pending_wal_bytes: IntGauge,
@@ -239,11 +247,20 @@ impl StrataStoreMetrics {
                     "sync_errors_total",
                     "Total failed Strata sync calls.",
                 )?,
-                sync_duration_seconds: register_histogram(
+                sync_duration_seconds: register_histogram_with_buckets(
                     registry,
                     &labels,
                     "sync_duration_seconds",
                     "Strata sync latency in seconds.",
+                    SYNC_PHASE_DURATION_BUCKETS.to_vec(),
+                )?,
+                sync_phase_duration_seconds: register_histogram_vec_with_buckets(
+                    registry,
+                    &labels,
+                    "sync_phase_duration_seconds",
+                    "Successful Strata durability publication latency by non-overlapping phase.",
+                    &["phase"],
+                    SYNC_PHASE_DURATION_BUCKETS.to_vec(),
                 )?,
                 sync_bytes_total: register_counter(
                     registry,
@@ -874,6 +891,35 @@ impl StrataStoreMetrics {
         }
     }
 
+    pub(crate) fn record_sync_phases(&self, profile: &StoreSyncProfile, total: Duration) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        let phases = [
+            ("capture", profile.capture),
+            ("segment_files", profile.segment_file_sync),
+            ("wal", profile.wal_sync),
+            ("completion_queue", profile.completion_queue_wait),
+            ("relocation_lock", profile.relocation_lock_wait),
+            ("metadata_build", profile.published_lsn_compute),
+            ("index_sync_commit", profile.index_batch_commit),
+            ("state_update", profile.state_update),
+            ("wal_reclaim", profile.wal_reclaim),
+        ];
+        let mut accounted = Duration::ZERO;
+        for (phase, elapsed) in phases {
+            metrics
+                .sync_phase_duration_seconds
+                .with_label_values(&[phase])
+                .observe(duration_seconds(elapsed));
+            accounted = accounted.saturating_add(elapsed);
+        }
+        metrics
+            .sync_phase_duration_seconds
+            .with_label_values(&["unattributed"])
+            .observe(duration_seconds(total.saturating_sub(accounted)));
+    }
+
     pub(crate) fn set_durability_pending(
         &self,
         wal_bytes: u64,
@@ -1426,6 +1472,24 @@ fn register_histogram_with_buckets(
     Ok(histogram)
 }
 
+fn register_histogram_vec_with_buckets(
+    registry: &Registry,
+    labels: &HashMap<String, String>,
+    name: &str,
+    help: &str,
+    variable_labels: &[&str],
+    buckets: Vec<f64>,
+) -> Result<HistogramVec, prometheus::Error> {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(metric_name(name), help)
+            .const_labels(labels.clone())
+            .buckets(buckets),
+        variable_labels,
+    )?;
+    registry.register(Box::new(histogram.clone()))?;
+    Ok(histogram)
+}
+
 fn register_counter_vec(
     registry: &Registry,
     labels: &HashMap<String, String>,
@@ -1538,6 +1602,79 @@ mod tests {
             MetricType::COUNTER => metric.counter.value(),
             MetricType::GAUGE => metric.gauge.value(),
             other => panic!("unexpected metric type {other:?} for {name}"),
+        }
+    }
+
+    fn histogram_value_with_labels(
+        registry: &Registry,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> (u64, f64) {
+        let family = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .expect("metric family registered");
+        let metric = family
+            .metric
+            .iter()
+            .find(|metric| {
+                labels.iter().all(|(name, value)| {
+                    metric
+                        .label
+                        .iter()
+                        .any(|label| label.name() == *name && label.value() == *value)
+                })
+            })
+            .expect("histogram with labels registered");
+        assert_eq!(family.type_(), MetricType::HISTOGRAM);
+        (
+            metric.histogram.sample_count(),
+            metric.histogram.sample_sum(),
+        )
+    }
+
+    #[test]
+    fn sync_phase_histograms_record_each_phase_and_residual() {
+        let registry = Registry::new();
+        let metrics = StrataStoreMetrics::new(&registry, "test").unwrap();
+        let profile = StoreSyncProfile {
+            capture: Duration::from_millis(1),
+            segment_file_sync: Duration::from_millis(2),
+            wal_sync: Duration::from_millis(3),
+            completion_queue_wait: Duration::from_millis(4),
+            relocation_lock_wait: Duration::from_millis(5),
+            published_lsn_compute: Duration::from_millis(6),
+            index_batch_commit: Duration::from_millis(7),
+            state_update: Duration::from_millis(8),
+            wal_reclaim: Duration::from_millis(9),
+            ..StoreSyncProfile::default()
+        };
+
+        metrics.record_sync_phases(&profile, Duration::from_millis(50));
+
+        for (phase, expected_seconds) in [
+            ("capture", 0.001),
+            ("segment_files", 0.002),
+            ("wal", 0.003),
+            ("completion_queue", 0.004),
+            ("relocation_lock", 0.005),
+            ("metadata_build", 0.006),
+            ("index_sync_commit", 0.007),
+            ("state_update", 0.008),
+            ("wal_reclaim", 0.009),
+            ("unattributed", 0.005),
+        ] {
+            let (count, sum) = histogram_value_with_labels(
+                &registry,
+                "strata_store_sync_phase_duration_seconds",
+                &[("phase", phase)],
+            );
+            assert_eq!(count, 1, "phase {phase}");
+            assert!(
+                (sum - expected_seconds).abs() < f64::EPSILON,
+                "phase {phase}"
+            );
         }
     }
 

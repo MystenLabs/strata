@@ -15,9 +15,9 @@ use std::{
 use core_types::{SegmentFileState, StoreCheckpoint};
 
 use crate::{
-    Error, PendingSyncRequest, Result, SYNC_AND_COMMIT_INTERVAL, SYNC_AND_COMMIT_SEGMENT_BYTES,
-    SYNC_AND_COMMIT_WAL_BYTES, SegmentSync, StoreSyncProfile, SyncAndCommit, SyncRequest,
-    WriteCommand, WriteCoordinator,
+    Error, FileSyncProfile, FileSyncTimings, PendingSyncRequest, Result, SYNC_AND_COMMIT_INTERVAL,
+    SYNC_AND_COMMIT_SEGMENT_BYTES, SYNC_AND_COMMIT_WAL_BYTES, SegmentSync, StoreSyncProfile,
+    SyncAndCommit, SyncRequest, WriteCommand, WriteCoordinator,
     file_sync::{FileSyncSender, FileSyncTask},
     maintenance::publish_blob_lsm_edit,
     profile_phase, publish_segment_allocation_baseline,
@@ -68,6 +68,10 @@ impl SyncAndCommit {
                 .take()
                 .expect("last segment completion has no WAL sync task")
         };
+        self.file_sync_timings
+            .lock()
+            .expect("durability file-sync timings lock poisoned")
+            .segment_files = Some(self.file_sync_started.elapsed());
         if self
             .file_sync_result
             .lock()
@@ -79,20 +83,47 @@ impl SyncAndCommit {
             }));
             return;
         }
+        self.file_sync_timings
+            .lock()
+            .expect("durability file-sync timings lock poisoned")
+            .wal_started_at = Some(Instant::now());
         if let Err(error) = wal_sync_tx.send(wal_sync) {
             error.0.complete(Err(Error::FileSyncQueueClosed));
         }
     }
 
     fn on_wal_sync_finished(self: &Arc<Self>, result: Result<()>) {
-        self.record_sync_error(result);
+        let completed_at = Instant::now();
+        let result = result.and_then(|()| {
+            let timings = self
+                .file_sync_timings
+                .lock()
+                .expect("durability file-sync timings lock poisoned");
+            let segment_files = timings
+                .segment_files
+                .ok_or_else(|| Error::InvariantViolation {
+                    reason: "WAL sync completed without segment-file timing".to_owned(),
+                })?;
+            let wal_started_at =
+                timings
+                    .wal_started_at
+                    .ok_or_else(|| Error::InvariantViolation {
+                        reason: "WAL sync completed without a start time".to_owned(),
+                    })?;
+            Ok(FileSyncProfile {
+                segment_files,
+                wal: completed_at.saturating_duration_since(wal_started_at),
+                total: completed_at.saturating_duration_since(self.file_sync_started),
+                completed_at,
+            })
+        });
         {
             let mut final_result = self
                 .file_sync_result
                 .lock()
                 .expect("durability file-sync result lock poisoned");
             if final_result.is_none() {
-                *final_result = Some(Ok(self.file_sync_started.elapsed()));
+                *final_result = Some(result);
             }
         }
         if self.sync_done_tx.send(Arc::clone(self)).is_ok() {
@@ -170,6 +201,7 @@ impl WriteCoordinator {
             segment_bytes,
             started,
             file_sync_started: Instant::now(),
+            file_sync_timings: std::sync::Mutex::new(FileSyncTimings::default()),
             file_sync_result: std::sync::Mutex::new(None),
             sync_done_tx: self.sync_done_tx.clone(),
             wake_tx: self.internal_write_tx.clone(),
@@ -272,6 +304,7 @@ impl WriteCoordinator {
         &mut self,
         commit: Arc<SyncAndCommit>,
     ) -> Result<(u64, StoreSyncProfile)> {
+        let commit_started = Instant::now();
         let expected = self.sync_and_commit_in_flight.take();
         if expected != Some(commit.target_lsn) {
             return Err(Error::InvariantViolation {
@@ -282,21 +315,29 @@ impl WriteCoordinator {
             });
         }
 
-        let file_sync_result = commit
+        let file_sync_profile = commit
             .file_sync_result
             .lock()
             .expect("durability file sync result lock poisoned")
             .take()
-            .expect("ready durability publication has no file-sync result");
+            .expect("ready durability publication has no file-sync result")?;
         let mut phases = StoreSyncProfile {
-            segment_sync: file_sync_result?,
+            capture: commit
+                .file_sync_started
+                .saturating_duration_since(commit.started),
+            segment_file_sync: file_sync_profile.segment_files,
+            wal_sync: file_sync_profile.wal,
+            segment_sync: file_sync_profile.total,
+            completion_queue_wait: commit_started
+                .saturating_duration_since(file_sync_profile.completed_at),
             ..StoreSyncProfile::default()
         };
-        let commit_started = Instant::now();
+        let relocation_lock_started = Instant::now();
         let _commit_guard = self
             .relocation_durability_lock
             .lock()
             .expect("relocation durability lock poisoned");
+        phases.relocation_lock_wait = relocation_lock_started.elapsed();
         // The relocation frontier must be sampled while holding the same lock used by GC
         // activation. The synced RocksDB write below then proves that every sampled manifest edit
         // and activation row reached disk together.
@@ -446,8 +487,13 @@ impl WriteCoordinator {
         );
         drop(_commit_guard);
 
-        self.reclaim_store_wal(commit.target_lsn)?;
+        profile_phase(
+            Some(&mut phases),
+            |profile, elapsed| profile.wal_reclaim += elapsed,
+            || self.reclaim_store_wal(commit.target_lsn),
+        )?;
         let elapsed = commit.started.elapsed();
+        self.metrics.record_sync_phases(&phases, elapsed);
         self.metrics.record_sync(Ok(commit.segment_bytes), elapsed);
         self.metrics.record_durability_wal_bytes(commit.wal_bytes);
         self.metrics.set_durability_pending(
@@ -520,10 +566,16 @@ impl WriteCoordinator {
                 let queue_wait = profile.queue_wait;
                 *profile = StoreSyncProfile {
                     queue_wait,
+                    capture: phases.capture,
+                    segment_file_sync: phases.segment_file_sync,
+                    wal_sync: phases.wal_sync,
                     segment_sync: phases.segment_sync,
+                    completion_queue_wait: phases.completion_queue_wait,
+                    relocation_lock_wait: phases.relocation_lock_wait,
                     published_lsn_compute: phases.published_lsn_compute,
                     index_batch_commit: phases.index_batch_commit,
                     state_update: phases.state_update,
+                    wal_reclaim: phases.wal_reclaim,
                     writer_total: pending.started.elapsed(),
                     ..StoreSyncProfile::default()
                 };
@@ -594,7 +646,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{FileSyncTask, PendingWalSync};
-    use crate::{SyncAndCommit, WriteCommand};
+    use crate::{FileSyncTimings, SyncAndCommit, WriteCommand};
 
     #[test]
     fn wal_sync_waits_for_all_segment_syncs() {
@@ -618,6 +670,7 @@ mod tests {
             segment_bytes: 0,
             started: Instant::now(),
             file_sync_started: Instant::now(),
+            file_sync_timings: Mutex::new(FileSyncTimings::default()),
             file_sync_result: Mutex::new(None),
             sync_done_tx: ready_tx,
             wake_tx,

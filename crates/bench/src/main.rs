@@ -1143,10 +1143,16 @@ struct StoreSyncProfileSummary {
     count: usize,
     queue_send: Duration,
     queue_wait: Duration,
+    capture: Duration,
+    segment_file_sync: Duration,
+    wal_sync: Duration,
     segment_sync: Duration,
+    completion_queue_wait: Duration,
+    relocation_lock_wait: Duration,
     published_lsn_compute: Duration,
     index_batch_commit: Duration,
     state_update: Duration,
+    wal_reclaim: Duration,
     response_send: Duration,
     writer_total: Duration,
 }
@@ -1157,10 +1163,16 @@ impl StoreSyncProfileSummary {
         self.count += 1;
         self.queue_send += profile.queue_send;
         self.queue_wait += profile.queue_wait;
+        self.capture += profile.capture;
+        self.segment_file_sync += profile.segment_file_sync;
+        self.wal_sync += profile.wal_sync;
         self.segment_sync += profile.segment_sync;
+        self.completion_queue_wait += profile.completion_queue_wait;
+        self.relocation_lock_wait += profile.relocation_lock_wait;
         self.published_lsn_compute += profile.published_lsn_compute;
         self.index_batch_commit += profile.index_batch_commit;
         self.state_update += profile.state_update;
+        self.wal_reclaim += profile.wal_reclaim;
         self.response_send += profile.response_send;
         self.writer_total += profile.writer_total;
     }
@@ -4425,9 +4437,26 @@ fn print_store_sync_profile(profile: &StoreSyncProfileSummary) {
     println!("sync_profile_ops={}", profile.count);
     print_profile_duration("sync_profile_queue_send", profile.queue_send, profile.count);
     print_profile_duration("sync_profile_queue_wait", profile.queue_wait, profile.count);
+    print_profile_duration("sync_profile_capture", profile.capture, profile.count);
+    print_profile_duration(
+        "sync_profile_segment_file_sync",
+        profile.segment_file_sync,
+        profile.count,
+    );
+    print_profile_duration("sync_profile_wal_sync", profile.wal_sync, profile.count);
     print_profile_duration(
         "sync_profile_segment_sync",
         profile.segment_sync,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_completion_queue_wait",
+        profile.completion_queue_wait,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_relocation_lock_wait",
+        profile.relocation_lock_wait,
         profile.count,
     );
     print_profile_duration(
@@ -4443,6 +4472,11 @@ fn print_store_sync_profile(profile: &StoreSyncProfileSummary) {
     print_profile_duration(
         "sync_profile_state_update",
         profile.state_update,
+        profile.count,
+    );
+    print_profile_duration(
+        "sync_profile_wal_reclaim",
+        profile.wal_reclaim,
         profile.count,
     );
     print_profile_duration(

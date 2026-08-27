@@ -167,12 +167,25 @@ pub struct StoreSyncProfile {
     pub queue_send: Duration,
     /// Time from client submission until the writer starts the command, excluding `queue_send`.
     pub queue_wait: Duration,
+    /// Time spent capturing the durability boundary and opening immutable file handles.
+    pub capture: Duration,
+    /// Wall time from file-sync dispatch until every captured segment file is durable.
+    pub segment_file_sync: Duration,
+    /// Wall time from WAL-sync dispatch until the captured WAL and its directory are durable.
+    pub wal_sync: Duration,
+    /// Combined segment-file and WAL durability pipeline, retained for profile compatibility.
     pub segment_sync: Duration,
+    /// Time between WAL-sync completion and the writer beginning durability publication.
+    pub completion_queue_wait: Duration,
+    /// Time waiting for GC relocation activation to leave the durability publication lock.
+    pub relocation_lock_wait: Duration,
     /// Includes durable segment state assembly, published LSN computation, and batch construction.
     pub published_lsn_compute: Duration,
     /// RocksDB batch commit with synchronous WAL durability.
     pub index_batch_commit: Duration,
     pub state_update: Duration,
+    /// Time publishing/materializing the durable blob-LSM frontier and reclaiming store WAL files.
+    pub wal_reclaim: Duration,
     pub response_send: Duration,
     pub writer_total: Duration,
 }

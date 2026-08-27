@@ -393,6 +393,20 @@ struct PendingSyncRequest {
     started: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FileSyncProfile {
+    segment_files: Duration,
+    wal: Duration,
+    total: Duration,
+    completed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct FileSyncTimings {
+    segment_files: Option<Duration>,
+    wal_started_at: Option<Instant>,
+}
+
 #[derive(Debug)]
 struct SyncAndCommit {
     target_lsn: StrataLsn,
@@ -404,10 +418,11 @@ struct SyncAndCommit {
     segment_bytes: u64,
     started: Instant,
     file_sync_started: Instant,
+    file_sync_timings: Mutex<FileSyncTimings>,
     ///None: still syncing
     ///Some(Err(error)): a sync failed
-    ///Some(Ok(duration)): all segment and WAL syncs completed in this duration
-    file_sync_result: Mutex<Option<Result<Duration>>>,
+    ///Some(Ok(profile)): all segment and WAL syncs completed with these timings
+    file_sync_result: Mutex<Option<Result<FileSyncProfile>>>,
     sync_done_tx: mpsc::Sender<Arc<SyncAndCommit>>,
     wake_tx: mpsc::SyncSender<WriteCommand>,
 }

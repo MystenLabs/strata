@@ -411,6 +411,64 @@
       ],
       "title": "Segment / Blob File I/O Throughput",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "p99 wall time for each non-overlapping Strata durability phase. Total is the existing end-to-end sync histogram; phase quantiles are diagnostic and are not additive.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "id": 13,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (phase, le) (rate(strata_store_sync_phase_duration_seconds_bucket{job=\"strata-bench\",store=\"strata\"}[$__rate_interval])))",
+          "legendFormat": "{{phase}} p99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(strata_store_sync_duration_seconds_bucket{job=\"strata-bench\",store=\"strata\"}[$__rate_interval])))",
+          "legendFormat": "total p99",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Strata Sync Phase p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Each phase's share of cumulative successful sync wall time over the selected rate interval. These shares are additive; unattributed covers orchestration not assigned to an explicit phase.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "stacking": { "group": "A", "mode": "normal" } },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "id": 14,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (phase) (rate(strata_store_sync_phase_duration_seconds_sum{job=\"strata-bench\",store=\"strata\"}[$__rate_interval])) / scalar(sum(rate(strata_store_sync_duration_seconds_sum{job=\"strata-bench\",store=\"strata\"}[$__rate_interval])))",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Strata Sync Time Share by Phase",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

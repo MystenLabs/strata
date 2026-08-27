@@ -238,6 +238,18 @@ strata_realistic_bench_storage_file_apparent_bytes
 rate(strata_store_segment_file_bytes_read_total[$__rate_interval]) / 1024 / 1024
 rate(strata_store_segment_file_bytes_written_total[$__rate_interval]) / 1024 / 1024
 
+# Strata durability p99 by non-overlapping phase
+histogram_quantile(0.99,
+  sum by (phase, le) (
+    rate(strata_store_sync_phase_duration_seconds_bucket[$__rate_interval])
+  )
+)
+
+# Each durability phase's additive share of total sync wall time
+sum by (phase) (
+  rate(strata_store_sync_phase_duration_seconds_sum[$__rate_interval])
+) / scalar(sum(rate(strata_store_sync_duration_seconds_sum[$__rate_interval])))
+
 # Live bytes copied by each engine's GC
 rate(strata_store_gc_output_bytes_total[$__rate_interval]) / 1024 / 1024
 rate(strata_realistic_bench_blobdb_gc_bytes_relocated[$__rate_interval]) / 1024 / 1024

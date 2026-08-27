@@ -353,6 +353,31 @@ fn histogram_sample_count(registry: &Registry, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("missing histogram metric {name}"))
 }
 
+fn histogram_sample_count_with_labels(
+    registry: &Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> u64 {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| {
+            family.get_metric().iter().find_map(|metric| {
+                labels
+                    .iter()
+                    .all(|(name, value)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == *name && label.value() == *value)
+                    })
+                    .then(|| metric.get_histogram().sample_count())
+            })
+        })
+        .unwrap_or_else(|| panic!("missing histogram metric {name} with labels {labels:?}"))
+}
+
 fn histogram_sample_sum(registry: &Registry, name: &str) -> f64 {
     registry
         .gather()
@@ -2379,6 +2404,28 @@ async fn metrics_track_core_store_operations() {
         counter_value(&registry, "strata_store_sync_errors_total"),
         0.0
     );
+    for phase in [
+        "capture",
+        "segment_files",
+        "wal",
+        "completion_queue",
+        "relocation_lock",
+        "metadata_build",
+        "index_sync_commit",
+        "state_update",
+        "wal_reclaim",
+        "unattributed",
+    ] {
+        assert_eq!(
+            histogram_sample_count_with_labels(
+                &registry,
+                "strata_store_sync_phase_duration_seconds",
+                &[("phase", phase)],
+            ),
+            1,
+            "phase {phase}",
+        );
+    }
     assert!(counter_value(&registry, "strata_store_sync_bytes_total") > 0.0);
     assert_eq!(
         counter_value(&registry, "strata_store_get_calls_total"),
