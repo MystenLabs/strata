@@ -770,6 +770,14 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
         .send(WriteCommand::Shutdown)
         .unwrap();
     store.store.writer_handle.take().unwrap().join().unwrap();
+    store.store.wal_reclaim_tx.take();
+    store
+        .store
+        .wal_reclaim_handle
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
     store.store.lsm_flush_tx.take();
     store.store.lsm_flush_handle.take().unwrap().join().unwrap();
     store.store.lsm_compact_tx.take();
@@ -2561,6 +2569,7 @@ async fn metrics_track_seal_backpressure_waits() {
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
+    let (wal_reclaim_tx, _wal_reclaim_rx) = mpsc::sync_channel(1);
     let mut coordinator = WriteCoordinator {
         config: cfg.clone(),
         index: index.clone(),
@@ -2593,6 +2602,7 @@ async fn metrics_track_seal_backpressure_waits() {
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
+        wal_reclaim_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         relocations: open_relocation_lsm(
@@ -5305,6 +5315,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
     let (segment_sync_tx, segment_syncer) = file_sync_channel();
     let (lsm_flush_tx, _lsm_flush_rx) = mpsc::channel();
     let (lsm_compact_tx, _lsm_compact_rx) = mpsc::channel();
+    let (wal_reclaim_tx, _wal_reclaim_rx) = mpsc::sync_channel(1);
     let (write_tx, write_rx) = mpsc::sync_channel(1);
     let (sync_done_tx, sync_done_rx) = mpsc::channel();
 
@@ -5340,6 +5351,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
         pending_rollovers: Vec::new(),
         lsm_flush_tx,
         lsm_compact_tx,
+        wal_reclaim_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
         relocations: open_relocation_lsm(

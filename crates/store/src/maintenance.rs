@@ -26,7 +26,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -38,6 +38,7 @@ use crate::{
     gc::GcCommand,
     metrics::MainCompactionKind,
     relocation::{RelocationCache, RelocationMerge, RelocationStore},
+    wal::WalReclaimer,
 };
 use core_types::SegmentFileState;
 use index::StrataIndex;
@@ -300,6 +301,92 @@ impl LsmFlusher {
         lsm.materialize_through(committed_lsn, |edit| {
             publish_blob_lsm_edit(&self.index, edit)
         })?;
+        Ok(())
+    }
+}
+
+/// Publishes the blob-LSM durability frontier and reclaims the store WAL away from the serialized
+/// writer. Durability completions wake this worker, while the fallback tick catches SSTs that a
+/// flusher finished after the last foreground commit.
+pub(crate) struct WalReclaimWorker {
+    pub(crate) index: StrataIndex,
+    pub(crate) lsm: Arc<Lsm>,
+    pub(crate) wal: WalReclaimer,
+    pub(crate) wake_rx: mpsc::Receiver<()>,
+    pub(crate) store_halt: StoreHalt,
+    pub(crate) metrics: StrataStoreMetrics,
+}
+
+impl WalReclaimWorker {
+    pub(crate) fn run(self) {
+        loop {
+            match self.wake_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            while self.wake_rx.try_recv().is_ok() {}
+            if let Err(error) = self.reclaim() {
+                let reason = format!("store WAL reclamation failed: {error}");
+                self.store_halt.halt(reason.clone());
+                self.lsm.halt(reason);
+                return;
+            }
+        }
+    }
+
+    fn reclaim(&self) -> Result<()> {
+        let total_started = Instant::now();
+        let committed_lsn = self.index.get_committed_lsn()?;
+
+        let started = Instant::now();
+        let published = self.lsm.publish_pending_through(committed_lsn, |edit| {
+            publish_blob_lsm_edit(&self.index, edit)
+        });
+        self.metrics
+            .record_wal_reclaim_phase("publish_pending", started.elapsed());
+        published?;
+
+        let started = Instant::now();
+        let materialized = self.lsm.materialize_through(committed_lsn, |edit| {
+            publish_blob_lsm_edit(&self.index, edit)
+        });
+        self.metrics
+            .record_wal_reclaim_phase("materialize", started.elapsed());
+        materialized?;
+
+        let reclaim_through = self.lsm.manifest().materialized_through.unwrap_or_default();
+        if reclaim_through == 0 {
+            self.metrics
+                .record_wal_reclaim_phase("total", total_started.elapsed());
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let plan = self.wal.plan(reclaim_through);
+        self.metrics
+            .record_wal_reclaim_phase("plan", started.elapsed());
+        let plan = plan?;
+
+        let started = Instant::now();
+        let retained_from = plan.retained_from();
+        let persisted = self.index.get_store_wal_retained_from()?;
+        let current = persisted.unwrap_or(self.lsm.manifest().wal_retained_from);
+        if retained_from > current || persisted.is_none() {
+            let mut batch = self.index.batch();
+            self.index
+                .put_store_wal_retained_from_batch(&mut batch, retained_from.max(current))?;
+            batch.write_with_sync(true).map_err(index::Error::from)?;
+        }
+        self.metrics
+            .record_wal_reclaim_phase("boundary_sync", started.elapsed());
+
+        let started = Instant::now();
+        let reclaimed = self.wal.apply(plan);
+        self.metrics
+            .record_wal_reclaim_phase("unlink", started.elapsed());
+        reclaimed?;
+        self.metrics
+            .record_wal_reclaim_phase("total", total_started.elapsed());
         Ok(())
     }
 }

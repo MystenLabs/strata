@@ -87,7 +87,96 @@ pub struct Wal {
     pending_bytes: u64,
 }
 
+/// Filesystem-only handle used by background maintenance to reclaim rolled WAL files without
+/// sharing the append-owned [`Wal`] with another thread.
+#[derive(Debug, Clone)]
+pub(crate) struct WalReclaimer {
+    dir: PathBuf,
+}
+
+/// One immutable reclaim decision. The retained boundary is durably published before these exact
+/// paths are unlinked, so a concurrent WAL rollover can only leave extra files for the next pass.
+#[derive(Debug)]
+pub(crate) struct WalReclaimPlan {
+    retained_from: u64,
+    remove: Vec<PathBuf>,
+}
+
+impl WalReclaimPlan {
+    pub(crate) fn retained_from(&self) -> u64 {
+        self.retained_from
+    }
+}
+
+impl WalReclaimer {
+    /// Scans the immutable rolled prefix once and captures the exact files covered by
+    /// `materialized`. The highest numbered file observed is treated as active and is never read
+    /// or removed.
+    pub(crate) fn plan(&self, materialized: StrataLsn) -> Result<WalReclaimPlan> {
+        let ids = log_ids(&self.dir)?;
+        let active_log_id = ids
+            .last()
+            .copied()
+            .ok_or_else(|| Error::InvalidWal("store WAL has no active file".to_owned()))?;
+        for pair in ids.windows(2) {
+            let expected = pair[0]
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+            if pair[1] != expected {
+                return Err(Error::InvalidWal(format!(
+                    "missing WAL file {expected} before active file {active_log_id}"
+                )));
+            }
+        }
+        let mut expected_id = ids[0];
+        let mut previous = None;
+        let mut remove = Vec::new();
+        let mut ignore = |_: &WalEntry| Ok(());
+        for id in ids.into_iter().take_while(|id| *id < active_log_id) {
+            if id != expected_id {
+                return Err(Error::InvalidWal(format!(
+                    "missing WAL file {expected_id} before active file {active_log_id}"
+                )));
+            }
+            let path = Wal::path(&self.dir, id);
+            let file_len = File::open(&path)
+                .and_then(|file| file.metadata())
+                .map_err(|source| io_error(&path, source))?
+                .len();
+            previous = scan_log(&path, file_len, previous, &mut ignore)?;
+            if previous.is_none_or(|lsn| lsn > materialized) {
+                break;
+            }
+            remove.push(path);
+            expected_id = expected_id
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
+        }
+        Ok(WalReclaimPlan {
+            retained_from: expected_id.min(active_log_id),
+            remove,
+        })
+    }
+
+    /// Applies a plan only after its retained boundary has been synced into store metadata.
+    pub(crate) fn apply(&self, plan: WalReclaimPlan) -> Result<()> {
+        for path in &plan.remove {
+            fs::remove_file(path).map_err(|source| io_error(path, source))?;
+        }
+        if !plan.remove.is_empty() {
+            sync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+}
+
 impl Wal {
+    pub(crate) fn reclaimer(&self) -> WalReclaimer {
+        WalReclaimer {
+            dir: self.dir.clone(),
+        }
+    }
+
     /// Validates that recovery can reopen the WAL at `last_lsn` without truncating any files.
     ///
     /// Store-level recovery uses this preflight to distinguish a complete buffered tail, which
@@ -579,90 +668,12 @@ impl Wal {
         Ok(())
     }
 
-    /// Deletes complete rolled files whose final lsn is materialized in durable SST metadata.
-    ///
-    /// Only whole, already-rolled files are candidates — the active file never is. Files are
-    /// scanned oldest first and removed while their final LSN sits at or below `materialized`;
-    /// the walk stops at the first file that still holds unmaterialized entries, since LSNs only
-    /// grow and no later file can qualify either. `materialized` must be the *minimum* of the
-    /// blob and relocation frontiers: a WAL file may only vanish when no projection could ever
-    /// need to replay it again. The caller durably publishes the retained boundary
-    /// (retained_from_after) before invoking this, so a crash mid-unlink leaves only
-    /// officially-dead files that the next recovery finishes deleting.
+    /// Test-only convenience for exercising physical reclamation without store metadata.
+    #[cfg(test)]
     pub fn reclaim_through(&mut self, materialized: StrataLsn) -> Result<()> {
-        let ids = log_ids(&self.dir)?;
-        let mut expected_id = ids.first().copied().ok_or_else(|| {
-            Error::InvalidWal(format!("active WAL file {} does not exist", self.log_id))
-        })?;
-        let mut previous = None;
-        let mut remove = Vec::new();
-        let mut ignore = |_: &WalEntry| Ok(());
-        for id in ids.into_iter().take_while(|id| *id < self.log_id) {
-            if id != expected_id {
-                return Err(Error::InvalidWal(format!(
-                    "missing WAL file {expected_id} before active file {}",
-                    self.log_id
-                )));
-            }
-            let path = Self::path(&self.dir, id);
-            let file_len = File::open(&path)
-                .and_then(|file| file.metadata())
-                .map_err(|source| io_error(&path, source))?
-                .len();
-            previous = scan_log(&path, file_len, previous, &mut ignore)?;
-            if previous.is_some_and(|lsn| lsn <= materialized) {
-                remove.push(path);
-            } else {
-                break;
-            }
-            expected_id = expected_id
-                .checked_add(1)
-                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
-        }
-        for path in &remove {
-            fs::remove_file(path).map_err(|source| io_error(path, source))?;
-        }
-        if !remove.is_empty() {
-            sync_dir(&self.dir)?;
-        }
-        Ok(())
-    }
-
-    /// Computes the first WAL file id that must survive reclamation at this frontier — the
-    /// read-only twin of reclaim_through.
-    ///
-    /// The two exist as a pair so the store can follow the publish-first, delete-second
-    /// protocol: this function names the boundary, a synced RocksDB write makes it official, and
-    /// only then does reclaim_through unlink — the same crash-safe ordering GC uses before
-    /// removing its own files.
-    pub fn retained_from_after(&self, materialized: StrataLsn) -> Result<u64> {
-        let ids = log_ids(&self.dir)?;
-        let mut expected_id = ids.first().copied().ok_or_else(|| {
-            Error::InvalidWal(format!("active WAL file {} does not exist", self.log_id))
-        })?;
-        let mut previous = None;
-        let mut ignore = |_: &WalEntry| Ok(());
-        for id in ids.into_iter().take_while(|id| *id < self.log_id) {
-            if id != expected_id {
-                return Err(Error::InvalidWal(format!(
-                    "missing WAL file {expected_id} before active file {}",
-                    self.log_id
-                )));
-            }
-            let path = Self::path(&self.dir, id);
-            let file_len = File::open(&path)
-                .and_then(|file| file.metadata())
-                .map_err(|source| io_error(&path, source))?
-                .len();
-            previous = scan_log(&path, file_len, previous, &mut ignore)?;
-            if previous.is_none_or(|lsn| lsn > materialized) {
-                return Ok(id);
-            }
-            expected_id = expected_id
-                .checked_add(1)
-                .ok_or_else(|| Error::InvalidWal("WAL id overflow".to_owned()))?;
-        }
-        Ok(self.log_id)
+        let reclaimer = self.reclaimer();
+        let plan = reclaimer.plan(materialized)?;
+        reclaimer.apply(plan)
     }
 
     /// Continues the chain in the next numbered file. The new file is written but not fsynced
@@ -1451,6 +1462,32 @@ mod tests {
         assert_eq!(wal.position(), recovered);
         assert_eq!(wal.last_lsn(), Some(second_lsn));
         assert_eq!(replay(&wal), vec![second]);
+    }
+
+    #[test]
+    fn reclaim_plan_does_not_expand_across_a_concurrent_rollover() {
+        let dir = tempdir().unwrap();
+        let first = entry(1, b"alpha");
+        let second = entry(2, b"bravo");
+        let max_file_bytes = HEADER_LEN + encoded_frame_len(std::slice::from_ref(&first)).unwrap();
+        let mut wal = open_wal(dir.path(), max_file_bytes, WalPosition::default()).unwrap();
+
+        wal.append(std::slice::from_ref(&first)).unwrap();
+        sync_wal(&mut wal);
+        wal.append(std::slice::from_ref(&second)).unwrap();
+        let reclaimer = wal.reclaimer();
+        let plan = reclaimer.plan(first.lsn).unwrap();
+        assert_eq!(plan.retained_from(), 2);
+
+        // File 2 becomes rolled after the plan is captured. Applying the old plan must leave it
+        // in place because the durable retained boundary will still name file 2.
+        sync_wal(&mut wal);
+        assert_eq!(wal.position().log_id, 3);
+        reclaimer.apply(plan).unwrap();
+
+        assert!(!Wal::path(dir.path(), 1).exists());
+        assert!(Wal::path(dir.path(), 2).exists());
+        assert!(Wal::path(dir.path(), 3).exists());
     }
 
     #[test]

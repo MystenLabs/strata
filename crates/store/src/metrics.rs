@@ -51,6 +51,7 @@ struct PrometheusMetrics {
     sync_errors_total: IntCounter,
     sync_duration_seconds: Histogram,
     sync_phase_duration_seconds: HistogramVec,
+    wal_reclaim_phase_duration_seconds: HistogramVec,
     sync_bytes_total: IntCounter,
     durability_wal_bytes_total: IntCounter,
     durability_pending_wal_bytes: IntGauge,
@@ -259,6 +260,14 @@ impl StrataStoreMetrics {
                     &labels,
                     "sync_phase_duration_seconds",
                     "Successful Strata durability publication latency by non-overlapping phase.",
+                    &["phase"],
+                    SYNC_PHASE_DURATION_BUCKETS.to_vec(),
+                )?,
+                wal_reclaim_phase_duration_seconds: register_histogram_vec_with_buckets(
+                    registry,
+                    &labels,
+                    "wal_reclaim_phase_duration_seconds",
+                    "Background store-WAL reclamation latency by phase.",
                     &["phase"],
                     SYNC_PHASE_DURATION_BUCKETS.to_vec(),
                 )?,
@@ -918,6 +927,16 @@ impl StrataStoreMetrics {
             .sync_phase_duration_seconds
             .with_label_values(&["unattributed"])
             .observe(duration_seconds(total.saturating_sub(accounted)));
+    }
+
+    pub(crate) fn record_wal_reclaim_phase(&self, phase: &str, elapsed: Duration) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics
+            .wal_reclaim_phase_duration_seconds
+            .with_label_values(&[phase])
+            .observe(duration_seconds(elapsed));
     }
 
     pub(crate) fn set_durability_pending(
@@ -1676,6 +1695,22 @@ mod tests {
                 "phase {phase}"
             );
         }
+    }
+
+    #[test]
+    fn wal_reclaim_phase_histograms_record_background_work() {
+        let registry = Registry::new();
+        let metrics = StrataStoreMetrics::new(&registry, "test").unwrap();
+
+        metrics.record_wal_reclaim_phase("materialize", Duration::from_millis(7));
+
+        let (count, sum) = histogram_value_with_labels(
+            &registry,
+            "strata_store_wal_reclaim_phase_duration_seconds",
+            &[("phase", "materialize")],
+        );
+        assert_eq!(count, 1);
+        assert!((sum - 0.007).abs() < f64::EPSILON);
     }
 
     #[test]

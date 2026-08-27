@@ -19,7 +19,6 @@ use crate::{
     SYNC_AND_COMMIT_SEGMENT_BYTES, SYNC_AND_COMMIT_WAL_BYTES, SegmentSync, StoreSyncProfile,
     SyncAndCommit, SyncRequest, WriteCommand, WriteCoordinator,
     file_sync::{FileSyncSender, FileSyncTask},
-    maintenance::publish_blob_lsm_edit,
     profile_phase, publish_segment_allocation_baseline,
     seal::prepare_synced_seal,
 };
@@ -487,11 +486,14 @@ impl WriteCoordinator {
         );
         drop(_commit_guard);
 
-        profile_phase(
-            Some(&mut phases),
-            |profile, elapsed| profile.wal_reclaim += elapsed,
-            || self.reclaim_store_wal(commit.target_lsn),
-        )?;
+        match self.wal_reclaim_tx.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => {
+                return Err(Error::StoreHalted {
+                    reason: "store WAL reclaim worker stopped".to_owned(),
+                });
+            }
+        }
         let elapsed = commit.started.elapsed();
         self.metrics.record_sync_phases(&phases, elapsed);
         self.metrics.record_sync(Ok(commit.segment_bytes), elapsed);
@@ -605,32 +607,6 @@ impl WriteCoordinator {
                 pending.profile_request.send(profile);
             }
         }
-    }
-
-    /// Advances the blob projection and reclaims complete WAL files no longer needed for replay.
-    fn reclaim_store_wal(&mut self, committed_lsn: u64) -> Result<()> {
-        self.lsm.publish_pending_through(committed_lsn, |edit| {
-            publish_blob_lsm_edit(&self.index, edit)
-        })?;
-        self.lsm.materialize_through(committed_lsn, |edit| {
-            publish_blob_lsm_edit(&self.index, edit)
-        })?;
-        let reclaim_through = self.lsm.manifest().materialized_through.unwrap_or_default();
-        if reclaim_through == 0 {
-            return Ok(());
-        }
-
-        let retained_from = self.wal.retained_from_after(reclaim_through)?;
-        let persisted = self.index.get_store_wal_retained_from()?;
-        let current = persisted.unwrap_or(self.lsm.manifest().wal_retained_from);
-        if retained_from > current || persisted.is_none() {
-            let mut batch = self.index.batch();
-            self.index
-                .put_store_wal_retained_from_batch(&mut batch, retained_from.max(current))?;
-            batch.write_with_sync(true).map_err(index::Error::from)?;
-        }
-        self.wal.reclaim_through(reclaim_through)?;
-        Ok(())
     }
 }
 

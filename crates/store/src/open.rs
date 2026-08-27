@@ -33,7 +33,7 @@ use crate::{
     },
     gc_rate_limiter::GcIoLimiter,
     layout::segment_path,
-    maintenance::{GarbageLogSweeper, LsmCompactor, LsmFlusher, garbage_log_dir},
+    maintenance::{GarbageLogSweeper, LsmCompactor, LsmFlusher, WalReclaimWorker, garbage_log_dir},
     reader_cache::SegmentReaderCache,
     recovery::{
         publish_recovered_store_checkpoint, reconcile_orphan_ingest_segment_files,
@@ -160,6 +160,7 @@ impl StrataStore {
         let store_checkpoint = index.get_store_checkpoint()?;
         let (store_wal, blob_recovery, relocation_recovery, lsm_sync_handles) =
             open_store_wal(&config, &index, next_lsn, store_checkpoint)?;
+        let wal_reclaimer = store_wal.reclaimer();
         let lsm = open_lsm(&config, &index, next_lsn, blob_recovery)?;
         publish_recovered_store_checkpoint(&index, &metrics, &store_wal, &active_segment_state)?;
         let relocations = open_relocation_lsm(&config, &index, next_lsn, relocation_recovery)?;
@@ -183,6 +184,19 @@ impl StrataStore {
             GcConcurrencyConfig::from_store_config(&config),
             metrics.clone(),
         ));
+        let (wal_reclaim_tx, wal_reclaim_rx) = mpsc::sync_channel(1);
+        let wal_reclaim_worker = WalReclaimWorker {
+            index: index.clone(),
+            lsm: Arc::clone(&lsm),
+            wal: wal_reclaimer,
+            wake_rx: wal_reclaim_rx,
+            store_halt: store_halt.clone(),
+            metrics: metrics.clone(),
+        };
+        let wal_reclaim_handle = thread::Builder::new()
+            .name(format!("strata-wal-reclaim-{}", config.namespace))
+            .spawn(move || wal_reclaim_worker.run())
+            .map_err(|source| Error::ThreadSpawn { source })?;
         let mut recovered_frozen_memtables = false;
         for partition in 0..config.lsm_partition_count {
             recovered_frozen_memtables |= !lsm.frozen_generations(partition)?.is_empty();
@@ -281,6 +295,7 @@ impl StrataStore {
             pending_rollovers: Vec::new(),
             lsm_flush_tx: lsm_flush_tx.clone(),
             lsm_compact_tx: lsm_compact_tx.clone(),
+            wal_reclaim_tx: wal_reclaim_tx.clone(),
             write_rx,
             ingest_owner: INGEST_SEGMENT_OWNER,
             relocations: Arc::clone(&relocations),
@@ -373,8 +388,10 @@ impl StrataStore {
             writer_handle: Some(writer_handle),
             lsm_flush_tx: Some(lsm_flush_tx),
             lsm_compact_tx: Some(lsm_compact_tx),
+            wal_reclaim_tx: Some(wal_reclaim_tx),
             lsm_flush_handle: Some(lsm_flush_handle),
             lsm_compact_handle: Some(lsm_compact_handle),
+            wal_reclaim_handle: Some(wal_reclaim_handle),
             lsm_sync_handles,
             garbage_sweep_tx: Some(garbage_sweep_tx),
             garbage_sweep_handle: Some(garbage_sweep_handle),

@@ -391,6 +391,10 @@ impl Drop for StrataStore {
         if let Some(writer_handle) = self.writer_handle.take() {
             let _ = writer_handle.join();
         }
+        self.wal_reclaim_tx.take();
+        if let Some(wal_reclaim_handle) = self.wal_reclaim_handle.take() {
+            let _ = wal_reclaim_handle.join();
+        }
         self.lsm_flush_tx.take();
         if let Some(lsm_flush_handle) = self.lsm_flush_handle.take() {
             let _ = lsm_flush_handle.join();

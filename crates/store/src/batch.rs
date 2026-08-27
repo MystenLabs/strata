@@ -184,7 +184,7 @@ pub struct StoreSyncProfile {
     /// RocksDB batch commit with synchronous WAL durability.
     pub index_batch_commit: Duration,
     pub state_update: Duration,
-    /// Time publishing/materializing the durable blob-LSM frontier and reclaiming store WAL files.
+    /// Retained for profile compatibility; WAL reclamation now runs on a background worker.
     pub wal_reclaim: Duration,
     pub response_send: Duration,
     pub writer_total: Duration,
