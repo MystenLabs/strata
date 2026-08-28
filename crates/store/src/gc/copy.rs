@@ -528,11 +528,10 @@ impl GcExecutor {
     /// charges the shared I/O limiter first, which is how the tuner's byte budget actually slows
     /// GC down), classify the record's range against the overlay. Dead ranges are the payoff of
     /// the ordered walk — B's bytes, had the overlay already known B was dead, would be skipped
-    /// here without ever reading the body. A live record is routed by its lifecycle: if the plan
-    /// does not name that bucket (a MoveEpochBytes plan moving only epoch-50 bytes leaves other
-    /// lifecycles in place), it is skipped and simply stays in S7 for a later plan. Otherwise the
-    /// body is read, decoded, and appended to the staging copier with its source ref, payload
-    /// LSN, and refreshed lifecycle riding along for publication.
+    /// here without ever reading the body. A live record is routed by its lifecycle. Every copy
+    /// policy is a full-source evacuation, so an unplanned live lifecycle aborts the attempt
+    /// instead of leaving the source stranded in `GcRelocating`. Routed records are decoded and
+    /// appended to the staging copier with their source ref, payload LSN, and refreshed lifecycle.
     fn copy_gc_source_segment_to_staging(
         &self,
         segment_id: SegmentId,
@@ -629,10 +628,9 @@ impl GcExecutor {
             };
 
             let Some(destination_class) = selector.destination_for(segment_id, lifecycle) else {
-                offset = offset
-                    .checked_add(record_len)
-                    .ok_or(segment::Error::RangeOverflow)?;
-                continue;
+                return Err(Error::GcInvalidPlan(
+                    "full-source GC plan omitted a route for a live record",
+                ));
             };
 
             let payload_len =
@@ -1163,7 +1161,7 @@ fn gc_source_segment_path(
 fn plan_has_copy_action(plan: &GcPlan) -> bool {
     matches!(
         &plan.action,
-        GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. }
+        GcAction::MoveLiveBytes { .. } | GcAction::MoveLiveBytesFromSources { .. }
     )
 }
 
@@ -1176,7 +1174,7 @@ fn copy_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
         } => {
             source_ids.insert(*source_segment_id);
         }
-        GcAction::MoveEpochBytes { routes, .. } => {
+        GcAction::MoveLiveBytesFromSources { routes } => {
             source_ids.extend(routes.iter().map(|route| route.source_segment_id));
         }
         GcAction::DeleteSegment { .. }
@@ -1201,7 +1199,7 @@ fn gc_plan_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
         GcAction::ReclassifySegment { segment_id, .. } => {
             source_ids.insert(*segment_id);
         }
-        GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {}
+        GcAction::MoveLiveBytes { .. } | GcAction::MoveLiveBytesFromSources { .. } => {}
     }
     source_ids
 }

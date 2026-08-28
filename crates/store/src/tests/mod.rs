@@ -4038,6 +4038,166 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
 }
 
 #[tokio::test]
+async fn join_multiple_fully_evacuates_and_deletes_every_source() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+    cfg.gc_workers_enabled = false;
+    cfg.lsm_partition_count = 4;
+    let keys = ["blob-a", "blob-b", "blob-c", "blob-d", "blob-e"]
+        .map(|key| BlobKey::new(key.as_bytes().to_vec()).unwrap());
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    for key in &keys {
+        store.set_blob_lifetime(key, 50).unwrap();
+    }
+    let mut last_put_lsn = 0;
+    for (key, payload) in keys.iter().zip([
+        b"payload-a".as_slice(),
+        b"payload-b".as_slice(),
+        b"payload-c".as_slice(),
+        b"payload-d".as_slice(),
+        b"payload-e".as_slice(),
+    ]) {
+        last_put_lsn = store.put(key, payload).unwrap();
+    }
+    store.sync().unwrap();
+    wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+    wait_for_segment_state(
+        store.index(),
+        FIRST_SEGMENT_ID + 1,
+        SegmentFileState::Sealed,
+    );
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, last_put_lsn);
+
+    let live_left = lsm_blob_ref(&store, &keys[1]);
+    let live_right = lsm_blob_ref(&store, &keys[3]);
+    assert_eq!(live_left.segment_id, FIRST_SEGMENT_ID);
+    assert_eq!(live_right.segment_id, FIRST_SEGMENT_ID + 1);
+
+    store.tombstone(&keys[0]).unwrap();
+    let last_tombstone_lsn = store.tombstone(&keys[2]).unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, last_tombstone_lsn);
+    wait_for_lsm_gc(&store, last_tombstone_lsn);
+
+    let source_ids = [live_left.segment_id, live_right.segment_id];
+    let source_paths = source_ids.map(|segment_id| {
+        let mut state = store
+            .index()
+            .get_segment_state(segment_id)
+            .unwrap()
+            .unwrap();
+        let path = segment_state_path(store.config(), &state);
+        state.placement_class = PlacementClass::ExactEpoch(50);
+        (state, path)
+    });
+    let mut batch = store.index().batch();
+    for (state, _) in &source_paths {
+        store
+            .index()
+            .put_segment_state_batch(&mut batch, state)
+            .unwrap();
+    }
+    batch.write_with_sync(true).unwrap();
+
+    let planner = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 6_600,
+        min_reclaim_bytes: u64::MAX,
+        min_garbage_ratio_bps: 10_000,
+        min_exact_epoch_bucket_bytes: 1,
+        min_exact_epoch_distance: 1,
+        max_exact_epoch_extension_count: 1,
+        min_join_output_bytes: 1,
+        max_join_sources: 4,
+    });
+    let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    assert_eq!(prepared.plan.scenario, GcScenario::JoinMultiple);
+    let GcAction::MoveLiveBytesFromSources { routes } = &prepared.plan.action else {
+        panic!("expected a full-source join action");
+    };
+    assert_eq!(
+        routes
+            .iter()
+            .map(|route| route.source_segment_id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(source_ids)
+    );
+    assert_eq!(prepared.plan.copied_bytes, TEST_RECORD_LEN * 2);
+
+    let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+    assert_eq!(copied.outputs.len(), 1);
+    assert_eq!(copied.copied_records.len(), 2);
+    let published = store.publish_prepared_gc_copy(copied).unwrap();
+    assert_eq!(published.output_segments.len(), 1);
+    assert_eq!(published.published_records.len(), 2);
+    for segment_id in source_ids {
+        assert_eq!(
+            store
+                .index()
+                .get_segment_state(segment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            SegmentFileState::GcRelocating
+        );
+    }
+
+    loop {
+        let swept = {
+            let _publish_guard = store
+                .store
+                .garbage_publish_lock
+                .lock()
+                .expect("garbage publication lock poisoned");
+            store
+                .index()
+                .sweep_garbage_log(
+                    garbage_log_dir(store.config()),
+                    store.config().namespace_dir(),
+                    GARBAGE_LOG_HEAD,
+                    GARBAGE_LOG_SWEEP_CURSOR,
+                )
+                .unwrap()
+        };
+        if !swept {
+            break;
+        }
+    }
+
+    let prepared_delete = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    assert_eq!(prepared_delete.plan.scenario, GcScenario::EmptyDelete);
+    assert_eq!(
+        prepared_delete.plan.action,
+        GcAction::DeleteSegments {
+            segment_ids: source_ids.to_vec(),
+        }
+    );
+    let copied_delete = store.copy_prepared_gc_plan(prepared_delete).unwrap();
+    store.publish_prepared_gc_copy(copied_delete).unwrap();
+
+    for (state, path) in source_paths {
+        assert_eq!(
+            store
+                .index()
+                .get_segment_state(state.segment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            SegmentFileState::Deleted
+        );
+        assert!(!path.exists());
+    }
+    assert_eq!(store.get(&keys[1]).unwrap(), Some(b"payload-b".to_vec()));
+    assert_eq!(store.get(&keys[3]).unwrap(), Some(b"payload-d".to_vec()));
+}
+
+#[tokio::test]
 async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();

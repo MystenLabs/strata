@@ -65,8 +65,8 @@ pub struct GcPlannerConfig {
     pub max_exact_epoch_extension_count: u32,
     /// Minimum joined bytes before JoinMultiple is considered.
     ///
-    /// JoinMultiple is a locality improvement more than direct space reclamation. This threshold
-    /// keeps it focused on output segments dense enough to matter.
+    /// JoinMultiple fully drains each selected source into a common exact-epoch output. This
+    /// threshold keeps the joined output dense enough to justify copying and deleting the sources.
     pub min_join_output_bytes: u64,
     /// Maximum number of sources in one JoinMultiple plan.
     ///
@@ -81,7 +81,7 @@ impl Default for GcPlannerConfig {
             max_copy_bytes_per_plan: 256 * 1024 * 1024,
             max_l0_copy_bytes_per_plan: 1024 * 1024 * 1024,
             min_l0_rewrite_epoch_distance: 2,
-            min_l0_rewrite_useful_ratio_bps: 7_500,
+            min_l0_rewrite_useful_ratio_bps: 6_600,
             min_reclaim_bytes: 64 * 1024 * 1024,
             min_garbage_ratio_bps: 6000,
             min_exact_epoch_bucket_bytes: 8 * 1024 * 1024,
@@ -229,7 +229,7 @@ pub enum GcScenario {
     L0Compaction,
     /// Drain a sparse retention segment whose garbage bytes justify rewriting remaining live bytes.
     DeadRef,
-    /// Combine same-epoch live buckets from multiple source segments into denser output.
+    /// Fully drain multiple same-epoch source segments into denser output.
     JoinMultiple,
     /// Handle an expired physical epoch segment that still contains future-live pinned bytes.
     PinnedEpochExpiry,
@@ -268,14 +268,13 @@ pub enum GcAction {
         /// Aggregate route estimates for the source's live lifetime buckets.
         routes: Vec<RouteEstimate>,
     },
-    /// Move same epoch live buckets from multiple sources.
+    /// Move all live bytes from multiple sources into shared destination groups.
     ///
-    /// JoinMultiple uses this action when the benefit is output density rather than immediate whole
-    /// source deletion.
-    MoveEpochBytes {
-        /// Common end epoch being packed.
-        epoch: Epoch,
-        /// Per-source movement estimates for the common epoch.
+    /// Every route must cover its source's complete live set. This lets publication use the same
+    /// short-lived `GcRelocating` transition as a single-source drain: once relocation retirement
+    /// records are swept, every source is empty and can be deleted.
+    MoveLiveBytesFromSources {
+        /// Per-source movement estimates covering every selected source's complete live set.
         routes: Vec<RouteEstimate>,
     },
     /// Change placement metadata without copying bytes.
@@ -305,9 +304,6 @@ pub struct GcPlan {
     /// Estimated bytes the executor would write.
     pub copied_bytes: u64,
     /// Estimated source bytes made reclaimable by the plan.
-    ///
-    /// For JoinMultiple this can be zero because the initial benefit is denser future placement, not
-    /// necessarily immediate source deletion.
     pub expected_reclaim_bytes: u64,
     /// Relative ranking score among candidates in the same snapshot.
     ///
@@ -476,7 +472,7 @@ impl GcPlanner {
     }
 
     fn join_multiple_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
-        let mut by_epoch: BTreeMap<Epoch, Vec<RouteEstimate>> = BTreeMap::new();
+        let mut by_epoch: BTreeMap<Epoch, Vec<(RouteEstimate, u64)>> = BTreeMap::new();
         for segment in snapshot
             .segments
             .iter()
@@ -487,31 +483,48 @@ impl GcPlanner {
                 continue;
             }
             for (epoch, bucket) in &segment.summary.future_epoch_histogram {
-                if !self.exact_epoch_bucket_is_useful(snapshot.current_epoch, *epoch, bucket.bytes)
+                if bucket.bytes != segment.summary.live_bytes
+                    || bucket.refs != segment.summary.live_ref_count
+                    || !self.exact_epoch_bucket_is_useful(
+                        snapshot.current_epoch,
+                        *epoch,
+                        bucket.bytes,
+                    )
                 {
                     continue;
                 }
-                by_epoch.entry(*epoch).or_default().push(RouteEstimate {
-                    source_segment_id: segment.segment_id(),
-                    end_epoch: Some(*epoch),
-                    destination_class: DestinationClass::ExactEpoch(*epoch),
-                    refs: bucket.refs,
-                    bytes: bucket.bytes,
-                });
+                by_epoch.entry(*epoch).or_default().push((
+                    RouteEstimate {
+                        source_segment_id: segment.segment_id(),
+                        end_epoch: Some(*epoch),
+                        destination_class: DestinationClass::ExactEpoch(*epoch),
+                        refs: bucket.refs,
+                        bytes: bucket.bytes,
+                    },
+                    segment.summary.garbage_bytes(),
+                ));
             }
         }
 
         by_epoch
             .into_iter()
-            .filter_map(|(epoch, mut routes)| {
-                routes.sort_by_key(|route| std::cmp::Reverse(route.bytes));
-                routes.truncate(self.config.max_join_sources);
+            .filter_map(|(_epoch, mut candidates)| {
+                candidates.sort_by_key(|(route, _)| std::cmp::Reverse(route.bytes));
+                candidates.truncate(self.config.max_join_sources);
+                let routes = candidates
+                    .iter()
+                    .map(|(route, _)| route.clone())
+                    .collect::<Vec<_>>();
                 let source_count = routes
                     .iter()
                     .map(|route| route.source_segment_id)
                     .collect::<std::collections::BTreeSet<_>>()
                     .len();
                 let copied_bytes = routes.iter().map(|route| route.bytes).sum::<u64>();
+                let expected_reclaim_bytes = candidates
+                    .iter()
+                    .map(|(_, reclaim_bytes)| *reclaim_bytes)
+                    .sum::<u64>();
                 if source_count < 2
                     || copied_bytes < self.config.min_join_output_bytes
                     || copied_bytes > self.config.max_copy_bytes_per_plan
@@ -520,10 +533,11 @@ impl GcPlanner {
                 }
                 Some(GcPlan {
                     scenario: GcScenario::JoinMultiple,
-                    action: GcAction::MoveEpochBytes { epoch, routes },
+                    action: GcAction::MoveLiveBytesFromSources { routes },
                     copied_bytes,
-                    expected_reclaim_bytes: 0,
-                    score: i128::from(copied_bytes) + i128::from(source_count as u64) * 8_000_000,
+                    expected_reclaim_bytes,
+                    score: score_rewrite(expected_reclaim_bytes, copied_bytes, 2_500)
+                        + i128::from(source_count as u64),
                 })
             })
             .collect()
@@ -703,7 +717,7 @@ mod tests {
             max_copy_bytes_per_plan: 1_000,
             max_l0_copy_bytes_per_plan: 1_000,
             min_l0_rewrite_epoch_distance: 2,
-            min_l0_rewrite_useful_ratio_bps: 7_500,
+            min_l0_rewrite_useful_ratio_bps: 6_600,
             min_reclaim_bytes: 100,
             min_garbage_ratio_bps: 5000,
             min_exact_epoch_bucket_bytes: 50,
@@ -924,7 +938,7 @@ mod tests {
             max_copy_bytes_per_plan: 1_000,
             max_l0_copy_bytes_per_plan: 2_000,
             min_l0_rewrite_epoch_distance: 2,
-            min_l0_rewrite_useful_ratio_bps: 7_500,
+            min_l0_rewrite_useful_ratio_bps: 6_600,
             min_reclaim_bytes: 100,
             min_garbage_ratio_bps: 5000,
             min_exact_epoch_bucket_bytes: 50,
@@ -987,8 +1001,8 @@ mod tests {
     #[test]
     fn l0_reclassifies_mixed_segment_to_avoid_moving_near_expiry_bytes() {
         let mut segment_summary = summary(1_000, 1_000, 0);
-        add_epoch_bucket(&mut segment_summary, 11, 300, 3);
-        add_epoch_bucket(&mut segment_summary, 20, 700, 7);
+        add_epoch_bucket(&mut segment_summary, 11, 350, 3);
+        add_epoch_bucket(&mut segment_summary, 20, 650, 7);
 
         assert_eq!(
             planner()
@@ -1004,6 +1018,24 @@ mod tests {
                 placement_class: PlacementClass::Spillover,
             }
         );
+    }
+
+    #[test]
+    fn l0_rewrites_when_sixty_six_percent_of_live_bytes_are_far() {
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        add_epoch_bucket(&mut segment_summary, 11, 340, 3);
+        add_epoch_bucket(&mut segment_summary, 20, 660, 7);
+
+        let plan = planner()
+            .plan(&snapshot(vec![sealed_segment(
+                1,
+                PlacementClass::Ingest,
+                segment_summary,
+            )]))
+            .unwrap();
+
+        assert_eq!(plan.scenario, GcScenario::L0Compaction);
+        assert!(matches!(plan.action, GcAction::MoveLiveBytes { .. }));
     }
 
     #[test]
@@ -1052,7 +1084,7 @@ mod tests {
             max_copy_bytes_per_plan: 1_000,
             max_l0_copy_bytes_per_plan: 2_000,
             min_l0_rewrite_epoch_distance: 2,
-            min_l0_rewrite_useful_ratio_bps: 7_500,
+            min_l0_rewrite_useful_ratio_bps: 6_600,
             min_reclaim_bytes: 100,
             min_garbage_ratio_bps: 5000,
             min_exact_epoch_bucket_bytes: 50,
@@ -1076,10 +1108,10 @@ mod tests {
     }
 
     #[test]
-    fn join_multiple_groups_common_epoch() {
-        let mut left_summary = summary(300, 100, 0);
+    fn join_multiple_fully_drains_sources_with_one_common_live_epoch() {
+        let mut left_summary = summary(300, 100, 200);
         add_epoch_bucket(&mut left_summary, 40, 100, 1);
-        let mut right_summary = summary(300, 120, 0);
+        let mut right_summary = summary(300, 120, 180);
         add_epoch_bucket(&mut right_summary, 40, 120, 1);
 
         let plan = planner()
@@ -1090,12 +1122,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.scenario, GcScenario::JoinMultiple);
-        let GcAction::MoveEpochBytes { epoch, routes } = &plan.action else {
+        let GcAction::MoveLiveBytesFromSources { routes } = &plan.action else {
             panic!("expected join action");
         };
-        assert_eq!(*epoch, 40);
         assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route.end_epoch == Some(40)));
         assert_eq!(plan.copied_bytes, 220);
+        assert_eq!(plan.expected_reclaim_bytes, 380);
+    }
+
+    #[test]
+    fn join_multiple_rejects_a_source_with_other_live_epochs() {
+        let mut mixed_summary = summary(200, 200, 0);
+        add_epoch_bucket(&mut mixed_summary, 40, 100, 1);
+        add_epoch_bucket(&mut mixed_summary, 50, 100, 1);
+        mixed_summary.live_ref_count = 2;
+        let mut pure_summary = summary(120, 120, 0);
+        add_epoch_bucket(&mut pure_summary, 40, 120, 1);
+
+        assert!(
+            planner()
+                .plan(&snapshot(vec![
+                    sealed_segment(1, PlacementClass::Spillover, mixed_summary),
+                    sealed_segment(2, PlacementClass::Spillover, pure_summary),
+                ]))
+                .is_none()
+        );
     }
 
     #[test]

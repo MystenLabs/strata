@@ -212,6 +212,7 @@ struct Config {
     max_unsealed_segments: usize,
     segment_max_bytes: u64,
     strata_gc: bool,
+    strata_gc_min_epoch_copy_distance: Option<Epoch>,
     relocation_profile_reads: usize,
     relocation_profile_timeout: Duration,
     rocksdb_min_blob_size: u64,
@@ -267,6 +268,7 @@ impl Config {
             max_unsealed_segments: DEFAULT_MAX_UNSEALED_SEGMENTS,
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             strata_gc: true,
+            strata_gc_min_epoch_copy_distance: None,
             relocation_profile_reads: DEFAULT_RELOCATION_PROFILE_READS,
             relocation_profile_timeout: DEFAULT_RELOCATION_PROFILE_TIMEOUT,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
@@ -389,6 +391,10 @@ impl Config {
                     config.segment_max_bytes = parse_size(&next_value(&mut args, &arg)?)? as u64
                 }
                 "--strata-gc" => config.strata_gc = parse_bool(&next_value(&mut args, &arg)?)?,
+                "--strata-gc-min-epoch-copy-distance" => {
+                    config.strata_gc_min_epoch_copy_distance =
+                        Some(parse_u64(&next_value(&mut args, &arg)?)?)
+                }
                 "--relocation-profile-reads" => {
                     config.relocation_profile_reads =
                         parse_nonzero_usize(&next_value(&mut args, &arg)?)?
@@ -532,6 +538,9 @@ impl Config {
         if self.relocation_profile_reads > 0 && self.engine != EngineKind::Strata {
             return Err("--relocation-profile-reads requires --engine strata".to_owned());
         }
+        if self.strata_gc_min_epoch_copy_distance.is_some() && self.engine != EngineKind::Strata {
+            return Err("--strata-gc-min-epoch-copy-distance requires --engine strata".to_owned());
+        }
         if self.relocation_profile_reads > 0 && self.relocation_profile_timeout.is_zero() {
             return Err("--relocation-profile-timeout must be non-zero".to_owned());
         }
@@ -539,6 +548,27 @@ impl Config {
     }
 
     fn store_config(&self) -> StrataStoreConfig {
+        let mut gc_planner_config = if self.relocation_profile_reads == 0 {
+            GcPlannerConfig::default()
+        } else {
+            GcPlannerConfig {
+                max_copy_bytes_per_plan: u64::MAX,
+                max_l0_copy_bytes_per_plan: u64::MAX,
+                min_l0_rewrite_epoch_distance: 1,
+                min_l0_rewrite_useful_ratio_bps: 1,
+                min_reclaim_bytes: 1,
+                min_garbage_ratio_bps: 1,
+                min_exact_epoch_bucket_bytes: u64::MAX,
+                min_exact_epoch_distance: 1,
+                max_exact_epoch_extension_count: 1,
+                min_join_output_bytes: u64::MAX,
+                max_join_sources: 2,
+            }
+        };
+        if let Some(distance) = self.strata_gc_min_epoch_copy_distance {
+            gc_planner_config.min_l0_rewrite_epoch_distance = distance;
+            gc_planner_config.min_exact_epoch_distance = distance;
+        }
         StrataStoreConfig {
             root_dir: self.root_dir.clone(),
             namespace: self.namespace.clone(),
@@ -557,23 +587,7 @@ impl Config {
             gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
             gc_io_bytes_per_sec: STRATA_GC_IO_BYTES_PER_SEC,
             gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
-            gc_planner_config: if self.relocation_profile_reads == 0 {
-                GcPlannerConfig::default()
-            } else {
-                GcPlannerConfig {
-                    max_copy_bytes_per_plan: u64::MAX,
-                    max_l0_copy_bytes_per_plan: u64::MAX,
-                    min_l0_rewrite_epoch_distance: 1,
-                    min_l0_rewrite_useful_ratio_bps: 1,
-                    min_reclaim_bytes: 1,
-                    min_garbage_ratio_bps: 1,
-                    min_exact_epoch_bucket_bytes: u64::MAX,
-                    min_exact_epoch_distance: 1,
-                    max_exact_epoch_extension_count: 1,
-                    min_join_output_bytes: u64::MAX,
-                    max_join_sources: 2,
-                }
-            },
+            gc_planner_config,
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: DEFAULT_STARTING_EPOCH,
         }
@@ -2794,6 +2808,19 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         EngineKind::Strata => {
             println!("segment_max_bytes={}", config.segment_max_bytes);
             println!("strata_gc={}", config.strata_gc);
+            let planner = config.store_config().gc_planner_config;
+            println!(
+                "strata_gc_min_l0_rewrite_epoch_distance={}",
+                planner.min_l0_rewrite_epoch_distance
+            );
+            println!(
+                "strata_gc_min_l0_rewrite_useful_ratio_bps={}",
+                planner.min_l0_rewrite_useful_ratio_bps
+            );
+            println!(
+                "strata_gc_min_exact_epoch_distance={}",
+                planner.min_exact_epoch_distance
+            );
             println!(
                 "relocation_profile_reads={}",
                 config.relocation_profile_reads
@@ -4002,6 +4029,8 @@ strata:
   --max-unsealed-segments <count>
   --segment-max-bytes <size>
   --strata-gc <true|false>
+  --strata-gc-min-epoch-copy-distance <epochs>
+                                           minimum distance considered far for L0 usefulness and exact routing
   --relocation-profile-reads <count>    post-workload HDD relocation profile; disables background GC for deterministic setup
   --relocation-profile-timeout <time>   setup/healing deadline; default 10m
 
@@ -4082,6 +4111,8 @@ mod tests {
                 "52",
                 "--lifetime-seed",
                 "7",
+                "--strata-gc-min-epoch-copy-distance",
+                "6",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -4092,6 +4123,11 @@ mod tests {
         assert_eq!(config.epoch_duration, Duration::from_secs(5 * 60));
         assert_eq!(config.future_epochs, 52);
         assert_eq!(config.lifetime_seed, 7);
+        assert_eq!(config.strata_gc_min_epoch_copy_distance, Some(6));
+        let planner = config.store_config().gc_planner_config;
+        assert_eq!(planner.min_l0_rewrite_epoch_distance, 6);
+        assert_eq!(planner.min_l0_rewrite_useful_ratio_bps, 6_600);
+        assert_eq!(planner.min_exact_epoch_distance, 6);
     }
 
     #[test]

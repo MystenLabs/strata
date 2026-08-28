@@ -132,6 +132,14 @@ pub enum GcSelectionError {
         source_segment_id: u64,
         end_epoch: Option<u64>,
     },
+    /// A copy action failed to route a live record from one of its sources.
+    ///
+    /// Every copy policy is a full-source evacuation. Silently leaving this record behind would
+    /// strand the source in `GcRelocating` instead of making it deletable.
+    UnroutedLiveRecord {
+        source_segment_id: u64,
+        end_epoch: Option<u64>,
+    },
     /// Exact selected bytes do not match the aggregate route bytes.
     CopyBytesMismatch { expected: u64, actual: u64 },
 }
@@ -146,6 +154,13 @@ impl fmt::Display for GcSelectionError {
             } => write!(
                 f,
                 "GC plan has duplicate route for source segment {source_segment_id} and end epoch {end_epoch:?}"
+            ),
+            Self::UnroutedLiveRecord {
+                source_segment_id,
+                end_epoch,
+            } => write!(
+                f,
+                "GC plan has no route for live record in source segment {source_segment_id} with end epoch {end_epoch:?}"
             ),
             Self::CopyBytesMismatch { expected, actual } => write!(
                 f,
@@ -169,10 +184,18 @@ pub fn select_copy_records(
     records: &[GcSourceRecord],
 ) -> Result<GcCopySelection, GcSelectionError> {
     let selector = GcCopySelector::new(plan)?;
-    let mut selected = records
-        .iter()
-        .filter_map(|record| selector.select_record(record))
-        .collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(records.len());
+    for record in records {
+        let Some(selected_record) = selector.select_record(record) else {
+            return Err(GcSelectionError::UnroutedLiveRecord {
+                source_segment_id: record.record_ref.segment_id,
+                end_epoch: record
+                    .lifecycle
+                    .map(|lifecycle| lifecycle.logical_end_epoch),
+            });
+        };
+        selected.push(selected_record);
+    }
 
     selected.sort_by_key(|record| (record.from.segment_id, record.from.offset));
     let copied_bytes = selected
@@ -225,7 +248,9 @@ fn route_table(plan: &GcPlan) -> Result<RouteTable, GcSelectionError> {
     let mut expected_bytes = 0_u64;
 
     let action_routes = match &plan.action {
-        GcAction::MoveLiveBytes { routes, .. } | GcAction::MoveEpochBytes { routes, .. } => routes,
+        GcAction::MoveLiveBytes { routes, .. } | GcAction::MoveLiveBytesFromSources { routes } => {
+            routes
+        }
         GcAction::DeleteSegment { .. }
         | GcAction::DeleteSegments { .. }
         | GcAction::ReclassifySegment { .. } => {
@@ -381,11 +406,34 @@ mod tests {
     }
 
     #[test]
-    fn join_multiple_selects_matching_epoch_from_each_source() {
+    fn join_multiple_selects_every_live_record_from_each_source() {
         let routes = vec![route(1, Some(50), 100), route(2, Some(50), 120)];
         let plan = GcPlan {
             scenario: GcScenario::JoinMultiple,
-            action: GcAction::MoveEpochBytes { epoch: 50, routes },
+            action: GcAction::MoveLiveBytesFromSources { routes },
+            copied_bytes: 220,
+            expected_reclaim_bytes: 0,
+            score: 1,
+        };
+        let records = vec![
+            source_record("left", 10, record_ref(1, 0, 100), Some(lifecycle(50))),
+            source_record("right", 11, record_ref(2, 0, 120), Some(lifecycle(50))),
+        ];
+
+        let selection = select_copy_records(&plan, &records).unwrap();
+
+        assert_eq!(selection.copied_bytes, 220);
+        assert_eq!(selection.records.len(), 2);
+        assert_eq!(selection.records[0].key, key("left"));
+        assert_eq!(selection.records[1].key, key("right"));
+    }
+
+    #[test]
+    fn join_multiple_rejects_an_unrouted_live_record() {
+        let routes = vec![route(1, Some(50), 100), route(2, Some(50), 120)];
+        let plan = GcPlan {
+            scenario: GcScenario::JoinMultiple,
+            action: GcAction::MoveLiveBytesFromSources { routes },
             copied_bytes: 220,
             expected_reclaim_bytes: 0,
             score: 1,
@@ -401,11 +449,12 @@ mod tests {
             ),
         ];
 
-        let selection = select_copy_records(&plan, &records).unwrap();
-
-        assert_eq!(selection.copied_bytes, 220);
-        assert_eq!(selection.records.len(), 2);
-        assert_eq!(selection.records[0].key, key("left"));
-        assert_eq!(selection.records[1].key, key("right"));
+        assert_eq!(
+            select_copy_records(&plan, &records).unwrap_err(),
+            GcSelectionError::UnroutedLiveRecord {
+                source_segment_id: 2,
+                end_epoch: Some(60),
+            }
+        );
     }
 }

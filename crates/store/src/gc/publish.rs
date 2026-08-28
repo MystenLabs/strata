@@ -309,7 +309,7 @@ impl GcExecutor {
                     skipped_records: Vec::new(),
                 });
             }
-            GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {}
+            GcAction::MoveLiveBytes { .. } | GcAction::MoveLiveBytesFromSources { .. } => {}
         }
 
         let survivors = copy.copied_records;
@@ -614,7 +614,7 @@ impl GcExecutor {
             } => {
                 self.reclassify_gc_segment(*segment_id, *placement_class)?;
             }
-            GcAction::MoveLiveBytes { .. } | GcAction::MoveEpochBytes { .. } => {
+            GcAction::MoveLiveBytes { .. } | GcAction::MoveLiveBytesFromSources { .. } => {
                 return Err(Error::GcInvalidPlan(
                     "copy action must use the copy publish path",
                 ));
