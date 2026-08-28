@@ -264,8 +264,6 @@ pub(crate) struct GcExecutor {
     pub(crate) publish_cleanup_lock: Arc<Mutex<()>>,
     /// Serializes whole-shard metadata removal with garbage-log publication and sweeping.
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
-    /// Keeps relocation activation atomic with durability certification.
-    pub(crate) relocation_durability_lock: Arc<Mutex<()>>,
     /// Excludes blob-LSM compaction while one relocation view is reconciled and activated.
     pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
     /// Relocation L0s and cache used directly by the GC publication lane.
@@ -302,7 +300,6 @@ impl StrataStore {
             index: self.index.clone(),
             publish_cleanup_lock: Arc::clone(&self.gc_publish_cleanup_lock),
             garbage_publish_lock: Arc::clone(&self.garbage_publish_lock),
-            relocation_durability_lock: Arc::clone(&self.relocation_durability_lock),
             compaction_admission_lock: Arc::clone(&self.compaction_admission_lock),
             relocations: Arc::clone(&self.relocations),
             relocation_cache: Arc::clone(&self.relocation_cache),

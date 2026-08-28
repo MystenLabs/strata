@@ -2563,7 +2563,7 @@ async fn metrics_track_seal_backpressure_waits() {
     let (write_tx, write_rx) = mpsc::sync_channel(1);
     let (sync_done_tx, sync_done_rx) = mpsc::channel();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
-    let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
+    let (wal, recovered, _relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
     let segment_sync_tx = wal.file_sync_sender();
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
@@ -2589,8 +2589,6 @@ async fn metrics_track_seal_backpressure_waits() {
         sync_done_rx,
         sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
-        relocation_durability_lock: Arc::new(Mutex::new(())),
-        durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
         active_allocation_records: 0,
@@ -2605,13 +2603,6 @@ async fn metrics_track_seal_backpressure_waits() {
         wal_reclaim_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
-        relocations: open_relocation_lsm(
-            &cfg,
-            &index,
-            index.get_next_lsn().unwrap(),
-            relocation_recovery,
-        )
-        .unwrap(),
         gc_concurrency,
         store_halt: StoreHalt::default(),
         metrics,
@@ -4194,12 +4185,6 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(store.published_lsn().unwrap(), published_record.publish_lsn);
     let executor = store.store.gc_executor().unwrap();
     assert!(
-        !executor
-            .relocation_activation_is_durable(ref_b.segment_id)
-            .unwrap()
-    );
-    store.sync().unwrap();
-    assert!(
         executor
             .relocation_activation_is_durable(ref_b.segment_id)
             .unwrap()
@@ -5309,7 +5294,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
     )
     .unwrap();
     let active_segment_state = active_segment_state(&cfg, INGEST_SEGMENT_OWNER, &active_writer, 0);
-    let (wal, recovered, relocation_recovery, _lsm_sync_handles) =
+    let (wal, recovered, _relocation_recovery, _lsm_sync_handles) =
         open_store_wal(&cfg, &index, index.get_next_lsn().unwrap(), None).unwrap();
     let lsm = open_lsm(&cfg, &index, index.get_next_lsn().unwrap(), recovered).unwrap();
     let (segment_sync_tx, segment_syncer) = file_sync_channel();
@@ -5338,8 +5323,6 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
         sync_done_rx,
         sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
-        relocation_durability_lock: Arc::new(Mutex::new(())),
-        durable_relocation_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_segment_state,
         durable_offset: 0,
         active_allocation_records: 0,
@@ -5354,13 +5337,6 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
         wal_reclaim_tx,
         write_rx,
         ingest_owner: INGEST_SEGMENT_OWNER,
-        relocations: open_relocation_lsm(
-            &cfg,
-            &index,
-            index.get_next_lsn().unwrap(),
-            relocation_recovery,
-        )
-        .unwrap(),
         gc_concurrency,
         store_halt: StoreHalt::default(),
         metrics,

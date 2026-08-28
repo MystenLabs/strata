@@ -2,8 +2,8 @@
 //!
 //! The executor revalidates staged copies, writes their relocations directly to a synced immutable
 //! L0 table, then activates that table and the related segment metadata in one RocksDB batch. The
-//! activation is intentionally not synced: a normal later RocksDB sync makes it durable, and source
-//! deletion is gated on that durability frontier.
+//! GC thread syncs that activation itself before source deletion becomes eligible; foreground
+//! writer durability is not part of the relocation protocol.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -189,12 +189,12 @@ impl GcExecutor {
     ///
     /// 1. Write, fsync, and rename one relocation patch SST. It has an independent relocation-LSM
     ///    sequence; GC does not reserve foreground LSNs or touch the main WAL.
-    /// 2. Under the garbage and relocation-durability locks, atomically add that table to the
-    ///    relocation manifest and publish output/source/garbage metadata with an unsynced batch.
+    /// 2. Under the garbage-publication lock, atomically add that table to the relocation manifest
+    ///    and publish output/source/garbage metadata with a synced batch.
     ///
     /// A crash before activation leaves an orphan SST that startup removes. A crash after activation
-    /// can recover it because the SST was durable first. Source files remain protected until a later
-    /// synced RocksDB batch advances `durable_relocation_lsn` through the activation sequence.
+    /// can recover it because the SST was durable first. The activation batch itself advances
+    /// `durable_relocation_lsn`, so source deletion never depends on foreground writer durability.
     ///
     /// The rest of this comment walks the function in code order, reusing the cast from
     /// prepare_gc_publish: source segment S7 (sealed, 100 MB) whose records A, B, C, D were copied
@@ -260,23 +260,18 @@ impl GcExecutor {
     /// now leaves an orphan that remove_orphan_tables deletes at the next open.
     ///
     /// Part two: activation. Under the garbage-publication lock, the global garbage log is opened
-    /// at its last committed position and the retirement frame is appended and synced. The
-    /// relocation-durability lock is then acquired before one RocksDB batch assembles the entire
-    /// publication: the manifest merge that adds the
+    /// at its last committed position and the retirement frame is appended and synced. One
+    /// RocksDB batch then assembles the entire publication: the manifest merge that adds the
     /// patch SST to the relocation manifest (the activation itself); S42's Sealed row, birth
     /// summary, segment-garbage-log position, and published_at_lsn of 1000 (what snapshot
     /// protection compares against); S7's GcRelocating row; the new global garbage-log head;
     /// reclaim-pending rows keyed (S7, activation sequence 87) → S42's byte total, which later
     /// both gates S7's deletion on durability and prices its net reclamation; Deleted rows for
     /// staging files that published nothing; and, tallied alongside, the metric delta for B's and
-    /// C's newborn garbage. The batch is written *without* sync, on purpose. The SST underneath
-    /// is already durable, so if a crash drops this batch, RocksDB atomicity drops it entirely —
-    /// manifest row, segment rows, and garbage head revert together, the SST becomes an orphan
-    /// again, and the world returns to "this publish never happened". The next ordinary synced
-    /// RocksDB write (a garbage sweep, a relocation compaction) hardens it for free. After the
-    /// write, the merged manifest is read back and installed into the in-memory relocation LSM —
-    /// this is the instant readers start resolving A and D to S42, and it also advances the LSM's
-    /// sequence past 87 so the next publish draws 88.
+    /// C's newborn garbage. GC writes this batch with sync, reads the merged manifest back, and
+    /// installs it into the in-memory relocation LSM. This is the instant readers start resolving
+    /// A and D to S42. The durable frontier then advances through sequence 87, so deletion of S7
+    /// is safe without waiting for any foreground writer sync.
     ///
     /// Aftermath. On success the relocation cache is warmed with the new destinations, metrics
     /// absorb the known-garbage delta, the relocating-segment count, and the published byte
@@ -288,13 +283,9 @@ impl GcExecutor {
     /// install after it, failed - the durable and in-memory views can no longer be trusted to
     /// agree, and that halts the store.
     ///
-    /// One thing deliberately does not happen here: S7 is not deleted, and cannot be for a while.
-    /// Activation is visible immediately but durable only after some later synced RocksDB write.
-    /// The garbage-log sweeps and the relocation compactor advance durable_relocation_lsn after
-    /// exactly such writes, and delete_empty_gc_segments refuses a GcRelocating source until that
-    /// frontier passes its activation sequence (relocation_activation_is_durable). The 100 MB
-    /// file therefore outlives its last live byte until the pointers that replaced it can no
-    /// longer be lost.
+    /// S7 is still deleted through the ordinary guarded cleanup path, but its activation is already
+    /// durable when this function returns. The durable frontier check remains the deletion fence;
+    /// it now passes immediately instead of waiting for unrelated foreground work.
     fn commit_gc_publish(&self, publish: GcPreparedPublish) -> Result<GcPublishResult> {
         let GcPreparedPublish {
             copy,
@@ -446,7 +437,6 @@ impl GcExecutor {
         let (activation_sequence, relocation_edit) =
             self.relocations.prepare_l0(&relocation_entries)?;
         let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
-        let relocation_durability_lock = Arc::clone(&self.relocation_durability_lock);
         let mut skipped_output_delta = GcKnownDelta::default();
         let commit_result = (|| {
             let _garbage_publish_guard = garbage_publish_lock
@@ -465,10 +455,6 @@ impl GcExecutor {
             let garbage_position = garbage_log
                 .append(&relocation_garbage)
                 .map_err(Error::from)?;
-            let _relocation_durability_guard = relocation_durability_lock
-                .lock()
-                .expect("relocation durability lock poisoned");
-
             let mut batch = self.index.batch();
             self.index.merge_lsm_manifest_batch(
                 &mut batch,
@@ -536,7 +522,7 @@ impl GcExecutor {
             }
 
             if let Err(error) = batch
-                .write()
+                .write_with_sync(true)
                 .map_err(index::Error::from)
                 .map_err(Error::from)
             {
@@ -556,6 +542,8 @@ impl GcExecutor {
                 .install_manifest(published)
                 .map_err(Error::from)
                 .map_err(GcPublishCommitError::IndexCommit)?;
+            self.durable_relocation_lsn
+                .fetch_max(activation_sequence, std::sync::atomic::Ordering::Release);
             Ok::<(), GcPublishCommitError>(())
         })();
 
@@ -800,30 +788,23 @@ impl GcExecutor {
     ///   example's table (all entries in that patch file) with sequence 87. It orders relocation tables and nothing else.
     /// - The *activation LSN* of a source segment is a bookmark into that sequence: the sequence
     ///   number 87 (the example's table) of the relocation lsm table whose activation published this source's replacement pointers. It is
-    ///   recorded at publish time as the reclaim pending row (S7, 87) → bytes, in the same
-    ///   unsynced RocksDB batch as S7's GcRelocating flip and the manifest merge itself. That
-    ///   shared batch is why the state and the bookmark exist atomically together: a crash that
-    ///   loses one loses both, and the segment simply reverts to Sealed with nothing to wait for.
+    ///   recorded at publish time as the reclaim pending row (S7, 87) → bytes, in the same synced
+    ///   RocksDB batch as S7's GcRelocating flip and the manifest merge itself. That shared batch
+    ///   makes the state, bookmark, and relocation manifest atomic and durable together.
     ///   get_gc_reclaim_activation_lsn returns the *max* across the source's rows - a source
     ///   published more than once must wait for its latest activation, and since the frontier
     ///   below only moves forward, covering the max covers them all.
     /// - `durable_relocation_lsn` is the store-wide frontier meaning "every activation at or
     ///   below this sequence is provably on disk." It is seeded at open from the recovered
     ///   manifest (whatever the durable manifest already references is durable by definition) and
-    ///   advances only when someone samples the relocation LSM before a *synced* RocksDB write —
-    ///   foreground sync, the garbage-log sweeper, and relocation compaction. The activation batch
-    ///   itself is deliberately unsynced; those later cumulative syncs are what harden it, for free
-    ///   (GarbageLogSweeper::drain has the ordering argument).
+    ///   advances as part of GC activation after its own synced RocksDB write. Recovery seeds it
+    ///   from the durable manifest, while sweeps and relocation compaction may conservatively
+    ///   reaffirm an already-durable frontier.
     ///
-    /// So the predicate is simply: activation 87 <= durable frontier. While that is false, the
-    /// activation is *visible* — readers already resolve A and D to S42 — but not yet provably
-    /// durable, and deleting S7 in that window is the one catastrophic interleaving this gate
-    /// exists to prevent: crash; the unsynced activation batch vanishes; the manifest no longer
-    /// references the table; A and D's new addresses are gone; readers fall back to their blob
-    /// rows, which still point into S7 — whose file we just unlinked. Callers
-    /// (delete_empty_gc_segments, shard-generation cleanup) treat a false answer as "skip this
-    /// segment for now", not an error: within about a second the sweeper's next synced batch
-    /// pushes the frontier past 87 and the next attempt passes.
+    /// So the predicate is simply: activation 87 <= durable frontier. Activation cannot become
+    /// visible before it is durable: the synced batch commits before the manifest is installed in
+    /// memory and before this frontier advances. The predicate remains a defensive deletion fence
+    /// for recovery and legacy relocation paths.
     ///
     /// A missing activation row answers false for the same reason: with no record of which
     /// sequence to wait for, durability cannot be proven, so the deletion stays blocked rather

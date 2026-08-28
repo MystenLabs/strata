@@ -259,8 +259,8 @@ pub(crate) const INGEST_SEGMENT_OWNER: SegmentOwner = SegmentOwner::Store;
 #[cfg(test)]
 use open::{
     cleanup_retired_projection_dir, ensure_epoch_initialized, ensure_ingest_dir,
-    load_blob_lsm_manifest, load_relocation_lsm_manifest, open_lsm, open_relocation_lsm,
-    open_store_wal, store_wal_recovery_state,
+    load_blob_lsm_manifest, load_relocation_lsm_manifest, open_lsm, open_store_wal,
+    store_wal_recovery_state,
 };
 #[cfg(test)]
 use read::{ResolvedBlobVersion, resolve_blob_version};
@@ -286,7 +286,6 @@ pub struct StrataStore {
     gc_handles: Vec<JoinHandle<()>>,
     pub(crate) gc_publish_cleanup_lock: Arc<Mutex<()>>,
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
-    pub(crate) relocation_durability_lock: Arc<Mutex<()>>,
     pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
@@ -349,8 +348,6 @@ struct WriteCoordinator {
     sync_done_rx: mpsc::Receiver<Arc<SyncAndCommit>>,
     sync_and_commit_in_flight: Option<StrataLsn>,
     pending_sync_requests: Vec<PendingSyncRequest>,
-    relocation_durability_lock: Arc<Mutex<()>>,
-    durable_relocation_lsn: Arc<AtomicU64>,
     active_segment_state: SegmentState,
     durable_offset: u64,
     active_allocation_records: u64,
@@ -365,7 +362,6 @@ struct WriteCoordinator {
     wal_reclaim_tx: mpsc::SyncSender<()>,
     write_rx: mpsc::Receiver<WriteCommand>,
     ingest_owner: SegmentOwner,
-    relocations: Arc<RelocationStore>,
     gc_concurrency: Arc<GcConcurrencyController>,
     store_halt: StoreHalt,
     metrics: StrataStoreMetrics,

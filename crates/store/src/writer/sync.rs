@@ -331,17 +331,6 @@ impl WriteCoordinator {
                 .saturating_duration_since(file_sync_profile.completed_at),
             ..StoreSyncProfile::default()
         };
-        let relocation_lock_started = Instant::now();
-        let _commit_guard = self
-            .relocation_durability_lock
-            .lock()
-            .expect("relocation durability lock poisoned");
-        phases.relocation_lock_wait = relocation_lock_started.elapsed();
-        // The relocation frontier must be sampled while holding the same lock used by GC
-        // activation. The synced RocksDB write below then proves that every sampled manifest edit
-        // and activation row reached disk together.
-        let durable_relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
-
         let current_committed_lsn = self.index.get_committed_lsn()?;
         if current_committed_lsn > commit.target_lsn {
             return Err(Error::InvariantViolation {
@@ -473,8 +462,6 @@ impl WriteCoordinator {
                     self.durable_offset = self.durable_offset.max(state.durable_offset);
                     self.active_segment_state.durable_offset = self.durable_offset;
                 }
-                self.durable_relocation_lsn
-                    .fetch_max(durable_relocation_lsn, std::sync::atomic::Ordering::Release);
                 self.last_committed_at = Instant::now();
                 self.metrics.set_active_segment(
                     self.active_segment_state.segment_id,
@@ -484,8 +471,6 @@ impl WriteCoordinator {
                 self.metrics.set_published_lsn(commit.target_lsn);
             },
         );
-        drop(_commit_guard);
-
         match self.wal_reclaim_tx.try_send(()) {
             Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
             Err(std::sync::mpsc::TrySendError::Disconnected(())) => {

@@ -177,7 +177,7 @@ pub struct StoreSyncProfile {
     pub segment_sync: Duration,
     /// Time between WAL-sync completion and the writer beginning durability publication.
     pub completion_queue_wait: Duration,
-    /// Time waiting for GC relocation activation to leave the durability publication lock.
+    /// Retained for profile compatibility; GC now syncs relocation activation independently.
     pub relocation_lock_wait: Duration,
     /// Includes durable segment state assembly, published LSN computation, and batch construction.
     pub published_lsn_compute: Duration,

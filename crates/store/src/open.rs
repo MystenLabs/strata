@@ -179,7 +179,6 @@ impl StrataStore {
         let store_halt = StoreHalt::default();
         let compaction_admission_lock = Arc::new(RwLock::new(()));
         let garbage_publish_lock = Arc::new(Mutex::new(()));
-        let relocation_durability_lock = Arc::new(Mutex::new(()));
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
             metrics.clone(),
@@ -282,8 +281,6 @@ impl StrataStore {
             sync_done_rx: durability_ready_rx,
             sync_and_commit_in_flight: None,
             pending_sync_requests: Vec::new(),
-            relocation_durability_lock: Arc::clone(&relocation_durability_lock),
-            durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             active_segment_state,
             durable_offset,
             active_allocation_records: 0,
@@ -298,7 +295,6 @@ impl StrataStore {
             wal_reclaim_tx: wal_reclaim_tx.clone(),
             write_rx,
             ingest_owner: INGEST_SEGMENT_OWNER,
-            relocations: Arc::clone(&relocations),
             gc_concurrency: Arc::clone(&gc_concurrency),
             store_halt: store_halt.clone(),
             metrics: metrics.clone(),
@@ -322,7 +318,6 @@ impl StrataStore {
                     index: index.clone(),
                     publish_cleanup_lock: Arc::clone(&gc_publish_cleanup_lock),
                     garbage_publish_lock: Arc::clone(&garbage_publish_lock),
-                    relocation_durability_lock: Arc::clone(&relocation_durability_lock),
                     compaction_admission_lock: Arc::clone(&compaction_admission_lock),
                     relocations: Arc::clone(&relocations),
                     relocation_cache: Arc::clone(&relocation_cache),
@@ -399,7 +394,6 @@ impl StrataStore {
             gc_handles,
             gc_publish_cleanup_lock,
             garbage_publish_lock,
-            relocation_durability_lock,
             compaction_admission_lock,
             durable_relocation_lsn,
             gc_claims,

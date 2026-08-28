@@ -6,7 +6,7 @@
 //! create its work or by a short fallback timer so nothing waits on a lost nudge:
 //!
 //! The sweeper folds committed global garbage frames into per-segment overlay files, and as a side
-//! effect is the store's durability heartbeat for GC relocation activations (see drain below).
+//! effect it reaffirms the durable relocation frontier after its own synced batches.
 //! The flusher turns frozen blob-LSM memtables into patch SSTs so memory stays bounded and the
 //! store WAL can be reclaimed. The compactor merges those patches back down, and while doing so it
 //! is the *producer* of most of the garbage the GC pipeline consumes — when compaction folds an
@@ -19,9 +19,8 @@
 //! Every durable publication in this file follows one shape: build the artifact (SST, garbage
 //! frame) and sync it first; then merge the manifest edit into RocksDB in one synced batch; then
 //! install the merged manifest into the in-memory LSM so readers see it. Because these batches are
-//! synced, each one also hardens every earlier unsynced write in the RocksDB WAL — GC's relocation
-//! activation deliberately leans on that (its own batch is unsynced) and the sweeper/compactor
-//! advance `durable_relocation_lsn` to announce it.
+//! synced, each one also hardens every earlier write in the RocksDB WAL. GC relocation activation
+//! now syncs itself; the sweeper/compactor frontier updates are conservative reaffirmations.
 
 use std::{
     path::PathBuf,
@@ -104,9 +103,9 @@ impl GarbageLogSweeper {
     /// last activation sequence, then run one bounded sweep. The sweep itself syncs each touched
     /// segment-local file and commits its cursor, positions, and summaries in one *synced* RocksDB
     /// batch. That sync is the whole trick: RocksDB WAL syncs are cumulative, so it also hardens
-    /// every batch written before it — including GC's deliberately unsynced relocation activation
-    /// batches. After the lock is released, `durable_relocation_lsn` is raised to the sampled
-    /// sequence, and source deletion (which is gated on that frontier) becomes possible.
+    /// every batch written before it. After the lock is released, `durable_relocation_lsn` is
+    /// raised to the sampled sequence. Normal GC activation already synced and announced that
+    /// sequence itself; this remains a conservative reaffirmation for recovered or legacy work.
     ///
     /// The ordering is load-bearing in both directions. The sample happens *under the same lock
     /// activations take*, so it can never observe a half-activated publish; and it happens
@@ -806,9 +805,8 @@ impl LsmCompactor {
 /// This is the callback handed to flush_one/materialize_through: those helpers build the edit,
 /// this function makes it durable, and the returned manifest is what they install in memory. The
 /// sync is deliberate — flush and frontier publications run outside any other durability
-/// envelope, so each edit must stand on its own. (Contrast with GC's relocation activation, which
-/// merges its edit unsynced inside a larger batch and borrows durability from the next synced
-/// write.)
+/// envelope, so each edit must stand on its own. GC relocation activation follows the same rule
+/// for its larger atomic metadata batch.
 pub(crate) fn publish_blob_lsm_edit(
     index: &StrataIndex,
     edit: &ManifestEdit,
