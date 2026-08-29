@@ -764,13 +764,7 @@ impl LsmCompactor {
             &mut garbage_log,
             &garbage,
         )?;
-        let published = self
-            .index
-            .get_lsm_manifest(BLOB_LSM_MANIFEST)?
-            .ok_or_else(|| Error::InvariantViolation {
-                reason: "published blob LSM manifest is missing".to_owned(),
-            })?;
-        lsm.install_manifest(published)?;
+        lsm.reload_manifest(|| read_blob_lsm_manifest(&self.index))?;
         self.metrics.record_main_compaction(
             if partial {
                 MainCompactionKind::Minor
@@ -843,6 +837,10 @@ pub(crate) fn publish_blob_lsm_edit(
     })
 }
 
+pub(crate) fn read_blob_lsm_manifest(index: &StrataIndex) -> lsm::Result<LsmManifest> {
+    read_lsm_manifest(index, BLOB_LSM_MANIFEST, "blob")
+}
+
 /// The relocation-manifest twin of publish_blob_lsm_edit; identical shape, different manifest row.
 pub(crate) fn publish_relocation_lsm_edit(
     index: &StrataIndex,
@@ -861,6 +859,25 @@ pub(crate) fn publish_relocation_lsm_edit(
     publish().map_err(|error| lsm::Error::InvalidManifest {
         reason: format!("relocation manifest publication failed: {error}"),
     })
+}
+
+pub(crate) fn read_relocation_lsm_manifest(index: &StrataIndex) -> lsm::Result<LsmManifest> {
+    read_lsm_manifest(index, RELOCATION_LSM_MANIFEST, "relocation")
+}
+
+fn read_lsm_manifest(
+    index: &StrataIndex,
+    name: &str,
+    description: &str,
+) -> lsm::Result<LsmManifest> {
+    index
+        .get_lsm_manifest(name)
+        .map_err(|error| lsm::Error::InvalidManifest {
+            reason: format!("{description} manifest reload failed: {error}"),
+        })?
+        .ok_or_else(|| lsm::Error::InvalidManifest {
+            reason: format!("published {description} LSM manifest is missing"),
+        })
 }
 
 /// Flushes the relocation LSM's memtable rows into a patch SST, then compacts if pressure built.
@@ -1004,12 +1021,9 @@ fn compact_relocation_lsm_partition(
     let mut batch = index.batch();
     index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, &edit)?;
     batch.write_with_sync(true).map_err(index::Error::from)?;
-    let published = index
-        .get_lsm_manifest(RELOCATION_LSM_MANIFEST)?
-        .ok_or_else(|| Error::InvariantViolation {
-            reason: "published relocation LSM manifest is missing".to_owned(),
-        })?;
-    relocations.lsm().install_manifest(published)?;
+    relocations
+        .lsm()
+        .reload_manifest(|| read_relocation_lsm_manifest(index))?;
     let (examined, dropped) = merge.counts();
     let dropped_entries = merge.dropped_entries();
     debug_assert_eq!(dropped, dropped_entries.len() as u64);

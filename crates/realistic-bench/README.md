@@ -254,6 +254,13 @@ sum by (phase) (
 rate(strata_store_gc_output_bytes_total[$__rate_interval]) / 1024 / 1024
 rate(strata_realistic_bench_blobdb_gc_bytes_relocated[$__rate_interval]) / 1024 / 1024
 
+# Selected versus successfully completed plans by Strata GC strategy
+sum by (strategy, action) (rate(strata_store_gc_strategy_selected_total[$__rate_interval]))
+sum by (strategy, action) (rate(strata_store_gc_strategy_completed_total[$__rate_interval]))
+
+# Actual net physical reclamation attributed to its originating Strata GC strategy
+sum by (strategy) (rate(strata_store_gc_strategy_reclaimed_bytes_total[$__rate_interval]))
+
 # Logical/physical space amplification
 strata_realistic_bench_space_amplification_ratio
 ```

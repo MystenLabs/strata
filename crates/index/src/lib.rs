@@ -11,6 +11,7 @@
 //! | segment_publication_lsns | SegmentId -> first visible Store LSN |
 //! | segment_gc_summaries | SegmentId -> SegmentGcSummary              |
 //! | gc_reclaim_pending | (SegmentId, StrataLsn) -> output bytes      |
+//! | gc_reclaim_strategies | (SegmentId, StrataLsn) -> strategy label  |
 //! | shards          | ShardId -> ShardInfo                          |
 //! | shard_cleanup_jobs | ShardKey -> ShardCleanupJob                 |
 //! | store_state     | StoreStateKey -> u64                         |
@@ -52,6 +53,7 @@ use std::sync::Arc;
 
 pub use cf::StrataIndexCfNames;
 pub use error::{Error, Result};
+pub use gc::GcReclaimAttribution;
 pub use indexed_batch::IndexedBatch;
 
 #[cfg(test)]
@@ -89,6 +91,8 @@ pub struct StrataIndex {
     segment_gc_summaries: DBMap<SegmentId, SegmentGcSummary>,
     /// GC output bytes attributed to each source until that source file is unlinked.
     gc_reclaim_pending: DBMap<(SegmentId, StrataLsn), u64>,
+    /// Originating GC strategy retained until the corresponding source file is unlinked.
+    gc_reclaim_strategies: DBMap<(SegmentId, StrataLsn), String>,
     /// Shard registry used to resolve the current internal generation for each logical shard.
     shards: DBMap<ShardId, ShardInfo>,
     /// Resumable whole-generation cleanup work created by shard drop.

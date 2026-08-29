@@ -219,7 +219,7 @@ use maintenance::{compact_relocation_lsm, flush_relocation_lsm, garbage_log_dir}
 #[cfg(test)]
 use segment_state::active_segment_state;
 use segment_state::{
-    SegmentAllocationTracker, active_segment_state_from_path, publish_segment_allocation_baseline,
+    SegmentAllocationTracker, active_segment_state_from_path, publish_segment_allocation_delta,
     unsealed_ingest_segment_count, unsealed_ingest_segment_ids,
 };
 

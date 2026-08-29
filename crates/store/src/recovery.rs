@@ -16,7 +16,7 @@ use crate::{
     layout::{parse_segment_file_name, segment_path},
     open::store_wal_recovery_state,
     segment_state::{
-        active_segment_state_from_path, publish_segment_allocation_baseline,
+        active_segment_state_from_path, publish_segment_allocation_delta,
         unsealed_ingest_segment_ids,
     },
     wal::Wal,
@@ -531,11 +531,11 @@ fn apply_recovered_segment_prefix(
             },
         )?;
     } else {
-        publish_segment_allocation_baseline(
+        publish_segment_allocation_delta(
             index,
             &mut batch,
             segment_id,
-            prefix.recovered_write_offset,
+            prefix.recovered_write_offset - baseline_bytes,
             allocation_records,
         )?;
     }

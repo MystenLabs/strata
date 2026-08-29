@@ -3582,6 +3582,7 @@ async fn gc_publish_skips_copy_prepared_before_shard_drop() {
         max_join_sources: 4,
     });
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    assert_eq!(prepared.plan.scenario, GcScenario::L0Compaction);
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     assert_eq!(copied.outputs.len(), 2);
 
@@ -4243,6 +4244,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
         max_join_sources: 4,
     });
     let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    assert_eq!(prepared.plan.scenario, GcScenario::L0Compaction);
     let copied = store.copy_prepared_gc_plan(prepared).unwrap();
     let staged_path = copied.outputs[0].path.clone();
     store
@@ -4281,6 +4283,30 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(store.relocation_cache.len(), 1);
     assert_eq!(
         counter_value(&registry, "strata_store_gc_output_bytes_total"),
+        ref_b.len as f64
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_gc_strategy_selected_total",
+            &[("strategy", "l0_compaction"), ("action", "move_live_bytes"),],
+        ),
+        1.0
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_gc_strategy_completed_total",
+            &[("strategy", "l0_compaction"), ("action", "move_live_bytes"),],
+        ),
+        1.0
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_gc_strategy_output_bytes_total",
+            &[("strategy", "l0_compaction")],
+        ),
         ref_b.len as f64
     );
     assert_eq!(
@@ -4431,6 +4457,22 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     );
     assert_eq!(
         counter_value(&registry, "strata_store_gc_reclaimed_bytes_total"),
+        ref_a.len as f64
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_gc_strategy_source_deleted_bytes_total",
+            &[("strategy", "l0_compaction")],
+        ),
+        (ref_a.len + ref_b.len) as f64
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_gc_strategy_reclaimed_bytes_total",
+            &[("strategy", "l0_compaction")],
+        ),
         ref_a.len as f64
     );
     assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));

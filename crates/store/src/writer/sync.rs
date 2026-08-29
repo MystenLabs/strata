@@ -19,7 +19,7 @@ use crate::{
     SYNC_AND_COMMIT_SEGMENT_BYTES, SYNC_AND_COMMIT_WAL_BYTES, SegmentSync, StoreSyncProfile,
     SyncAndCommit, SyncRequest, WriteCommand, WriteCoordinator,
     file_sync::{FileSyncSender, FileSyncTask},
-    profile_phase, publish_segment_allocation_baseline,
+    profile_phase, publish_segment_allocation_delta,
     seal::prepare_synced_seal,
 };
 
@@ -395,18 +395,21 @@ impl WriteCoordinator {
                     }
                     self.index.put_segment_state_batch(&mut batch, &state)?;
 
-                    let allocation_records = segment
-                        .allocation_tracker
-                        .unpublished_records(segment.allocation_records)?;
-                    publish_segment_allocation_baseline(
+                    let (allocation_bytes, allocation_records) =
+                        segment.allocation_tracker.unpublished_allocation(
+                            segment.durable_offset,
+                            segment.allocation_records,
+                        )?;
+                    publish_segment_allocation_delta(
                         &self.index,
                         &mut batch,
                         segment.segment_id,
-                        segment.durable_offset,
+                        allocation_bytes,
                         allocation_records,
                     )?;
                     allocation_marks.push((
                         Arc::clone(&segment.allocation_tracker),
+                        segment.durable_offset,
                         segment.allocation_records,
                     ));
                     states.push(state);
@@ -430,8 +433,8 @@ impl WriteCoordinator {
             |profile, elapsed| profile.index_batch_commit += elapsed,
             || batch.write_with_sync(true).map_err(index::Error::from),
         )?;
-        for (tracker, records) in allocation_marks {
-            tracker.mark_published(records);
+        for (tracker, bytes, records) in allocation_marks {
+            tracker.mark_published(bytes, records);
         }
         let sealed_segments = states
             .iter()

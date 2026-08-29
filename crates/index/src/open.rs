@@ -7,9 +7,10 @@ use typed_store::{
 use crate::Result;
 
 use super::cf::{
-    EPOCH_CHANGES_CF, GARBAGE_LOG_POSITIONS_CF, GC_RECLAIM_PENDING_CF, LSM_MANIFESTS_CF,
-    SEGMENT_GARBAGE_LOG_POSITIONS_CF, SEGMENT_GC_SUMMARIES_CF, SEGMENT_PUBLICATION_LSNS_CF,
-    SEGMENT_STATES_CF, SHARD_CLEANUP_JOBS_CF, SHARDS_CF, STORE_STATE_CF,
+    EPOCH_CHANGES_CF, GARBAGE_LOG_POSITIONS_CF, GC_RECLAIM_PENDING_CF, GC_RECLAIM_STRATEGIES_CF,
+    LSM_MANIFESTS_CF, SEGMENT_GARBAGE_LOG_POSITIONS_CF, SEGMENT_GC_SUMMARIES_CF,
+    SEGMENT_PUBLICATION_LSNS_CF, SEGMENT_STATES_CF, SHARD_CLEANUP_JOBS_CF, SHARDS_CF,
+    STORE_STATE_CF,
 };
 use super::migration::migrate_and_drop_retired_cfs;
 use super::options::cf_options;
@@ -87,6 +88,13 @@ impl StrataIndex {
             &rw_options,
             true,
         )?;
+        let gc_reclaim_strategies = DBMap::reopen_with_class(
+            &db,
+            Some(&cf_names.gc_reclaim_strategies),
+            Some(GC_RECLAIM_STRATEGIES_CF),
+            &rw_options,
+            true,
+        )?;
         let shards = DBMap::reopen_with_class(
             &db,
             Some(&cf_names.shards),
@@ -144,6 +152,7 @@ impl StrataIndex {
             segment_publication_lsns,
             segment_gc_summaries,
             gc_reclaim_pending,
+            gc_reclaim_strategies,
             shards,
             shard_cleanup_jobs,
             store_state,

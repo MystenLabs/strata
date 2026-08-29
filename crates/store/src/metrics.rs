@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use core_types::{Epoch, SegmentGcSummary, SegmentId, StrataLsn};
+use gc_planner::{GcAction, GcScenario};
 use prometheus::{
     Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
 };
@@ -105,6 +106,11 @@ struct PrometheusMetrics {
     gc_output_bytes_total: IntCounter,
     gc_source_deleted_bytes_total: IntCounter,
     gc_reclaimed_bytes_total: IntCounter,
+    gc_strategy_selected_total: IntCounterVec,
+    gc_strategy_completed_total: IntCounterVec,
+    gc_strategy_output_bytes_total: IntCounterVec,
+    gc_strategy_source_deleted_bytes_total: IntCounterVec,
+    gc_strategy_reclaimed_bytes_total: IntCounterVec,
     current_epoch: IntGauge,
     pending_lsn_count: IntGauge,
     unsealed_segments: IntGauge,
@@ -592,6 +598,41 @@ impl StrataStoreMetrics {
                     &labels,
                     "gc_reclaimed_bytes_total",
                     "Net physical bytes reclaimed by GC after subtracting replacement output bytes from successfully unlinked source bytes.",
+                )?,
+                gc_strategy_selected_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "gc_strategy_selected_total",
+                    "GC plans successfully selected and source-claimed, classified by strategy and action.",
+                    &["strategy", "action"],
+                )?,
+                gc_strategy_completed_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "gc_strategy_completed_total",
+                    "GC plans whose metadata or relocation publication completed successfully, classified by strategy and action.",
+                    &["strategy", "action"],
+                )?,
+                gc_strategy_output_bytes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "gc_strategy_output_bytes_total",
+                    "Encoded bytes in successfully published GC output segments, classified by originating strategy.",
+                    &["strategy"],
+                )?,
+                gc_strategy_source_deleted_bytes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "gc_strategy_source_deleted_bytes_total",
+                    "Physical source-file bytes successfully unlinked, attributed to the GC strategy that made them reclaimable.",
+                    &["strategy"],
+                )?,
+                gc_strategy_reclaimed_bytes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "gc_strategy_reclaimed_bytes_total",
+                    "Net physical bytes reclaimed after subtracting replacement output, attributed to the originating GC strategy.",
+                    &["strategy"],
                 )?,
                 current_epoch: register_gauge(
                     registry,
@@ -1341,22 +1382,56 @@ impl StrataStoreMetrics {
     }
 
     /// Records physical bytes made visible by a successful GC relocation publication.
-    pub(crate) fn record_gc_output_published(&self, output_bytes: u64) {
+    pub(crate) fn record_gc_output_published(&self, strategy: &str, output_bytes: u64) {
         let Some(metrics) = &self.inner else {
             return;
         };
         metrics.gc_output_bytes_total.inc_by(output_bytes);
+        metrics
+            .gc_strategy_output_bytes_total
+            .with_label_values(&[strategy])
+            .inc_by(output_bytes);
     }
 
     /// Records a source file that GC successfully unlinked.
-    pub(crate) fn record_gc_source_deleted(&self, source_bytes: u64, copied_bytes: u64) {
+    pub(crate) fn record_gc_source_deleted(
+        &self,
+        strategy: &str,
+        source_bytes: u64,
+        copied_bytes: u64,
+    ) {
         let Some(metrics) = &self.inner else {
             return;
         };
+        let reclaimed_bytes = source_bytes.saturating_sub(copied_bytes);
         metrics.gc_source_deleted_bytes_total.inc_by(source_bytes);
+        metrics.gc_reclaimed_bytes_total.inc_by(reclaimed_bytes);
         metrics
-            .gc_reclaimed_bytes_total
-            .inc_by(source_bytes.saturating_sub(copied_bytes));
+            .gc_strategy_source_deleted_bytes_total
+            .with_label_values(&[strategy])
+            .inc_by(source_bytes);
+        metrics
+            .gc_strategy_reclaimed_bytes_total
+            .with_label_values(&[strategy])
+            .inc_by(reclaimed_bytes);
+    }
+
+    pub(crate) fn record_gc_strategy_selected(&self, scenario: GcScenario, action: &GcAction) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .gc_strategy_selected_total
+                .with_label_values(&[scenario.metric_label(), action.metric_label()])
+                .inc();
+        }
+    }
+
+    pub(crate) fn record_gc_strategy_completed(&self, scenario: GcScenario, action: &GcAction) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .gc_strategy_completed_total
+                .with_label_values(&[scenario.metric_label(), action.metric_label()])
+                .inc();
+        }
     }
 
     pub(crate) fn record_gc_admitted(&self) {
@@ -1753,6 +1828,60 @@ mod tests {
         assert_eq!(
             metric_value(&registry, "strata_store_gc_consecutive_run_failures"),
             0.0
+        );
+    }
+
+    #[test]
+    fn gc_strategy_metrics_separate_attempts_and_actual_byte_attribution() {
+        let registry = Registry::new();
+        let metrics = StrataStoreMetrics::new(&registry, "test").unwrap();
+        let action = GcAction::MoveLiveBytes {
+            source_segment_id: 7,
+            routes: Vec::new(),
+        };
+
+        metrics.record_gc_strategy_selected(GcScenario::L0Compaction, &action);
+        metrics.record_gc_strategy_selected(GcScenario::L0Compaction, &action);
+        metrics.record_gc_strategy_completed(GcScenario::L0Compaction, &action);
+        metrics.record_gc_output_published("l0_compaction", 40);
+        metrics.record_gc_source_deleted("l0_compaction", 100, 40);
+
+        let labels = &[("strategy", "l0_compaction"), ("action", "move_live_bytes")];
+        assert_eq!(
+            metric_value_with_labels(&registry, "strata_store_gc_strategy_selected_total", labels,),
+            2.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_gc_strategy_completed_total",
+                labels,
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_gc_strategy_output_bytes_total",
+                &[("strategy", "l0_compaction")],
+            ),
+            40.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_gc_strategy_source_deleted_bytes_total",
+                &[("strategy", "l0_compaction")],
+            ),
+            100.0
+        );
+        assert_eq!(
+            metric_value_with_labels(
+                &registry,
+                "strata_store_gc_strategy_reclaimed_bytes_total",
+                &[("strategy", "l0_compaction")],
+            ),
+            60.0
         );
     }
 

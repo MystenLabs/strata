@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, num::NonZeroU32};
 
 use core_types::{
-    PlacementClass, SegmentFileState, SegmentGcSummary, SegmentOwner, ShardCleanupJob,
-    ShardCleanupState, ShardInfo, ShardKey, ShardState,
+    EpochBucket, PlacementClass, SegmentFileState, SegmentGcSummary, SegmentGcSummaryDelta,
+    SegmentOwner, ShardCleanupJob, ShardCleanupState, ShardInfo, ShardKey, ShardState,
 };
 use core_types::{StoreCheckpoint, WalPosition};
 use lsm::{Manifest, ManifestEdit, TableMeta};
 use tempfile::tempdir;
-use typed_store::rocks::open_cf;
+use typed_store::{Map, rocks::open_cf};
 
 use super::*;
 
@@ -95,7 +95,7 @@ async fn from_db_creates_only_the_live_column_families() {
     for name in index.cf_names().as_strs() {
         assert!(index.db().cf_handle(name).is_some(), "missing {name}");
     }
-    assert_eq!(index.cf_names().as_strs().len(), 11);
+    assert_eq!(index.cf_names().as_strs().len(), 12);
 }
 
 #[tokio::test]
@@ -208,13 +208,13 @@ async fn gc_reclaim_pending_rows_survive_until_removed() {
     let index = open_test_index(&dir);
     let mut batch = index.batch();
     index
-        .put_gc_reclaim_pending_batch(&mut batch, 1, 4, 10)
+        .put_gc_reclaim_pending_batch(&mut batch, 1, 4, 10, "l0_compaction")
         .unwrap();
     index
-        .put_gc_reclaim_pending_batch(&mut batch, 1, 6, 20)
+        .put_gc_reclaim_pending_batch(&mut batch, 1, 6, 20, "l0_compaction")
         .unwrap();
     index
-        .put_gc_reclaim_pending_batch(&mut batch, 2, 6, 30)
+        .put_gc_reclaim_pending_batch(&mut batch, 2, 6, 30, "join_multiple")
         .unwrap();
     batch.write().unwrap();
 
@@ -227,16 +227,39 @@ async fn gc_reclaim_pending_rows_survive_until_removed() {
     );
     batch.write().unwrap();
     assert_eq!(index.iter_gc_reclaim_pending().unwrap(), vec![((1, 4), 10)]);
+    assert_eq!(
+        index
+            .gc_reclaim_strategies()
+            .safe_iter()
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![((1, 4), "l0_compaction".to_owned())]
+    );
 
     let mut batch = index.batch();
     assert_eq!(
         index
             .remove_gc_reclaim_pending_for_sources_batch(&mut batch, &[1])
             .unwrap(),
-        BTreeMap::from([(1, 10)])
+        BTreeMap::from([(
+            1,
+            GcReclaimAttribution {
+                output_bytes: 10,
+                strategy: Some("l0_compaction".to_owned()),
+            }
+        )])
     );
     batch.write().unwrap();
     assert!(index.iter_gc_reclaim_pending().unwrap().is_empty());
+    assert!(
+        index
+            .gc_reclaim_strategies()
+            .safe_iter()
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -268,7 +291,7 @@ async fn store_frontiers_and_checkpoint_round_trip() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     assert_eq!(index.get_next_lsn().unwrap(), 1);
-    assert_eq!(index.get_published_lsn().unwrap(), 0);
+    assert_eq!(index.get_committed_lsn().unwrap(), 0);
     assert_eq!(index.get_store_wal_retained_from().unwrap(), None);
 
     let checkpoint = StoreCheckpoint {
@@ -291,7 +314,7 @@ async fn store_frontiers_and_checkpoint_round_trip() {
     batch.write().unwrap();
 
     assert_eq!(index.get_next_lsn().unwrap(), 42);
-    assert_eq!(index.get_published_lsn().unwrap(), 41);
+    assert_eq!(index.get_committed_lsn().unwrap(), 41);
     assert_eq!(index.get_store_wal_retained_from().unwrap(), Some(3));
     assert_eq!(index.get_store_checkpoint().unwrap(), Some(checkpoint));
 }
@@ -361,4 +384,82 @@ async fn lsm_manifest_edits_share_an_atomic_metadata_batch() {
     manifest.apply(&edit).unwrap();
     assert_eq!(index.get_lsm_manifest("blob").unwrap(), Some(manifest));
     assert_eq!(index.get_segment_state(17).unwrap(), Some(state));
+}
+
+#[tokio::test]
+async fn segment_summary_merge_operands_preserve_concurrent_allocation_and_expiry() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let index = open_test_index(&dir);
+    let segment_id = 7;
+    let mut initial = SegmentGcSummary {
+        total_bytes: 100,
+        live_bytes: 100,
+        live_ref_count: 1,
+        ..Default::default()
+    };
+    initial.future_epoch_histogram.insert(
+        50,
+        EpochBucket {
+            refs: 1,
+            bytes: 100,
+        },
+    );
+    initial.min_live_end_epoch = Some(50);
+    initial.max_live_end_epoch = Some(50);
+    let mut batch = index.batch();
+    index
+        .put_segment_gc_summary_batch(&mut batch, segment_id, &initial)
+        .unwrap();
+    batch.write().unwrap();
+
+    // Prepare both publications from the same logical starting point. With whole-summary puts,
+    // committing the allocation after the expiry would restore the expired record. Additive merge
+    // operands commute and retain both changes.
+    let mut expiry = index.batch();
+    index
+        .merge_segment_gc_summary_batch(
+            &mut expiry,
+            segment_id,
+            &SegmentGcSummaryDelta {
+                live_bytes: -100,
+                expired_bytes: 100,
+                live_ref_count: -1,
+                epoch_bytes: BTreeMap::from([(50, -100)]),
+                epoch_refs: BTreeMap::from([(50, -1)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut allocation = index.batch();
+    index
+        .merge_segment_gc_summary_batch(
+            &mut allocation,
+            segment_id,
+            &SegmentGcSummaryDelta {
+                total_bytes: 100,
+                live_bytes: 100,
+                live_ref_count: 1,
+                unknown_lifetime_bytes: 100,
+                unknown_lifetime_ref_count: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    expiry.write_with_sync(true).unwrap();
+    allocation.write_with_sync(true).unwrap();
+
+    assert_eq!(
+        index.get_segment_gc_summary(segment_id).unwrap(),
+        Some(SegmentGcSummary {
+            total_bytes: 200,
+            live_bytes: 100,
+            expired_bytes: 100,
+            live_ref_count: 1,
+            unknown_lifetime_bytes: 100,
+            unknown_lifetime_ref_count: 1,
+            ..Default::default()
+        })
+    );
 }

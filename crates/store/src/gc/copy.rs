@@ -223,6 +223,9 @@ impl GcExecutor {
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?;
 
+            self.metrics
+                .record_gc_strategy_selected(plan.scenario, &plan.action);
+
             return Ok(Some(PreparedGcPlan {
                 plan,
                 source_overlays,
@@ -299,6 +302,8 @@ impl GcExecutor {
     /// publish, nothing is touched: the on-disk state is exactly the evidence recovery will use,
     /// and "cleaning up" here could destroy files a half-committed activation still references.
     pub fn publish_prepared_gc_copy(&self, copy: PreparedGcCopy) -> Result<GcPublishResult> {
+        let scenario = copy.plan.scenario;
+        let action = copy.plan.action.clone();
         // Keep shard cleanup ordered with every phase that can create or remove a retention path.
         // The writer may fence a shard while this guard is held; drop cleanup waits until publish
         // has reconciled that fence and removed any now-unpublished output.
@@ -312,6 +317,7 @@ impl GcExecutor {
 
         match result {
             Ok(result) => {
+                self.metrics.record_gc_strategy_completed(scenario, &action);
                 remove_unpublished_prepublished_outputs(
                     &self.config,
                     &prepublished_outputs,

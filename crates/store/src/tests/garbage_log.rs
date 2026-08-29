@@ -4,12 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use core_types::{BlobKey, GarbageEvent, RecordRef, SegmentGcRecordRange, SegmentGcSummaryDelta};
+use core_types::{BlobKey, GarbageEvent, RecordRef, SegmentGcSummary, SegmentGcSummaryDelta};
 use index::StrataIndex;
 use lsm::{GarbageLog, GarbageRecord, Manifest, ManifestEdit, SegmentKey, TableMeta};
 use tempfile::tempdir;
 
-use crate::{GARBAGE_LOG_HEAD, garbage_log_dir};
+use crate::{GARBAGE_LOG_HEAD, GARBAGE_LOG_SWEEP_CURSOR, garbage_log_dir};
 
 use super::{StrataStoreMetrics, config, init_typed_store_metrics, try_open_standalone_store};
 
@@ -51,13 +51,98 @@ async fn store_open_sweeps_an_already_committed_global_frame() {
     wait_for_sweep(&store);
 }
 
-fn publish_compaction(index: &StrataIndex, config: &crate::StrataStoreConfig) {
-    let mut batch = index.batch();
-    index
-        .put_segment_gc_summary_batch(&mut batch, 1, &Default::default())
+#[tokio::test]
+async fn garbage_sweep_waits_until_allocation_covers_the_record() {
+    init_typed_store_metrics();
+    let directory = tempdir().unwrap();
+    let mut store_config = config(directory.path(), "garbage-allocation-gate");
+    store_config.gc_workers_enabled = false;
+    let store = try_open_standalone_store(store_config, StrataStoreMetrics::default()).unwrap();
+    initialize_manifest(store.index());
+
+    let mut batch = store.index().batch();
+    store
+        .index()
+        .put_segment_gc_summary_batch(
+            &mut batch,
+            1,
+            &SegmentGcSummary {
+                total_bytes: 10,
+                live_bytes: 10,
+                live_ref_count: 1,
+                unknown_lifetime_bytes: 10,
+                unknown_lifetime_ref_count: 1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     batch.write_with_sync(true).unwrap();
 
+    publish_compaction_records(store.index(), store.config(), &[garbage_record_at(10)]);
+    assert!(
+        !store
+            .index()
+            .sweep_garbage_log(
+                garbage_log_dir(store.config()),
+                store.config().namespace_dir(),
+                GARBAGE_LOG_HEAD,
+                GARBAGE_LOG_SWEEP_CURSOR,
+            )
+            .unwrap(),
+        "sweeper consumed garbage for a record beyond the allocation baseline"
+    );
+
+    let mut batch = store.index().batch();
+    store
+        .index()
+        .merge_segment_gc_summary_batch(
+            &mut batch,
+            1,
+            &SegmentGcSummaryDelta {
+                total_bytes: 10,
+                live_bytes: 10,
+                live_ref_count: 1,
+                unknown_lifetime_bytes: 10,
+                unknown_lifetime_ref_count: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
+    wait_for_sweep(&store);
+    let summary = store.index().get_segment_gc_summary(1).unwrap().unwrap();
+    assert_eq!(summary.total_bytes, 20);
+    assert_eq!(summary.live_bytes, 10);
+    assert_eq!(summary.retired_bytes, 10);
+}
+
+fn publish_compaction(index: &StrataIndex, config: &crate::StrataStoreConfig) {
+    let mut batch = index.batch();
+    index
+        .put_segment_gc_summary_batch(
+            &mut batch,
+            1,
+            &SegmentGcSummary {
+                total_bytes: 10,
+                live_bytes: 10,
+                live_ref_count: 1,
+                unknown_lifetime_bytes: 10,
+                unknown_lifetime_ref_count: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
+    publish_compaction_records(index, config, &[garbage_record()]);
+}
+
+fn publish_compaction_records(
+    index: &StrataIndex,
+    config: &crate::StrataStoreConfig,
+    records: &[GarbageRecord],
+) {
     let committed = index
         .get_garbage_log_position(GARBAGE_LOG_HEAD)
         .unwrap()
@@ -69,7 +154,7 @@ fn publish_compaction(index: &StrataIndex, config: &crate::StrataStoreConfig) {
             &manifest_edit(),
             GARBAGE_LOG_HEAD,
             &mut log,
-            &[garbage_record()],
+            records,
         )
         .unwrap();
 }
@@ -113,9 +198,13 @@ fn manifest_edit() -> ManifestEdit {
 }
 
 fn garbage_record() -> GarbageRecord {
+    garbage_record_at(0)
+}
+
+fn garbage_record_at(offset: u64) -> GarbageRecord {
     let record = RecordRef {
         segment_id: 1,
-        offset: 0,
+        offset,
         len: 10,
     };
     GarbageRecord {
@@ -126,8 +215,11 @@ fn garbage_record() -> GarbageRecord {
         lsn: 1,
         event: GarbageEvent::Retired { record },
         summary_delta: SegmentGcSummaryDelta {
-            total_bytes: 10,
+            live_bytes: -10,
             retired_bytes: 10,
+            live_ref_count: -1,
+            unknown_lifetime_bytes: -10,
+            unknown_lifetime_ref_count: -1,
             ..Default::default()
         },
     }
@@ -143,8 +235,8 @@ fn wait_for_sweep(store: &super::StandaloneStore) {
             .unwrap();
         if overlay.summary.retired_bytes == 10 {
             assert_eq!(
-                overlay.retired,
-                vec![SegmentGcRecordRange { offset: 0, len: 10 }]
+                overlay.retired.iter().map(|range| range.len).sum::<u64>(),
+                10
             );
             break;
         }

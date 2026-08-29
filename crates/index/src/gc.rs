@@ -9,6 +9,14 @@ use crate::{Error, Result};
 
 use super::{StrataIndex, shard::shard_generation_is_obsolete};
 
+/// Actual GC byte attribution consumed when one or more source files are physically unlinked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcReclaimAttribution {
+    pub output_bytes: u64,
+    /// Missing for legacy reclaim rows created before per-strategy attribution was persisted.
+    pub strategy: Option<String>,
+}
+
 impl StrataIndex {
     /// Builds a point-in-time GC planning view from published segment state.
     ///
@@ -97,10 +105,15 @@ impl StrataIndex {
         source_segment_id: SegmentId,
         activation_lsn: StrataLsn,
         output_bytes: u64,
+        strategy: &str,
     ) -> Result<()> {
         let key = (source_segment_id, activation_lsn);
         batch
             .insert_batch(self.gc_reclaim_pending(), [(&key, &output_bytes)])
+            .map_err(Error::from)?;
+        let strategy = strategy.to_owned();
+        batch
+            .insert_batch(self.gc_reclaim_strategies(), [(&key, &strategy)])
             .map_err(Error::from)?;
         Ok(())
     }
@@ -132,23 +145,47 @@ impl StrataIndex {
         &self,
         batch: &mut DBBatch,
         source_segment_ids: &[SegmentId],
-    ) -> Result<BTreeMap<SegmentId, u64>> {
+    ) -> Result<BTreeMap<SegmentId, GcReclaimAttribution>> {
         let rows = self.iter_gc_reclaim_pending()?;
+        let strategies = self
+            .gc_reclaim_strategies
+            .safe_iter()?
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
         let mut keys = Vec::new();
-        let mut output_bytes = source_segment_ids
+        let mut row_counts = BTreeMap::<SegmentId, usize>::new();
+        let mut attribution = source_segment_ids
             .iter()
             .copied()
-            .map(|segment_id| (segment_id, 0_u64))
+            .map(|segment_id| {
+                (
+                    segment_id,
+                    GcReclaimAttribution {
+                        output_bytes: 0,
+                        strategy: None,
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         for (key, bytes) in rows {
-            let Some(total) = output_bytes.get_mut(&key.0) else {
+            let Some(total) = attribution.get_mut(&key.0) else {
                 continue;
             };
             keys.push(key);
-            *total = total.saturating_add(bytes);
+            total.output_bytes = total.output_bytes.saturating_add(bytes);
+            let strategy = strategies.get(&key).cloned();
+            let count = row_counts.entry(key.0).or_default();
+            if *count == 0 {
+                total.strategy = strategy;
+            } else if total.strategy != strategy {
+                // Multiple publications for one source are not expected. If legacy or mixed
+                // attribution is encountered, preserve byte correctness and label it unknown.
+                total.strategy = None;
+            }
+            *count += 1;
         }
-        batch.delete_batch(self.gc_reclaim_pending(), keys)?;
-        Ok(output_bytes)
+        batch.delete_batch(self.gc_reclaim_pending(), keys.iter().copied())?;
+        batch.delete_batch(self.gc_reclaim_strategies(), keys)?;
+        Ok(attribution)
     }
 
     /// Removes legacy reclaim attribution created by GC publications hidden during foreground-LSN
@@ -164,7 +201,8 @@ impl StrataIndex {
             .filter_map(|(key, _)| (key.1 >= rollback_from).then_some(key))
             .collect::<Vec<_>>();
         let removed = keys.len();
-        batch.delete_batch(self.gc_reclaim_pending(), keys)?;
+        batch.delete_batch(self.gc_reclaim_pending(), keys.iter().copied())?;
+        batch.delete_batch(self.gc_reclaim_strategies(), keys)?;
         Ok(removed)
     }
 }

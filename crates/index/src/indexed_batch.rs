@@ -29,6 +29,10 @@ impl StrataIndex {
 }
 
 impl IndexedBatch<'_> {
+    pub(crate) fn raw_batch_mut(&mut self) -> &mut DBBatch {
+        &mut self.batch
+    }
+
     pub fn get<K, V>(&self, map: &DBMap<K, V>, key: &K) -> Result<Option<V>>
     where
         K: Serialize + DeserializeOwned,

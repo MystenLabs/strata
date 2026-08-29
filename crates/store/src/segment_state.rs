@@ -16,22 +16,46 @@ use crate::{
 /// In-memory allocation publication state shared by the active writer and captured durability
 /// checkpoints.
 ///
-/// Each checkpoint carries a cumulative record count captured at its byte boundary. This tracker
-/// turns that count into a delta so the GC baseline is applied exactly once.
+/// Each checkpoint carries cumulative byte and record counts. This tracker turns them into a
+/// delta so the GC allocation baseline is applied exactly once.
 #[derive(Debug, Default)]
 pub(crate) struct SegmentAllocationTracker {
+    published_bytes: AtomicU64,
     published_records: AtomicU64,
 }
 
 impl SegmentAllocationTracker {
-    pub(crate) fn unpublished_records(&self, captured_records: u64) -> Result<u64> {
-        let published = self.published_records.load(Ordering::Acquire);
-        // A later full-segment seal can win the publication race against an older durability
-        // snapshot. In that case the captured prefix is already covered and contributes no delta.
-        Ok(captured_records.saturating_sub(published))
+    pub(crate) fn with_published_bytes(published_bytes: u64) -> Self {
+        Self {
+            published_bytes: AtomicU64::new(published_bytes),
+            published_records: AtomicU64::new(0),
+        }
     }
 
-    pub(crate) fn mark_published(&self, captured_records: u64) {
+    pub(crate) fn unpublished_allocation(
+        &self,
+        captured_bytes: u64,
+        captured_records: u64,
+    ) -> Result<(u64, u64)> {
+        let published_bytes = self.published_bytes.load(Ordering::Acquire);
+        let published_records = self.published_records.load(Ordering::Acquire);
+        // A later full-segment seal can win the publication race against an older durability
+        // snapshot. In that case the captured prefix is already covered and contributes no delta.
+        let bytes = captured_bytes.saturating_sub(published_bytes);
+        let records = captured_records.saturating_sub(published_records);
+        if (bytes == 0) != (records == 0) {
+            return Err(Error::InvariantViolation {
+                reason: format!(
+                    "segment allocation advances by {bytes} bytes and {records} records"
+                ),
+            });
+        }
+        Ok((bytes, records))
+    }
+
+    pub(crate) fn mark_published(&self, captured_bytes: u64, captured_records: u64) {
+        self.published_bytes
+            .fetch_max(captured_bytes, Ordering::Release);
         self.published_records
             .fetch_max(captured_records, Ordering::Release);
     }
@@ -149,23 +173,16 @@ pub(crate) fn active_segment_state_from_path(
     }
 }
 
-pub(crate) fn publish_segment_allocation_baseline(
+pub(crate) fn publish_segment_allocation_delta(
     index: &StrataIndex,
     batch: &mut typed_store::rocks::DBBatch,
     segment_id: SegmentId,
-    durable_bytes: u64,
+    allocation_bytes: u64,
     allocation_records: u64,
 ) -> Result<bool> {
-    let mut summary = index
-        .get_segment_gc_summary(segment_id)?
-        .unwrap_or_default();
-    // An earlier durability snapshot may already have covered this byte boundary. The cumulative
-    // record tracker lets the caller mark its captured count covered without applying a duplicate
-    // GC delta.
-    if summary.total_bytes >= durable_bytes {
+    if allocation_bytes == 0 && allocation_records == 0 {
         return Ok(false);
     }
-    let allocation_bytes = durable_bytes - summary.total_bytes;
     if (allocation_bytes == 0) != (allocation_records == 0) {
         return Err(Error::InvariantViolation {
             reason: format!(
@@ -174,32 +191,18 @@ pub(crate) fn publish_segment_allocation_baseline(
         });
     }
 
-    summary.total_bytes = durable_bytes;
-    summary.live_bytes = summary
-        .live_bytes
-        .checked_add(allocation_bytes)
-        .ok_or_else(|| Error::InvariantViolation {
-            reason: format!("segment {segment_id} live-byte baseline overflow"),
-        })?;
-    summary.live_ref_count = summary
-        .live_ref_count
-        .checked_add(allocation_records)
-        .ok_or_else(|| Error::InvariantViolation {
-            reason: format!("segment {segment_id} live-ref baseline overflow"),
-        })?;
-    summary.unknown_lifetime_bytes = summary
-        .unknown_lifetime_bytes
-        .checked_add(allocation_bytes)
-        .ok_or_else(|| Error::InvariantViolation {
-            reason: format!("segment {segment_id} unknown-lifetime byte baseline overflow"),
-        })?;
-    summary.unknown_lifetime_ref_count = summary
-        .unknown_lifetime_ref_count
-        .checked_add(allocation_records)
-        .ok_or_else(|| Error::InvariantViolation {
-            reason: format!("segment {segment_id} unknown-lifetime ref baseline overflow"),
-        })?;
-    index.put_segment_gc_summary_batch(batch, segment_id, &summary)?;
+    index.merge_segment_gc_summary_batch(
+        batch,
+        segment_id,
+        &core_types::SegmentGcSummaryDelta {
+            total_bytes: i128::from(allocation_bytes),
+            live_bytes: i128::from(allocation_bytes),
+            live_ref_count: i128::from(allocation_records),
+            unknown_lifetime_bytes: i128::from(allocation_bytes),
+            unknown_lifetime_ref_count: i128::from(allocation_records),
+            ..Default::default()
+        },
+    )?;
     Ok(true)
 }
 

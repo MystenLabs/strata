@@ -235,6 +235,19 @@ pub enum GcScenario {
     PinnedEpochExpiry,
 }
 
+impl GcScenario {
+    /// Stable low-cardinality label used by execution metrics and durable reclaim attribution.
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::EmptyDelete => "empty_delete",
+            Self::L0Compaction => "l0_compaction",
+            Self::DeadRef => "dead_ref",
+            Self::JoinMultiple => "join_multiple",
+            Self::PinnedEpochExpiry => "pinned_epoch_expiry",
+        }
+    }
+}
+
 /// One operation the executor should perform if it accepts a plan.
 ///
 /// Actions are declarative and side-effect free. They describe intent; the executor is responsible
@@ -288,6 +301,19 @@ pub enum GcAction {
         /// Replacement class, currently expected to be `PlacementClass::Spillover`.
         placement_class: PlacementClass,
     },
+}
+
+impl GcAction {
+    /// Stable low-cardinality label for distinguishing the physical shape of a GC strategy run.
+    pub const fn metric_label(&self) -> &'static str {
+        match self {
+            Self::DeleteSegment { .. } => "delete_segment",
+            Self::DeleteSegments { .. } => "delete_segments",
+            Self::MoveLiveBytes { .. } => "move_live_bytes",
+            Self::MoveLiveBytesFromSources { .. } => "move_live_bytes_from_sources",
+            Self::ReclassifySegment { .. } => "reclassify_segment",
+        }
+    }
 }
 
 /// Planner output for one scheduling decision.

@@ -2,6 +2,7 @@ pub(crate) const SEGMENT_STATES_CF: &str = "segment_states";
 pub(crate) const SEGMENT_PUBLICATION_LSNS_CF: &str = "segment_publication_lsns";
 pub(crate) const SEGMENT_GC_SUMMARIES_CF: &str = "segment_gc_summaries";
 pub(crate) const GC_RECLAIM_PENDING_CF: &str = "gc_reclaim_pending";
+pub(crate) const GC_RECLAIM_STRATEGIES_CF: &str = "gc_reclaim_strategies";
 pub(crate) const SHARDS_CF: &str = "shards";
 pub(crate) const SHARD_CLEANUP_JOBS_CF: &str = "shard_cleanup_jobs";
 pub(crate) const STORE_STATE_CF: &str = "store_state";
@@ -16,6 +17,7 @@ pub struct StrataIndexCfNames {
     pub segment_publication_lsns: String,
     pub segment_gc_summaries: String,
     pub gc_reclaim_pending: String,
+    pub gc_reclaim_strategies: String,
     pub shards: String,
     pub shard_cleanup_jobs: String,
     pub store_state: String,
@@ -41,6 +43,7 @@ impl StrataIndexCfNames {
             segment_publication_lsns: with_prefix(SEGMENT_PUBLICATION_LSNS_CF),
             segment_gc_summaries: with_prefix(SEGMENT_GC_SUMMARIES_CF),
             gc_reclaim_pending: with_prefix(GC_RECLAIM_PENDING_CF),
+            gc_reclaim_strategies: with_prefix(GC_RECLAIM_STRATEGIES_CF),
             shards: with_prefix(SHARDS_CF),
             shard_cleanup_jobs: with_prefix(SHARD_CLEANUP_JOBS_CF),
             store_state: with_prefix(STORE_STATE_CF),
@@ -51,12 +54,13 @@ impl StrataIndexCfNames {
         }
     }
 
-    pub(crate) fn as_strs(&self) -> [&str; 11] {
+    pub(crate) fn as_strs(&self) -> [&str; 12] {
         [
             self.segment_states.as_str(),
             self.segment_publication_lsns.as_str(),
             self.segment_gc_summaries.as_str(),
             self.gc_reclaim_pending.as_str(),
+            self.gc_reclaim_strategies.as_str(),
             self.shards.as_str(),
             self.shard_cleanup_jobs.as_str(),
             self.store_state.as_str(),

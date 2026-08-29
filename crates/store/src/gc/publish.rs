@@ -25,7 +25,7 @@ use crate::{
         OverlayRecordState,
     },
     layout::segment_state_path,
-    maintenance::garbage_log_dir,
+    maintenance::{garbage_log_dir, read_relocation_lsm_manifest},
     metrics::GcKnownDelta,
     relocation::RelocationEntry,
     shard_gc::shard_generation_is_obsolete,
@@ -33,7 +33,7 @@ use crate::{
 use core_types::{
     GarbageEvent, PlacementClass, SegmentFileState, SegmentGcRecordRange, SegmentId, SegmentState,
 };
-use gc_planner::GcAction;
+use gc_planner::{GcAction, GcScenario};
 use lsm::{GarbageLog, SegmentGarbageLog};
 
 #[derive(Debug)]
@@ -301,7 +301,7 @@ impl GcExecutor {
                         "metadata action cannot include staged outputs or copied records",
                     ));
                 }
-                self.apply_gc_metadata_action(&copy.plan.action)?;
+                self.apply_gc_metadata_action(copy.plan.scenario, &copy.plan.action)?;
                 return Ok(GcPublishResult {
                     reconciled_lsn,
                     output_segments: Vec::new(),
@@ -497,6 +497,7 @@ impl GcExecutor {
                     *source_segment_id,
                     activation_sequence,
                     *output_bytes,
+                    copy.plan.scenario.metric_label(),
                 )?;
             }
             for output in &copy.outputs {
@@ -528,18 +529,9 @@ impl GcExecutor {
             {
                 return Err(GcPublishCommitError::IndexCommit(error));
             }
-            let published = self
-                .index
-                .get_lsm_manifest(RELOCATION_LSM_MANIFEST)
-                .map_err(Error::from)
-                .map_err(GcPublishCommitError::IndexCommit)?
-                .ok_or_else(|| Error::InvariantViolation {
-                    reason: "published relocation LSM manifest is missing".to_owned(),
-                })
-                .map_err(GcPublishCommitError::IndexCommit)?;
             self.relocations
                 .lsm()
-                .install_manifest(published)
+                .reload_manifest(|| read_relocation_lsm_manifest(&self.index))
                 .map_err(Error::from)
                 .map_err(GcPublishCommitError::IndexCommit)?;
             self.durable_relocation_lsn
@@ -560,8 +552,10 @@ impl GcExecutor {
                 self.metrics.apply_gc_known_delta(skipped_output_delta);
                 self.metrics
                     .add_gc_relocating_segments(relocating_source_states.len());
-                self.metrics
-                    .record_gc_output_published(published_output_bytes);
+                self.metrics.record_gc_output_published(
+                    copy.plan.scenario.metric_label(),
+                    published_output_bytes,
+                );
                 // A foreground mutation may have stayed copy-eligible because it had not reached
                 // the garbage log before this publication. Prompt a relocation-aware compaction
                 // to project that mutation (or the current lifecycle) onto the new destination.
@@ -600,13 +594,13 @@ impl GcExecutor {
     /// delete_empty_gc_segments, ReclassifySegment to reclassify_gc_segment. The last arm is the
     /// mirror image of the guard in commit_gc_publish: a copy action arriving here is exactly as
     /// invalid as a metadata action arriving with staged outputs, and both fail the same way.
-    fn apply_gc_metadata_action(&self, action: &GcAction) -> Result<()> {
+    fn apply_gc_metadata_action(&self, scenario: GcScenario, action: &GcAction) -> Result<()> {
         match action {
             GcAction::DeleteSegment { segment_id } => {
-                self.delete_empty_gc_segments(&[*segment_id])?;
+                self.delete_empty_gc_segments(&[*segment_id], scenario)?;
             }
             GcAction::DeleteSegments { segment_ids } => {
-                self.delete_empty_gc_segments(segment_ids)?;
+                self.delete_empty_gc_segments(segment_ids, scenario)?;
             }
             GcAction::ReclassifySegment {
                 segment_id,
@@ -682,7 +676,11 @@ impl GcExecutor {
     /// reclaim-pending rows written at publish time are consumed and net reclamation is recorded:
     /// for S7 that is its 100 MB of file freed, offset by the S42 bytes GC created on its behalf —
     /// so the metric reports what GC actually gave back, not just what it unlinked.
-    fn delete_empty_gc_segments(&self, segment_ids: &[SegmentId]) -> Result<()> {
+    fn delete_empty_gc_segments(
+        &self,
+        segment_ids: &[SegmentId],
+        fallback_scenario: GcScenario,
+    ) -> Result<()> {
         let mut states = Vec::with_capacity(segment_ids.len());
         let mut states_to_commit = Vec::new();
         let mut summaries_to_remove = Vec::new();
@@ -759,17 +757,27 @@ impl GcExecutor {
                 .map(|(segment_id, _)| *segment_id)
                 .collect::<Vec<_>>();
             let mut batch = self.index.batch();
-            let output_bytes_by_source = self
+            let attribution_by_source = self
                 .index
                 .remove_gc_reclaim_pending_for_sources_batch(&mut batch, &source_segment_ids)?;
             batch.write().map_err(index::Error::from)?;
             for (segment_id, source_bytes) in unlinked_segments {
-                let output_bytes = output_bytes_by_source
-                    .get(&segment_id)
-                    .copied()
-                    .unwrap_or(0);
-                self.metrics
-                    .record_gc_source_deleted(source_bytes, output_bytes);
+                let attribution = attribution_by_source.get(&segment_id).cloned().unwrap_or(
+                    index::GcReclaimAttribution {
+                        output_bytes: 0,
+                        strategy: None,
+                    },
+                );
+                let strategy = match attribution.strategy.as_deref() {
+                    Some(strategy) => strategy,
+                    None if attribution.output_bytes == 0 => fallback_scenario.metric_label(),
+                    None => "unknown",
+                };
+                self.metrics.record_gc_source_deleted(
+                    strategy,
+                    source_bytes,
+                    attribution.output_bytes,
+                );
             }
         }
         Ok(())

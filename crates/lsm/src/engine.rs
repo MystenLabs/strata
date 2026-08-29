@@ -780,6 +780,24 @@ impl Lsm {
     /// Installs a separately published manifest, for example after compaction.
     pub fn install_manifest(&self, manifest: Manifest) -> Result<()> {
         let _flush = lock(&self.flush_lock);
+        self.install_manifest_locked(manifest)
+    }
+
+    /// Reloads and installs the latest durable manifest under the flush/install lock.
+    ///
+    /// Compaction can publish its edit before taking this lock, keeping expensive SST and
+    /// garbage-log I/O out of the flush critical section. The durable read must happen after the
+    /// lock is acquired: otherwise a frontier publisher can advance and install a newer manifest
+    /// between the read and this installation, and the stale compaction read would regress the
+    /// in-memory frontier.
+    pub fn reload_manifest(&self, load: impl FnOnce() -> Result<Manifest>) -> Result<()> {
+        let _flush = lock(&self.flush_lock);
+        self.check_running()?;
+        let manifest = load()?;
+        self.install_manifest_locked(manifest)
+    }
+
+    fn install_manifest_locked(&self, manifest: Manifest) -> Result<()> {
         manifest.validate()?;
         let manifest_lsn = manifest
             .partitions
@@ -1522,7 +1540,7 @@ mod tests {
     use std::{
         collections::HashSet,
         num::{NonZeroU32, NonZeroUsize},
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -1612,6 +1630,53 @@ mod tests {
             target.relative_path() == format!("patch-{:020}.sst", target.id())
                 || target.relative_path() == format!("base-{:020}.sst", target.id())
         }));
+    }
+
+    #[test]
+    fn manifest_reload_holds_flush_lock_across_load_and_install() {
+        let directory = TempDir::new().unwrap();
+        let lsm = open(&directory, Vec::new());
+        lsm.materialize_through(10, |edit| {
+            let mut manifest = (*lsm.manifest()).clone();
+            manifest.apply(edit)?;
+            Ok(manifest)
+        })
+        .unwrap();
+
+        let (load_entered_tx, load_entered_rx) = mpsc::channel();
+        let (release_load_tx, release_load_rx) = mpsc::channel();
+        let reload_lsm = Arc::clone(&lsm);
+        let reload = thread::spawn(move || {
+            reload_lsm.reload_manifest(|| {
+                load_entered_tx.send(()).unwrap();
+                release_load_rx.recv().unwrap();
+                Ok((*reload_lsm.manifest()).clone())
+            })
+        });
+        load_entered_rx.recv().unwrap();
+
+        let (frontier_done_tx, frontier_done_rx) = mpsc::channel();
+        let frontier_lsm = Arc::clone(&lsm);
+        let frontier = thread::spawn(move || {
+            let result = frontier_lsm.materialize_through(20, |edit| {
+                let mut manifest = (*frontier_lsm.manifest()).clone();
+                manifest.apply(edit)?;
+                Ok(manifest)
+            });
+            frontier_done_tx.send(()).unwrap();
+            result
+        });
+        assert!(
+            frontier_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "frontier publication passed manifest reload's flush lock"
+        );
+
+        release_load_tx.send(()).unwrap();
+        reload.join().unwrap().unwrap();
+        frontier.join().unwrap().unwrap();
+        assert_eq!(lsm.manifest().materialized_through, Some(20));
     }
 
     #[test]

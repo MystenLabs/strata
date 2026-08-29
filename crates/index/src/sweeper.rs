@@ -5,7 +5,7 @@ use std::{
 
 use core_types::{
     GarbageEvent, SegmentFileState, SegmentGcLifetimeUpdate, SegmentGcOverlay,
-    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentId,
+    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentGcSummaryDelta, SegmentId,
 };
 use lsm::{
     GarbageLog, GarbageRecord, SegmentGarbageLog, fold_segment_garbage, read_segment_garbage,
@@ -90,9 +90,9 @@ impl StrataIndex {
 
     /// Sweeps a bounded batch of committed global frames into segment-local files.
     ///
-    /// Each touched local file is synced once before its position, full summary, and the sweep
-    /// cursor become visible in one RocksDB batch. Calls for the same log must be serialized by the
-    /// owner.
+    /// Each touched local file is synced once before its position, additive summary delta, and the
+    /// sweep cursor become visible in one RocksDB batch. Calls for the same log must be serialized
+    /// by the owner.
     pub fn sweep_garbage_log(
         &self,
         global_log_dir: impl AsRef<Path>,
@@ -149,10 +149,31 @@ impl StrataIndex {
                 continue;
             }
             // Leave the frame pending until Store durability publication installs the segment's
-            // allocation baseline.
+            // allocation baseline. A summary row alone is insufficient: active segments publish
+            // several durable prefixes, and a garbage event can name a record beyond the prefix
+            // currently accounted by the row. Applying its negative live-byte delta first would
+            // make the summary depend on whether the sweeper or the next durability publication
+            // won the race.
             let Some(summary) = batch.get(self.segment_gc_summaries(), segment_id)? else {
                 return Ok(false);
             };
+            let required_bytes = by_segment[segment_id]
+                .iter()
+                .map(|record| {
+                    let range = record.event.record();
+                    range.offset.checked_add(range.len).ok_or_else(|| {
+                        Error::InvalidGarbageSweep(format!(
+                            "segment {segment_id} garbage range overflows"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or_default();
+            if summary.total_bytes < required_bytes {
+                return Ok(false);
+            }
             states.insert(*segment_id, state);
             summaries.insert(*segment_id, summary);
         }
@@ -180,16 +201,85 @@ impl StrataIndex {
                     .expect("summaries were resolved above"),
             )?;
             overlay.apply_merge_ops(records.iter().map(garbage_merge_op));
+            let summary_delta = sum_summary_deltas(&records)?;
             let mut file = SegmentGarbageLog::open(path, committed)?;
             let position = file.append(&records)?;
             batch.put(self.segment_garbage_log_positions(), &segment_id, &position)?;
-            batch.put(self.segment_gc_summaries(), &segment_id, &overlay.summary)?;
+            self.merge_segment_gc_summary_batch(batch.raw_batch_mut(), segment_id, &summary_delta)?;
         }
         batch.put(self.garbage_log_positions(), &cursor_name, &next_cursor)?;
         batch.write_with_sync(true)?;
         GarbageLog::reclaim_before(global_log_dir, next_cursor)?;
         Ok(true)
     }
+}
+
+fn sum_summary_deltas(records: &[GarbageRecord]) -> Result<SegmentGcSummaryDelta> {
+    let mut total = SegmentGcSummaryDelta::default();
+    for record in records {
+        add_delta_field(
+            &mut total.total_bytes,
+            record.summary_delta.total_bytes,
+            "total bytes",
+        )?;
+        add_delta_field(
+            &mut total.live_bytes,
+            record.summary_delta.live_bytes,
+            "live bytes",
+        )?;
+        add_delta_field(
+            &mut total.retired_bytes,
+            record.summary_delta.retired_bytes,
+            "retired bytes",
+        )?;
+        add_delta_field(
+            &mut total.expired_bytes,
+            record.summary_delta.expired_bytes,
+            "expired bytes",
+        )?;
+        add_delta_field(
+            &mut total.live_ref_count,
+            record.summary_delta.live_ref_count,
+            "live refs",
+        )?;
+        add_delta_field(
+            &mut total.unknown_lifetime_bytes,
+            record.summary_delta.unknown_lifetime_bytes,
+            "unknown-lifetime bytes",
+        )?;
+        add_delta_field(
+            &mut total.unknown_lifetime_ref_count,
+            record.summary_delta.unknown_lifetime_ref_count,
+            "unknown-lifetime refs",
+        )?;
+        add_delta_map(&mut total.epoch_bytes, &record.summary_delta.epoch_bytes)?;
+        add_delta_map(&mut total.epoch_refs, &record.summary_delta.epoch_refs)?;
+        add_delta_map(
+            &mut total.extension_counts,
+            &record.summary_delta.extension_counts,
+        )?;
+    }
+    Ok(total)
+}
+
+fn add_delta_field(total: &mut i128, change: i128, name: &str) -> Result<()> {
+    *total = total.checked_add(change).ok_or_else(|| {
+        Error::InvalidGarbageSweep(format!("segment summary {name} delta overflows"))
+    })?;
+    Ok(())
+}
+
+fn add_delta_map<K: Copy + Ord>(
+    total: &mut BTreeMap<K, i128>,
+    changes: &BTreeMap<K, i128>,
+) -> Result<()> {
+    for (&key, &change) in changes {
+        let value = total.entry(key).or_default();
+        *value = value.checked_add(change).ok_or_else(|| {
+            Error::InvalidGarbageSweep("segment summary histogram delta overflows".to_owned())
+        })?;
+    }
+    Ok(())
 }
 
 fn garbage_merge_op(record: &GarbageRecord) -> SegmentGcOverlayMergeOp {

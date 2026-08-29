@@ -47,7 +47,7 @@ async fn sweep_copies_details_before_publishing_summaries_and_cursor() {
                 record: record(1, 0, 100),
                 lifecycle: None,
             },
-            live_delta(100),
+            lifecycle_delta(),
         ),
         event(
             b"a",
@@ -64,7 +64,7 @@ async fn sweep_copies_details_before_publishing_summaries_and_cursor() {
                 record: record(2, 0, 50),
                 lifecycle: None,
             },
-            live_delta(50),
+            lifecycle_delta(),
         ),
     ];
     let head = log.append(&first_frame).unwrap();
@@ -232,7 +232,7 @@ async fn sweep_reclaims_a_global_log_after_crossing_its_boundary() {
                 record: record(1, 0, 100),
                 lifecycle: None,
             },
-            live_delta(100),
+            lifecycle_delta(),
         )])
         .unwrap();
     let head = log
@@ -278,10 +278,10 @@ async fn sweep_stops_at_the_frame_batch_limit() {
                 b"a",
                 sequence,
                 GarbageEvent::SetLifecycle {
-                    record: record(1, sequence, 1),
+                    record: record(1, sequence - 1, 1),
                     lifecycle: None,
                 },
-                live_delta(1),
+                lifecycle_delta(),
             )])
             .unwrap(),
         );
@@ -453,15 +453,8 @@ fn record(segment_id: SegmentId, offset: u64, len: u64) -> RecordRef {
     }
 }
 
-fn live_delta(bytes: i128) -> SegmentGcSummaryDelta {
-    SegmentGcSummaryDelta {
-        total_bytes: bytes,
-        live_bytes: bytes,
-        live_ref_count: 1,
-        unknown_lifetime_bytes: bytes,
-        unknown_lifetime_ref_count: 1,
-        ..Default::default()
-    }
+fn lifecycle_delta() -> SegmentGcSummaryDelta {
+    SegmentGcSummaryDelta::default()
 }
 
 fn retire_delta(bytes: i128) -> SegmentGcSummaryDelta {

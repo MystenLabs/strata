@@ -469,6 +469,160 @@
       ],
       "title": "Strata Sync Time Share by Phase",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "id": 15,
+      "panels": [],
+      "title": "Strata — GC Strategies",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Plans successfully source-claimed versus plans whose metadata or relocation publication completed. A widening gap isolates a strategy failing during copy or publication.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+      "id": 16,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (strategy, action) (rate(strata_store_gc_strategy_selected_total{job=\"strata-bench\"}[$__rate_interval]))",
+          "legendFormat": "selected {{strategy}} / {{action}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (strategy, action) (rate(strata_store_gc_strategy_completed_total{job=\"strata-bench\"}[$__rate_interval]))",
+          "legendFormat": "completed {{strategy}} / {{action}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "GC Strategy Selection vs Completion Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Selected and successfully completed plans during the dashboard range. Counters reset on process restart.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+      "id": 17,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum by (strategy, action) (increase(strata_store_gc_strategy_selected_total{job=\"strata-bench\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "selected {{strategy}} / {{action}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (strategy, action) (increase(strata_store_gc_strategy_completed_total{job=\"strata-bench\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "completed {{strategy}} / {{action}}",
+          "refId": "B"
+        }
+      ],
+      "title": "GC Strategy Invocations in Range",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Actual source-file bytes unlinked minus replacement output bytes, attributed to the strategy that originally made each source reclaimable.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 66 },
+      "id": 18,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (strategy) (rate(strata_store_gc_strategy_reclaimed_bytes_total{job=\"strata-bench\"}[$__rate_interval]))",
+          "legendFormat": "{{strategy}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Net Reclamation Throughput by GC Strategy",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Actual net bytes reclaimed by each originating strategy during the selected range.",
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 66 },
+      "id": 19,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum by (strategy) (increase(strata_store_gc_strategy_reclaimed_bytes_total{job=\"strata-bench\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "{{strategy}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Net Reclamation Contribution in Range",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Physical source deletion, replacement output, and resulting net reclamation by strategy.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 74 },
+      "id": 20,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (strategy) (rate(strata_store_gc_strategy_source_deleted_bytes_total{job=\"strata-bench\"}[$__rate_interval]))",
+          "legendFormat": "source deleted {{strategy}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (strategy) (rate(strata_store_gc_strategy_output_bytes_total{job=\"strata-bench\"}[$__rate_interval]))",
+          "legendFormat": "output {{strategy}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (strategy) (rate(strata_store_gc_strategy_reclaimed_bytes_total{job=\"strata-bench\"}[$__rate_interval]))",
+          "legendFormat": "net reclaimed {{strategy}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "GC Strategy Source, Output, and Net Byte Rates",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

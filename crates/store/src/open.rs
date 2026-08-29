@@ -284,7 +284,9 @@ impl StrataStore {
             active_segment_state,
             durable_offset,
             active_allocation_records: 0,
-            active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
+            active_allocation_tracker: Arc::new(SegmentAllocationTracker::with_published_bytes(
+                durable_offset,
+            )),
             pending_segment_bytes: 0,
             unsealed_segments,
             oldest_uncommitted_at: None,
