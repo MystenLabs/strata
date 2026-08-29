@@ -4928,6 +4928,60 @@ async fn cold_base_sweep_updates_gc_summary_without_a_user_touch() {
     assert_eq!(stats.min_live_end_epoch, None);
     assert!(stats.is_empty());
 }
+
+#[tokio::test]
+async fn continuous_compaction_wakes_do_not_starve_cold_base_sweep() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.gc_workers_enabled = false;
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    store.put(&key, b"payload").unwrap();
+    let lifetime_lsn = store.extend(&key, 43).unwrap().unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, lifetime_lsn);
+
+    let compact_tx = store.store.lsm_compact_tx.as_ref().unwrap().clone();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let wake_handle = thread::spawn(move || {
+        while stop_rx.try_recv().is_err() {
+            if compact_tx.send(()).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let (epoch, epoch_lsn) = store.increment_epoch().unwrap();
+    assert_eq!(epoch, 43);
+    store.sync().unwrap();
+
+    let started = Instant::now();
+    let advanced_while_wakes_continued = loop {
+        let accounted = store
+            .index()
+            .get_blob_expiry_accounted_lsn()
+            .unwrap()
+            .unwrap_or_default();
+        if accounted >= epoch_lsn {
+            break true;
+        }
+        if started.elapsed() >= Duration::from_secs(5) {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    stop_tx.send(()).unwrap();
+    wake_handle.join().unwrap();
+    assert!(
+        advanced_while_wakes_continued,
+        "continuous compaction nudges reset the forced-pass deadline"
+    );
+}
+
 #[tokio::test]
 async fn compaction_expiry_does_not_revive_blob_on_extension() {
     init_typed_store_metrics();

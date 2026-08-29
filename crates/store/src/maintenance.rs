@@ -412,17 +412,23 @@ pub(crate) struct LsmCompactor {
 
 impl LsmCompactor {
     /// The loop: wake on a nudge (the flusher after new patches, the writer after a durability
-    /// sync, GC after activating relocations) or on the one-second fallback tick. A tick sets
-    /// `force`, which both bypasses the patch-pressure thresholds and requests the full
-    /// (base-materializing) form, so healing and garbage discovery keep happening even on an
-    /// otherwise idle store. Any failure halts the store and the LSM — compaction publishes
+    /// sync, GC after activating relocations) or on the one-second periodic deadline. Reaching the
+    /// deadline sets `force`, which both bypasses the patch-pressure thresholds and requests the
+    /// full (base-materializing) form, so healing and garbage discovery keep happening even when
+    /// nudges arrive continuously. Any failure halts the store and the LSM — compaction publishes
     /// manifests, and a half-trusted manifest is not a state to keep running in.
     pub(crate) fn run(mut self) {
+        let mut next_forced_pass = Instant::now() + LSM_OBSOLETE_CLEANUP_INTERVAL;
         loop {
-            let force = match self.wake_rx.recv_timeout(LSM_OBSOLETE_CLEANUP_INTERVAL) {
-                Ok(()) => false,
-                Err(mpsc::RecvTimeoutError::Timeout) => true,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            // Use an absolute deadline rather than a fresh timeout after every nudge. Otherwise a
+            // continuously non-empty wake queue can postpone cold-base expiry indefinitely.
+            let force = match next_forced_pass.checked_duration_since(Instant::now()) {
+                None | Some(Duration::ZERO) => true,
+                Some(wait) => match self.wake_rx.recv_timeout(wait) {
+                    Ok(()) => false,
+                    Err(mpsc::RecvTimeoutError::Timeout) => true,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                },
             };
             let Some(lsm) = self.lsm.upgrade() else {
                 return;
@@ -440,6 +446,12 @@ impl LsmCompactor {
                 return;
             }
             self.cleanup_obsolete(&lsm);
+            if force {
+                // Schedule from completion rather than replaying missed ticks. A full compaction
+                // can itself take longer than the interval; immediately replaying those ticks
+                // could starve newly created patch work.
+                next_forced_pass = Instant::now() + LSM_OBSOLETE_CLEANUP_INTERVAL;
+            }
         }
     }
 
@@ -623,6 +635,11 @@ impl LsmCompactor {
         // contiguous: if bases [a,f] and [n,z] have an untouched [g,m] base between them, writing
         // the two disjoint seeds into one SST would create an invalid [a,z] overlap. The base-seed
         // selector still pulls in every patch transitively connected to this one range.
+        //
+        // TODO: Replace the fixed one-base cadence with a backlog-aware scheduler. It should pick
+        // the oldest merge frontier, derive an expiry work rate from the stale-base backlog, and
+        // re-evaluate patch soft/hard pressure after every base so neither expiry nor new patch
+        // compaction can starve the other.
         let stale_base = if force {
             partition_manifest
                 .base
