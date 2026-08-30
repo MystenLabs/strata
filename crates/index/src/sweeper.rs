@@ -5,7 +5,8 @@ use std::{
 
 use core_types::{
     GarbageEvent, SegmentFileState, SegmentGcLifetimeUpdate, SegmentGcOverlay,
-    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentGcSummaryDelta, SegmentId,
+    SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentGcSummary, SegmentGcSummaryDelta,
+    SegmentId,
 };
 use lsm::{
     GarbageLog, GarbageRecord, SegmentGarbageLog, fold_segment_garbage, read_segment_garbage,
@@ -200,8 +201,15 @@ impl StrataIndex {
                     .remove(&segment_id)
                     .expect("summaries were resolved above"),
             )?;
+            let before_summary = overlay.summary.clone();
             overlay.apply_merge_ops(records.iter().map(garbage_merge_op));
-            let summary_delta = sum_summary_deltas(&records)?;
+            // Garbage events describe idempotent state transitions, while their serialized
+            // summary deltas describe the transition from the compactor's input view. A later
+            // relocation-aware compaction may legitimately restate an event already present in
+            // the segment log. Reapplying that raw delta would subtract the old state twice.
+            // Derive the merge operand from the overlay transition instead, preserving both
+            // idempotency and commutativity with allocation-baseline merge operands.
+            let summary_delta = summary_delta_between(&before_summary, &overlay.summary);
             let mut file = SegmentGarbageLog::open(path, committed)?;
             let position = file.append(&records)?;
             batch.put(self.segment_garbage_log_positions(), &segment_id, &position)?;
@@ -214,72 +222,52 @@ impl StrataIndex {
     }
 }
 
-fn sum_summary_deltas(records: &[GarbageRecord]) -> Result<SegmentGcSummaryDelta> {
-    let mut total = SegmentGcSummaryDelta::default();
-    for record in records {
-        add_delta_field(
-            &mut total.total_bytes,
-            record.summary_delta.total_bytes,
-            "total bytes",
-        )?;
-        add_delta_field(
-            &mut total.live_bytes,
-            record.summary_delta.live_bytes,
-            "live bytes",
-        )?;
-        add_delta_field(
-            &mut total.retired_bytes,
-            record.summary_delta.retired_bytes,
-            "retired bytes",
-        )?;
-        add_delta_field(
-            &mut total.expired_bytes,
-            record.summary_delta.expired_bytes,
-            "expired bytes",
-        )?;
-        add_delta_field(
-            &mut total.live_ref_count,
-            record.summary_delta.live_ref_count,
-            "live refs",
-        )?;
-        add_delta_field(
-            &mut total.unknown_lifetime_bytes,
-            record.summary_delta.unknown_lifetime_bytes,
-            "unknown-lifetime bytes",
-        )?;
-        add_delta_field(
-            &mut total.unknown_lifetime_ref_count,
-            record.summary_delta.unknown_lifetime_ref_count,
-            "unknown-lifetime refs",
-        )?;
-        add_delta_map(&mut total.epoch_bytes, &record.summary_delta.epoch_bytes)?;
-        add_delta_map(&mut total.epoch_refs, &record.summary_delta.epoch_refs)?;
-        add_delta_map(
-            &mut total.extension_counts,
-            &record.summary_delta.extension_counts,
-        )?;
+fn summary_delta_between(
+    before: &SegmentGcSummary,
+    after: &SegmentGcSummary,
+) -> SegmentGcSummaryDelta {
+    let mut delta = SegmentGcSummaryDelta {
+        total_bytes: difference(after.total_bytes, before.total_bytes),
+        live_bytes: difference(after.live_bytes, before.live_bytes),
+        retired_bytes: difference(after.retired_bytes, before.retired_bytes),
+        expired_bytes: difference(after.expired_bytes, before.expired_bytes),
+        live_ref_count: difference(after.live_ref_count, before.live_ref_count),
+        unknown_lifetime_bytes: difference(
+            after.unknown_lifetime_bytes,
+            before.unknown_lifetime_bytes,
+        ),
+        unknown_lifetime_ref_count: difference(
+            after.unknown_lifetime_ref_count,
+            before.unknown_lifetime_ref_count,
+        ),
+        ..Default::default()
+    };
+
+    for (&epoch, bucket) in &before.future_epoch_histogram {
+        delta.epoch_bytes.insert(epoch, -i128::from(bucket.bytes));
+        delta.epoch_refs.insert(epoch, -i128::from(bucket.refs));
     }
-    Ok(total)
+    for (&epoch, bucket) in &after.future_epoch_histogram {
+        *delta.epoch_bytes.entry(epoch).or_default() += i128::from(bucket.bytes);
+        *delta.epoch_refs.entry(epoch).or_default() += i128::from(bucket.refs);
+    }
+    delta.epoch_bytes.retain(|_, change| *change != 0);
+    delta.epoch_refs.retain(|_, change| *change != 0);
+
+    for (&extension_count, &count) in &before.extension_count_histogram {
+        delta
+            .extension_counts
+            .insert(extension_count, -i128::from(count));
+    }
+    for (&extension_count, &count) in &after.extension_count_histogram {
+        *delta.extension_counts.entry(extension_count).or_default() += i128::from(count);
+    }
+    delta.extension_counts.retain(|_, change| *change != 0);
+    delta
 }
 
-fn add_delta_field(total: &mut i128, change: i128, name: &str) -> Result<()> {
-    *total = total.checked_add(change).ok_or_else(|| {
-        Error::InvalidGarbageSweep(format!("segment summary {name} delta overflows"))
-    })?;
-    Ok(())
-}
-
-fn add_delta_map<K: Copy + Ord>(
-    total: &mut BTreeMap<K, i128>,
-    changes: &BTreeMap<K, i128>,
-) -> Result<()> {
-    for (&key, &change) in changes {
-        let value = total.entry(key).or_default();
-        *value = value.checked_add(change).ok_or_else(|| {
-            Error::InvalidGarbageSweep("segment summary histogram delta overflows".to_owned())
-        })?;
-    }
-    Ok(())
+fn difference(after: u64, before: u64) -> i128 {
+    i128::from(after) - i128::from(before)
 }
 
 fn garbage_merge_op(record: &GarbageRecord) -> SegmentGcOverlayMergeOp {

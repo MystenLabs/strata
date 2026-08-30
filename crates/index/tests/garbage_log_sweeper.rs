@@ -1,8 +1,9 @@
-use std::sync::Once;
+use std::{collections::BTreeMap, sync::Once};
 
 use core_types::{
-    BlobKey, PlacementClass, RecordRef, SegmentFileState, SegmentGcRecordRange, SegmentGcSummary,
-    SegmentGcSummaryDelta, SegmentId, SegmentOwner, SegmentState,
+    BlobKey, BlobLifecycle, EpochBucket, PlacementClass, RecordRef, SegmentFileState,
+    SegmentGcRecordRange, SegmentGcSummary, SegmentGcSummaryDelta, SegmentId, SegmentOwner,
+    SegmentState,
 };
 use index::StrataIndex;
 use lsm::{
@@ -165,6 +166,80 @@ async fn sweep_copies_details_before_publishing_summaries_and_cursor() {
     );
     assert!(!local_events.contains(&orphan));
     assert!(!sweep(&index, &global_dir, &namespace_dir));
+}
+
+#[tokio::test]
+async fn repeated_lifecycle_restatement_is_idempotent_for_summary_merges() {
+    init_typed_store_metrics();
+    let directory = TempDir::new().unwrap();
+    let index = StrataIndex::open_path(
+        directory.path().join("index"),
+        "strata",
+        directory.path().display().to_string(),
+    )
+    .unwrap();
+    put_ready_segment(&index, 1, 100, 1);
+
+    let global_dir = directory.path().join("global-garbage");
+    let namespace_dir = directory.path().join("namespace");
+    let mut log =
+        GarbageLog::open(&global_dir, 1024 * 1024, GarbageLogPosition::default()).unwrap();
+    let lifecycle = BlobLifecycle {
+        logical_end_epoch: 50,
+        extension_count: 2,
+    };
+    let restatement = event(
+        b"a",
+        1,
+        GarbageEvent::SetLifecycle {
+            record: record(1, 0, 100),
+            lifecycle: Some(lifecycle),
+        },
+        set_lifecycle_delta(100, lifecycle),
+    );
+
+    let first_head = log.append(std::slice::from_ref(&restatement)).unwrap();
+    publish_head(&index, first_head);
+    assert!(sweep(&index, &global_dir, &namespace_dir));
+
+    let expected = SegmentGcSummary {
+        total_bytes: 100,
+        live_bytes: 100,
+        live_ref_count: 1,
+        min_live_end_epoch: Some(50),
+        max_live_end_epoch: Some(50),
+        future_epoch_histogram: BTreeMap::from([(
+            50,
+            EpochBucket {
+                bytes: 100,
+                refs: 1,
+            },
+        )]),
+        extension_count_histogram: BTreeMap::from([(2, 1)]),
+        ..Default::default()
+    };
+    assert_eq!(
+        index.get_segment_gc_summary(1).unwrap(),
+        Some(expected.clone())
+    );
+
+    // Relocation-aware compaction may emit this exact state assignment again in a later frame.
+    // Its stored transition delta is not idempotent, but applying the event to the overlay is.
+    let second_head = log.append(std::slice::from_ref(&restatement)).unwrap();
+    publish_head(&index, second_head);
+    assert!(sweep(&index, &global_dir, &namespace_dir));
+    assert_eq!(
+        index.get_segment_gc_summary(1).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        index
+            .read_segment_garbage_overlay(&namespace_dir, 1)
+            .unwrap()
+            .unwrap()
+            .summary,
+        expected
+    );
 }
 
 #[tokio::test]
@@ -455,6 +530,17 @@ fn record(segment_id: SegmentId, offset: u64, len: u64) -> RecordRef {
 
 fn lifecycle_delta() -> SegmentGcSummaryDelta {
     SegmentGcSummaryDelta::default()
+}
+
+fn set_lifecycle_delta(bytes: i128, lifecycle: BlobLifecycle) -> SegmentGcSummaryDelta {
+    SegmentGcSummaryDelta {
+        unknown_lifetime_bytes: -bytes,
+        unknown_lifetime_ref_count: -1,
+        epoch_bytes: BTreeMap::from([(lifecycle.logical_end_epoch, bytes)]),
+        epoch_refs: BTreeMap::from([(lifecycle.logical_end_epoch, 1)]),
+        extension_counts: BTreeMap::from([(lifecycle.extension_count, 1)]),
+        ..Default::default()
+    }
 }
 
 fn retire_delta(bytes: i128) -> SegmentGcSummaryDelta {
