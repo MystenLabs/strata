@@ -49,6 +49,7 @@ use lsm::{LiveSnapshots, Lsm};
 
 use crate::{
     Error, GcIoLimiter, Result, SegmentIdAllocator, StoreHalt, StrataStore,
+    batch::WriteCommand,
     layout::relative_segment_path,
     metrics::StrataStoreMetrics,
     reader_cache::SegmentReaderCache,
@@ -253,6 +254,17 @@ pub struct GcStagedCopiedRecord {
     pub staged: RecordRef,
 }
 
+/// Foreground write-back handle, present only when `relocation_writeback_chunk` is configured.
+///
+/// Evaluation mode: after a relocation activates, GC pushes the same relocations through the
+/// ordinary bounded write queue as conditional main-LSM mutations, `chunk` records per command,
+/// so the per-record foreground metadata cost of compaction-coupled designs can be measured.
+#[derive(Clone)]
+pub(crate) struct RelocationWriteback {
+    pub(crate) write_tx: mpsc::SyncSender<WriteCommand>,
+    pub(crate) chunk: usize,
+}
+
 /// Store-local executor for one GC attempt.
 ///
 /// This object bridges pure planning with real files and durable store metadata. It is cheap to
@@ -295,6 +307,8 @@ pub(crate) struct GcExecutor {
     pub(crate) store_halt: StoreHalt,
     /// Store metrics sink.
     pub(crate) metrics: StrataStoreMetrics,
+    /// Evaluation-only eager healing through the foreground writer.
+    pub(crate) writeback: Option<RelocationWriteback>,
 }
 
 impl StrataStore {
@@ -324,6 +338,12 @@ impl StrataStore {
             reader_cache: Arc::clone(&self.reader_cache),
             store_halt: self.store_halt.clone(),
             metrics: self.metrics.clone(),
+            writeback: self.config.relocation_writeback_chunk.and_then(|chunk| {
+                self.write_tx.as_ref().map(|write_tx| RelocationWriteback {
+                    write_tx: write_tx.clone(),
+                    chunk,
+                })
+            }),
         })
     }
 

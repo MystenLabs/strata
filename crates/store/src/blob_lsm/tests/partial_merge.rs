@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use core_types::{BlobKey, BlobLifecycle, GarbageEvent};
-use lsm::{MergeOperator, StoredValue, decode_value, encode_inline_value};
+use lsm::{
+    GarbageRecord, MergeOperator, StoredValue, StrataLsn, decode_value, encode_inline_value,
+};
 
 use crate::blob_lsm::format::BlobMutationWithLSN;
 use crate::blob_lsm::merge::decode_patches;
@@ -162,6 +164,135 @@ fn partial_merge_publishes_patch_local_lifetime_for_surviving_put() {
     from_batch_garbage.extend(partial_garbage);
     assert_eq!(from_batch_state, direct.0);
     assert_functionally_equivalent_garbage(&from_batch_garbage, &direct.1);
+}
+
+fn reduce_without_base(
+    patches: &[(StrataLsn, Vec<u8>)],
+) -> (Vec<BlobMutationWithLSN>, Vec<GarbageRecord>) {
+    let borrowed = patches
+        .iter()
+        .map(|(lsn, value)| (*lsn, value.as_slice()))
+        .collect::<Vec<_>>();
+    let mutations = decode_patches(&borrowed).unwrap();
+    let mut garbage = Vec::new();
+    let reduced = reduce_patch_mutations(b"blob", mutations, None, &[], &mut |record| {
+        garbage.push(record);
+        Ok(())
+    })
+    .unwrap();
+    (reduced, garbage)
+}
+
+#[test]
+fn partial_merge_folds_a_write_back_relocation_into_its_patch_local_put() {
+    let shard = shard(1, 1);
+    let source = record(1, 10);
+    let destination = record(9, 90);
+    let replacement = record(2, 20);
+    let patches = vec![
+        (1, put_patch(shard, 5, source)),
+        (
+            2,
+            inline_patch(BlobMutation::Relocate {
+                shard,
+                payload_lsn: 1,
+                to: destination,
+            }),
+        ),
+    ];
+
+    let (reduced, garbage) = reduce_without_base(&patches);
+    assert_eq!(reduced.len(), 1);
+    assert_eq!(reduced[0].lsn, 1);
+    assert_eq!(
+        reduced[0].mutation,
+        BlobMutation::Put {
+            shard,
+            write_epoch: 5,
+            record_ref: destination,
+        }
+    );
+    assert!(garbage.is_empty());
+
+    // A later overwrite in the same patch retires the folded destination, exactly once, and the
+    // relocation itself leaves no trace.
+    let mut all = patches;
+    all.push((3, put_patch(shard, 5, replacement)));
+    let (reduced, garbage) = reduce_without_base(&all);
+    assert_eq!(reduced.len(), 1);
+    assert_eq!(reduced[0].lsn, 3);
+    assert_eq!(garbage.len(), 1);
+    assert_eq!(garbage[0].lsn, 3);
+    assert_eq!(
+        garbage[0].event,
+        GarbageEvent::Retired {
+            record: destination
+        }
+    );
+}
+
+#[test]
+fn partial_merge_drops_a_write_back_relocation_for_a_version_ended_in_the_patch() {
+    let shard = shard(1, 1);
+    let source = record(1, 10);
+    let destination = record(9, 90);
+    let replacement = record(2, 20);
+    let relocate = inline_patch(BlobMutation::Relocate {
+        shard,
+        payload_lsn: 1,
+        to: destination,
+    });
+
+    let (reduced, garbage) = reduce_without_base(&[
+        (1, put_patch(shard, 5, source)),
+        (2, put_patch(shard, 5, replacement)),
+        (3, relocate.clone()),
+    ]);
+    assert_eq!(reduced.len(), 1);
+    assert_eq!(reduced[0].lsn, 2);
+    assert_eq!(garbage.len(), 1);
+    assert_eq!(garbage[0].event, GarbageEvent::Retired { record: source });
+
+    let (reduced, garbage) = reduce_without_base(&[
+        (1, put_patch(shard, 5, source)),
+        (2, inline_patch(BlobMutation::Tombstone { shard })),
+        (3, relocate),
+    ]);
+    assert_eq!(reduced.len(), 1);
+    assert_eq!(reduced[0].mutation, BlobMutation::Tombstone { shard });
+    assert_eq!(garbage.len(), 1);
+    assert_eq!(garbage[0].event, GarbageEvent::Retired { record: source });
+}
+
+#[test]
+fn partial_merge_retains_a_write_back_relocation_for_an_unknown_base() {
+    let shard = shard(1, 1);
+    let destination = record(9, 90);
+    let patches = vec![
+        (
+            2,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 10,
+                current_epoch: 5,
+            }),
+        ),
+        (
+            3,
+            inline_patch(BlobMutation::Relocate {
+                shard,
+                payload_lsn: 1,
+                to: destination,
+            }),
+        ),
+    ];
+
+    let (reduced, garbage) = reduce_without_base(&patches);
+    let borrowed = patches
+        .iter()
+        .map(|(lsn, value)| (*lsn, value.as_slice()))
+        .collect::<Vec<_>>();
+    assert_eq!(reduced, decode_patches(&borrowed).unwrap());
+    assert!(garbage.is_empty());
 }
 
 #[test]

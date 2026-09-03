@@ -222,6 +222,7 @@ struct Config {
     strata_gc_workers: Option<usize>,
     strata_lsm_partitions: Option<u32>,
     strata_memtable_max_age: Option<Duration>,
+    strata_relocation_writeback: Option<usize>,
     relocation_profile_reads: usize,
     relocation_profile_timeout: Duration,
     rocksdb_min_blob_size: u64,
@@ -285,6 +286,7 @@ impl Config {
             strata_gc_workers: None,
             strata_lsm_partitions: None,
             strata_memtable_max_age: None,
+            strata_relocation_writeback: None,
             relocation_profile_reads: DEFAULT_RELOCATION_PROFILE_READS,
             relocation_profile_timeout: DEFAULT_RELOCATION_PROFILE_TIMEOUT,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
@@ -436,6 +438,14 @@ impl Config {
                                 "--strata-lsm-partitions must be between 1 and u32::MAX".to_owned()
                             })?,
                     );
+                }
+                "--strata-relocation-writeback" => {
+                    let value = next_value(&mut args, &arg)?;
+                    config.strata_relocation_writeback = if value == "off" {
+                        None
+                    } else {
+                        Some(parse_nonzero_usize(&value)?)
+                    };
                 }
                 "--relocation-profile-reads" => {
                     config.relocation_profile_reads =
@@ -613,6 +623,9 @@ impl Config {
         if self.strata_gc_max_copy_bytes_per_plan.is_some() && self.engine != EngineKind::Strata {
             return Err("--strata-gc-max-copy-bytes-per-plan requires --engine strata".to_owned());
         }
+        if self.strata_relocation_writeback.is_some() && self.engine != EngineKind::Strata {
+            return Err("--strata-relocation-writeback requires --engine strata".to_owned());
+        }
         if self.relocation_profile_reads > 0 && self.relocation_profile_timeout.is_zero() {
             return Err("--relocation-profile-timeout must be non-zero".to_owned());
         }
@@ -673,6 +686,7 @@ impl Config {
             gc_planner_config,
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: DEFAULT_STARTING_EPOCH,
+            relocation_writeback_chunk: self.strata_relocation_writeback,
         }
     }
 }
@@ -2967,6 +2981,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 planner.max_copy_bytes_per_plan
             );
             println!(
+                "strata_relocation_writeback_chunk={}",
+                config
+                    .strata_relocation_writeback
+                    .map_or("off".to_owned(), |chunk| chunk.to_string())
+            );
+            println!(
                 "relocation_profile_reads={}",
                 config.relocation_profile_reads
             );
@@ -4181,6 +4201,8 @@ strata:
   --strata-gc-workers <count>            GC workers started and admitted initially; default 1
   --strata-lsm-partitions <count>        hash partitions for the main and relocation LSMs; default 1
   --strata-memtable-max-age <time>       oldest an LSM memtable grows before it flushes; default 1s
+  --strata-relocation-writeback <count|off>
+                                           evaluation mode: push GC relocations through the foreground writer in chunks of <count>; default off
   --relocation-profile-reads <count>    post-workload HDD relocation profile; disables background GC for deterministic setup
   --relocation-profile-timeout <time>   setup/healing deadline; default 10m
 

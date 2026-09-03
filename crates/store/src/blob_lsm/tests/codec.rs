@@ -33,6 +33,11 @@ fn mutation_codecs_round_trip() {
             current_epoch: 4,
         },
         BlobMutation::Tombstone { shard: shard(5, 6) },
+        BlobMutation::Relocate {
+            shard: shard(5, 6),
+            payload_lsn: 7,
+            to: record(9, 11),
+        },
     ];
     for mutation in inline_mutations {
         assert_eq!(
@@ -40,6 +45,26 @@ fn mutation_codecs_round_trip() {
             vec![BlobMutationWithLSN { lsn: 10, mutation }]
         );
     }
+
+    let batch = vec![
+        BlobMutationWithLSN {
+            lsn: 3,
+            mutation: put,
+        },
+        BlobMutationWithLSN {
+            lsn: 4,
+            mutation: BlobMutation::Relocate {
+                shard: shard(1, 2),
+                payload_lsn: 3,
+                to: record(9, 11),
+            },
+        },
+    ];
+    assert_eq!(
+        BlobMutationWithLSN::decode_inline(4, &BlobMutationWithLSN::encode_batch(&batch).unwrap())
+            .unwrap(),
+        batch
+    );
 }
 
 #[test]

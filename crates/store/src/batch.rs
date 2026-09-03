@@ -102,6 +102,14 @@ pub(crate) enum BatchOp {
         shard_id: ShardId,
         key: BlobKey,
     },
+    /// GC relocation write-back (evaluation mode only). The shard generation was resolved and
+    /// validated when the relocation was published, so it carries the exact key rather than an id.
+    Relocate {
+        key: BlobKey,
+        shard: ShardKey,
+        payload_lsn: StrataLsn,
+        to: RecordRef,
+    },
     IncrementEpoch,
 }
 
@@ -326,6 +334,13 @@ pub(crate) enum PreparedBatchOp {
         key: BlobKey,
         lsn: StrataLsn,
     },
+    Relocate {
+        key: BlobKey,
+        shard: ShardKey,
+        payload_lsn: StrataLsn,
+        to: RecordRef,
+        lsn: StrataLsn,
+    },
     EpochChange {
         lsn: StrataLsn,
         epoch: Epoch,
@@ -338,6 +353,7 @@ impl PreparedBatchOp {
             Self::Put { lsn, .. }
             | Self::Lifecycle { lsn, .. }
             | Self::Tombstone { lsn, .. }
+            | Self::Relocate { lsn, .. }
             | Self::EpochChange { lsn, .. } => *lsn,
         }
     }
@@ -376,6 +392,22 @@ impl PreparedBatchOp {
                 partition: partition_for_key(key.as_bytes(), partition_count),
                 key: key.as_bytes().to_vec(),
                 value: BlobMutation::Tombstone { shard: *shard }.encode_inline()?,
+            })),
+            Self::Relocate {
+                key,
+                shard,
+                payload_lsn,
+                to,
+                ..
+            } => Ok(Some(LsmMutation::Put {
+                partition: partition_for_key(key.as_bytes(), partition_count),
+                key: key.as_bytes().to_vec(),
+                value: BlobMutation::Relocate {
+                    shard: *shard,
+                    payload_lsn: *payload_lsn,
+                    to: *to,
+                }
+                .encode_inline()?,
             })),
             Self::EpochChange { .. } => Ok(None),
         }

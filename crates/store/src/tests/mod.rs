@@ -289,6 +289,7 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         gc_planner_config: GcPlannerConfig::default(),
         shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
         starting_epoch: 42,
+        relocation_writeback_chunk: None,
     }
 }
 
@@ -5192,6 +5193,118 @@ async fn relocation_patch_tier_merges_patches_without_rewriting_the_base() {
         ),
         1.0
     );
+}
+
+/// Evaluation-mode write-back: GC publication additionally pushes each relocation through the
+/// foreground writer, so the main-LSM row is healed before any compaction runs while the
+/// relocation LSM keeps its forwarding entry. A later overwrite must still retire the destination
+/// exactly once.
+#[tokio::test]
+async fn gc_relocation_writeback_heals_main_lsm_before_compaction() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+    cfg.gc_workers_enabled = false;
+    cfg.relocation_writeback_chunk = Some(1);
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "relocation-writeback").unwrap();
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+    let store = try_open_standalone_store(cfg, metrics).unwrap();
+
+    store.put(&key_a, b"payload-a").unwrap();
+    store.put(&key_b, b"payload-b").unwrap();
+    let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+    store.sync().unwrap();
+    wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, lsn_c);
+    let mut source_state = store
+        .index()
+        .get_segment_state(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    source_state.placement_class = PlacementClass::Spillover;
+    store.index().put_segment_state(&source_state).unwrap();
+
+    let ref_b = lsm_blob_ref(&store, &key_b);
+    let payload_lsn_b = lsm_blob(&store, STANDALONE_SHARD, &key_b).payload_lsn;
+    let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
+
+    let planner = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
+        min_reclaim_bytes: 1,
+        min_garbage_ratio_bps: 1,
+        min_exact_epoch_bucket_bytes: 1,
+        min_exact_epoch_distance: 1,
+        max_exact_epoch_extension_count: 1,
+        min_join_output_bytes: 1,
+        max_join_sources: 4,
+    });
+    let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+    let published = store.publish_prepared_gc_copy(copied).unwrap();
+    assert_eq!(published.published_records.len(), 1);
+    assert_eq!(published.published_records[0].source.from, ref_b);
+    let destination = published.published_records[0].to;
+
+    // Write-back healed the row synchronously: reads resolve the destination without any
+    // relocation lookup and before any compaction ran.
+    assert_eq!(lsm_blob_ref(&store, &key_b), destination);
+    assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+    assert_eq!(
+        counter_value(
+            &registry,
+            "strata_store_relocation_writeback_mutations_total"
+        ),
+        1.0
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_writeback_batches_total",
+            &[("result", "ok")],
+        ),
+        1.0
+    );
+    // The relocation LSM remains the durable forwarding view.
+    assert!(
+        store
+            .relocations
+            .lookup(&key_b, STANDALONE_SHARD, payload_lsn_b)
+            .unwrap()
+            .is_some_and(|relocation| relocation.to == destination)
+    );
+
+    // Compaction finds nothing left to heal.
+    let writeback_lsn = store.index().get_next_lsn().unwrap() - 1;
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, writeback_lsn);
+    assert_eq!(
+        counter_value(
+            &registry,
+            "strata_store_main_compaction_healed_references_total"
+        ),
+        0.0
+    );
+    assert_eq!(lsm_blob_ref(&store, &key_b), destination);
+
+    // A later overwrite retires the destination exactly once in its overlay.
+    let overwrite_lsn = store.put(&key_b, b"payload-B").unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, overwrite_lsn);
+    let destination_overlay = segment_overlay(&store, destination.segment_id);
+    assert!(gc_ranges_contain(&destination_overlay.retired, destination));
+    assert_eq!(destination_overlay.summary.retired_bytes, destination.len);
+    assert_eq!(destination_overlay.summary.live_bytes, 0);
+    assert_eq!(destination_overlay.summary.live_ref_count, 0);
 }
 
 #[tokio::test]

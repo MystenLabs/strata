@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, mpsc},
     time::Instant,
 };
 
@@ -19,11 +19,12 @@ use super::output::{
 use crate::{
     Error, GARBAGE_LOG_HEAD, GARBAGE_LOG_SWEEP_CURSOR, GcPublishResult, GcStagedCopiedRecord,
     LSM_GARBAGE_LOG_MAX_BYTES, RELOCATION_LSM_MANIFEST, Result,
+    batch::{BatchOp, BatchWriteRequest, ProfileRequest, WriteCommand},
     blob_lsm::{BlobMerge, BlobState, effective_lifecycle, terminal_garbage_record},
     fs_util::{segment_garbage_log_path, unlink_gc_segment_files},
     gc::{
-        GcExecutor, GcPrepublishedCopy, GcPrepublishedOutputSegment, OverlayRecordClassifier,
-        OverlayRecordState,
+        GcExecutor, GcPrepublishedCopy, GcPrepublishedOutputSegment, GcPublishedRecord,
+        OverlayRecordClassifier, OverlayRecordState,
     },
     layout::segment_state_path,
     maintenance::{garbage_log_dir, read_relocation_lsm_manifest},
@@ -56,27 +57,73 @@ impl GcExecutor {
     /// redirected to the new copies. Foreground writes do not take this lock and do not enter
     /// this call path.
     pub(crate) fn submit_gc_publish(&self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
-        let scenario = Some(copy.plan.scenario);
-        let started = Instant::now();
-        let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
-        let _publish_guard = garbage_publish_lock
-            .lock()
-            .expect("garbage publication lock poisoned");
-        self.metrics
-            .record_gc_attempt_phase(scenario, "publish_lock_wait", started.elapsed());
-        let started = Instant::now();
-        self.drain_gc_reconciliation_log()?;
-        self.metrics
-            .record_gc_attempt_phase(scenario, "drain", started.elapsed());
-        let started = Instant::now();
-        let publish = self.prepare_gc_publish(copy)?;
-        self.metrics
-            .record_gc_attempt_phase(scenario, "revalidate", started.elapsed());
-        let started = Instant::now();
-        let result = self.commit_gc_publish(publish)?;
-        self.metrics
-            .record_gc_attempt_phase(scenario, "commit", started.elapsed());
+        let result = {
+            let scenario = Some(copy.plan.scenario);
+            let started = Instant::now();
+            let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
+            let _publish_guard = garbage_publish_lock
+                .lock()
+                .expect("garbage publication lock poisoned");
+            self.metrics
+                .record_gc_attempt_phase(scenario, "publish_lock_wait", started.elapsed());
+            let started = Instant::now();
+            self.drain_gc_reconciliation_log()?;
+            self.metrics
+                .record_gc_attempt_phase(scenario, "drain", started.elapsed());
+            let started = Instant::now();
+            let publish = self.prepare_gc_publish(copy)?;
+            self.metrics
+                .record_gc_attempt_phase(scenario, "revalidate", started.elapsed());
+            let started = Instant::now();
+            let result = self.commit_gc_publish(publish)?;
+            self.metrics
+                .record_gc_attempt_phase(scenario, "commit", started.elapsed());
+            result
+        };
+        // The publication lock is released with the block above; write-back must not hold it.
+        self.write_back_relocations(&result.published_records);
         Ok(result)
+    }
+
+    /// Evaluation-only eager healing: pushes each published relocation through the foreground
+    /// writer as a conditional main-LSM mutation, chunked so one GC publish becomes several
+    /// ordinary write commands competing with client traffic. This runs after the publication
+    /// lock is released so a slow writer queue cannot hold up compaction. The relocation LSM is
+    /// already active, so a failure here forfeits only the healing shortcut: it is counted, and
+    /// compaction heals the row later exactly as it would without write-back.
+    fn write_back_relocations(&self, records: &[GcPublishedRecord]) {
+        let Some(writeback) = &self.writeback else {
+            return;
+        };
+        for chunk in records.chunks(writeback.chunk.max(1)) {
+            let ops = chunk
+                .iter()
+                .map(|record| BatchOp::Relocate {
+                    key: record.source.key.clone(),
+                    shard: record.source.shard,
+                    payload_lsn: record.source.payload_lsn,
+                    to: record.to,
+                })
+                .collect::<Vec<_>>();
+            let (response_tx, response_rx) = mpsc::channel();
+            let started = Instant::now();
+            let sent = writeback
+                .write_tx
+                .send(WriteCommand::Batch(BatchWriteRequest {
+                    ops,
+                    response_tx,
+                    profile: ProfileRequest::default(),
+                }));
+            let result = match sent {
+                Ok(()) => match response_rx.recv() {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(_)) | Err(_) => Err(()),
+                },
+                Err(_) => Err(()),
+            };
+            self.metrics
+                .record_relocation_writeback(chunk.len(), result, started.elapsed());
+        }
     }
 
     /// Folds all committed garbage into the per-segment overlays used for revalidation. The

@@ -67,6 +67,9 @@ struct PrometheusMetrics {
     relocation_cache_requests_total: IntCounterVec,
     relocation_lookups_total: IntCounterVec,
     relocation_lookup_duration_seconds: Histogram,
+    relocation_writeback_mutations_total: IntCounter,
+    relocation_writeback_batches_total: IntCounterVec,
+    relocation_writeback_duration_seconds: Histogram,
     main_compaction_healed_references_total: IntCounter,
     main_compaction_redirected_garbage_total: IntCounter,
     main_compaction_duration_seconds: Histogram,
@@ -380,6 +383,25 @@ impl StrataStoreMetrics {
                     &labels,
                     "main_compaction_redirected_garbage_total",
                     "Garbage events a blob compaction pass re-pointed at a GC destination because the copy moved while the pass ran.",
+                )?,
+                relocation_writeback_mutations_total: register_counter(
+                    registry,
+                    &labels,
+                    "relocation_writeback_mutations_total",
+                    "Total GC relocations pushed through the foreground writer as main-LSM mutations.",
+                )?,
+                relocation_writeback_batches_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "relocation_writeback_batches_total",
+                    "Total GC relocation write-back batches by result.",
+                    &["result"],
+                )?,
+                relocation_writeback_duration_seconds: register_histogram(
+                    registry,
+                    &labels,
+                    "relocation_writeback_duration_seconds",
+                    "Foreground writer round-trip latency of one GC relocation write-back batch in seconds.",
                 )?,
                 main_compaction_healed_references_total: register_counter(
                     registry,
@@ -1141,6 +1163,33 @@ impl StrataStoreMetrics {
             .inc();
         metrics
             .relocation_lookup_duration_seconds
+            .observe(duration_seconds(elapsed));
+    }
+
+    pub(crate) fn record_relocation_writeback(
+        &self,
+        mutations: usize,
+        result: Result<(), ()>,
+        elapsed: Duration,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        let label = match result {
+            Ok(()) => "ok",
+            Err(()) => "error",
+        };
+        metrics
+            .relocation_writeback_batches_total
+            .with_label_values(&[label])
+            .inc();
+        if result.is_ok() {
+            metrics
+                .relocation_writeback_mutations_total
+                .inc_by(mutations as u64);
+        }
+        metrics
+            .relocation_writeback_duration_seconds
             .observe(duration_seconds(elapsed));
     }
 
