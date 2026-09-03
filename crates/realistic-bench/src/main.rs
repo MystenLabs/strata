@@ -187,6 +187,7 @@ struct Config {
     retention_jitter_percent: u64,
     epoch_duration: Duration,
     future_epochs: Epoch,
+    min_future_epoch_offset: Epoch,
     lifetime_seed: u64,
     hashed_keys: bool,
     cleanup_grace: Duration,
@@ -250,6 +251,7 @@ impl Config {
             retention_jitter_percent: 0,
             epoch_duration: DEFAULT_EPOCH_DURATION,
             future_epochs: DEFAULT_FUTURE_EPOCHS,
+            min_future_epoch_offset: 1,
             lifetime_seed: DEFAULT_LIFETIME_SEED,
             hashed_keys: false,
             cleanup_grace: DEFAULT_CLEANUP_GRACE,
@@ -322,6 +324,9 @@ impl Config {
                 }
                 "--future-epochs" => {
                     config.future_epochs = parse_u64(&next_value(&mut args, &arg)?)?
+                }
+                "--min-future-epoch-offset" => {
+                    config.min_future_epoch_offset = parse_u64(&next_value(&mut args, &arg)?)?
                 }
                 "--lifetime-seed" => {
                     config.lifetime_seed = parse_u64(&next_value(&mut args, &arg)?)?
@@ -529,6 +534,14 @@ impl Config {
             }
             if self.future_epochs > 10_000 {
                 return Err("--future-epochs must not exceed 10000".to_owned());
+            }
+            if self.min_future_epoch_offset == 0 {
+                return Err(
+                    "--min-future-epoch-offset must be non-zero in epoch lifetime mode".to_owned(),
+                );
+            }
+            if self.min_future_epoch_offset > self.future_epochs {
+                return Err("--min-future-epoch-offset must not exceed --future-epochs".to_owned());
             }
             if DEFAULT_STARTING_EPOCH
                 .checked_add(self.future_epochs)
@@ -1775,7 +1788,11 @@ impl EpochClock {
                 .lifetime_seed
                 .wrapping_add(key_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
         );
-        let offset = 1 + rng.next_u64() % config.future_epochs;
+        let offset_count = config
+            .future_epochs
+            .saturating_sub(config.min_future_epoch_offset)
+            .saturating_add(1);
+        let offset = config.min_future_epoch_offset + rng.next_u64() % offset_count;
         let logical_end_epoch = self.current_epoch.saturating_add(offset);
         let intervals_after_next = u32::try_from(offset.saturating_sub(1))
             .expect("validated future epoch count must fit u32");
@@ -2869,6 +2886,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 config.epoch_duration.as_secs_f64()
             );
             println!("future_epochs={}", config.future_epochs);
+            println!("min_future_epoch_offset={}", config.min_future_epoch_offset);
             println!("lifetime_seed={}", config.lifetime_seed);
             println!("hashed_keys={}", config.hashed_keys);
         }
@@ -4126,6 +4144,7 @@ workload:
   --retention <duration>                 retention-mode age before tombstone; default 5m
   --epoch-duration <duration>            epoch-mode cadence; default 5m
   --future-epochs <count>                epoch-mode uniform future lifetime window; default 52
+  --min-future-epoch-offset <count>      lower bound for the future lifetime window; default 1
   --lifetime-seed <u64>                  deterministic lifetime distribution seed
   --hashed-keys <true|false>             spread keys uniformly over the key space instead of in id order; default false
   --cleanup-grace <duration>             no-traffic reclamation window; default 5m
@@ -4273,6 +4292,8 @@ mod tests {
                 "5m",
                 "--future-epochs",
                 "52",
+                "--min-future-epoch-offset",
+                "20",
                 "--lifetime-seed",
                 "7",
                 "--strata-gc-min-epoch-copy-distance",
@@ -4286,6 +4307,7 @@ mod tests {
         assert_eq!(config.lifetime_mode, LifetimeMode::Epoch);
         assert_eq!(config.epoch_duration, Duration::from_secs(5 * 60));
         assert_eq!(config.future_epochs, 52);
+        assert_eq!(config.min_future_epoch_offset, 20);
         assert_eq!(config.lifetime_seed, 7);
         assert_eq!(config.strata_gc_min_epoch_copy_distance, Some(6));
         let planner = config.store_config().gc_planner_config;
@@ -4326,6 +4348,73 @@ mod tests {
             counts[assignment.offset as usize - 1] += 1;
         }
         assert!(counts.into_iter().all(|count| count > 0));
+    }
+
+    #[test]
+    fn lifetime_assignment_can_use_a_bounded_future_window() {
+        let config = Config::parse(
+            [
+                "--engine",
+                "blobdb",
+                "--root",
+                "/tmp/realistic",
+                "--lifetime-mode",
+                "epoch",
+                "--epoch-duration",
+                "216s",
+                "--future-epochs",
+                "50",
+                "--min-future-epoch-offset",
+                "20",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("fixed epoch lifetime configuration should parse");
+        let now = Instant::now();
+        let clock = EpochClock {
+            current_epoch: 10,
+            next_transition_at: now,
+        };
+
+        let mut counts = [0_u64; 31];
+        for key_id in 0..10_000 {
+            let assignment = clock.assignment(key_id, &config);
+            assert!((20..=50).contains(&assignment.offset));
+            assert_eq!(
+                assignment.logical_end_epoch,
+                clock.current_epoch + assignment.offset
+            );
+            assert_eq!(
+                assignment.due_at,
+                now + Duration::from_secs((assignment.offset - 1) * 216)
+            );
+            counts[(assignment.offset - 20) as usize] += 1;
+        }
+        assert!(counts.into_iter().all(|count| count > 0));
+    }
+
+    #[test]
+    fn minimum_future_offset_must_fit_the_future_window() {
+        let error = Config::parse(
+            [
+                "--engine",
+                "blobdb",
+                "--root",
+                "/tmp/realistic",
+                "--lifetime-mode",
+                "epoch",
+                "--future-epochs",
+                "50",
+                "--min-future-epoch-offset",
+                "51",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect_err("minimum offset outside the configured window should fail");
+
+        assert!(error.contains("must not exceed --future-epochs"));
     }
 
     #[test]
