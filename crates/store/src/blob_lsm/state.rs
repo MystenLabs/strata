@@ -3,7 +3,9 @@
 use core_types::{BlobLifecycle, Epoch, GarbageEvent, RecordRef, ShardKey};
 use lsm::{GarbageRecord, Result, StrataLsn};
 
-use super::format::{BlobLifetime, BlobMutation, BlobMutationWithLSN, BlobState, BlobVersion};
+use super::format::{
+    BlobLifetime, BlobMutation, BlobMutationWithLSN, BlobState, BlobVersion, invalid,
+};
 use super::garbage::{emit_lifetime_change, emit_record};
 use super::snapshot::BlobCompactionSnapshot;
 
@@ -40,6 +42,11 @@ impl BlobState {
                 current_epoch,
             } => self.set_lifetime(key, lsn, logical_end_epoch, current_epoch, emit),
             BlobMutation::Tombstone { shard } => self.tombstone(key, lsn, shard, emit),
+            BlobMutation::Relocate {
+                shard,
+                payload_lsn,
+                to,
+            } => self.relocate(key, lsn, shard, payload_lsn, to, emit),
         }
     }
 
@@ -179,6 +186,43 @@ impl BlobState {
             }
         }
         self.lifetime = Some(next);
+        Ok(())
+    }
+
+    /// Applies a GC relocation pushed through the foreground writer.
+    ///
+    /// This mirrors compaction healing: only the version whose LSN still matches is moved, and
+    /// moving it republishes the lifecycle for the destination bytes so the output segment's
+    /// overlay learns the lifetime exactly once. A relocation for a superseded, tombstoned, or
+    /// expired version is silently dropped; the compaction relocation scan retires that
+    /// born-dead destination, exactly as it does without write-back.
+    fn relocate(
+        &mut self,
+        key: &[u8],
+        lsn: StrataLsn,
+        shard: ShardKey,
+        payload_lsn: StrataLsn,
+        to: RecordRef,
+        emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
+    ) -> Result<()> {
+        let Some(version) = self
+            .versions
+            .get_mut(&shard)
+            .filter(|version| version.lsn == payload_lsn)
+        else {
+            return Ok(());
+        };
+        if version.record_ref.len != to.len {
+            return Err(invalid("relocation changed the payload length"));
+        }
+        if version.record_ref == to {
+            return Ok(());
+        }
+        version.record_ref = to;
+        let version = *version;
+        if let Some(lifecycle) = effective_lifecycle(self.lifetime, &version) {
+            emit_lifetime_change(key, lsn, version, None, Some(lifecycle), emit)?;
+        }
         Ok(())
     }
 

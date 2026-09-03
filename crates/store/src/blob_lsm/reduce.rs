@@ -141,13 +141,18 @@ fn merge_patch_events<'a>(
 ///   ```
 pub(crate) fn reduce_patch_mutations(
     key: &[u8],
-    mutations: Vec<BlobMutationWithLSN>,
+    mut mutations: Vec<BlobMutationWithLSN>,
     snapshot: Option<&BlobCompactionSnapshot>,
     relocations: &[RelocationEntry],
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<Vec<BlobMutationWithLSN>> {
     let mut buckets = BTreeMap::<ShardKey, PatchBucket>::new();
     let mut current_lifetime = None::<PatchLifecycleHint>;
+    // Write-back relocations folded into a patch-local Put (index, destination), applied after
+    // the scan because the event iterator borrows `mutations`.
+    let mut folded_relocations = Vec::new();
+    // Write-back relocations whose version may live in the unknown base.
+    let mut retained_relocations = Vec::new();
     for event in merge_patch_events(&mutations, snapshot) {
         let mutation_index = match event {
             PatchEvent::Mutation(mutation_index) => mutation_index,
@@ -230,10 +235,41 @@ pub(crate) fn reduce_patch_mutations(
                     emit,
                 )?;
             }
+            BlobMutation::Relocate {
+                shard,
+                payload_lsn,
+                to,
+            } => match buckets.get_mut(&shard) {
+                Some(bucket) => {
+                    // The moved version is patch-local: fold the destination into its Put so a
+                    // later replacement retires the destination, not the retired source. Any other
+                    // bucket means a later same-shard mutation already ended this version inside
+                    // the patch, so the relocation can never apply and is dropped.
+                    if let Some(version) = bucket
+                        .put
+                        .as_mut()
+                        .filter(|version| version.lsn == payload_lsn)
+                    {
+                        version.record_ref = to;
+                        folded_relocations.push((bucket.mutation_index, to));
+                    }
+                }
+                // The version may live in the unknown base. Keep the mutation so the full merge
+                // can decide.
+                None => retained_relocations.push(mutation_index),
+            },
         }
     }
 
+    for (index, to) in folded_relocations {
+        if let BlobMutation::Put { record_ref, .. } = &mut mutations[index].mutation {
+            *record_ref = to;
+        }
+    }
     let mut keep = vec![false; mutations.len()];
+    for index in retained_relocations {
+        keep[index] = true;
+    }
     for (index, mutation) in mutations.iter().enumerate() {
         if matches!(mutation.mutation, BlobMutation::SetLifetime { .. }) {
             keep[index] = true;

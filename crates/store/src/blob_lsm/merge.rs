@@ -145,20 +145,42 @@ impl MergeOperator for BlobMergeWithRelocations {
         // is retired by the normal blob mutation below and must not be retired a second time.
         let mut input_record_refs = BTreeMap::new();
         if !relocations.is_empty() {
+            // Current version LSN per shard while replaying the inputs in LSN order, so a
+            // write-back relocation counts as "already moved" only if it actually applied.
+            let mut current_lsns = BTreeMap::new();
             if let Some(base) = base {
                 let StoredValue::Inline(bytes) = decode_value(base)? else {
                     return Err(invalid("materialized blob state cannot be segment-backed"));
                 };
                 for (shard, version) in BlobState::decode(bytes)?.versions {
                     input_record_refs.insert((shard, version.lsn), version.record_ref);
+                    current_lsns.insert(shard, version.lsn);
                 }
             }
             for mutation in decode_patches(patches)? {
-                if let BlobMutation::Put {
-                    shard, record_ref, ..
-                } = mutation.mutation
-                {
-                    input_record_refs.insert((shard, mutation.lsn), record_ref);
+                match mutation.mutation {
+                    BlobMutation::Put {
+                        shard, record_ref, ..
+                    } => {
+                        input_record_refs.insert((shard, mutation.lsn), record_ref);
+                        current_lsns.insert(shard, mutation.lsn);
+                    }
+                    BlobMutation::Tombstone { shard } => {
+                        current_lsns.remove(&shard);
+                    }
+                    BlobMutation::Relocate {
+                        shard,
+                        payload_lsn,
+                        to,
+                    } => {
+                        // An applied write-back already moved this version, so the relocation
+                        // entry below must not retire the destination as born dead: a later
+                        // overwrite or expiry retires the destination through the state machine.
+                        if current_lsns.get(&shard) == Some(&payload_lsn) {
+                            input_record_refs.insert((shard, payload_lsn), to);
+                        }
+                    }
+                    BlobMutation::SetLifetime { .. } => {}
                 }
             }
         }

@@ -157,6 +157,7 @@ impl Config {
             gc_planner_config: GcPlannerConfig::default(),
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: self.starting_epoch,
+            relocation_writeback_chunk: None,
         }
     }
 }

@@ -29,6 +29,125 @@ fn merge_keeps_one_version_per_shard_and_retires_overwrites() {
 }
 
 #[test]
+fn relocate_moves_only_the_matching_version_and_republishes_its_lifecycle() {
+    let shard = shard(1, 1);
+    let source = record(1, 10);
+    let destination = record(9, 90);
+    let stale_destination = record(9, 190);
+    let patches = [
+        (1, put_patch(shard, 5, source)),
+        (
+            2,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 10,
+                current_epoch: 5,
+            }),
+        ),
+        (
+            3,
+            inline_patch(BlobMutation::Relocate {
+                shard,
+                payload_lsn: 1,
+                to: destination,
+            }),
+        ),
+        // A relocation for a version this shard never held is a no-op.
+        (
+            4,
+            inline_patch(BlobMutation::Relocate {
+                shard,
+                payload_lsn: 99,
+                to: stale_destination,
+            }),
+        ),
+    ];
+
+    let (state, garbage) = merge(&patches);
+
+    let (version, lifecycle) = state.resolve(shard, 6).unwrap();
+    assert_eq!(version.record_ref, destination);
+    assert_eq!(version.lsn, 1);
+    assert_eq!(lifecycle.unwrap().logical_end_epoch, 10);
+    // Moving the bytes republishes the lifecycle for the destination, once, at the relocation
+    // LSN; nothing is retired because the source retirement belongs to GC publication.
+    let destination_events = garbage
+        .iter()
+        .filter(|record| record.event.record() == destination)
+        .collect::<Vec<_>>();
+    assert_eq!(destination_events.len(), 1);
+    assert_eq!(destination_events[0].lsn, 3);
+    assert_eq!(
+        destination_events[0].event,
+        GarbageEvent::SetLifecycle {
+            record: destination,
+            lifecycle: Some(BlobLifecycle {
+                logical_end_epoch: 10,
+                extension_count: 0,
+            }),
+        }
+    );
+    assert!(
+        garbage
+            .iter()
+            .all(|record| record.event.record() != stale_destination)
+    );
+    assert!(
+        garbage
+            .iter()
+            .all(|record| !matches!(record.event, GarbageEvent::Retired { .. }))
+    );
+}
+
+#[test]
+fn relocate_after_an_overwrite_is_a_no_op_and_the_overwrite_retires_the_destination() {
+    let shard = shard(1, 1);
+    let source = record(1, 10);
+    let destination = record(9, 90);
+    let replacement = record(2, 20);
+
+    // Overwrite first: the relocation targets a dead version and must not resurface it.
+    let (state, garbage) = merge(&[
+        (1, put_patch(shard, 5, source)),
+        (2, put_patch(shard, 5, replacement)),
+        (
+            3,
+            inline_patch(BlobMutation::Relocate {
+                shard,
+                payload_lsn: 1,
+                to: destination,
+            }),
+        ),
+    ]);
+    assert_eq!(state.resolve(shard, 5).unwrap().0.record_ref, replacement);
+    assert_eq!(garbage.len(), 1);
+    assert_eq!(garbage[0].event, GarbageEvent::Retired { record: source });
+
+    // Relocate first: the later overwrite retires the destination, not the already-retired
+    // source, so every physical copy gets exactly one terminal event.
+    let (state, garbage) = merge(&[
+        (1, put_patch(shard, 5, source)),
+        (
+            2,
+            inline_patch(BlobMutation::Relocate {
+                shard,
+                payload_lsn: 1,
+                to: destination,
+            }),
+        ),
+        (3, put_patch(shard, 5, replacement)),
+    ]);
+    assert_eq!(state.resolve(shard, 5).unwrap().0.record_ref, replacement);
+    assert_eq!(garbage.len(), 1);
+    assert_eq!(garbage[0].lsn, 3);
+    assert_eq!(
+        garbage[0].event,
+        GarbageEvent::Retired {
+            record: destination
+        }
+    );
+}
+
+#[test]
 fn tombstone_only_retires_its_shard() {
     let shard_a = shard(1, 1);
     let shard_b = shard(2, 1);

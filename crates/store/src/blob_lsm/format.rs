@@ -12,6 +12,7 @@ const PUT: u8 = 1;
 const SET_LIFETIME: u8 = 2;
 const TOMBSTONE: u8 = 3;
 const BATCH: u8 = 4;
+const RELOCATE: u8 = 5;
 
 /// Classifies one key's stored blob-LSM operands for the patch's global operand floor.
 ///
@@ -41,7 +42,9 @@ pub(crate) fn global_operand_floor(operands: &[(StrataLsn, &[u8])]) -> Result<Op
                                 current.min(mutation.lsn)
                             }));
                         }
-                        BlobMutation::Tombstone { .. } => {}
+                        // A write-back relocation only moves bytes; it neither creates nor ends
+                        // a version and takes no part in expiry.
+                        BlobMutation::Tombstone { .. } | BlobMutation::Relocate { .. } => {}
                     }
                 }
             }
@@ -64,6 +67,17 @@ pub(crate) enum BlobMutation {
     },
     Tombstone {
         shard: ShardKey,
+    },
+    /// Moves the physical location of one exact payload version after GC copied it.
+    ///
+    /// Written only by the evaluation-mode relocation write-back path. It carries the same
+    /// conditional identity compaction healing uses: it applies only while the shard's current
+    /// version still has `payload_lsn`, and a newer version, tombstone, or expiry makes it a
+    /// no-op. It never changes logical liveness.
+    Relocate {
+        shard: ShardKey,
+        payload_lsn: StrataLsn,
+        to: RecordRef,
     },
 }
 
@@ -117,6 +131,16 @@ impl BlobMutation {
                 bytes.push(TOMBSTONE);
                 push_shard(&mut bytes, shard);
             }
+            Self::Relocate {
+                shard,
+                payload_lsn,
+                to,
+            } => {
+                bytes.push(RELOCATE);
+                push_shard(&mut bytes, shard);
+                push_lsn(&mut bytes, payload_lsn);
+                bytes.extend_from_slice(&encode_record_ref(to));
+            }
         }
         Ok(bytes)
     }
@@ -165,6 +189,16 @@ impl BlobMutationWithLSN {
                     bytes.push(TOMBSTONE);
                     push_shard(&mut bytes, shard);
                 }
+                BlobMutation::Relocate {
+                    shard,
+                    payload_lsn,
+                    to,
+                } => {
+                    bytes.push(RELOCATE);
+                    push_shard(&mut bytes, shard);
+                    push_lsn(&mut bytes, payload_lsn);
+                    bytes.extend_from_slice(&encode_record_ref(to));
+                }
             }
         }
         Ok(bytes)
@@ -190,6 +224,14 @@ impl BlobMutationWithLSN {
                     shard: decoder.shard()?,
                 },
             }],
+            RELOCATE => vec![Self {
+                lsn: outer_lsn,
+                mutation: BlobMutation::Relocate {
+                    shard: decoder.shard()?,
+                    payload_lsn: decoder.lsn()?,
+                    to: decoder.record_ref()?,
+                },
+            }],
             BATCH => {
                 let count = decoder.u32()?;
                 let mut mutations = Vec::with_capacity(count as usize);
@@ -207,6 +249,11 @@ impl BlobMutationWithLSN {
                         },
                         TOMBSTONE => BlobMutation::Tombstone {
                             shard: decoder.shard()?,
+                        },
+                        RELOCATE => BlobMutation::Relocate {
+                            shard: decoder.shard()?,
+                            payload_lsn: decoder.lsn()?,
+                            to: decoder.record_ref()?,
                         },
                         tag => {
                             return Err(invalid(format!("unknown batched mutation tag {tag}")));

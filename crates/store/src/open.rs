@@ -30,7 +30,7 @@ use crate::{
     fs_util::{sync_parent_dir, unlink_gc_segment_file},
     gc::{
         GcCommand, GcConcurrencyConfig, GcConcurrencyController, GcExecutor, GcSourceClaims,
-        GcWorker,
+        GcWorker, RelocationWriteback,
     },
     gc_rate_limiter::GcIoLimiter,
     layout::segment_path,
@@ -342,6 +342,12 @@ impl StrataStore {
                     reader_cache: Arc::clone(&reader_cache),
                     store_halt: store_halt.clone(),
                     metrics: metrics.clone(),
+                    writeback: config
+                        .relocation_writeback_chunk
+                        .map(|chunk| RelocationWriteback {
+                            write_tx: write_tx.clone(),
+                            chunk,
+                        }),
                 },
                 planner: GcPlanner::new(config.gc_planner_config.clone()),
                 interval: config.gc_interval,

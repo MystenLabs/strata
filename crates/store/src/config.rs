@@ -79,6 +79,14 @@ pub struct StrataStoreConfig {
     pub shard_drop_gc_drain_timeout: Duration,
     /// Initial epoch used only when creating a namespace without persisted epoch metadata.
     pub starting_epoch: Epoch,
+    /// Evaluation mode: push every published GC relocation through the foreground writer as a
+    /// conditional main-LSM mutation, in batches of this many records. `None` leaves healing to
+    /// compaction.
+    ///
+    /// The relocation LSM stays the durable forwarding view and the source-deletion fence either
+    /// way. Write-back only adds the per-record foreground metadata path that compaction-coupled
+    /// designs require, so its cost can be measured against lazy healing.
+    pub relocation_writeback_chunk: Option<usize>,
 }
 
 /// Policy used when recovering unsealed ingest segments after a crash.
@@ -128,6 +136,7 @@ impl StrataStoreConfig {
             gc_planner_config: GcPlannerConfig::default(),
             shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
             starting_epoch: 0,
+            relocation_writeback_chunk: None,
         }
     }
 

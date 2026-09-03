@@ -534,6 +534,24 @@ impl WriteCoordinator {
                     prepared_ops.push(PreparedBatchOp::Tombstone { shard, key, lsn });
                     op_epochs.push(None);
                 }
+                BatchOp::Relocate {
+                    key,
+                    shard,
+                    payload_lsn,
+                    to,
+                } => {
+                    // GC validated the shard generation at publish, and the mutation is
+                    // conditional on the exact payload version, so a stale relocation folds to a
+                    // no-op rather than failing the batch.
+                    prepared_ops.push(PreparedBatchOp::Relocate {
+                        key,
+                        shard,
+                        payload_lsn,
+                        to,
+                        lsn,
+                    });
+                    op_epochs.push(None);
+                }
                 BatchOp::IncrementEpoch => {
                     let next_epoch = current_epoch
                         .ok_or(Error::EpochNotInitialized)?
@@ -608,7 +626,9 @@ impl WriteCoordinator {
                     PreparedBatchOp::Put { .. } => {
                         wrote_payload = true;
                     }
-                    PreparedBatchOp::Lifecycle { .. } | PreparedBatchOp::Tombstone { .. } => {}
+                    PreparedBatchOp::Lifecycle { .. }
+                    | PreparedBatchOp::Tombstone { .. }
+                    | PreparedBatchOp::Relocate { .. } => {}
                     PreparedBatchOp::EpochChange { lsn, epoch } => {
                         self.index
                             .put_epoch_change_batch(&mut batch, *lsn, *epoch)?;
