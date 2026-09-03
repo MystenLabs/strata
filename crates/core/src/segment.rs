@@ -195,229 +195,386 @@ pub struct SegmentGcOverlay {
 
 impl SegmentGcOverlay {
     /// Applies GC overlay merge operations in commit order and leaves the overlay canonical.
+    ///
+    /// The fold runs on indexed working copies of the three range lists, so each operation is a
+    /// logarithmic lookup plus the spans it actually touches. The lists themselves stay plain
+    /// vectors because every consumer (the copy classifier, the planner, tests) merge-joins
+    /// against them in offset order. A segment with 65k records produces two events per record,
+    /// and the sweeper replays a segment's whole history on every sweep, so per-event scans and
+    /// re-sorts made one fold quadratic in records per segment.
     pub fn apply_merge_ops(&mut self, ops: impl IntoIterator<Item = SegmentGcOverlayMergeOp>) {
+        let mut fold = OverlayFold::take(self);
         for op in ops {
-            self.apply_merge_op_unchecked(op);
+            fold.apply(&mut self.summary, op);
         }
-        self.normalize();
+        fold.restore(self);
     }
 
     /// Applies one GC overlay merge operation and leaves the overlay canonical.
     pub fn apply_merge_op(&mut self, op: SegmentGcOverlayMergeOp) {
-        self.apply_merge_op_unchecked(op);
-        self.normalize();
+        self.apply_merge_ops([op]);
+    }
+}
+
+/// Indexed working form of an overlay's range lists during one fold.
+struct OverlayFold {
+    retired: GcRangeSet,
+    expired: GcRangeSet,
+    lifetimes: GcLifetimeSet,
+}
+
+impl OverlayFold {
+    fn take(overlay: &mut SegmentGcOverlay) -> Self {
+        Self {
+            retired: GcRangeSet::from_ranges(std::mem::take(&mut overlay.retired)),
+            expired: GcRangeSet::from_ranges(std::mem::take(&mut overlay.expired)),
+            lifetimes: GcLifetimeSet::from_ranges(std::mem::take(&mut overlay.lifetimes)),
+        }
     }
 
-    fn apply_merge_op_unchecked(&mut self, op: SegmentGcOverlayMergeOp) {
+    /// Writes the canonical lists back: coalesced spans in offset order, and only the lifetime
+    /// hints that no retired or expired span overlaps.
+    fn restore(self, overlay: &mut SegmentGcOverlay) {
+        let Self {
+            retired,
+            expired,
+            lifetimes,
+        } = self;
+        overlay.lifetimes =
+            lifetimes.into_ranges(|range| !retired.overlaps(range) && !expired.overlaps(range));
+        overlay.retired = retired.into_ranges();
+        overlay.expired = expired.into_ranges();
+    }
+
+    fn apply(&mut self, summary: &mut SegmentGcSummary, op: SegmentGcOverlayMergeOp) {
         match op {
             SegmentGcOverlayMergeOp::AddLiveBatch { records } => {
                 for record in records {
-                    self.add_live_record(record);
+                    self.add_live_record(summary, record);
                 }
             }
             SegmentGcOverlayMergeOp::AddRetiredBatch { ranges } => {
                 for range in ranges {
-                    self.add_retired_record(range);
+                    self.add_retired_record(summary, range);
                 }
             }
             SegmentGcOverlayMergeOp::AddExpiredBatch { ranges } => {
                 for range in ranges {
-                    self.add_expired_record(range);
+                    self.add_expired_record(summary, range);
                 }
             }
             SegmentGcOverlayMergeOp::ExpireBatch { ranges } => {
                 for range in ranges {
-                    self.expire_range(range);
+                    self.expire_range(summary, range);
                 }
             }
             SegmentGcOverlayMergeOp::RetireBatch { ranges } => {
                 for range in ranges {
-                    self.retire_range(range);
+                    self.retire_range(summary, range);
                 }
             }
             SegmentGcOverlayMergeOp::LifetimeBatch { updates } => {
                 for update in updates {
-                    self.apply_lifetime_update(update);
+                    self.apply_lifetime_update(summary, update);
                 }
             }
         }
     }
 
-    fn add_live_record(&mut self, record: SegmentGcLiveRecord) {
+    fn add_live_record(&mut self, summary: &mut SegmentGcSummary, record: SegmentGcLiveRecord) {
         if is_empty_gc_range(record.range) {
             return;
         }
 
-        subtract_gc_range(&mut self.expired, record.range);
-        subtract_gc_range(&mut self.retired, record.range);
-        remove_lifetimes_overlapping(&mut self.lifetimes, record.range);
-        add_live_summary(&mut self.summary, record.range.len, record.lifecycle);
-        self.summary.total_bytes = self.summary.total_bytes.saturating_add(record.range.len);
+        self.expired.subtract(record.range);
+        self.retired.subtract(record.range);
+        self.lifetimes.remove_overlapping(record.range);
+        add_live_summary(summary, record.range.len, record.lifecycle);
+        summary.total_bytes = summary.total_bytes.saturating_add(record.range.len);
         if let Some(lifecycle) = record.lifecycle {
-            self.lifetimes.push(SegmentGcLifetimeRange {
-                range: record.range,
-                lifecycle,
-            });
+            self.lifetimes.insert(record.range, lifecycle);
         }
     }
 
-    fn add_retired_record(&mut self, range: SegmentGcRecordRange) {
-        if is_empty_gc_range(range) {
+    fn add_retired_record(&mut self, summary: &mut SegmentGcSummary, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) || self.retired.contains(range) {
             return;
         }
 
-        if self
-            .retired
-            .iter()
-            .any(|retired| range_contains(*retired, range))
-        {
-            return;
-        }
-
-        let was_expired = self
-            .expired
-            .iter()
-            .any(|expired| range_contains(*expired, range));
-        if was_expired {
-            subtract_gc_range(&mut self.expired, range);
-            self.summary.expired_bytes = self.summary.expired_bytes.saturating_sub(range.len);
+        if self.expired.contains(range) {
+            self.expired.subtract(range);
+            summary.expired_bytes = summary.expired_bytes.saturating_sub(range.len);
         } else {
-            self.summary.total_bytes = self.summary.total_bytes.saturating_add(range.len);
+            summary.total_bytes = summary.total_bytes.saturating_add(range.len);
         }
-        subtract_gc_range(&mut self.expired, range);
-        remove_lifetimes_overlapping(&mut self.lifetimes, range);
-        self.summary.retired_bytes = self.summary.retired_bytes.saturating_add(range.len);
-        self.retired.push(range);
-        coalesce_gc_ranges(&mut self.retired);
+        self.expired.subtract(range);
+        self.lifetimes.remove_overlapping(range);
+        summary.retired_bytes = summary.retired_bytes.saturating_add(range.len);
+        self.retired.insert(range);
     }
 
-    fn add_expired_record(&mut self, range: SegmentGcRecordRange) {
-        if is_empty_gc_range(range) {
+    fn add_expired_record(&mut self, summary: &mut SegmentGcSummary, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) || self.retired.contains(range) {
             return;
         }
 
-        if self
-            .retired
-            .iter()
-            .any(|retired| range_contains(*retired, range))
-        {
-            return;
-        }
-        subtract_gc_range(&mut self.retired, range);
-        remove_lifetimes_overlapping(&mut self.lifetimes, range);
-        self.summary.total_bytes = self.summary.total_bytes.saturating_add(range.len);
-        self.summary.expired_bytes = self.summary.expired_bytes.saturating_add(range.len);
-        self.expired.push(range);
-        coalesce_gc_ranges(&mut self.expired);
+        self.retired.subtract(range);
+        self.lifetimes.remove_overlapping(range);
+        summary.total_bytes = summary.total_bytes.saturating_add(range.len);
+        summary.expired_bytes = summary.expired_bytes.saturating_add(range.len);
+        self.expired.insert(range);
     }
 
-    fn expire_range(&mut self, range: SegmentGcRecordRange) {
-        if is_empty_gc_range(range)
-            || self
-                .retired
-                .iter()
-                .any(|retired| range_contains(*retired, range))
-            || self
-                .expired
-                .iter()
-                .any(|expired| range_contains(*expired, range))
+    fn expire_range(&mut self, summary: &mut SegmentGcSummary, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) || self.retired.contains(range) || self.expired.contains(range)
         {
             return;
         }
 
-        let lifecycle = self.lifecycle_for_range(range);
-        remove_live_summary(&mut self.summary, range.len, lifecycle);
-        self.summary.expired_bytes = self.summary.expired_bytes.saturating_add(range.len);
-        remove_lifetimes_overlapping(&mut self.lifetimes, range);
-        self.expired.push(range);
-        coalesce_gc_ranges(&mut self.expired);
+        let lifecycle = self.lifetimes.lifecycle_for_range(range);
+        remove_live_summary(summary, range.len, lifecycle);
+        summary.expired_bytes = summary.expired_bytes.saturating_add(range.len);
+        self.lifetimes.remove_overlapping(range);
+        self.expired.insert(range);
     }
 
-    fn retire_range(&mut self, range: SegmentGcRecordRange) {
-        if is_empty_gc_range(range)
-            || self
-                .retired
-                .iter()
-                .any(|retired| range_contains(*retired, range))
-        {
+    fn retire_range(&mut self, summary: &mut SegmentGcSummary, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) || self.retired.contains(range) {
             return;
         }
 
-        if self
-            .expired
-            .iter()
-            .any(|expired| range_contains(*expired, range))
-        {
-            self.summary.expired_bytes = self.summary.expired_bytes.saturating_sub(range.len);
-            self.summary.retired_bytes = self.summary.retired_bytes.saturating_add(range.len);
-            subtract_gc_range(&mut self.expired, range);
+        if self.expired.contains(range) {
+            summary.expired_bytes = summary.expired_bytes.saturating_sub(range.len);
+            summary.retired_bytes = summary.retired_bytes.saturating_add(range.len);
+            self.expired.subtract(range);
         } else {
-            let lifecycle = self.lifecycle_for_range(range);
-            remove_live_summary(&mut self.summary, range.len, lifecycle);
-            self.summary.retired_bytes = self.summary.retired_bytes.saturating_add(range.len);
+            let lifecycle = self.lifetimes.lifecycle_for_range(range);
+            remove_live_summary(summary, range.len, lifecycle);
+            summary.retired_bytes = summary.retired_bytes.saturating_add(range.len);
         }
 
-        remove_lifetimes_overlapping(&mut self.lifetimes, range);
-        self.retired.push(range);
-        coalesce_gc_ranges(&mut self.retired);
+        self.lifetimes.remove_overlapping(range);
+        self.retired.insert(range);
     }
 
-    fn apply_lifetime_update(&mut self, update: SegmentGcLifetimeUpdate) {
-        if is_empty_gc_range(update.range) {
-            return;
-        }
-
-        if self
-            .retired
-            .iter()
-            .any(|retired| range_contains(*retired, update.range))
+    fn apply_lifetime_update(
+        &mut self,
+        summary: &mut SegmentGcSummary,
+        update: SegmentGcLifetimeUpdate,
+    ) {
+        if is_empty_gc_range(update.range)
+            || self.retired.contains(update.range)
+            || self.expired.contains(update.range)
         {
             return;
         }
 
-        if self
-            .expired
-            .iter()
-            .any(|expired| range_contains(*expired, update.range))
-        {
-            return;
-        }
-
-        let old = self.lifecycle_for_range(update.range);
+        let old = self.lifetimes.lifecycle_for_range(update.range);
         if old == update.lifecycle {
             return;
         }
-        remove_live_summary(&mut self.summary, update.range.len, old);
-        add_live_summary(&mut self.summary, update.range.len, update.lifecycle);
-        remove_lifetimes_overlapping(&mut self.lifetimes, update.range);
-
+        remove_live_summary(summary, update.range.len, old);
+        add_live_summary(summary, update.range.len, update.lifecycle);
+        self.lifetimes.remove_overlapping(update.range);
         if let Some(lifecycle) = update.lifecycle {
-            self.lifetimes.push(SegmentGcLifetimeRange {
-                range: update.range,
+            self.lifetimes.insert(update.range, lifecycle);
+        }
+    }
+}
+
+/// Coalesced, non-overlapping byte spans keyed by start offset; the value is the exclusive end.
+///
+/// Adjacent spans are merged on insert, which is the same canonical form the vector lists use.
+#[derive(Default)]
+struct GcRangeSet {
+    spans: BTreeMap<u64, u64>,
+}
+
+impl GcRangeSet {
+    fn from_ranges(ranges: Vec<SegmentGcRecordRange>) -> Self {
+        let mut set = Self::default();
+        for range in ranges {
+            set.insert(range);
+        }
+        set
+    }
+
+    fn into_ranges(self) -> Vec<SegmentGcRecordRange> {
+        self.spans
+            .into_iter()
+            .map(|(offset, end)| SegmentGcRecordRange {
+                offset,
+                len: end.saturating_sub(offset),
+            })
+            .collect()
+    }
+
+    /// The span starting at or before `offset`, as owned values so the borrow ends here.
+    fn span_at_or_before(&self, offset: u64) -> Option<(u64, u64)> {
+        self.spans
+            .range(..=offset)
+            .next_back()
+            .map(|(&start, &end)| (start, end))
+    }
+
+    /// The span starting strictly before `offset`.
+    fn span_before(&self, offset: u64) -> Option<(u64, u64)> {
+        self.spans
+            .range(..offset)
+            .next_back()
+            .map(|(&start, &end)| (start, end))
+    }
+
+    /// The first span starting within `start..=end`.
+    fn first_span_within(&self, start: u64, end: u64) -> Option<(u64, u64)> {
+        self.spans
+            .range(start..=end)
+            .next()
+            .map(|(&start, &end)| (start, end))
+    }
+
+    /// Whether one span covers the whole range.
+    fn contains(&self, range: SegmentGcRecordRange) -> bool {
+        self.span_at_or_before(range.offset)
+            .is_some_and(|(_, end)| end >= gc_range_end(range))
+    }
+
+    /// Whether any span strictly overlaps the range.
+    fn overlaps(&self, range: SegmentGcRecordRange) -> bool {
+        if is_empty_gc_range(range) {
+            return false;
+        }
+        self.span_before(gc_range_end(range))
+            .is_some_and(|(_, end)| end > range.offset)
+    }
+
+    /// Adds the range, merging it with every span it overlaps or touches.
+    fn insert(&mut self, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) {
+            return;
+        }
+        let mut start = range.offset;
+        let mut end = gc_range_end(range);
+        if let Some((span_start, span_end)) = self.span_at_or_before(start)
+            && span_end >= start
+        {
+            start = span_start;
+            end = end.max(span_end);
+            self.spans.remove(&span_start);
+        }
+        while let Some((span_start, span_end)) = self.first_span_within(start, end) {
+            end = end.max(span_end);
+            self.spans.remove(&span_start);
+        }
+        self.spans.insert(start, end);
+    }
+
+    /// Removes the range from every span, keeping the parts of those spans outside it.
+    fn subtract(&mut self, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) {
+            return;
+        }
+        let start = range.offset;
+        let end = gc_range_end(range);
+        let mut removed = Vec::new();
+        let mut pieces = Vec::new();
+        if let Some((span_start, span_end)) = self.span_before(start)
+            && span_end > start
+        {
+            removed.push(span_start);
+            pieces.push((span_start, start));
+            if span_end > end {
+                pieces.push((end, span_end));
+            }
+        }
+        for (&span_start, &span_end) in self.spans.range(start..end) {
+            removed.push(span_start);
+            if span_end > end {
+                pieces.push((end, span_end));
+            }
+        }
+        for span_start in removed {
+            self.spans.remove(&span_start);
+        }
+        for (span_start, span_end) in pieces {
+            self.spans.insert(span_start, span_end);
+        }
+    }
+}
+
+/// Lifetime hints keyed by start offset; the value is the exclusive end and the lifecycle.
+///
+/// Every mutation removes overlapping hints before inserting, so entries never overlap and the
+/// hint covering a record is always the one starting at or before it.
+#[derive(Default)]
+struct GcLifetimeSet {
+    entries: BTreeMap<u64, (u64, BlobLifecycle)>,
+}
+
+impl GcLifetimeSet {
+    fn from_ranges(mut ranges: Vec<SegmentGcLifetimeRange>) -> Self {
+        // Canonical input never has two hints at one offset; if it did, the previous
+        // first-match lookup would have chosen the shorter one.
+        ranges.sort_by_key(|entry| (entry.range.offset, entry.range.len));
+        let mut set = Self::default();
+        for entry in ranges {
+            if is_empty_gc_range(entry.range) {
+                continue;
+            }
+            set.entries
+                .entry(entry.range.offset)
+                .or_insert((gc_range_end(entry.range), entry.lifecycle));
+        }
+        set
+    }
+
+    fn into_ranges(
+        self,
+        keep: impl Fn(SegmentGcRecordRange) -> bool,
+    ) -> Vec<SegmentGcLifetimeRange> {
+        self.entries
+            .into_iter()
+            .map(|(offset, (end, lifecycle))| SegmentGcLifetimeRange {
+                range: SegmentGcRecordRange {
+                    offset,
+                    len: end.saturating_sub(offset),
+                },
                 lifecycle,
-            });
-            self.lifetimes
-                .sort_by_key(|entry| (entry.range.offset, entry.range.len));
+            })
+            .filter(|entry| keep(entry.range))
+            .collect()
+    }
+
+    /// The lifecycle of the hint that wholly contains the range, if any.
+    fn lifecycle_for_range(&self, range: SegmentGcRecordRange) -> Option<BlobLifecycle> {
+        self.entries
+            .range(..=range.offset)
+            .next_back()
+            .and_then(|(_, &(end, lifecycle))| (end >= gc_range_end(range)).then_some(lifecycle))
+    }
+
+    /// Drops every hint that strictly overlaps the range.
+    fn remove_overlapping(&mut self, range: SegmentGcRecordRange) {
+        if is_empty_gc_range(range) {
+            return;
+        }
+        let start = range.offset;
+        let end = gc_range_end(range);
+        let mut removed = Vec::new();
+        if let Some((&entry_start, &(entry_end, _))) = self.entries.range(..start).next_back()
+            && entry_end > start
+        {
+            removed.push(entry_start);
+        }
+        removed.extend(self.entries.range(start..end).map(|(&offset, _)| offset));
+        for offset in removed {
+            self.entries.remove(&offset);
         }
     }
 
-    fn lifecycle_for_range(&self, range: SegmentGcRecordRange) -> Option<BlobLifecycle> {
-        self.lifetimes
-            .iter()
-            .find(|entry| range_contains(entry.range, range))
-            .map(|entry| entry.lifecycle)
-    }
-
-    fn normalize(&mut self) {
-        coalesce_gc_ranges(&mut self.retired);
-        coalesce_gc_ranges(&mut self.expired);
-        self.lifetimes.retain(|entry| {
-            !is_empty_gc_range(entry.range)
-                && !range_overlaps_any(entry.range, &self.retired)
-                && !range_overlaps_any(entry.range, &self.expired)
-        });
-        self.lifetimes
-            .sort_by_key(|entry| (entry.range.offset, entry.range.len));
+    fn insert(&mut self, range: SegmentGcRecordRange, lifecycle: BlobLifecycle) {
+        self.entries
+            .insert(range.offset, (gc_range_end(range), lifecycle));
     }
 }
 
@@ -523,85 +680,6 @@ where
     }
 }
 
-fn coalesce_gc_ranges(ranges: &mut Vec<SegmentGcRecordRange>) {
-    ranges.retain(|range| !is_empty_gc_range(*range));
-    ranges.sort_by_key(|range| (range.offset, range.len));
-
-    let mut coalesced: Vec<SegmentGcRecordRange> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        let Some(last) = coalesced.last_mut() else {
-            coalesced.push(range);
-            continue;
-        };
-
-        let last_end = gc_range_end(*last);
-        let range_end = gc_range_end(range);
-        if range.offset <= last_end {
-            let new_end = last_end.max(range_end);
-            last.len = new_end.saturating_sub(last.offset);
-        } else {
-            coalesced.push(range);
-        }
-    }
-
-    *ranges = coalesced;
-}
-
-fn subtract_gc_range(ranges: &mut Vec<SegmentGcRecordRange>, removed: SegmentGcRecordRange) {
-    if is_empty_gc_range(removed) {
-        return;
-    }
-
-    let removed_end = gc_range_end(removed);
-    let mut remaining = Vec::with_capacity(ranges.len().saturating_add(1));
-    for range in ranges.drain(..) {
-        let range_end = gc_range_end(range);
-        if range_end <= removed.offset || range.offset >= removed_end {
-            remaining.push(range);
-            continue;
-        }
-
-        if range.offset < removed.offset {
-            remaining.push(SegmentGcRecordRange {
-                offset: range.offset,
-                len: removed.offset.saturating_sub(range.offset),
-            });
-        }
-        if range_end > removed_end {
-            remaining.push(SegmentGcRecordRange {
-                offset: removed_end,
-                len: range_end.saturating_sub(removed_end),
-            });
-        }
-    }
-
-    *ranges = remaining;
-}
-
-fn remove_lifetimes_overlapping(
-    lifetimes: &mut Vec<SegmentGcLifetimeRange>,
-    range: SegmentGcRecordRange,
-) {
-    lifetimes.retain(|entry| !gc_ranges_overlap(entry.range, range));
-}
-
-fn range_overlaps_any(range: SegmentGcRecordRange, ranges: &[SegmentGcRecordRange]) -> bool {
-    ranges
-        .iter()
-        .any(|candidate| gc_ranges_overlap(range, *candidate))
-}
-
-fn range_contains(container: SegmentGcRecordRange, contained: SegmentGcRecordRange) -> bool {
-    contained.offset >= container.offset && gc_range_end(contained) <= gc_range_end(container)
-}
-
-fn gc_ranges_overlap(left: SegmentGcRecordRange, right: SegmentGcRecordRange) -> bool {
-    !is_empty_gc_range(left)
-        && !is_empty_gc_range(right)
-        && left.offset < gc_range_end(right)
-        && right.offset < gc_range_end(left)
-}
-
 fn is_empty_gc_range(range: SegmentGcRecordRange) -> bool {
     range.len == 0
 }
@@ -666,3 +744,6 @@ pub struct EpochBucket {
     pub refs: u64,
     pub bytes: u64,
 }
+
+#[cfg(test)]
+mod tests;
