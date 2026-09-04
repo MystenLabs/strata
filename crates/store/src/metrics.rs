@@ -78,6 +78,8 @@ struct PrometheusMetrics {
     relocation_compaction_duration_seconds: Histogram,
     relocation_compaction_input_bytes_total: IntCounter,
     relocation_compaction_output_bytes_total: IntCounter,
+    relocation_compaction_passes_total: IntCounterVec,
+    relocation_compaction_pass_input_bytes_total: IntCounterVec,
     range_read_calls_total: IntCounter,
     range_read_hits_total: IntCounter,
     range_read_misses_total: IntCounter,
@@ -430,6 +432,20 @@ impl StrataStoreMetrics {
                     &labels,
                     "relocation_compaction_output_bytes_total",
                     "Encoded relocation SST output bytes created by successful compactions; this is not a device I/O counter.",
+                )?,
+                relocation_compaction_passes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "relocation_compaction_passes_total",
+                    "Total relocation LSM compaction passes by shape (partial merges a patch tier; full rewrites base tables).",
+                    &["kind"],
+                )?,
+                relocation_compaction_pass_input_bytes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "relocation_compaction_pass_input_bytes_total",
+                    "Total relocation LSM compaction input bytes by pass shape.",
+                    &["kind"],
                 )?,
                 range_read_calls_total: register_counter(
                     registry,
@@ -1119,6 +1135,20 @@ impl StrataStoreMetrics {
         metrics
             .relocation_compaction_output_bytes_total
             .inc_by(output_bytes);
+    }
+
+    pub(crate) fn record_relocation_compaction_pass(&self, kind: &str, input_bytes: u64) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        metrics
+            .relocation_compaction_passes_total
+            .with_label_values(&[kind])
+            .inc();
+        metrics
+            .relocation_compaction_pass_input_bytes_total
+            .with_label_values(&[kind])
+            .inc_by(input_bytes);
     }
 
     pub(crate) fn record_range_read(&self, result: Result<Option<u64>, ()>, elapsed: Duration) {

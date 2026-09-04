@@ -35,6 +35,7 @@ pub fn select_compaction_inputs(
         std::slice::from_ref(patch),
         None,
         true,
+        true,
     )
 }
 
@@ -51,7 +52,7 @@ pub fn select_base_compaction_inputs(
     partition: u32,
     base: &TableMeta,
 ) -> Result<Option<CompactionInputs>> {
-    select_inputs(manifest, tables, partition, &[], Some(base), true)
+    select_inputs(manifest, tables, partition, &[], Some(base), true, true)
 }
 
 /// Selects and reserves an overlap-closed patch set for patch-only compaction.
@@ -63,7 +64,24 @@ pub fn select_patch_compaction_inputs(
     partition: u32,
     patches: &[TableMeta],
 ) -> Result<Option<CompactionInputs>> {
-    select_inputs(manifest, tables, partition, patches, None, false)
+    select_inputs(manifest, tables, partition, patches, None, false, true)
+}
+
+/// Selects and reserves exactly the given patch SSTs for patch-only compaction, without closing
+/// over other patches that overlap them.
+///
+/// This is only sound for operators whose partial merge of any subsequence of one key's operands
+/// is equivalent to merging the whole ordered sequence, such as last-write-wins: every row keeps
+/// its own lsn, so an unselected overlapping patch stays correctly ordered against the merged
+/// output. It lets a caller merge patches by size tier instead of by overlap component, which is
+/// what bounds the write amplification of a patch tier.
+pub fn select_patch_group_inputs(
+    manifest: &Manifest,
+    tables: &Arc<TableStore>,
+    partition: u32,
+    patches: &[TableMeta],
+) -> Result<Option<CompactionInputs>> {
+    select_inputs(manifest, tables, partition, patches, None, false, false)
 }
 
 fn select_inputs(
@@ -73,6 +91,7 @@ fn select_inputs(
     patches: &[TableMeta],
     base: Option<&TableMeta>,
     include_base: bool,
+    close_over_overlaps: bool,
 ) -> Result<Option<CompactionInputs>> {
     manifest.validate()?;
     if patches.is_empty() && base.is_none() {
@@ -148,7 +167,10 @@ fn select_inputs(
     //
     // Patch-only compaction uses the same loop with an empty base side. Range overlap remains
     // conservative, but avoids inspecting unselected files to prove they do not contain a common
-    // key.
+    // key. A patch group selection skips the loop entirely; see select_patch_group_inputs.
+    if !close_over_overlaps {
+        return reserve_inputs(manifest, tables, selected_base, selected_patches);
+    }
     loop {
         let patch_additions = partition_manifest
             .patches
@@ -190,6 +212,16 @@ fn select_inputs(
         selected_base.extend(base_additions);
     }
 
+    reserve_inputs(manifest, tables, selected_base, selected_patches)
+}
+
+/// Reserves the selected files and computes their complete key bounds.
+fn reserve_inputs(
+    manifest: &Manifest,
+    tables: &Arc<TableStore>,
+    selected_base: Vec<TableMeta>,
+    selected_patches: Vec<TableMeta>,
+) -> Result<Option<CompactionInputs>> {
     let mut reserved = selected_base.clone();
     reserved.extend(selected_patches.iter().cloned());
     let Some(reservation) = tables.reserve_for_compaction(&reserved)? else {

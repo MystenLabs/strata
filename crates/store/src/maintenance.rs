@@ -23,6 +23,7 @@
 //! now syncs itself; the sweeper/compactor frontier updates are conservative reaffirmations.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
     time::{Duration, Instant},
@@ -44,7 +45,7 @@ use index::StrataIndex;
 use lsm::{
     GarbageLog, Lsm, Manifest as LsmManifest, ManifestEdit, TableMeta,
     select_base_compaction_inputs, select_compaction_inputs, select_patch_compaction_inputs,
-    write_compaction, write_patch_compaction,
+    select_patch_group_inputs, write_compaction, write_patch_compaction,
 };
 
 /// Folds the global garbage log into per-segment overlays on a one-second cadence.
@@ -455,11 +456,13 @@ impl LsmCompactor {
         }
     }
 
-    /// Compacts the relocation LSM when its patch count or bytes cross the shared thresholds.
+    /// Compacts the relocation LSM when a partition is under patch pressure.
     ///
     /// Every GC publish adds one patch SST to the relocation manifest, so a busy GC period grows
-    /// a long patch chain that every relocation lookup must walk. This folds them into one base.
-    /// The admission lock is taken in read mode to exclude GC publication for the duration —
+    /// a long patch chain that every relocation lookup must walk. Count pressure merges a size
+    /// tier of patches among themselves; only once the patch tier is a set fraction of the base
+    /// does a full pass fold it into new base tables (see `relocation_compaction_shape`). The
+    /// admission lock is taken in read mode to exclude GC publication for the duration —
     /// activation edits the same manifest, and the merge-batch's live-file validation must not
     /// race it.
     ///
@@ -479,7 +482,8 @@ impl LsmCompactor {
             .partitions
             .iter()
             .filter_map(|(&partition, tables)| {
-                partition_needs_compaction(&tables.patches).then_some(partition)
+                relocation_compaction_shape(&tables.patches, &tables.base)
+                    .map(|shape| (partition, shape))
             })
             .collect::<Vec<_>>();
         if pressured.is_empty() {
@@ -492,13 +496,14 @@ impl LsmCompactor {
             .expect("compaction admission lock poisoned");
         let relocation_lsn = relocations.lsm().last_lsn()?.unwrap_or_default();
         let mut compacted = false;
-        for partition in pressured {
+        for (partition, shape) in pressured {
             compacted |= compact_relocation_lsm_partition(
                 &self.index,
                 &relocations,
                 &relocation_cache,
                 &self.metrics,
                 partition,
+                shape,
             )?;
         }
         if compacted {
@@ -922,23 +927,105 @@ pub(crate) fn flush_relocation_lsm(
         .partitions
         .iter()
         .filter_map(|(&partition, tables)| {
-            partition_needs_compaction(&tables.patches).then_some(partition)
+            relocation_compaction_shape(&tables.patches, &tables.base)
+                .map(|shape| (partition, shape))
         })
         .collect::<Vec<_>>();
-    for partition in pressured {
-        compact_relocation_lsm_partition(index, relocations, relocation_cache, metrics, partition)?;
+    for (partition, shape) in pressured {
+        compact_relocation_lsm_partition(
+            index,
+            relocations,
+            relocation_cache,
+            metrics,
+            partition,
+            shape,
+        )?;
     }
     Ok(())
 }
 
-fn partition_needs_compaction(patches: &[TableMeta]) -> bool {
+/// How one relocation-LSM compaction pass rewrites a partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelocationCompactionShape {
+    /// Merge one size tier of patches among themselves; base tables are neither read nor
+    /// rewritten, and no entry is retired.
+    Partial,
+    /// Fold the oldest patch's overlap component into fresh base tables and retire entries whose
+    /// destination segment is gone.
+    Full,
+}
+
+impl RelocationCompactionShape {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// The patch tier is folded into the base only once it reaches this fraction of the base, so the
+/// bytes rewritten into base tables stay a constant multiple of the bytes GC publishes instead of
+/// a whole-base rewrite every few publishes.
+const RELOCATION_FULL_COMPACTION_BASE_DIVISOR: u64 = 4;
+/// A patch joins a tier merge when it is at most this many times larger than the smallest patch,
+/// which keeps each byte's number of tier rewrites logarithmic in the tier size.
+const RELOCATION_PATCH_TIER_SIZE_RATIO: u64 = 4;
+/// Upper bound on the patches one tier merge reads.
+const RELOCATION_PATCH_TIER_MAX_INPUTS: usize = 16;
+
+/// Decides whether a relocation partition needs a pass, and which shape.
+///
+/// Byte pressure relative to the base selects the full pass. Otherwise the shared patch-count or
+/// patch-byte pressure selects a tier merge, which `select_relocation_patch_tier` may still
+/// decline when no two patches are of comparable size.
+fn relocation_compaction_shape(
+    patches: &[TableMeta],
+    base: &[TableMeta],
+) -> Option<RelocationCompactionShape> {
+    if patches.is_empty() {
+        return None;
+    }
     let patch_bytes = patches
         .iter()
         .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
-    patches.len() >= LSM_COMPACTION_PATCH_COUNT || patch_bytes >= LSM_COMPACTION_PATCH_BYTES
+    let base_bytes = base
+        .iter()
+        .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
+    let full_threshold =
+        LSM_COMPACTION_PATCH_BYTES.max(base_bytes / RELOCATION_FULL_COMPACTION_BASE_DIVISOR);
+    if patch_bytes >= full_threshold {
+        return Some(RelocationCompactionShape::Full);
+    }
+    if patches.len() >= LSM_COMPACTION_PATCH_COUNT || patch_bytes >= LSM_COMPACTION_PATCH_BYTES {
+        return Some(RelocationCompactionShape::Partial);
+    }
+    None
 }
 
-/// Rewrites one overlap-connected relocation component into fresh base tables.
+/// Picks the size tier to merge: the smallest patch and every patch within a constant factor of
+/// it, in manifest order. Returns nothing when fewer than two patches are comparable, because
+/// merging a small patch into a much larger one is exactly the rewrite the tier avoids.
+fn select_relocation_patch_tier(patches: &[TableMeta]) -> Vec<TableMeta> {
+    let Some(smallest) = patches.iter().map(|table| table.file_len).min() else {
+        return Vec::new();
+    };
+    let limit = smallest
+        .max(1)
+        .saturating_mul(RELOCATION_PATCH_TIER_SIZE_RATIO);
+    let mut tier = patches
+        .iter()
+        .filter(|table| table.file_len <= limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    tier.truncate(RELOCATION_PATCH_TIER_MAX_INPUTS);
+    if tier.len() < 2 {
+        tier.clear();
+    }
+    tier
+}
+
+/// Test helper: forces a full pass over every partition that has patches.
 ///
 /// The merge does two things per key identity: keep only the newest value (Replace — a record
 /// relocated twice keeps only its latest destination), and drop entries whose destination
@@ -960,6 +1047,24 @@ pub(crate) fn compact_relocation_lsm(
     relocation_cache: &RelocationCache,
     metrics: &StrataStoreMetrics,
 ) -> Result<bool> {
+    compact_relocation_lsm_with_shape(
+        index,
+        relocations,
+        relocation_cache,
+        metrics,
+        RelocationCompactionShape::Full,
+    )
+}
+
+/// Test helper: runs one pass of the given shape over every partition.
+#[cfg(test)]
+pub(crate) fn compact_relocation_lsm_with_shape(
+    index: &StrataIndex,
+    relocations: &RelocationStore,
+    relocation_cache: &RelocationCache,
+    metrics: &StrataStoreMetrics,
+    shape: RelocationCompactionShape,
+) -> Result<bool> {
     let partition_count = relocations.lsm().manifest().partition_count;
     let mut compacted = false;
     for partition in 0..partition_count {
@@ -969,53 +1074,102 @@ pub(crate) fn compact_relocation_lsm(
             relocation_cache,
             metrics,
             partition,
+            shape,
         )?;
     }
     Ok(compacted)
 }
 
+/// One relocation-LSM compaction pass over one partition.
+///
+/// A partial pass reads only a size tier of patches and writes one merged patch: a record
+/// relocated twice keeps only its latest destination, and nothing else changes. Selection is by
+/// size rather than overlap component (`select_patch_group_inputs`), which is sound because the
+/// merge is last-write-wins and every row keeps its own lsn. The output is not split by size so
+/// tiers keep growing geometrically instead of degenerating into equal-sized files that would be
+/// merged again and again.
+///
+/// A full pass is the original rewrite of one overlap-connected component into fresh base tables.
+/// Besides keeping the latest destination per identity, it drops entries whose destination
+/// segment has since been Deleted: once compaction has healed every blob row that pointed into
+/// S42 and S42 itself is retired and deleted, the A → S42 and D → S42 entries are pure dead
+/// weight, and this pass removes them and evicts them from the relocation cache. Relocation
+/// compaction emits no garbage events (the debug_assert) — destinations were accounted for by
+/// segment deletion, not by this fold.
+///
+/// Publication follows the standard shape: SSTs are durable from the writer, the manifest edit
+/// commits in one synced batch, the merged manifest installs in memory. Unlike blob compaction,
+/// the replaced inputs are unlinked immediately (still respecting reader pins) — there is no
+/// deferred-obsolete list on this path. Returns whether a compaction actually ran, which the
+/// caller uses to decide whether to advance `durable_relocation_lsn`.
 fn compact_relocation_lsm_partition(
     index: &StrataIndex,
     relocations: &RelocationStore,
     relocation_cache: &RelocationCache,
     metrics: &StrataStoreMetrics,
     partition: u32,
+    shape: RelocationCompactionShape,
 ) -> Result<bool> {
     let manifest = relocations.lsm().manifest();
-    let patches = &manifest.partitions[&partition].patches;
-    let Some(seed) = patches.first() else {
-        return Ok(false);
-    };
+    let partition_manifest = &manifest.partitions[&partition];
     let tables = relocations.lsm().table_store();
-    let Some(inputs) = select_compaction_inputs(&manifest, &tables, partition, seed)? else {
-        return Ok(false);
+    let (inputs, merge) = match shape {
+        RelocationCompactionShape::Partial => {
+            let tier = select_relocation_patch_tier(&partition_manifest.patches);
+            if tier.is_empty() {
+                return Ok(false);
+            }
+            let Some(inputs) = select_patch_group_inputs(&manifest, &tables, partition, &tier)?
+            else {
+                return Ok(false);
+            };
+            (inputs, RelocationMerge::new(HashSet::new()))
+        }
+        RelocationCompactionShape::Full => {
+            let Some(seed) = partition_manifest.patches.first() else {
+                return Ok(false);
+            };
+            let Some(inputs) = select_compaction_inputs(&manifest, &tables, partition, seed)?
+            else {
+                return Ok(false);
+            };
+            let dead_segments = index
+                .iter_segment_states()?
+                .into_iter()
+                .filter_map(|(segment_id, state)| {
+                    (state.state == SegmentFileState::Deleted).then_some(segment_id)
+                })
+                .collect();
+            (inputs, RelocationMerge::new(dead_segments))
+        }
     };
-    let obsolete = inputs
-        .base
-        .iter()
-        .chain(&inputs.patches)
-        .cloned()
-        .collect::<Vec<_>>();
+    let obsolete = match shape {
+        RelocationCompactionShape::Partial => inputs.patches.clone(),
+        RelocationCompactionShape::Full => {
+            inputs.base.iter().chain(&inputs.patches).cloned().collect()
+        }
+    };
     let input_bytes = obsolete
         .iter()
         .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
-    let merge = RelocationMerge::new(
-        index
-            .iter_segment_states()?
-            .into_iter()
-            .filter_map(|(segment_id, state)| {
-                (state.state == SegmentFileState::Deleted).then_some(segment_id)
-            })
-            .collect(),
-    );
     let started = Instant::now();
-    let (edit, garbage) = write_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
-        relocations.lsm().allocate_base_target()
-    })?;
+    let (edit, garbage) = match shape {
+        RelocationCompactionShape::Partial => {
+            write_patch_compaction(&inputs, &merge, u64::MAX, || {
+                relocations.lsm().allocate_patch_target()
+            })?
+        }
+        RelocationCompactionShape::Full => {
+            write_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
+                relocations.lsm().allocate_base_target()
+            })?
+        }
+    };
     debug_assert!(garbage.is_empty());
     let output_bytes = edit
         .add_base
         .iter()
+        .chain(&edit.add_patches)
         .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
 
     let mut batch = index.batch();
@@ -1035,9 +1189,86 @@ fn compact_relocation_lsm_partition(
         output_bytes,
         started.elapsed(),
     );
+    metrics.record_relocation_compaction_pass(shape.metric_label(), input_bytes);
     drop(inputs);
     for table in obsolete {
         tables.remove_if_unpinned(&table)?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod relocation_compaction_tests {
+    use super::*;
+
+    fn meta(id: u64, file_len: u64) -> TableMeta {
+        TableMeta {
+            id,
+            partition: 0,
+            relative_path: format!("patch-{id}.sst"),
+            first_key: b"a".to_vec(),
+            last_key: b"z".to_vec(),
+            min_lsn: Some(id),
+            max_lsn: Some(id),
+            merge_applied_through_lsn: None,
+            record_count: 1,
+            file_len,
+            checksum: [0; 32],
+        }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn shape_needs_patches_and_pressure() {
+        assert_eq!(relocation_compaction_shape(&[], &[]), None);
+        assert_eq!(relocation_compaction_shape(&[meta(1, MIB)], &[]), None);
+        let eight = (1..=8).map(|id| meta(id, MIB)).collect::<Vec<_>>();
+        assert_eq!(
+            relocation_compaction_shape(&eight, &[]),
+            Some(RelocationCompactionShape::Partial)
+        );
+    }
+
+    #[test]
+    fn shape_goes_full_only_once_the_tier_is_a_fraction_of_the_base() {
+        let base = vec![meta(100, 1024 * MIB)];
+        let below = (1..=3).map(|id| meta(id, 80 * MIB)).collect::<Vec<_>>();
+        assert_eq!(
+            relocation_compaction_shape(&below, &base),
+            Some(RelocationCompactionShape::Partial)
+        );
+        let above = (1..=4).map(|id| meta(id, 80 * MIB)).collect::<Vec<_>>();
+        assert_eq!(
+            relocation_compaction_shape(&above, &base),
+            Some(RelocationCompactionShape::Full)
+        );
+        // With no base yet, the shared byte threshold alone selects the full pass.
+        assert_eq!(
+            relocation_compaction_shape(&[meta(1, LSM_COMPACTION_PATCH_BYTES)], &[]),
+            Some(RelocationCompactionShape::Full)
+        );
+    }
+
+    #[test]
+    fn tier_selects_comparable_sizes_in_manifest_order() {
+        let patches = vec![
+            meta(1, MIB),
+            meta(2, 10 * MIB),
+            meta(3, MIB),
+            meta(4, 4 * MIB),
+        ];
+        let tier = select_relocation_patch_tier(&patches);
+        assert_eq!(
+            tier.iter().map(|table| table.id).collect::<Vec<_>>(),
+            [1, 3, 4]
+        );
+        assert!(select_relocation_patch_tier(&[meta(1, MIB), meta(2, 5 * MIB)]).is_empty());
+        assert!(select_relocation_patch_tier(&[]).is_empty());
+        let many = (1..=20).map(|id| meta(id, MIB)).collect::<Vec<_>>();
+        assert_eq!(
+            select_relocation_patch_tier(&many).len(),
+            RELOCATION_PATCH_TIER_MAX_INPUTS
+        );
+    }
 }

@@ -1,8 +1,9 @@
 use std::{num::NonZeroU32, path::Path, sync::Arc};
 
 use lsm::{
-    GarbageRecord, Manifest, ManifestEdit, MergeOperator, Result, Snapshot, StrataLsn, TableMeta,
-    TableStore, TableTarget, TableWriter, select_patch_compaction_inputs, write_patch_compaction,
+    GarbageRecord, Manifest, ManifestEdit, MergeOperator, Replace, Result, Snapshot, StrataLsn,
+    TableMeta, TableStore, TableTarget, TableWriter, encode_inline_value,
+    select_patch_compaction_inputs, select_patch_group_inputs, write_patch_compaction,
 };
 use tempfile::TempDir;
 
@@ -86,5 +87,56 @@ fn write_base(root: &Path) -> TableMeta {
 fn write_patch(root: &Path, path: &str, id: u64, sequence: u64, value: &[u8]) -> TableMeta {
     let mut writer = TableWriter::create_patch(root, path, id, 0, "patch-v1").unwrap();
     writer.add_patch(b"a", sequence, value).unwrap();
+    writer.finish().unwrap()
+}
+
+/// A patch group merges exactly the patches it names. The unselected patch in the middle keeps
+/// its own lsn, so it still orders correctly against the merged output under last-write-wins.
+#[test]
+fn patch_group_compaction_merges_only_the_selected_patches() {
+    let directory = TempDir::new().unwrap();
+    let early = write_inline_patch(directory.path(), "early.sst", 2, 5, b"-5");
+    let mid = write_inline_patch(directory.path(), "mid.sst", 3, 7, b"-7");
+    let late = write_inline_patch(directory.path(), "late.sst", 4, 10, b"-10");
+    let mut manifest = Manifest::empty("base-v1", "patch-v1", NonZeroU32::new(1).unwrap());
+    manifest
+        .apply(&ManifestEdit {
+            remove: Vec::new(),
+            add_base: Vec::new(),
+            add_patches: vec![early.clone(), mid.clone(), late.clone()],
+            materialized_through: None,
+            wal_retained_from: None,
+        })
+        .unwrap();
+    let tables = Arc::new(TableStore::new(directory.path()));
+
+    let inputs = select_patch_group_inputs(&manifest, &tables, 0, &[early.clone(), late.clone()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(inputs.patches, [early, late]);
+
+    let (edit, garbage) =
+        write_patch_compaction(&inputs, &Replace, u64::MAX, || Ok(TableTarget::patch(5))).unwrap();
+    assert!(garbage.is_empty());
+    assert!(edit.add_base.is_empty());
+    assert_eq!(edit.add_patches.len(), 1);
+    assert_eq!(edit.remove, ["early.sst", "late.sst"]);
+    manifest.apply(&edit).unwrap();
+    let patches = &manifest.partitions[&0].patches;
+    assert_eq!(patches.len(), 2);
+    assert!(patches.contains(&mid));
+
+    let snapshot = Snapshot::new(tables, Arc::new(manifest), 10).unwrap();
+    assert_eq!(
+        snapshot.get(0, b"a", &Replace).unwrap(),
+        Some(encode_inline_value(b"-10"))
+    );
+}
+
+fn write_inline_patch(root: &Path, path: &str, id: u64, sequence: u64, value: &[u8]) -> TableMeta {
+    let mut writer = TableWriter::create_patch(root, path, id, 0, "patch-v1").unwrap();
+    writer
+        .add_patch(b"a", sequence, &encode_inline_value(value))
+        .unwrap();
     writer.finish().unwrap()
 }

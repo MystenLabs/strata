@@ -30,7 +30,8 @@ mod table_format;
 
 pub use compaction::{
     CompactionInputs, merge_compaction, select_base_compaction_inputs, select_compaction_inputs,
-    select_patch_compaction_inputs, write_compaction, write_patch_compaction,
+    select_patch_compaction_inputs, select_patch_group_inputs, write_compaction,
+    write_patch_compaction,
 };
 pub use core_types::{GarbageEvent, SegmentKey, StrataLsn};
 pub use engine::{
