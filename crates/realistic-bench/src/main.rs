@@ -213,6 +213,7 @@ struct Config {
     segment_max_bytes: u64,
     strata_gc: bool,
     strata_gc_min_epoch_copy_distance: Option<Epoch>,
+    strata_gc_workers: Option<usize>,
     relocation_profile_reads: usize,
     relocation_profile_timeout: Duration,
     rocksdb_min_blob_size: u64,
@@ -269,6 +270,7 @@ impl Config {
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             strata_gc: true,
             strata_gc_min_epoch_copy_distance: None,
+            strata_gc_workers: None,
             relocation_profile_reads: DEFAULT_RELOCATION_PROFILE_READS,
             relocation_profile_timeout: DEFAULT_RELOCATION_PROFILE_TIMEOUT,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
@@ -394,6 +396,10 @@ impl Config {
                 "--strata-gc-min-epoch-copy-distance" => {
                     config.strata_gc_min_epoch_copy_distance =
                         Some(parse_u64(&next_value(&mut args, &arg)?)?)
+                }
+                "--strata-gc-workers" => {
+                    config.strata_gc_workers =
+                        Some(parse_nonzero_usize(&next_value(&mut args, &arg)?)?)
                 }
                 "--relocation-profile-reads" => {
                     config.relocation_profile_reads =
@@ -541,6 +547,9 @@ impl Config {
         if self.strata_gc_min_epoch_copy_distance.is_some() && self.engine != EngineKind::Strata {
             return Err("--strata-gc-min-epoch-copy-distance requires --engine strata".to_owned());
         }
+        if self.strata_gc_workers.is_some() && self.engine != EngineKind::Strata {
+            return Err("--strata-gc-workers requires --engine strata".to_owned());
+        }
         if self.relocation_profile_reads > 0 && self.relocation_profile_timeout.is_zero() {
             return Err("--relocation-profile-timeout must be non-zero".to_owned());
         }
@@ -581,8 +590,10 @@ impl Config {
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             gc_workers_enabled: self.strata_gc && self.relocation_profile_reads == 0,
             gc_interval: DEFAULT_GC_INTERVAL,
-            gc_worker_count: DEFAULT_GC_WORKER_COUNT,
-            gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
+            gc_worker_count: self.strata_gc_workers.unwrap_or(DEFAULT_GC_WORKER_COUNT),
+            gc_initial_worker_count: self
+                .strata_gc_workers
+                .unwrap_or(DEFAULT_GC_INITIAL_WORKER_COUNT),
             gc_tuning_window_cycles: DEFAULT_GC_TUNING_WINDOW_CYCLES,
             gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
             gc_io_bytes_per_sec: STRATA_GC_IO_BYTES_PER_SEC,
@@ -2810,6 +2821,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             println!("strata_gc={}", config.strata_gc);
             let planner = config.store_config().gc_planner_config;
             println!(
+                "strata_gc_workers={}",
+                config.store_config().gc_worker_count
+            );
+            println!(
                 "strata_gc_min_l0_rewrite_epoch_distance={}",
                 planner.min_l0_rewrite_epoch_distance
             );
@@ -4031,6 +4046,7 @@ strata:
   --strata-gc <true|false>
   --strata-gc-min-epoch-copy-distance <epochs>
                                            minimum distance considered far for L0 usefulness and exact routing
+  --strata-gc-workers <count>            GC workers started and admitted initially; default 1
   --relocation-profile-reads <count>    post-workload HDD relocation profile; disables background GC for deterministic setup
   --relocation-profile-timeout <time>   setup/healing deadline; default 10m
 
