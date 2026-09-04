@@ -453,6 +453,25 @@ fn wait_for_lsm_gc(store: &StrataStore, expected_lsn: StrataLsn) {
     }
 }
 
+fn wait_for_writes_merged(store: &StrataStore, expected_lsn: StrataLsn) {
+    let started = Instant::now();
+    loop {
+        let merged = store
+            .index()
+            .get_blob_writes_merged_lsn()
+            .unwrap()
+            .unwrap_or_default();
+        if merged >= expected_lsn {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for writes merged through LSN {expected_lsn}; current frontier was {merged}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_for_expiry_accounting(store: &StrataStore, expected_lsn: StrataLsn) {
     let started = Instant::now();
     loop {
@@ -3936,6 +3955,99 @@ async fn cold_epoch_expiry_enables_gc_after_the_accounting_frontier() {
     assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
 }
 
+/// Clock-based expiry: once the write-merge frontier passes an epoch transition, an exact-epoch
+/// segment whose summary says every record ends at that epoch is deleted without waiting for the
+/// cold-base sweep to emit per-record Expired events. The compactor is held out with the
+/// admission lock so the strict frontier provably stays behind while the decision is made.
+#[tokio::test]
+async fn clock_expiry_deletes_exact_epoch_segment_before_the_cold_sweep() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
+    cfg.gc_interval = Duration::from_secs(3600);
+    cfg.gc_workers_enabled = false;
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    store.put(&key_a, b"payload-a").unwrap();
+    let extend_lsn = store.extend(&key_a, 43).unwrap().unwrap();
+    let lsn_b = store.put(&key_b, b"payload-b").unwrap();
+    store.sync().unwrap();
+    let mut sealed_state =
+        wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+    sealed_state.placement_class = PlacementClass::ExactEpoch(43);
+    store.index().put_segment_state(&sealed_state).unwrap();
+    let sealed_path = segment_state_path(store.config(), &sealed_state);
+    store.sync().unwrap();
+    // The lifetime hint reaches the segment summary through an ordinary merge of the extension.
+    wait_for_lsm_gc(&store, extend_lsn.max(lsn_b));
+    let summary = store
+        .index()
+        .get_segment_gc_summary(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.live_ref_count, 1);
+    assert_eq!(summary.future_epoch_histogram[&43].refs, 1);
+
+    // Hold the compactor out so no stale-base sweep can produce the Expired event.
+    let admission_lock = Arc::clone(&store.store.compaction_admission_lock);
+    let admission_guard = admission_lock.write().unwrap();
+
+    let (_, epoch_lsn) = store.increment_epoch().unwrap();
+    store.sync().unwrap();
+    assert_eq!(store.get(&key_a).unwrap(), None);
+    wait_for_writes_merged(&store, epoch_lsn);
+
+    // The strict frontier is stuck behind the transition; the write frontier has passed it.
+    let strict = store
+        .index()
+        .get_blob_expiry_accounted_lsn()
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        strict < epoch_lsn,
+        "strict frontier {strict} passed transition {epoch_lsn}"
+    );
+    let snapshot = store.index().build_gc_snapshot().unwrap().unwrap();
+    assert!(
+        snapshot
+            .expiry_accounted_epoch
+            .is_none_or(|epoch| epoch < 43)
+    );
+    assert_eq!(snapshot.writes_merged_epoch, Some(43));
+    assert_eq!(snapshot.clock_expiry_epoch(), Some(43));
+    let segment = snapshot
+        .segments
+        .iter()
+        .find(|segment| segment.state.segment_id == FIRST_SEGMENT_ID)
+        .unwrap();
+    assert_eq!(segment.summary.live_ref_count, 1);
+    let plan = GcPlanner::new(store.config().gc_planner_config.clone())
+        .plan(&snapshot)
+        .unwrap();
+    assert_eq!(plan.scenario, GcScenario::EmptyDelete);
+    assert_eq!(
+        plan.action,
+        GcAction::DeleteSegments {
+            segment_ids: vec![FIRST_SEGMENT_ID]
+        }
+    );
+    drop(admission_guard);
+
+    store.run_gc_once().unwrap();
+    let state = store
+        .index()
+        .get_segment_state(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.state, SegmentFileState::Deleted);
+    assert!(!sealed_path.exists());
+    assert_eq!(store.get(&key_a).unwrap(), None);
+    assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
+}
+
 #[tokio::test]
 async fn gc_worker_count_broadcasts_request_to_parallel_workers() {
     init_typed_store_metrics();
@@ -4068,13 +4180,18 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
         )
         .unwrap();
     // This test constructs an exact-epoch segment and its GC summary directly, bypassing the
-    // blob-LSM compaction and garbage-sweeper pipeline that normally advances this frontier.
-    // LSN 0 contains the store's genesis epoch transition, so accounting through LSN 0 means:
-    // "all bases have applied the genesis epoch, and its garbage records have been swept."
-    // Without this explicit test fixture state, the planner must conservatively return no plan.
+    // blob-LSM compaction and garbage-sweeper pipeline that normally advances these frontiers.
+    // LSN 0 contains the store's genesis epoch transition, so a frontier through LSN 0 means:
+    // "every write before the genesis epoch has been merged, and its garbage records have been
+    // swept." Pinned-epoch planning keys off the write-merge frontier; without this explicit
+    // fixture state the planner must conservatively return no plan.
     store
         .index()
         .put_blob_expiry_accounted_lsn_batch(&mut batch, 0)
+        .unwrap();
+    store
+        .index()
+        .put_blob_writes_merged_lsn_batch(&mut batch, 0)
         .unwrap();
     batch.write().unwrap();
     store.index().flush_wal(true).unwrap();

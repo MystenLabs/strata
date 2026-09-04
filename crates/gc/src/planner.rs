@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use core_types::SegmentOwner;
 use core_types::{
-    Epoch, PlacementClass, SegmentFileState, SegmentGcSummary, SegmentId, SegmentState, StrataLsn,
+    Epoch, EpochBucket, PlacementClass, SegmentFileState, SegmentGcSummary, SegmentId,
+    SegmentState, StrataLsn,
 };
 
 /// Cost and eligibility knobs for pure GC planning.
@@ -112,6 +113,14 @@ pub struct GcSnapshot {
     /// bases have been swept, and prevents `ExactEpoch(50)` from being treated as expired merely
     /// because `current_epoch` reached 50 while its summary still calls all bytes live.
     pub expiry_accounted_epoch: Option<Epoch>,
+    /// Latest epoch whose transition LSN the write-merge frontier has passed: every blob mutation
+    /// from before that transition has been merged into a base and folded into the summaries.
+    /// Unlike `expiry_accounted_epoch`, cold bases need not have been re-read.
+    ///
+    /// A lifetime extension is a write, so once this covers a transition no record can still hold
+    /// an unmerged extension across it, and a summary bucket ending at or before the covered
+    /// epoch is dead by the clock. `None` disables clock-based expiry.
+    pub writes_merged_epoch: Option<Epoch>,
     /// Highest contiguous Store LSN whose blob mutations have passed through a complete merge and
     /// whose resulting garbage records have reached the segment summaries in this snapshot.
     ///
@@ -126,6 +135,15 @@ pub struct GcSnapshot {
     pub published_lsn: StrataLsn,
     /// Candidate source segments and their GC summaries.
     pub segments: Vec<SegmentSnapshot>,
+}
+
+impl GcSnapshot {
+    /// Epoch through which known end epochs may be judged against the clock: the current epoch,
+    /// capped by the write-merge frontier's coverage.
+    pub fn clock_expiry_epoch(&self) -> Option<Epoch> {
+        self.writes_merged_epoch
+            .map(|epoch| epoch.min(self.current_epoch))
+    }
 }
 
 /// Per-source segment facts used by the planner.
@@ -182,6 +200,20 @@ impl SegmentSnapshot {
             && !self.claimed
             && self.liveness_complete(published_lsn)
             && self.summary.total_bytes > 0
+    }
+
+    /// Bytes and refs still live once records the clock has ended are discounted.
+    ///
+    /// With no clock-expiry epoch this is the summary's own live counters, which only per-record
+    /// Expired events decrement.
+    fn clock_live(&self, snapshot: &GcSnapshot) -> EpochBucket {
+        match snapshot.clock_expiry_epoch() {
+            Some(epoch) => self.summary.live_after_epoch(epoch),
+            None => EpochBucket {
+                refs: self.summary.live_ref_count,
+                bytes: self.summary.live_bytes,
+            },
+        }
     }
 }
 
@@ -381,7 +413,7 @@ impl GcPlanner {
             .segments
             .iter()
             .filter(|segment| segment.eligible_empty_delete_source(snapshot.published_lsn))
-            .filter(|segment| segment.summary.live_ref_count == 0)
+            .filter(|segment| segment.clock_live(snapshot).refs == 0)
             .map(|segment| {
                 (
                     segment.segment_id(),
@@ -572,12 +604,13 @@ impl GcPlanner {
     fn pinned_epoch_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
         // Pinned-epoch cleanup is the one planner scenario whose eligibility is created by the
         // wall-clock-like epoch pointer rather than by explicit retired/expired counters. Require
-        // the independent accounting frontier before using it. Example: current epoch 50 with no
-        // accounted epoch may still have a pre-expiry SetLifetime(70) waiting in a patch, so an
-        // ExactEpoch(50) segment is left alone. Once `expiry_accounted_epoch >= 50`, every such
-        // patch and cold base has been merged and its garbage swept, making `live_bytes` suitable
-        // for the copy-versus-reclassify decision below.
-        let Some(expiry_accounted_epoch) = snapshot.expiry_accounted_epoch else {
+        // the write-merge frontier before using it. Example: current epoch 50 with no covered
+        // epoch may still have a pre-expiry SetLifetime(70) waiting in a patch, so an
+        // ExactEpoch(50) segment is left alone. Once the frontier covers the transition to 50,
+        // every such patch has been merged and its hint swept, so the summary's end-epoch buckets
+        // are exact: bytes ending at or before 50 are dead by the clock, and only the extended
+        // buckets remain live for the copy-versus-reclassify decision below.
+        let Some(clock_expiry_epoch) = snapshot.clock_expiry_epoch() else {
             return Vec::new();
         };
         snapshot
@@ -587,13 +620,14 @@ impl GcPlanner {
             .filter(|segment| {
                 matches!(
                     segment.state.placement_class,
-                    PlacementClass::ExactEpoch(epoch)
-                        if epoch <= snapshot.current_epoch && epoch <= expiry_accounted_epoch
+                    PlacementClass::ExactEpoch(epoch) if epoch <= clock_expiry_epoch
                 )
             })
-            .filter(|segment| segment.summary.live_bytes > 0)
-            .map(|segment| {
-                if segment.summary.live_bytes > self.config.max_copy_bytes_per_plan {
+            .map(|segment| (segment, segment.clock_live(snapshot)))
+            .filter(|(_, live)| live.bytes > 0)
+            .map(|(segment, live)| {
+                let garbage_bytes = segment.summary.total_bytes.saturating_sub(live.bytes);
+                if live.bytes > self.config.max_copy_bytes_per_plan {
                     GcPlan {
                         scenario: GcScenario::PinnedEpochExpiry,
                         action: GcAction::ReclassifySegment {
@@ -602,7 +636,7 @@ impl GcPlanner {
                         },
                         copied_bytes: 0,
                         expected_reclaim_bytes: 0,
-                        score: i128::from(segment.summary.live_bytes),
+                        score: i128::from(live.bytes),
                     }
                 } else {
                     let routes = self.route_segment_live_bytes(snapshot, segment);
@@ -612,13 +646,9 @@ impl GcPlanner {
                             source_segment_id: segment.segment_id(),
                             routes,
                         },
-                        copied_bytes: segment.summary.live_bytes,
-                        expected_reclaim_bytes: segment.summary.garbage_bytes(),
-                        score: score_rewrite(
-                            segment.summary.garbage_bytes(),
-                            segment.summary.live_bytes,
-                            1_750,
-                        ),
+                        copied_bytes: live.bytes,
+                        expected_reclaim_bytes: garbage_bytes,
+                        score: score_rewrite(garbage_bytes, live.bytes, 1_750),
                     }
                 }
             })
@@ -633,8 +663,13 @@ impl GcPlanner {
         let mut routes = Vec::new();
 
         let stable_lifetimes = self.segment_lifetimes_stable(&segment.summary);
+        let clock_expiry_epoch = snapshot.clock_expiry_epoch();
         for (epoch, bucket) in &segment.summary.future_epoch_histogram {
             if bucket.bytes == 0 || bucket.refs == 0 {
+                continue;
+            }
+            // Dead by the clock: the copy path skips these records, so they need no route.
+            if clock_expiry_epoch.is_some_and(|cutoff| *epoch <= cutoff) {
                 continue;
             }
             let destination_class = if stable_lifetimes
@@ -817,6 +852,7 @@ mod tests {
         GcSnapshot {
             current_epoch: 10,
             expiry_accounted_epoch: Some(10),
+            writes_merged_epoch: Some(10),
             lifecycle_accounted_lsn: Some(10),
             published_lsn: 10,
             segments,
@@ -1205,19 +1241,20 @@ mod tests {
         add_epoch_bucket(&mut segment_summary, 30, 1_500, 3);
         let segment = sealed_segment(1, PlacementClass::ExactEpoch(9), segment_summary);
 
-        // `current_epoch` alone used to create an eager reclassification here. With no accounted
-        // frontier the 1,500 bytes may still include records whose expiry or pre-expiry extension
-        // has not reached the summary, so the planner must leave the exact-epoch segment alone.
+        // `current_epoch` alone used to create an eager reclassification here. With no write
+        // frontier the 1,500 bytes may still include records whose pre-expiry extension has not
+        // been merged, so the planner must leave the exact-epoch segment alone.
         let mut unaccounted = snapshot(vec![segment.clone()]);
-        unaccounted.expiry_accounted_epoch = None;
+        unaccounted.writes_merged_epoch = None;
         assert!(planner().plan(&unaccounted).is_none());
 
-        // A frontier behind the physical directory is equally insufficient: accounting through
-        // epoch 8 says nothing about the transition that made ExactEpoch(9) eligible.
-        unaccounted.expiry_accounted_epoch = Some(8);
+        // A frontier behind the physical directory is equally insufficient: writes merged through
+        // epoch 8 say nothing about extensions racing the transition that made ExactEpoch(9)
+        // eligible.
+        unaccounted.writes_merged_epoch = Some(8);
         assert!(planner().plan(&unaccounted).is_none());
 
-        unaccounted.expiry_accounted_epoch = Some(9);
+        unaccounted.writes_merged_epoch = Some(9);
         assert_eq!(
             planner().plan(&unaccounted).unwrap().scenario,
             GcScenario::PinnedEpochExpiry
@@ -1231,11 +1268,60 @@ mod tests {
         let snapshot = GcSnapshot {
             current_epoch: 10,
             expiry_accounted_epoch: Some(10),
+            writes_merged_epoch: Some(10),
             lifecycle_accounted_lsn: Some(10),
             published_lsn: 10,
             segments: vec![segment],
         };
 
         assert!(planner().plan(&snapshot).is_none());
+    }
+
+    #[test]
+    fn clock_expiry_deletes_an_exact_epoch_segment_before_its_expired_events_arrive() {
+        // The summary still counts every record live: no cold sweep has re-read the keys.
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        segment_summary.live_ref_count = 4;
+        add_epoch_bucket(&mut segment_summary, 9, 1_000, 4);
+        let segment = sealed_segment(1, PlacementClass::ExactEpoch(9), segment_summary);
+
+        // With the write frontier past the transition to 9, the bucket ending at 9 is dead by
+        // the clock and the segment is empty, whatever the strict frontier says.
+        let mut snapshot = snapshot(vec![segment.clone()]);
+        snapshot.expiry_accounted_epoch = Some(3);
+        let plan = planner().plan(&snapshot).unwrap();
+        assert_eq!(plan.scenario, GcScenario::EmptyDelete);
+        assert_eq!(
+            plan.action,
+            GcAction::DeleteSegments {
+                segment_ids: vec![1]
+            }
+        );
+
+        // Without the write frontier the per-record counters are all the planner may trust.
+        snapshot.writes_merged_epoch = None;
+        assert!(planner().plan(&snapshot).is_none());
+    }
+
+    #[test]
+    fn clock_expiry_drains_only_the_extended_records_of_a_pinned_epoch() {
+        let mut segment_summary = summary(1_000, 1_000, 0);
+        segment_summary.live_ref_count = 4;
+        add_epoch_bucket(&mut segment_summary, 9, 750, 3);
+        add_epoch_bucket(&mut segment_summary, 30, 250, 1);
+        let segment = sealed_segment(1, PlacementClass::ExactEpoch(9), segment_summary);
+
+        let mut snapshot = snapshot(vec![segment]);
+        snapshot.expiry_accounted_epoch = Some(3);
+        let plan = planner().plan(&snapshot).unwrap();
+        assert_eq!(plan.scenario, GcScenario::PinnedEpochExpiry);
+        assert_eq!(plan.copied_bytes, 250);
+        assert_eq!(plan.expected_reclaim_bytes, 750);
+        let GcAction::MoveLiveBytes { routes, .. } = &plan.action else {
+            panic!("pinned drain must copy the extended bytes");
+        };
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].end_epoch, Some(30));
+        assert_eq!(routes[0].bytes, 250);
     }
 }

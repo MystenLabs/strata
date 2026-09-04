@@ -189,16 +189,28 @@ impl GarbageLogSweeper {
             .index
             .get_blob_expiry_accounted_lsn()?
             .unwrap_or_default();
+        // The write-merge frontier is the same bound minus the per-base re-read requirement. It
+        // is what lets GC judge known end epochs against the clock: once it passes an epoch
+        // transition, no lifetime extension from before that transition is still unmerged, and
+        // the drained log above guarantees every merged extension's hint reached its summary.
+        let writes_candidate = manifest.writes_merged_through_lsn();
+        let writes_current = self.index.get_blob_writes_merged_lsn()?.unwrap_or_default();
         // LSN 0 is only the genesis epoch and cannot expire a valid foreground write: lifetimes
         // must be strictly greater than the current epoch when assigned. Waiting for a positive
         // frontier also avoids waking GC on every empty store merely to publish genesis coverage.
-        if candidate <= current {
+        if candidate <= current && writes_candidate <= writes_current {
             return Ok(false);
         }
 
         let mut batch = self.index.batch();
-        self.index
-            .put_blob_expiry_accounted_lsn_batch(&mut batch, candidate)?;
+        if candidate > current {
+            self.index
+                .put_blob_expiry_accounted_lsn_batch(&mut batch, candidate)?;
+        }
+        if writes_candidate > writes_current {
+            self.index
+                .put_blob_writes_merged_lsn_batch(&mut batch, writes_candidate)?;
+        }
         batch.write_with_sync(true).map_err(index::Error::from)?;
         Ok(true)
     }

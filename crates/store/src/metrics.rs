@@ -143,6 +143,9 @@ struct PrometheusMetrics {
     gc_tuner_increases_total: IntCounter,
     gc_tuner_decreases_total: IntCounter,
     gc_tuner_health_state: IntGauge,
+    gc_expiry_accounted_epoch: IntGauge,
+    gc_writes_merged_epoch: IntGauge,
+    gc_clock_expiry_lag_epochs: IntGauge,
 }
 
 impl StrataStoreMetrics {
@@ -831,6 +834,24 @@ impl StrataStoreMetrics {
                     "gc_tuner_health_state",
                     "Current Strata GC tuner health state: 0 healthy, 1 pressured, 2 cooldown.",
                 )?,
+                gc_expiry_accounted_epoch: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_expiry_accounted_epoch",
+                    "Latest epoch whose transition every blob-LSM base has been re-read after (-1 when unknown).",
+                )?,
+                gc_writes_merged_epoch: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_writes_merged_epoch",
+                    "Latest epoch whose transition the blob-LSM write-merge frontier has passed (-1 when unknown).",
+                )?,
+                gc_clock_expiry_lag_epochs: register_gauge(
+                    registry,
+                    &labels,
+                    "gc_clock_expiry_lag_epochs",
+                    "Epochs between the current epoch and the clock-expiry epoch GC may judge known end epochs against.",
+                )?,
             })),
             #[cfg(feature = "internal-profiling")]
             profile_sink: None,
@@ -1509,6 +1530,28 @@ impl StrataStoreMetrics {
         if let Some(metrics) = &self.inner {
             metrics.gc_tuner_health_state.set(state);
         }
+    }
+
+    pub(crate) fn set_gc_frontier_epochs(
+        &self,
+        current_epoch: Epoch,
+        expiry_accounted_epoch: Option<Epoch>,
+        writes_merged_epoch: Option<Epoch>,
+    ) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        let gauge = |epoch: Option<Epoch>| epoch.map_or(-1, to_i64);
+        metrics
+            .gc_expiry_accounted_epoch
+            .set(gauge(expiry_accounted_epoch));
+        metrics
+            .gc_writes_merged_epoch
+            .set(gauge(writes_merged_epoch));
+        let clock_expiry_epoch = writes_merged_epoch.map(|epoch| epoch.min(current_epoch));
+        metrics.gc_clock_expiry_lag_epochs.set(
+            clock_expiry_epoch.map_or(-1, |epoch| to_i64(current_epoch.saturating_sub(epoch))),
+        );
     }
 }
 

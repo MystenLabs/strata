@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use core_types::{SegmentId, SegmentOwner, ShardId, ShardInfo, StoreStateKey, StrataLsn};
+use core_types::{Epoch, SegmentId, SegmentOwner, ShardId, ShardInfo, StoreStateKey, StrataLsn};
 use gc_planner::{GcSnapshot, SegmentSnapshot};
 use typed_store::Map;
 use typed_store::rocks::DBBatch;
@@ -44,23 +44,26 @@ impl StrataIndex {
         let expiry_accounted_lsn = self
             .store_state
             .get_with_snapshot(&snapshot, &StoreStateKey::BlobExpiryAccountedLsn)?;
-        let expiry_accounted_epoch = if let Some(accounted_lsn) = expiry_accounted_lsn {
-            // Epoch history and the frontier are read from the same RocksDB snapshot as the
-            // segment summaries below. For example, frontier LSN 120 maps to epoch 50 only when
-            // the `(120, 50)` history row is visible here; this prevents a newly published epoch
-            // pointer from being paired with counters from before its expiry sweep.
-            let mut accounted_epoch = None;
-            for result in self.epoch_changes.safe_iter_with_snapshot(&snapshot)? {
-                let (lsn, epoch) = result?;
-                if lsn <= accounted_lsn
-                    && accounted_epoch.is_none_or(|(latest_lsn, _)| lsn > latest_lsn)
-                {
-                    accounted_epoch = Some((lsn, epoch));
-                }
-            }
-            accounted_epoch.map(|(_, epoch)| epoch)
-        } else {
-            None
+        // Epoch history and the frontiers are read from the same RocksDB snapshot as the segment
+        // summaries below. For example, frontier LSN 120 maps to epoch 50 only when the
+        // `(120, 50)` history row is visible here; this prevents a newly published epoch pointer
+        // from being paired with counters from before its expiry sweep.
+        let expiry_accounted_epoch = match expiry_accounted_lsn {
+            Some(lsn) => latest_epoch_at_or_before(
+                self.epoch_changes.safe_iter_with_snapshot(&snapshot)?,
+                lsn,
+            )?,
+            None => None,
+        };
+        let writes_merged_lsn = self
+            .store_state
+            .get_with_snapshot(&snapshot, &StoreStateKey::BlobWritesMergedLsn)?;
+        let writes_merged_epoch = match writes_merged_lsn {
+            Some(lsn) => latest_epoch_at_or_before(
+                self.epoch_changes.safe_iter_with_snapshot(&snapshot)?,
+                lsn,
+            )?,
+            None => None,
         };
         let shard_infos = self
             .shards
@@ -91,10 +94,38 @@ impl StrataIndex {
         Ok(Some(GcSnapshot {
             current_epoch,
             expiry_accounted_epoch,
+            writes_merged_epoch,
             lifecycle_accounted_lsn: expiry_accounted_lsn,
             published_lsn,
             segments,
         }))
+    }
+
+    /// Epoch through which GC may trust a record's known end epoch against the clock: the current
+    /// epoch, capped by the epoch whose transition the write-merge frontier has passed.
+    ///
+    /// The clock, the frontier, and the epoch history are read from one RocksDB snapshot so a
+    /// newly published epoch pointer cannot be paired with an older frontier. `None` means no
+    /// frontier has been published yet, which disables clock-based expiry.
+    pub fn clock_expiry_epoch(&self) -> Result<Option<Epoch>> {
+        let snapshot = self.db.snapshot();
+        let Some(current_epoch) = self
+            .store_state
+            .get_with_snapshot(&snapshot, &StoreStateKey::CurrentEpoch)?
+        else {
+            return Ok(None);
+        };
+        let Some(writes_merged_lsn) = self
+            .store_state
+            .get_with_snapshot(&snapshot, &StoreStateKey::BlobWritesMergedLsn)?
+        else {
+            return Ok(None);
+        };
+        Ok(latest_epoch_at_or_before(
+            self.epoch_changes.safe_iter_with_snapshot(&snapshot)?,
+            writes_merged_lsn,
+        )?
+        .map(|epoch| epoch.min(current_epoch)))
     }
 
     /// Persists GC output bytes and the relocation activation that must be durable before the
@@ -205,4 +236,20 @@ impl StrataIndex {
         batch.delete_batch(self.gc_reclaim_strategies(), keys)?;
         Ok(removed)
     }
+}
+
+/// The epoch published at the latest transition whose LSN is at or below `lsn`.
+fn latest_epoch_at_or_before<I, E>(changes: I, lsn: StrataLsn) -> Result<Option<Epoch>>
+where
+    I: IntoIterator<Item = std::result::Result<(StrataLsn, Epoch), E>>,
+    Error: From<E>,
+{
+    let mut latest = None;
+    for result in changes {
+        let (change_lsn, epoch) = result?;
+        if change_lsn <= lsn && latest.is_none_or(|(latest_lsn, _)| change_lsn > latest_lsn) {
+            latest = Some((change_lsn, epoch));
+        }
+    }
+    Ok(latest.map(|(_, epoch)| epoch))
 }

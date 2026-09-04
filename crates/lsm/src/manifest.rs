@@ -145,6 +145,27 @@ impl Manifest {
         applied
     }
 
+    /// Highest contiguous caller LSN below which every write has been merged into a base table.
+    ///
+    /// This is [`Self::merge_applied_through_lsn`] without the per-base bound: it stops at the
+    /// materialized frontier and just below the oldest live patch, but does not wait for cold
+    /// bases to be revisited. A key with no live patch has no unmerged write, so global state
+    /// that only matters through writes, such as a lifetime extension racing an epoch
+    /// transition, is fully reflected in the bases once this passes the transition.
+    pub fn writes_merged_through_lsn(&self) -> StrataLsn {
+        let mut merged = self.materialized_through.unwrap_or_default();
+        for tables in self.partitions.values() {
+            for patch in &tables.patches {
+                let before_patch = patch
+                    .min_lsn
+                    .expect("validated patch tables have a minimum LSN")
+                    .saturating_sub(1);
+                merged = merged.min(before_patch);
+            }
+        }
+        merged
+    }
+
     /// Applies one file level edit without requiring the manifest generation captured by its
     /// producer to still be current.
     ///
@@ -547,11 +568,16 @@ mod tests {
         // Even though the patch extends to LSN 140, its LSN-125 operand may be a lifetime
         // extension that must be folded before an epoch transition at 125 can be called applied.
         assert_eq!(manifest.merge_applied_through_lsn(), 124);
+        // The write frontier is bounded by the same unmerged patch...
+        assert_eq!(manifest.writes_merged_through_lsn(), 124);
 
         manifest
             .apply(&edit(&["p.sst"], Vec::new(), Vec::new()))
             .unwrap();
         assert_eq!(manifest.merge_applied_through_lsn(), 130);
+        // ...but not by cold bases: with no live patch, every write through the materialized
+        // frontier has been merged, even though the bases were last re-read at 130 and 135.
+        assert_eq!(manifest.writes_merged_through_lsn(), 140);
     }
 
     #[test]

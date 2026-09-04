@@ -544,3 +544,49 @@ fn reference_fold_of_a_small_record_segment_for_comparison() {
     );
     assert_eq!(reference, indexed);
 }
+
+#[test]
+fn live_after_epoch_discounts_ended_buckets_and_keeps_the_unclassified_remainder() {
+    let mut summary = SegmentGcSummary {
+        total_bytes: 1_000,
+        live_bytes: 1_000,
+        live_ref_count: 5,
+        unknown_lifetime_bytes: 100,
+        unknown_lifetime_ref_count: 1,
+        ..SegmentGcSummary::default()
+    };
+    summary.future_epoch_histogram.insert(
+        50,
+        EpochBucket {
+            refs: 2,
+            bytes: 500,
+        },
+    );
+    summary.future_epoch_histogram.insert(
+        70,
+        EpochBucket {
+            refs: 1,
+            bytes: 200,
+        },
+    );
+    // 5 live refs: 2 end at 50, 1 ends at 70, 1 is unknown, 1 is unclassified.
+
+    let live = summary.live_after_epoch(49);
+    assert_eq!((live.refs, live.bytes), (5, 1_000));
+    let live = summary.live_after_epoch(50);
+    assert_eq!((live.refs, live.bytes), (3, 500));
+    let live = summary.live_after_epoch(70);
+    assert_eq!((live.refs, live.bytes), (2, 300));
+
+    // A fully classified summary reaches zero once every bucket has ended.
+    summary.live_ref_count = 4;
+    summary.live_bytes = 800;
+    summary.unknown_lifetime_bytes = 0;
+    summary.unknown_lifetime_ref_count = 0;
+    let live = summary.live_after_epoch(70);
+    assert_eq!((live.refs, live.bytes), (1, 100));
+    summary.live_ref_count = 3;
+    summary.live_bytes = 700;
+    let live = summary.live_after_epoch(70);
+    assert_eq!((live.refs, live.bytes), (0, 0));
+}

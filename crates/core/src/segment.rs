@@ -172,6 +172,40 @@ impl SegmentGcSummary {
     pub fn is_empty(&self) -> bool {
         self.live_ref_count == 0
     }
+
+    /// Live bytes and refs the clock has not ended by `epoch`: every histogram bucket ending after
+    /// it, plus bytes whose lifetime is unknown.
+    ///
+    /// A record whose known end epoch is at or before `epoch` is dead once the clock reaches it,
+    /// whether or not compaction has produced its per-record Expired event yet. Callers may rely
+    /// on that only once every write from before the transition to `epoch` has been merged, so
+    /// no lifetime extension can still be unfolded; the GC snapshot's clock-expiry epoch is that
+    /// bound.
+    pub fn live_after_epoch(&self, epoch: Epoch) -> EpochBucket {
+        let mut live = EpochBucket {
+            refs: self.unknown_lifetime_ref_count,
+            bytes: self.unknown_lifetime_bytes,
+        };
+        let mut classified = live;
+        for (&end_epoch, bucket) in &self.future_epoch_histogram {
+            classified.refs = classified.refs.saturating_add(bucket.refs);
+            classified.bytes = classified.bytes.saturating_add(bucket.bytes);
+            if end_epoch > epoch {
+                live.refs = live.refs.saturating_add(bucket.refs);
+                live.bytes = live.bytes.saturating_add(bucket.bytes);
+            }
+        }
+        // Live refs the histogram and unknown counters do not account for (a summary written
+        // before lifetimes were tracked, or one built by hand) cannot be judged by the clock and
+        // stay live.
+        live.refs = live
+            .refs
+            .saturating_add(self.live_ref_count.saturating_sub(classified.refs));
+        live.bytes = live
+            .bytes
+            .saturating_add(self.live_bytes.saturating_sub(classified.bytes));
+        live
+    }
 }
 
 /// Stale tolerant segment local overlay used by GC copy planning.

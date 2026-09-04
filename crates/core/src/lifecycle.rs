@@ -245,6 +245,15 @@ pub enum StoreStateKey {
     ///
     /// Appended here so every preceding persisted discriminant remains stable.
     BlobExpiryAccountedLsn,
+    /// Highest Store LSN below which every blob mutation has been merged into a base table and
+    /// its garbage has reached the per-segment summaries: the write-coverage half of
+    /// `BlobExpiryAccountedLsn`, without requiring that cold bases were re-read.
+    ///
+    /// GC uses it to trust a record's known end epoch against the clock. A lifetime extension is
+    /// a write, so once this frontier passes an epoch transition no extension from before that
+    /// transition can still be unmerged. Appended here so every preceding persisted discriminant
+    /// remains stable.
+    BlobWritesMergedLsn,
 }
 
 /// Exclusive end of a store-WAL prefix made durable by a completed file sync.
