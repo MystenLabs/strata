@@ -186,6 +186,7 @@ struct Config {
     epoch_duration: Duration,
     future_epochs: Epoch,
     lifetime_seed: u64,
+    hashed_keys: bool,
     cleanup_grace: Duration,
     payload_size: usize,
     put_ops_per_second: u64,
@@ -243,6 +244,7 @@ impl Config {
             epoch_duration: DEFAULT_EPOCH_DURATION,
             future_epochs: DEFAULT_FUTURE_EPOCHS,
             lifetime_seed: DEFAULT_LIFETIME_SEED,
+            hashed_keys: false,
             cleanup_grace: DEFAULT_CLEANUP_GRACE,
             payload_size: DEFAULT_PAYLOAD_SIZE,
             put_ops_per_second: 0,
@@ -311,6 +313,7 @@ impl Config {
                 "--lifetime-seed" => {
                     config.lifetime_seed = parse_u64(&next_value(&mut args, &arg)?)?
                 }
+                "--hashed-keys" => config.hashed_keys = parse_bool(&next_value(&mut args, &arg)?)?,
                 "--cleanup-grace" => {
                     config.cleanup_grace = parse_duration(&next_value(&mut args, &arg)?)?
                 }
@@ -1763,11 +1766,24 @@ impl LifetimeOffsetCounts {
     }
 }
 
-fn make_key(id: u64) -> Result<BlobKey, String> {
+/// Sequential keys sort in id order, so a memtable flush overlaps only the newest main-LSM base
+/// file. Hashed keys sort like production blob ids: every flush spans the whole key space.
+fn make_key(id: u64, hashed: bool) -> Result<BlobKey, String> {
     let mut bytes = Vec::with_capacity(KEY_PREFIX.len() + 20);
     bytes.extend_from_slice(KEY_PREFIX);
-    bytes.extend_from_slice(id.to_string().as_bytes());
+    if hashed {
+        bytes.extend_from_slice(format!("{:016x}", splitmix64(id)).as_bytes());
+    } else {
+        bytes.extend_from_slice(id.to_string().as_bytes());
+    }
     BlobKey::new(bytes).map_err(|error| error.to_string())
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 fn make_payload(size: usize) -> Arc<[u8]> {
@@ -1830,7 +1846,7 @@ fn run_writer(worker_index: usize, context: Arc<WorkloadContext>) {
         }
 
         let id = context.next_key_id.fetch_add(1, Ordering::Relaxed);
-        let key = match make_key(id) {
+        let key = match make_key(id, context.config.hashed_keys) {
             Ok(key) => key,
             Err(error) => {
                 context.fatal.set(
@@ -2771,6 +2787,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("future_epochs={}", config.future_epochs);
             println!("lifetime_seed={}", config.lifetime_seed);
+            println!("hashed_keys={}", config.hashed_keys);
         }
     }
     println!(
@@ -4015,6 +4032,7 @@ workload:
   --epoch-duration <duration>            epoch-mode cadence; default 5m
   --future-epochs <count>                epoch-mode uniform future lifetime window; default 52
   --lifetime-seed <u64>                  deterministic lifetime distribution seed
+  --hashed-keys <true|false>             spread keys uniformly over the key space instead of in id order; default false
   --cleanup-grace <duration>             no-traffic reclamation window; default 5m
   --payload-size <bytes|KiB|MiB|GiB>     default 1MiB
   --put-ops-per-second <count>           global put-rate target; 0 keeps AIMD control (default)
@@ -4305,7 +4323,7 @@ mod tests {
         let written_at = Instant::now();
         let mut model = Model::new(10);
         let record = Arc::new(KeyRecord::with_retention(
-            make_key(7).expect("key should be valid"),
+            make_key(7, false).expect("key should be valid"),
             written_at,
             Duration::from_secs(10),
         ));
@@ -4334,7 +4352,7 @@ mod tests {
         let mut model = Model::new(10);
         for (key, retention) in [(1, 10), (3, 30), (2, 20)] {
             model.push_live(Arc::new(KeyRecord::with_retention(
-                make_key(key).expect("key should be valid"),
+                make_key(key, false).expect("key should be valid"),
                 written_at,
                 Duration::from_secs(retention),
             )));
@@ -4345,7 +4363,7 @@ mod tests {
                 .claim_due(written_at + Duration::from_secs(10), None, &metrics)
                 .expect("first key should be due")
                 .key,
-            make_key(1).expect("key should be valid")
+            make_key(1, false).expect("key should be valid")
         );
         assert!(
             model
@@ -4357,7 +4375,7 @@ mod tests {
                 .claim_due(written_at + Duration::from_secs(20), None, &metrics)
                 .expect("second key should be due")
                 .key,
-            make_key(2).expect("key should be valid")
+            make_key(2, false).expect("key should be valid")
         );
         assert_eq!(model.live.len(), 1);
         assert_eq!(model.live_sample.len(), 1);
@@ -4373,7 +4391,7 @@ mod tests {
         let mut model = Model::new(10);
         for (key_id, end_epoch, due_after) in [(1, 2, 10), (2, 3, 20)] {
             model.push_live(Arc::new(KeyRecord::with_epoch(
-                make_key(key_id).expect("key should be valid"),
+                make_key(key_id, false).expect("key should be valid"),
                 written_at,
                 written_at + Duration::from_secs(due_after),
                 end_epoch,
