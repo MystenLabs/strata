@@ -89,6 +89,14 @@ pub struct TableStore {
     uses: Mutex<HashMap<String, TableUse>>,
     live_snapshots: LiveSnapshots,
     block_cache: Arc<BlockCache>,
+    /// Open readers shared by every snapshot over the same file, keyed by relative path.
+    ///
+    /// A manifest install builds a fresh snapshot over every live table. Without this cache that
+    /// reopened each file and re-decoded its footer, Bloom filters, and indexes under the engine's
+    /// memory lock on every flush, compaction, and relocation activation, which stalled every
+    /// concurrent read for the duration. A reader is opened once per file and dropped when the
+    /// file is removed.
+    readers: Mutex<HashMap<String, Arc<TableReader>>>,
 }
 
 impl TableStore {
@@ -102,6 +110,7 @@ impl TableStore {
             uses: Mutex::new(HashMap::new()),
             live_snapshots: LiveSnapshots::default(),
             block_cache: Arc::new(BlockCache::new(capacity)),
+            readers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -115,6 +124,57 @@ impl TableStore {
 
     pub fn block_cache_stats(&self) -> BlockCacheStats {
         self.block_cache.stats()
+    }
+
+    /// Number of table readers currently held open by the reader cache.
+    pub fn cached_reader_count(&self) -> usize {
+        self.readers().len()
+    }
+
+    /// The shared reader for a base table, opened and cached on first use.
+    pub(crate) fn cached_base_reader(
+        &self,
+        meta: &TableMeta,
+        schema_id: &str,
+    ) -> Result<Arc<TableReader>> {
+        self.cached_reader(meta, |block_cache| {
+            TableReader::open_base_cached(&self.root, meta, schema_id, block_cache)
+        })
+    }
+
+    /// The shared reader for a patch table, opened and cached on first use.
+    pub(crate) fn cached_patch_reader(
+        &self,
+        meta: &TableMeta,
+        patch_format_id: &str,
+    ) -> Result<Arc<TableReader>> {
+        self.cached_reader(meta, |block_cache| {
+            TableReader::open_patch_cached(&self.root, meta, patch_format_id, block_cache)
+        })
+    }
+
+    /// Looks the reader up, or opens it outside the cache lock so a slow open never blocks
+    /// other snapshots from reusing readers they already have. A racing opener of the same file
+    /// simply loses and adopts the winner's reader.
+    fn cached_reader(
+        &self,
+        meta: &TableMeta,
+        open: impl FnOnce(Arc<BlockCache>) -> Result<TableReader>,
+    ) -> Result<Arc<TableReader>> {
+        if let Some(reader) = self.readers().get(&meta.relative_path) {
+            return Ok(Arc::clone(reader));
+        }
+        let reader = Arc::new(open(Arc::clone(&self.block_cache))?);
+        let mut readers = self.readers();
+        Ok(Arc::clone(
+            readers.entry(meta.relative_path.clone()).or_insert(reader),
+        ))
+    }
+
+    fn readers(&self) -> MutexGuard<'_, HashMap<String, Arc<TableReader>>> {
+        self.readers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     pub fn is_pinned(&self, table: &TableMeta) -> bool {
@@ -194,6 +254,7 @@ impl TableStore {
             Err(source) => return Err(Error::Io { path, source }),
         }
         self.block_cache.remove_table(table.id);
+        self.readers().remove(&table.relative_path);
         Ok(true)
     }
 
@@ -347,28 +408,12 @@ impl Snapshot {
             let base = partition_tables
                 .base
                 .iter()
-                .map(|table| {
-                    TableReader::open_base_cached(
-                        tables.root(),
-                        table,
-                        &manifest.schema_id,
-                        Arc::clone(&tables.block_cache),
-                    )
-                    .map(Arc::new)
-                })
+                .map(|table| tables.cached_base_reader(table, &manifest.schema_id))
                 .collect::<Result<Vec<_>>>()?;
             let patches = partition_tables
                 .patches
                 .iter()
-                .map(|table| {
-                    TableReader::open_patch_cached(
-                        tables.root(),
-                        table,
-                        &manifest.patch_format_id,
-                        Arc::clone(&tables.block_cache),
-                    )
-                    .map(Arc::new)
-                })
+                .map(|table| tables.cached_patch_reader(table, &manifest.patch_format_id))
                 .collect::<Result<Vec<_>>>()?;
             readers.insert(partition, PartitionReaders { base, patches });
         }
