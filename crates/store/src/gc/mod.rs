@@ -40,7 +40,7 @@ use std::{
 };
 
 use core_types::{
-    PlacementClass, RecordRef, SegmentFileState, SegmentGcOverlay, SegmentId, SegmentOwner,
+    Epoch, PlacementClass, RecordRef, SegmentFileState, SegmentGcOverlay, SegmentId, SegmentOwner,
     SegmentState, ShardKey, StrataLsn,
 };
 use gc_planner::{DestinationClass, GcCopyRecord, GcPlan, GcPlanner};
@@ -79,6 +79,9 @@ pub struct PreparedGcPlan {
     pub plan: GcPlan,
     /// Source classifications folded from the selected segments' committed local garbage logs.
     source_overlays: BTreeMap<SegmentId, SegmentGcOverlay>,
+    /// Epoch through which a record's known end epoch may be judged dead by the clock during the
+    /// copy, from the same snapshot the plan was made from. See `GcSnapshot::clock_expiry_epoch`.
+    clock_expiry_epoch: Option<Epoch>,
     /// In-memory source segment claim held until this plan is copied or dropped.
     #[doc(hidden)]
     pub claim: Option<GcSourceClaimGuard>,

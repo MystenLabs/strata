@@ -38,6 +38,12 @@ impl StrataIndex {
             .get(&StoreStateKey::BlobExpiryAccountedLsn)?)
     }
 
+    /// Returns the durable write-merge frontier: every blob mutation below it has been merged
+    /// into a base table and its garbage swept into the segment summaries.
+    pub fn get_blob_writes_merged_lsn(&self) -> Result<Option<StrataLsn>> {
+        Ok(self.store_state.get(&StoreStateKey::BlobWritesMergedLsn)?)
+    }
+
     pub fn get_store_wal_retained_from(&self) -> Result<Option<u64>> {
         Ok(self.store_state.get(&StoreStateKey::StoreWalRetainedFrom)?)
     }
@@ -162,6 +168,20 @@ impl StrataIndex {
         batch.insert_batch(
             self.store_state(),
             [(&StoreStateKey::BlobExpiryAccountedLsn, &lsn)],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the write-merge frontier in the caller's batch, under the same drained-garbage-log
+    /// rule as the expiry frontier.
+    pub fn put_blob_writes_merged_lsn_batch(
+        &self,
+        batch: &mut DBBatch,
+        lsn: StrataLsn,
+    ) -> Result<()> {
+        batch.insert_batch(
+            self.store_state(),
+            [(&StoreStateKey::BlobWritesMergedLsn, &lsn)],
         )?;
         Ok(())
     }

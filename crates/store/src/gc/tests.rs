@@ -42,7 +42,7 @@ fn overlay_record_classifier_advances_through_sorted_ranges() {
         ],
         ..SegmentGcOverlay::default()
     };
-    let mut classifier = OverlayRecordClassifier::new(7, &overlay);
+    let mut classifier = OverlayRecordClassifier::new(7, &overlay, None);
 
     assert_eq!(
         classifier.classify(gc_test_range(0, 50)).unwrap(),
@@ -80,7 +80,7 @@ fn overlay_record_classifier_rejects_partial_overlap() {
         expired: vec![gc_test_range(25, 50)],
         ..SegmentGcOverlay::default()
     };
-    let mut classifier = OverlayRecordClassifier::new(7, &overlay);
+    let mut classifier = OverlayRecordClassifier::new(7, &overlay, None);
 
     let error = classifier.classify(gc_test_range(0, 50)).unwrap_err();
     assert!(matches!(

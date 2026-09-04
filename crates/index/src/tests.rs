@@ -199,6 +199,20 @@ async fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
     let snapshot = index.build_gc_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.expiry_accounted_epoch, Some(9));
     assert_eq!(snapshot.lifecycle_accounted_lsn, Some(5));
+    assert_eq!(snapshot.writes_merged_epoch, None);
+    assert_eq!(index.clock_expiry_epoch().unwrap(), None);
+
+    // The write-merge frontier maps the same way, and the clock-expiry epoch is capped by the
+    // current epoch even when the frontier runs ahead of the epoch pointer's own history row.
+    let mut batch = index.batch();
+    index
+        .put_blob_writes_merged_lsn_batch(&mut batch, 6)
+        .unwrap();
+    batch.write().unwrap();
+    let snapshot = index.build_gc_snapshot().unwrap().unwrap();
+    assert_eq!(snapshot.writes_merged_epoch, Some(10));
+    assert_eq!(snapshot.expiry_accounted_epoch, Some(9));
+    assert_eq!(index.clock_expiry_epoch().unwrap(), Some(10));
 }
 
 #[tokio::test]

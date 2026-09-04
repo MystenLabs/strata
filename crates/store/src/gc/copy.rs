@@ -10,7 +10,7 @@ use std::{
 };
 
 use core_types::{
-    BlobLifecycle, DecodedRecord, FIXED_RECORD_HEADER_LEN, PlacementClass, RecordRef,
+    BlobLifecycle, DecodedRecord, Epoch, FIXED_RECORD_HEADER_LEN, PlacementClass, RecordRef,
     SegmentFileState, SegmentGcOverlay, SegmentGcRecordRange, SegmentGcSummary, SegmentId,
     SegmentState, ShardCleanupState, ShardKey,
 };
@@ -205,6 +205,11 @@ impl GcExecutor {
         let Some(mut snapshot) = self.index.build_gc_snapshot()? else {
             return Ok(None);
         };
+        self.metrics.set_gc_frontier_epochs(
+            snapshot.current_epoch,
+            snapshot.expiry_accounted_epoch,
+            snapshot.writes_merged_epoch,
+        );
         self.claims.mark_snapshot(&mut snapshot);
         for plan in planner.plans(&snapshot) {
             let source_segments = gc_plan_source_segment_ids(&plan);
@@ -229,6 +234,7 @@ impl GcExecutor {
             return Ok(Some(PreparedGcPlan {
                 plan,
                 source_overlays,
+                clock_expiry_epoch: snapshot.clock_expiry_epoch(),
                 claim: Some(claim),
             }));
         }
@@ -251,6 +257,7 @@ impl GcExecutor {
         let PreparedGcPlan {
             plan,
             source_overlays,
+            clock_expiry_epoch,
             claim,
         } = prepared;
         if !plan_has_copy_action(&plan) {
@@ -263,7 +270,8 @@ impl GcExecutor {
         }
 
         let staging_dir = create_gc_staging_dir(&self.config)?;
-        let copy_result = self.copy_gc_plan_to_staging(&staging_dir, &plan, &source_overlays);
+        let copy_result =
+            self.copy_gc_plan_to_staging(&staging_dir, &plan, &source_overlays, clock_expiry_epoch);
         let (outputs, copied_records) = match copy_result {
             Ok(copy) => copy,
             Err(error) => {
@@ -497,6 +505,7 @@ impl GcExecutor {
         staging_dir: &Path,
         plan: &GcPlan,
         source_overlays: &BTreeMap<SegmentId, SegmentGcOverlay>,
+        clock_expiry_epoch: Option<Epoch>,
     ) -> Result<(Vec<GcStagedOutputSegment>, Vec<GcStagedCopiedRecord>)> {
         let selector = GcCopySelector::new(plan)?;
         let mut copier = GcStagingCopier::new(
@@ -515,7 +524,13 @@ impl GcExecutor {
                             "GC copy plan omitted snapshot overlay for source segment {segment_id}"
                         ),
                     })?;
-            self.copy_gc_source_segment_to_staging(segment_id, overlay, &selector, &mut copier)?;
+            self.copy_gc_source_segment_to_staging(
+                segment_id,
+                overlay,
+                clock_expiry_epoch,
+                &selector,
+                &mut copier,
+            )?;
         }
 
         selector.validate_copied_bytes(copier.copied_bytes())?;
@@ -542,6 +557,7 @@ impl GcExecutor {
         &self,
         segment_id: SegmentId,
         overlay: &SegmentGcOverlay,
+        clock_expiry_epoch: Option<Epoch>,
         selector: &GcCopySelector,
         copier: &mut GcStagingCopier<'_>,
     ) -> Result<()> {
@@ -578,7 +594,7 @@ impl GcExecutor {
             path: path.clone(),
             source,
         })?;
-        let mut classifier = OverlayRecordClassifier::new(segment_id, overlay);
+        let mut classifier = OverlayRecordClassifier::new(segment_id, overlay, clock_expiry_epoch);
         let mut offset = 0_u64;
 
         while offset < sealed_len {
@@ -1030,16 +1046,24 @@ pub(crate) enum OverlayRecordState {
 pub(crate) struct OverlayRecordClassifier<'a> {
     segment_id: SegmentId,
     overlay: &'a SegmentGcOverlay,
+    /// Records whose overlay lifetime ends at or before this epoch are expired by the clock even
+    /// without an Expired range; `None` trusts only the overlay's explicit ranges.
+    clock_expiry_epoch: Option<Epoch>,
     expired_index: usize,
     retired_index: usize,
     lifetime_index: usize,
 }
 
 impl<'a> OverlayRecordClassifier<'a> {
-    pub(crate) fn new(segment_id: SegmentId, overlay: &'a SegmentGcOverlay) -> Self {
+    pub(crate) fn new(
+        segment_id: SegmentId,
+        overlay: &'a SegmentGcOverlay,
+        clock_expiry_epoch: Option<Epoch>,
+    ) -> Self {
         Self {
             segment_id,
             overlay,
+            clock_expiry_epoch,
             expired_index: 0,
             retired_index: 0,
             lifetime_index: 0,
@@ -1065,6 +1089,11 @@ impl<'a> OverlayRecordClassifier<'a> {
         }
 
         let lifecycle = self.lifecycle_for_record(record)?;
+        if let (Some(cutoff), Some(lifecycle)) = (self.clock_expiry_epoch, lifecycle)
+            && lifecycle.logical_end_epoch <= cutoff
+        {
+            return Ok(OverlayRecordState::Expired);
+        }
         Ok(OverlayRecordState::CopyEligible { lifecycle })
     }
 

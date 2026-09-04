@@ -132,12 +132,13 @@ impl GcExecutor {
                     .ok_or(Error::GcMissingSourceSegment { segment_id })
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let clock_expiry_epoch = self.index.clock_expiry_epoch()?;
         let mut classifiers = overlays
             .iter()
             .map(|(&segment_id, overlay)| {
                 (
                     segment_id,
-                    OverlayRecordClassifier::new(segment_id, overlay),
+                    OverlayRecordClassifier::new(segment_id, overlay, clock_expiry_epoch),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -685,6 +686,9 @@ impl GcExecutor {
         let mut states_to_commit = Vec::new();
         let mut summaries_to_remove = Vec::new();
         let mut relocating_segments_to_remove = 0;
+        // Read the clock bound before the summaries: it only advances, so a summary read later
+        // can only have fewer clock-live records than this bound admits.
+        let clock_expiry_epoch = self.index.clock_expiry_epoch()?;
         for segment_id in segment_ids {
             let mut state = self.index.get_segment_state(*segment_id)?.ok_or(
                 Error::GcMissingSourceSegment {
@@ -708,10 +712,14 @@ impl GcExecutor {
                 .index
                 .get_segment_gc_summary(*segment_id)?
                 .unwrap_or_default();
-            if summary.live_ref_count != 0 {
+            let live_ref_count = match clock_expiry_epoch {
+                Some(epoch) => summary.live_after_epoch(epoch).refs,
+                None => summary.live_ref_count,
+            };
+            if live_ref_count != 0 {
                 return Err(Error::GcSourceSegmentNotEmpty {
                     segment_id: *segment_id,
-                    live_ref_count: summary.live_ref_count,
+                    live_ref_count,
                 });
             }
             if state.state == SegmentFileState::GcRelocating
