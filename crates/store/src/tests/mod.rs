@@ -4957,6 +4957,162 @@ async fn gc_publish_forwards_lagging_lifetime_then_retires_destination() {
     assert_eq!(destination_overlay.summary.live_ref_count, 0);
     assert_eq!(destination_overlay.summary.retired_bytes, destination.len);
 }
+/// The patch tier merges comparable patches among themselves: the base is not read or rewritten,
+/// a twice-relocated identity keeps its latest destination, and a later full pass still folds the
+/// merged tier into a base table.
+#[tokio::test]
+async fn relocation_patch_tier_merges_patches_without_rewriting_the_base() {
+    use crate::maintenance::{
+        RelocationCompactionShape, compact_relocation_lsm, compact_relocation_lsm_with_shape,
+        publish_relocation_lsm_edit, read_relocation_lsm_manifest,
+    };
+    use crate::relocation::RelocationEntry;
+
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "relocation-tier");
+    cfg.gc_workers_enabled = false;
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "relocation-tier").unwrap();
+    let mut store = try_open_standalone_store(cfg, metrics.clone()).unwrap();
+    // Only this test may compact the relocation LSM. The compactor's wake channel has senders in
+    // the writer and flusher, so stop those first and the compactor last.
+    store
+        .store
+        .write_tx
+        .take()
+        .unwrap()
+        .send(WriteCommand::Shutdown)
+        .unwrap();
+    store.store.writer_handle.take().unwrap().join().unwrap();
+    store.store.wal_reclaim_tx.take();
+    store
+        .store
+        .wal_reclaim_handle
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    store.store.lsm_flush_tx.take();
+    store.store.lsm_flush_handle.take().unwrap().join().unwrap();
+    store.store.lsm_compact_tx.take();
+    store
+        .store
+        .lsm_compact_handle
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+
+    let key = |index: u32| BlobKey::new(format!("blob-{index:04}").into_bytes()).unwrap();
+    let destination = |segment_id: u64, offset: u64| RecordRef {
+        segment_id,
+        offset,
+        len: 16,
+    };
+    let publish = |keys: std::ops::Range<u32>, segment_id: u64, publish_lsn: StrataLsn| {
+        let entries = keys
+            .map(|index| RelocationEntry {
+                key: key(index),
+                shard: STANDALONE_SHARD,
+                payload_lsn: 1,
+                publish_lsn,
+                to: destination(segment_id, u64::from(index) * 16),
+            })
+            .collect::<Vec<_>>();
+        let (_, edit) = store.relocations.prepare_l0(&entries).unwrap();
+        publish_relocation_lsm_edit(store.index(), &edit).unwrap();
+        store
+            .relocations
+            .lsm()
+            .reload_manifest(|| read_relocation_lsm_manifest(store.index()))
+            .unwrap();
+    };
+    publish(0..100, 10, 100);
+    publish(50..150, 11, 200);
+    publish(200..250, 12, 300);
+    let before = store.relocations.lsm().manifest();
+    assert!(before.partitions[&0].base.is_empty());
+    assert_eq!(before.partitions[&0].patches.len(), 3);
+
+    assert!(
+        compact_relocation_lsm_with_shape(
+            store.index(),
+            &store.relocations,
+            &store.relocation_cache,
+            &metrics,
+            RelocationCompactionShape::Partial,
+        )
+        .unwrap()
+    );
+    let after = store.relocations.lsm().manifest();
+    assert!(after.partitions[&0].base.is_empty());
+    assert_eq!(after.partitions[&0].patches.len(), 1);
+    let lookup = |index: u32| {
+        store
+            .relocations
+            .lookup(&key(index), STANDALONE_SHARD, 1)
+            .unwrap()
+            .map(|relocation| relocation.to.segment_id)
+    };
+    assert_eq!(lookup(10), Some(10));
+    assert_eq!(lookup(75), Some(11));
+    assert_eq!(lookup(220), Some(12));
+    assert_eq!(lookup(300), None);
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_compaction_passes_total",
+            &[("kind", "partial")],
+        ),
+        1.0
+    );
+
+    // Nothing comparable is left to merge, so another partial pass is a no-op.
+    assert!(
+        !compact_relocation_lsm_with_shape(
+            store.index(),
+            &store.relocations,
+            &store.relocation_cache,
+            &metrics,
+            RelocationCompactionShape::Partial,
+        )
+        .unwrap()
+    );
+
+    assert!(
+        compact_relocation_lsm(
+            store.index(),
+            &store.relocations,
+            &store.relocation_cache,
+            &metrics,
+        )
+        .unwrap()
+    );
+    let folded = store.relocations.lsm().manifest();
+    assert_eq!(folded.partitions[&0].base.len(), 1);
+    assert!(folded.partitions[&0].patches.is_empty());
+    assert_eq!(lookup(10), Some(10));
+    assert_eq!(lookup(75), Some(11));
+    assert_eq!(lookup(220), Some(12));
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_compaction_passes_total",
+            &[("kind", "full")],
+        ),
+        1.0
+    );
+    assert_eq!(
+        counter_value_with_labels(
+            &registry,
+            "strata_store_relocation_compaction_passes_total",
+            &[("kind", "partial")],
+        ),
+        1.0
+    );
+}
+
 #[tokio::test]
 async fn blob_lsm_retire_removes_lifetime_hint() {
     init_typed_store_metrics();

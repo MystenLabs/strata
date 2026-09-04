@@ -343,6 +343,21 @@ impl MergeOperator for RelocationMerge {
             Ok(Some(value))
         }
     }
+
+    /// Patch-tier merge: one identity relocated several times keeps only its latest destination.
+    ///
+    /// Dead destinations are deliberately not dropped here. Removing a patch entry without seeing
+    /// the base could resurface an older destination for the same identity; only the full pass,
+    /// which sees the whole history, retires entries.
+    fn partial_merge(
+        &self,
+        key: &[u8],
+        patches: &[(StrataLsn, &[u8])],
+        emit: &mut dyn FnMut(GarbageRecord) -> lsm::Result<()>,
+    ) -> lsm::Result<Option<Vec<u8>>> {
+        self.examined.fetch_add(1, Ordering::Relaxed);
+        Replace.partial_merge(key, patches, emit)
+    }
 }
 
 impl RelocationScan {
