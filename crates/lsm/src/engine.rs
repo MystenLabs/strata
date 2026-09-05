@@ -4,7 +4,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -13,8 +13,8 @@ use core_types::RecordRef;
 
 use crate::{
     BlockCacheStats, DEFAULT_BLOCK_CACHE_BYTES, Error, FrozenMemtable, LsmIter, Manifest,
-    ManifestEdit, Memtable, MemtableRolloverPolicy, MergeOperator, Result, Snapshot, StrataLsn,
-    TableMeta, TableStore, memtable::VERSION_BYTES, table::sync_parent,
+    ManifestEdit, Memtable, MemtableRolloverPolicy, MergeOperator, OperandFloorFn, Result,
+    Snapshot, StrataLsn, TableMeta, TableStore, memtable::VERSION_BYTES, table::sync_parent,
 };
 
 const RECORD_REF_BYTES: usize = 3 * mem::size_of::<u64>();
@@ -207,6 +207,9 @@ pub struct Lsm {
     halted: Mutex<Option<String>>,
     flush_lock: Mutex<()>,
     next_table_id: AtomicU64,
+    /// Classifies flushed operands for [`TableMeta::global_operand_floor`]; unset leaves every
+    /// flushed patch at `OperandFloor::Unknown`.
+    global_operand_floor: OnceLock<OperandFloorFn>,
 }
 
 impl Lsm {
@@ -309,6 +312,7 @@ impl Lsm {
             halted: Mutex::new(None),
             flush_lock: Mutex::new(()),
             next_table_id: AtomicU64::new(next_table_id),
+            global_operand_floor: OnceLock::new(),
         })
     }
 
@@ -479,6 +483,16 @@ impl Lsm {
         Ok(lock(&self.writes).last_lsn)
     }
 
+    /// Installs the operand classifier every later flush stamps into its patch's
+    /// [`TableMeta::global_operand_floor`]. Must be called once, before the first flush.
+    pub fn set_global_operand_floor(&self, classify: OperandFloorFn) -> Result<()> {
+        self.global_operand_floor
+            .set(classify)
+            .map_err(|_| Error::InvalidManifest {
+                reason: "operand classifier is already installed".to_owned(),
+            })
+    }
+
     pub fn manifest(&self) -> Arc<Manifest> {
         Arc::clone(&lock(&self.memory).manifest)
     }
@@ -592,6 +606,7 @@ impl Lsm {
             id,
             partition,
             &manifest.patch_format_id,
+            self.global_operand_floor.get(),
         )?;
         let (mut ready, mut remaining) =
             split_publishable_pending(&pending_patches, publish_through);

@@ -5,7 +5,7 @@ use core_types::{
     SegmentOwner, ShardCleanupJob, ShardCleanupState, ShardInfo, ShardKey, ShardState,
 };
 use core_types::{StoreCheckpoint, WalPosition};
-use lsm::{Manifest, ManifestEdit, TableMeta};
+use lsm::{Manifest, ManifestEdit, OperandFloor, TableMeta};
 use tempfile::tempdir;
 use typed_store::{Map, rocks::open_cf};
 
@@ -43,6 +43,7 @@ fn lsm_table(id: u64, path: &str) -> TableMeta {
         min_lsn: None,
         max_lsn: None,
         merge_applied_through_lsn: None,
+        global_operand_floor: OperandFloor::Unknown,
         record_count: 1,
         file_len: 100,
         checksum: [id as u8; 32],

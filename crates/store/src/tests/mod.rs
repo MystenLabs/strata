@@ -274,6 +274,7 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         max_unsealed_segments: 8,
         segment_reader_cache_capacity: 16,
         lsm_partition_count: DEFAULT_LSM_PARTITION_COUNT,
+        lsm_compaction_patch_bytes: DEFAULT_LSM_COMPACTION_PATCH_BYTES,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
         gc_workers_enabled: true,
@@ -5242,6 +5243,60 @@ async fn cold_base_sweep_updates_gc_summary_without_a_user_touch() {
     assert!(stats.future_epoch_histogram.is_empty());
     assert_eq!(stats.min_live_end_epoch, None);
     assert!(stats.is_empty());
+}
+
+#[tokio::test]
+async fn cold_base_sweep_rereads_one_base_without_reading_patches() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.gc_workers_enabled = false;
+    // A one-byte floor: every patch goes straight into the base, and the tick never folds the
+    // partition whole, so a cold base can only be revisited by the budgeted sweep.
+    cfg.lsm_compaction_patch_bytes = 1;
+    let registry = Registry::new();
+    let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
+    let store = try_open_standalone_store(cfg, metrics).unwrap();
+
+    store.put(&key_a, b"payload-a").unwrap();
+    store.put(&key_b, b"payload-bb").unwrap();
+    store.extend(&key_a, 43).unwrap().unwrap();
+    let lifetime_b_lsn = store.extend(&key_b, 50).unwrap().unwrap();
+    let ref_a = lsm_blob_ref(&store, &key_a);
+    let ref_b = lsm_blob_ref(&store, &key_b);
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, lifetime_b_lsn);
+    let stats = segment_summary(store.index(), ref_a.segment_id);
+    assert_eq!(stats.live_ref_count, 2);
+
+    let (epoch, epoch_lsn) = store.increment_epoch().unwrap();
+    assert_eq!(epoch, 43);
+    store.sync().unwrap();
+    wait_for_expiry_accounting(&store, epoch_lsn);
+
+    // No patch existed after the epoch change, so only a sweep can have stamped the base past
+    // the transition, and it did so without manufacturing a patch or a second base.
+    let sweeps = counter_value_with_labels(
+        &registry,
+        "strata_store_main_compaction_passes_total",
+        &[("kind", "sweep")],
+    );
+    assert!(sweeps >= 1.0, "sweeps: {sweeps}");
+    let manifest = store
+        .index()
+        .get_lsm_manifest(BLOB_LSM_MANIFEST)
+        .unwrap()
+        .unwrap();
+    let partition = &manifest.partitions[&0];
+    assert!(partition.patches.is_empty(), "{:?}", partition.patches);
+    assert_eq!(partition.base.len(), 1);
+    assert!(partition.base[0].merge_applied_through_lsn.unwrap() >= epoch_lsn);
+    let stats = segment_summary(store.index(), ref_a.segment_id);
+    assert_eq!(stats.live_bytes, ref_b.len);
+    assert_eq!(stats.live_ref_count, 1);
+    assert_eq!(stats.expired_bytes, ref_a.len);
 }
 
 #[tokio::test]

@@ -73,6 +73,9 @@ struct PrometheusMetrics {
     main_compaction_output_bytes_total: IntCounter,
     main_minor_compaction_lsn: IntGauge,
     main_full_compaction_lsn: IntGauge,
+    main_sweep_compaction_lsn: IntGauge,
+    main_compaction_passes_total: IntCounterVec,
+    main_compaction_pass_input_bytes_total: IntCounterVec,
     relocation_compaction_entries_examined_total: IntCounter,
     relocation_compaction_entries_dropped_total: IntCounter,
     relocation_compaction_duration_seconds: Histogram,
@@ -404,6 +407,26 @@ impl StrataStoreMetrics {
                     &labels,
                     "main_full_compaction_lsn",
                     "Highest durable LSN cutoff processed by a successful full main LSM compaction in this process.",
+                )?,
+                main_sweep_compaction_lsn: register_gauge(
+                    registry,
+                    &labels,
+                    "main_sweep_compaction_lsn",
+                    "Highest global-transition bound applied by a successful cold-base sweep in this process.",
+                )?,
+                main_compaction_passes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "main_compaction_passes_total",
+                    "Total main LSM compaction passes by shape (minor merges one patch tier; full folds patches into base tables; sweep re-reads one cold base alone).",
+                    &["kind"],
+                )?,
+                main_compaction_pass_input_bytes_total: register_counter_vec(
+                    registry,
+                    &labels,
+                    "main_compaction_pass_input_bytes_total",
+                    "Total main LSM compaction input bytes by pass shape.",
+                    &["kind"],
                 )?,
                 relocation_compaction_entries_examined_total: register_counter(
                     registry,
@@ -1126,8 +1149,17 @@ impl StrataStoreMetrics {
         let lsn = match kind {
             MainCompactionKind::Minor => &metrics.main_minor_compaction_lsn,
             MainCompactionKind::Full => &metrics.main_full_compaction_lsn,
+            MainCompactionKind::Sweep => &metrics.main_sweep_compaction_lsn,
         };
         lsn.set(lsn.get().max(to_i64(compacted_through_lsn)));
+        metrics
+            .main_compaction_passes_total
+            .with_label_values(&[kind.metric_label()])
+            .inc();
+        metrics
+            .main_compaction_pass_input_bytes_total
+            .with_label_values(&[kind.metric_label()])
+            .inc_by(input_bytes);
     }
 
     pub(crate) fn record_relocation_compaction(
@@ -1573,8 +1605,22 @@ pub(crate) struct PutMetric {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MainCompactionKind {
+    /// One patch tier merged among itself; no base is read.
     Minor,
+    /// Patches folded into fresh base tables.
     Full,
+    /// One cold base re-read by itself to apply global transitions.
+    Sweep,
+}
+
+impl MainCompactionKind {
+    pub(crate) fn metric_label(self) -> &'static str {
+        match self {
+            Self::Minor => "minor",
+            Self::Full => "full",
+            Self::Sweep => "sweep",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1978,6 +2024,7 @@ mod tests {
         );
         metrics.record_main_compaction(MainCompactionKind::Minor, 140, 0, 0, 0, Duration::ZERO);
         metrics.record_main_compaction(MainCompactionKind::Minor, 130, 0, 0, 0, Duration::ZERO);
+        metrics.record_main_compaction(MainCompactionKind::Sweep, 110, 0, 0, 0, Duration::ZERO);
         metrics.record_relocation_compaction(10, 3, 1_000, 400, Duration::from_millis(3));
 
         for result in ["hit", "miss", "error"] {
@@ -2023,6 +2070,32 @@ mod tests {
             metric_value(&registry, "strata_store_main_full_compaction_lsn"),
             120.0
         );
+        assert_eq!(
+            metric_value(&registry, "strata_store_main_sweep_compaction_lsn"),
+            110.0
+        );
+        for (kind, passes, bytes) in [
+            ("minor", 2.0, 0.0),
+            ("full", 1.0, 2_000.0),
+            ("sweep", 1.0, 0.0),
+        ] {
+            assert_eq!(
+                metric_value_with_labels(
+                    &registry,
+                    "strata_store_main_compaction_passes_total",
+                    &[("kind", kind)],
+                ),
+                passes
+            );
+            assert_eq!(
+                metric_value_with_labels(
+                    &registry,
+                    "strata_store_main_compaction_pass_input_bytes_total",
+                    &[("kind", kind)],
+                ),
+                bytes
+            );
+        }
         assert_eq!(
             metric_value(
                 &registry,

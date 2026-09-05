@@ -181,8 +181,8 @@ use wal_format::StoreWalMutation;
 pub use config::{
     DEFAULT_GC_INITIAL_WORKER_COUNT, DEFAULT_GC_INTERVAL, DEFAULT_GC_IO_BYTES_PER_SEC,
     DEFAULT_GC_MIN_IO_BYTES_PER_SEC, DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
-    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_LSM_PARTITION_COUNT,
-    DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+    DEFAULT_GC_TUNING_WINDOW_CYCLES, DEFAULT_GC_WORKER_COUNT, DEFAULT_LSM_COMPACTION_PATCH_BYTES,
+    DEFAULT_LSM_PARTITION_COUNT, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
     DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT, SealedSegmentIntegrityPolicy, StrataRecoveryPolicy,
     StrataStoreConfig,
 };
@@ -239,6 +239,21 @@ const LSM_FILE_SYNC_WORKERS: usize = 2;
 const LSM_COMPACTION_PATCH_COUNT: usize = 8;
 const LSM_COMPACTION_PATCH_BYTES: u64 = 64 * 1024 * 1024;
 const LSM_COMPACTION_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+/// The blob patch tier is folded into the base only once it reaches this fraction of the base, so
+/// base bytes rewritten per ingested byte stay a constant instead of growing with the base.
+const LSM_FULL_COMPACTION_BASE_DIVISOR: u64 = 10;
+/// Consecutive blob patches form one size tier while the largest is at most this many times the
+/// smallest, which keeps each byte's number of tier rewrites logarithmic in the tier size.
+const LSM_PATCH_TIER_SIZE_RATIO: u64 = 4;
+/// A tier merge needs at least this many comparable consecutive patches.
+const LSM_PATCH_TIER_FANOUT: usize = 4;
+/// Upper bound on the patches one tier merge reads.
+const LSM_PATCH_TIER_MAX_INPUTS: usize = 16;
+/// Once a partition carries this many patches, a tier merge accepts any run of two.
+const LSM_PATCH_TIER_MAX_PATCHES: usize = 32;
+/// Cold base tables one partition re-reads each time a newer epoch transition becomes applicable
+/// without reading patches.
+const LSM_SWEEP_TABLES_PER_EPOCH: usize = 1;
 const LSM_GARBAGE_LOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const LSM_OBSOLETE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const LSM_BASE_FORMAT: &str = "store-base-v2";

@@ -23,7 +23,7 @@
 //! now syncs itself; the sweeper/compactor frontier updates are conservative reaffirmations.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
     time::{Duration, Instant},
@@ -32,7 +32,9 @@ use std::{
 use crate::{
     BLOB_LSM_MANIFEST, Error, GARBAGE_LOG_HEAD, GARBAGE_LOG_SWEEP_CURSOR, GARBAGE_SWEEP_INTERVAL,
     LSM_COMPACTION_PATCH_BYTES, LSM_COMPACTION_PATCH_COUNT, LSM_COMPACTION_TARGET_BYTES,
-    LSM_GARBAGE_LOG_MAX_BYTES, LSM_MEMTABLE_MAX_AGE, LSM_OBSOLETE_CLEANUP_INTERVAL,
+    LSM_FULL_COMPACTION_BASE_DIVISOR, LSM_GARBAGE_LOG_MAX_BYTES, LSM_MEMTABLE_MAX_AGE,
+    LSM_OBSOLETE_CLEANUP_INTERVAL, LSM_PATCH_TIER_FANOUT, LSM_PATCH_TIER_MAX_INPUTS,
+    LSM_PATCH_TIER_MAX_PATCHES, LSM_PATCH_TIER_SIZE_RATIO, LSM_SWEEP_TABLES_PER_EPOCH,
     RELOCATION_LSM_MANIFEST, Result, StoreHalt, StrataStoreConfig, StrataStoreMetrics,
     blob_lsm::{BlobCompactionSnapshot, BlobMergeWithRelocations},
     gc::GcCommand,
@@ -43,9 +45,9 @@ use crate::{
 use core_types::SegmentFileState;
 use index::StrataIndex;
 use lsm::{
-    GarbageLog, Lsm, Manifest as LsmManifest, ManifestEdit, TableMeta,
-    select_base_compaction_inputs, select_compaction_inputs, select_patch_compaction_inputs,
-    select_patch_group_inputs, write_compaction, write_patch_compaction,
+    GarbageLog, Lsm, Manifest as LsmManifest, ManifestEdit, StrataLsn, TableMeta,
+    select_base_sweep_inputs, select_compaction_inputs, select_patch_group_inputs,
+    write_compaction, write_patch_compaction,
 };
 
 /// Folds the global garbage log into per-segment overlays on a one-second cadence.
@@ -189,11 +191,13 @@ impl GarbageLogSweeper {
             .index
             .get_blob_expiry_accounted_lsn()?
             .unwrap_or_default();
-        // The write-merge frontier is the same bound minus the per-base re-read requirement. It
-        // is what lets GC judge known end epochs against the clock: once it passes an epoch
-        // transition, no lifetime extension from before that transition is still unmerged, and
-        // the drained log above guarantees every merged extension's hint reached its summary.
-        let writes_candidate = manifest.writes_merged_through_lsn();
+        // The write-merge frontier is the same bound minus the per-base re-read requirement, and
+        // minus every live patch that holds no lifetime change. It is what lets GC judge known end
+        // epochs against the clock: once it passes an epoch transition, no lifetime extension from
+        // before that transition is still unmerged, and the drained log above guarantees every
+        // merged extension's hint reached its summary. Plain puts and tombstones may stay in the
+        // patch tier for as long as the tier policy likes without holding it back.
+        let writes_candidate = manifest.global_writes_merged_through_lsn();
         let writes_current = self.index.get_blob_writes_merged_lsn()?.unwrap_or_default();
         // LSN 0 is only the genesis epoch and cannot expire a valid foreground write: lifetimes
         // must be strictly greater than the current epoch when assigned. Waiting for a positive
@@ -421,15 +425,22 @@ pub(crate) struct LsmCompactor {
     pub(crate) store_halt: StoreHalt,
     pub(crate) metrics: StrataStoreMetrics,
     pub(crate) obsolete: Vec<TableMeta>,
+    /// `StrataStoreConfig::lsm_compaction_patch_bytes`: the full-pass floor and the size under
+    /// which a partition is folded whole on the tick.
+    pub(crate) patch_bytes_floor: u64,
+    /// Per partition: the newest epoch transition the cold-base sweep has been credited for, and
+    /// how many base re-reads remain from that credit.
+    pub(crate) sweep_credits: HashMap<u32, (StrataLsn, usize)>,
 }
 
 impl LsmCompactor {
     /// The loop: wake on a nudge (the flusher after new patches, the writer after a durability
     /// sync, GC after activating relocations) or on the one-second periodic deadline. Reaching the
-    /// deadline sets `force`, which both bypasses the patch-pressure thresholds and requests the
-    /// full (base-materializing) form, so healing and garbage discovery keep happening even when
-    /// nudges arrive continuously. Any failure halts the store and the LSM — compaction publishes
-    /// manifests, and a half-trusted manifest is not a state to keep running in.
+    /// deadline sets `force`, which admits the work that patch pressure alone never asks for: a
+    /// small partition is folded whole, and a cold base earns one re-read per newly applicable
+    /// epoch transition, so expiry discovery and healing keep happening on quiet key ranges. Any
+    /// failure halts the store and the LSM — compaction publishes manifests, and a half-trusted
+    /// manifest is not a state to keep running in.
     pub(crate) fn run(mut self) {
         let mut next_forced_pass = Instant::now() + LSM_OBSOLETE_CLEANUP_INTERVAL;
         loop {
@@ -530,11 +541,16 @@ impl LsmCompactor {
     /// Admission and thresholds. The admission lock is taken in read mode: compactions may run
     /// beside each other conceptually, but GC publication takes it in write mode, so a relocation
     /// view can never be reconciled and activated while a compaction is mid-flight (the TODO
-    /// below describes the finer-grained future). Then the pressure gates: skip unless the patch
-    /// count or patch bytes crossed their thresholds, or `force` (the periodic tick) says run
-    /// anyway. A forced pass can also select one cold base whose expiry-accounting frontier is
-    /// behind the latest epoch transition. For example, a base last merged at LSN 40 is selected
-    /// after an epoch change at LSN 50 even when no user has written a patch over that key range.
+    /// below describes the finer-grained future). Then `blob_compaction_shape` decides from
+    /// pressure alone: the patch tier goes into the base only once it reaches a fixed fraction of
+    /// the base (or the configured floor while the base is small), and otherwise a run of
+    /// comparably sized consecutive patches is merged among itself. With random keys every patch
+    /// overlaps every base table, so a full pass rewrites the whole partition base; tying it to a
+    /// fraction of the base keeps base bytes written per ingested byte constant as the base grows.
+    /// The periodic tick (`force`) adds what pressure never asks for: a partition smaller than the
+    /// floor is folded whole, and a cold base is re-read by itself once per newly applicable epoch
+    /// transition. For example, a base last merged at LSN 40 is swept after an epoch change at LSN
+    /// 50 even when no user has written a patch over that key range.
     ///
     /// The durability gate. Compaction sees only the temporal patch prefix that is fully below
     /// published_lsn. Newer patches stay live in the real manifest but are absent from the
@@ -542,15 +558,21 @@ impl LsmCompactor {
     /// snapshot stops before the first excluded patch: compaction must not apply a global event
     /// without seeing an earlier mutation held in a patch that straddles published_lsn.
     ///
-    /// Two shapes of pass. Count pressure runs a *partial* pass: coalesce many small patches into
-    /// fewer big ones — cheap, no relocation healing, no shard fencing. Byte pressure or the
-    /// periodic force runs the *full* pass that materializes a base, and that is where the heavy
+    /// Three shapes of pass. A *tier* pass merges one run of consecutive patches into one patch —
+    /// cheap, no shard fencing. The *full* pass materializes a base, and that is where the heavy
     /// machinery lives: a relocation scan over the input key range (bounded by the relocation
     /// LSM's current sequence) lets the merge rewrite blob rows that still point at relocated
     /// bytes — a row for key "a" still referencing S7 is healed to point at S42, counted in
     /// healed_references; the shard registry, drop LSNs, and already-deleted shard segments let
-    /// it drop rows fenced by dropped generations; and the epoch-change history (up to the
-    /// materialized frontier, capped by published_lsn) drives expiry decisions.
+    /// it drop rows fenced by dropped generations; and the epoch-change history drives expiry
+    /// decisions. The *sweep* is a full pass over one base with no patches read at all.
+    ///
+    /// Every pass applies global transitions only up to the LSN below which every operand of its
+    /// keys is either in the pass or older than it. A full pass closes over overlapping patches,
+    /// so it may use the materialized frontier (capped by published_lsn). A tier pass leaves newer
+    /// patches unread, so it stops below the oldest patch newer than the tier. A sweep reads no
+    /// patch, so it stops below the oldest live patch of the partition. The bound is stamped on
+    /// every base the pass writes.
     ///
     /// This merge is where most garbage is born. When folding reveals that an overwrite retired
     /// key "k"'s old bytes in S7, the merge emits the Retired event for that range — the very
@@ -615,86 +637,96 @@ impl LsmCompactor {
             });
         let partition_manifest = &compaction_manifest.partitions[&partition];
         let patches = &partition_manifest.patches;
-        let patch_bytes = patches
-            .iter()
-            .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
-        if !force
-            && patches.len() < LSM_COMPACTION_PATCH_COUNT
-            && patch_bytes < LSM_COMPACTION_PATCH_BYTES
-        {
-            return Ok(());
-        }
+        let base = &partition_manifest.base;
+        let patch_bytes = table_bytes(patches);
+        let base_bytes = table_bytes(base);
         // The LSM frontier proves that every earlier keyed mutation is represented in SSTs;
         // publication is the store-wide durability bound for RocksDB-only transitions.
         let materialized_through_lsn = manifest
             .materialized_through
             .unwrap_or_default()
             .min(compact_through_lsn);
-        let emit_garbage_from_lsn = self
-            .index
-            .get_blob_compaction_garbage_from_lsn()?
-            .ok_or_else(|| Error::InvariantViolation {
-                reason: "blob compaction garbage cutover is missing".to_owned(),
-            })?;
+        // Every live patch of the partition, durable or not: what a pass that leaves patches unread
+        // must stay below when applying global transitions.
+        let live_patches = &manifest.partitions[&partition].patches;
         let epoch_changes = self
             .index
             .iter_epoch_changes_from(0)?
             .into_iter()
             .filter(|(lsn, _)| *lsn <= materialized_through_lsn)
             .collect::<Vec<_>>();
-        let expiry_target_lsn = epoch_changes
-            .last()
-            .map(|(lsn, _)| *lsn)
-            .unwrap_or_default();
 
-        // A forced pass advances expiry across one cold base per partition. Starting from the base
-        // (rather than mixing it with unrelated patch-pressure work) keeps the output range
-        // contiguous: if bases [a,f] and [n,z] have an untouched [g,m] base between them, writing
-        // the two disjoint seeds into one SST would create an invalid [a,z] overlap. The base-seed
-        // selector still pulls in every patch transitively connected to this one range.
-        //
-        // TODO: Replace the fixed one-base cadence with a backlog-aware scheduler. It should pick
-        // the oldest merge frontier, derive an expiry work rate from the stale-base backlog, and
-        // re-evaluate patch soft/hard pressure after every base so neither expiry nor new patch
-        // compaction can starve the other.
-        let stale_base = if force {
-            partition_manifest
-                .base
-                .iter()
-                .find(|base| base.merge_applied_through_lsn.unwrap_or_default() < expiry_target_lsn)
-        } else {
-            None
+        let shape = match blob_compaction_shape(patches, base, self.patch_bytes_floor) {
+            Some(shape) => shape,
+            None if force
+                && !patches.is_empty()
+                && base_bytes.saturating_add(patch_bytes) < self.patch_bytes_floor =>
+            {
+                // A partition this small is folded whole on the tick, as it always was: the entire
+                // rewrite costs less than one patch threshold, and it keeps healing and garbage
+                // discovery prompt for small stores.
+                BlobCompactionShape::Full
+            }
+            None if force => {
+                let bound = sweep_bound(materialized_through_lsn, live_patches);
+                let target = epoch_changes
+                    .iter()
+                    .rev()
+                    .find(|(lsn, _)| *lsn <= bound)
+                    .map(|(lsn, _)| *lsn)
+                    .unwrap_or_default();
+                match self.take_sweep_credit(partition, target, base) {
+                    Some(table) => BlobCompactionShape::Sweep(table),
+                    None => return Ok(()),
+                }
+            }
+            None => return Ok(()),
         };
+        let emit_garbage_from_lsn = self
+            .index
+            .get_blob_compaction_garbage_from_lsn()?
+            .ok_or_else(|| Error::InvariantViolation {
+                reason: "blob compaction garbage cutover is missing".to_owned(),
+            })?;
 
-        // Count pressure coalesces patches; byte pressure and the periodic pass materialize a base.
-        // A quiet partition with no patches still enters the full path when `stale_base` exists,
-        // which is the new cold-key expiry sweep.
-        let partial = !force && patch_bytes < LSM_COMPACTION_PATCH_BYTES;
-        if patches.is_empty() && stale_base.is_none() {
-            return Ok(());
-        }
         let tables = lsm.table_store();
-        let selected = if partial {
-            select_patch_compaction_inputs(&compaction_manifest, &tables, partition, patches)
-        } else if let Some(base) = stale_base {
-            select_base_compaction_inputs(&compaction_manifest, &tables, partition, base)
-        } else {
-            select_compaction_inputs(&compaction_manifest, &tables, partition, &patches[0])
+        let (selected, bound, kind) = match &shape {
+            BlobCompactionShape::Tier(tier) => (
+                select_patch_group_inputs(&compaction_manifest, &tables, partition, tier)?,
+                tier_bound(materialized_through_lsn, tier, live_patches),
+                MainCompactionKind::Minor,
+            ),
+            BlobCompactionShape::Full => {
+                // Seed from the oldest patch so the write frontiers advance in LSN order.
+                let seed = patches
+                    .iter()
+                    .min_by_key(|patch| patch.min_lsn)
+                    .expect("a full pass needs a durable patch");
+                (
+                    select_compaction_inputs(&compaction_manifest, &tables, partition, seed)?,
+                    materialized_through_lsn,
+                    MainCompactionKind::Full,
+                )
+            }
+            BlobCompactionShape::Sweep(table) => (
+                select_base_sweep_inputs(&compaction_manifest, &tables, partition, table)?,
+                sweep_bound(materialized_through_lsn, live_patches),
+                MainCompactionKind::Sweep,
+            ),
         };
-        let Some(inputs) = selected? else {
+        let Some(inputs) = selected else {
             return Ok(());
         };
-        let obsolete = if partial {
+        let tier = kind == MainCompactionKind::Minor;
+        let obsolete = if tier {
             inputs.patches.clone()
         } else {
             inputs.base.iter().chain(&inputs.patches).cloned().collect()
         };
-        let input_bytes = obsolete
-            .iter()
-            .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
+        let input_bytes = table_bytes(&obsolete);
         let started = Instant::now();
         let epoch_snapshot = BlobCompactionSnapshot {
-            materialized_through_lsn,
+            materialized_through_lsn: bound,
             emit_garbage_from_lsn,
             epoch_changes,
             ..BlobCompactionSnapshot::default()
@@ -716,12 +748,12 @@ impl LsmCompactor {
                 .transpose()?,
             _ => None,
         };
-        let (edit, garbage, healed_references) = if partial {
+        let (edit, garbage, healed_references) = if tier {
             let merge = BlobMergeWithRelocations::new(relocation_scan, epoch_snapshot);
+            // One output per tier merge whatever its size, so tiers keep growing geometrically
+            // instead of splitting into equal files that would be merged again and again.
             let (edit, garbage) =
-                write_patch_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
-                    lsm.allocate_patch_target()
-                })?;
+                write_patch_compaction(&inputs, &merge, u64::MAX, || lsm.allocate_patch_target())?;
             (edit, garbage, 0)
         } else {
             let snapshot = BlobCompactionSnapshot {
@@ -750,19 +782,15 @@ impl LsmCompactor {
                     lsm.allocate_base_target()
                 })?;
             // All rows in every output passed through `merge` with the epoch snapshot bounded by
-            // this exact materialized frontier. If the frontier is 120, a later global coverage
-            // calculation may count these bases as having considered the epoch transition at 120;
-            // it must not stamp the store's newer `current_epoch` instead.
+            // exactly this LSN. If the bound is 120, a later global coverage calculation may count
+            // these bases as having considered the epoch transition at 120; it must not stamp the
+            // store's newer `current_epoch` instead.
             for table in &mut edit.add_base {
-                table.merge_applied_through_lsn = Some(materialized_through_lsn);
+                table.merge_applied_through_lsn = Some(bound);
             }
             (edit, garbage, merge.healed_references())
         };
-        let output_bytes = edit
-            .add_base
-            .iter()
-            .chain(&edit.add_patches)
-            .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
+        let output_bytes = table_bytes(&edit.add_base) + table_bytes(&edit.add_patches);
 
         let _publish_guard = self
             .garbage_publish_lock
@@ -783,12 +811,12 @@ impl LsmCompactor {
         )?;
         lsm.reload_manifest(|| read_blob_lsm_manifest(&self.index))?;
         self.metrics.record_main_compaction(
-            if partial {
-                MainCompactionKind::Minor
+            kind,
+            if kind == MainCompactionKind::Sweep {
+                bound
             } else {
-                MainCompactionKind::Full
+                compact_through_lsn
             },
-            compact_through_lsn,
             healed_references,
             input_bytes,
             output_bytes,
@@ -797,6 +825,34 @@ impl LsmCompactor {
         drop(inputs);
         self.obsolete.extend(obsolete);
         Ok(())
+    }
+
+    /// Grants one round of cold-base re-reads per partition each time a newer epoch transition
+    /// becomes applicable without reading patches, and spends one on the base that has gone
+    /// longest without a re-read. Bases already stamped at or past the transition need nothing.
+    fn take_sweep_credit(
+        &mut self,
+        partition: u32,
+        target: StrataLsn,
+        base: &[TableMeta],
+    ) -> Option<TableMeta> {
+        if target == 0 {
+            return None;
+        }
+        let credit = self.sweep_credits.entry(partition).or_insert((0, 0));
+        if target > credit.0 {
+            *credit = (target, LSM_SWEEP_TABLES_PER_EPOCH);
+        }
+        if credit.1 == 0 {
+            return None;
+        }
+        let stale = base
+            .iter()
+            .filter(|table| table.merge_applied_through_lsn.unwrap_or_default() < target)
+            .min_by_key(|table| table.merge_applied_through_lsn.unwrap_or_default())
+            .cloned()?;
+        credit.1 -= 1;
+        Some(stale)
     }
 
     /// Retries unlinking SSTs that earlier compactions replaced.
@@ -973,6 +1029,284 @@ impl RelocationCompactionShape {
             Self::Partial => "partial",
             Self::Full => "full",
         }
+    }
+}
+
+/// How one blob-LSM compaction pass rewrites a partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlobCompactionShape {
+    /// Merge one run of consecutive, comparably sized patches into one patch; the base is not
+    /// read.
+    Tier(Vec<TableMeta>),
+    /// Fold the oldest durable patch's overlap component into fresh base tables.
+    Full,
+    /// Re-read one cold base by itself to apply the global transitions it has not seen.
+    Sweep(TableMeta),
+}
+
+fn table_bytes(tables: &[TableMeta]) -> u64 {
+    tables
+        .iter()
+        .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len))
+}
+
+/// Decides from pressure alone whether a blob partition needs a pass, and which shape.
+///
+/// The patch tier goes into the base once it reaches `1 / LSM_FULL_COMPACTION_BASE_DIVISOR` of
+/// the base, with `patch_bytes_floor` as the minimum while the base is small: a 5 GB base is
+/// rewritten once per 500 MB of patches rather than once per 64 MB, so base bytes written per
+/// ingested byte stay near the divisor instead of growing with the base. Below that, a run of
+/// comparable consecutive patches is merged among itself when one exists.
+fn blob_compaction_shape(
+    patches: &[TableMeta],
+    base: &[TableMeta],
+    patch_bytes_floor: u64,
+) -> Option<BlobCompactionShape> {
+    if patches.is_empty() {
+        return None;
+    }
+    let full_threshold =
+        patch_bytes_floor.max(table_bytes(base) / LSM_FULL_COMPACTION_BASE_DIVISOR);
+    if table_bytes(patches) >= full_threshold {
+        return Some(BlobCompactionShape::Full);
+    }
+    let tier = select_blob_patch_tier(patches);
+    (!tier.is_empty()).then_some(BlobCompactionShape::Tier(tier))
+}
+
+/// Picks the oldest run of consecutive patches, in LSN order, whose sizes lie within a constant
+/// factor of each other.
+///
+/// Consecutive matters: the blob merge folds one key's operands in LSN order, and a lifetime change
+/// between two merged puts must not be skipped over. Merging only LSN-adjacent patches keeps every
+/// unselected operand either entirely before or entirely after the merged one. Size tiers matter
+/// for cost: with one-second flushes, merging every patch whenever eight exist would rewrite the
+/// whole tier every eight seconds, while merging fours of a kind rewrites each byte once per tier
+/// level. Once a partition holds too many patches, any adjacent pair qualifies so the count stays
+/// bounded.
+fn select_blob_patch_tier(patches: &[TableMeta]) -> Vec<TableMeta> {
+    let mut ordered = patches.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|table| (table.min_lsn, table.max_lsn, table.id));
+    let fanout = if ordered.len() >= LSM_PATCH_TIER_MAX_PATCHES {
+        2
+    } else {
+        LSM_PATCH_TIER_FANOUT
+    };
+    let mut start = 0;
+    while start < ordered.len() {
+        let mut smallest = ordered[start].file_len.max(1);
+        let mut largest = smallest;
+        let mut end = start + 1;
+        while end < ordered.len() {
+            let len = ordered[end].file_len.max(1);
+            let (low, high) = (smallest.min(len), largest.max(len));
+            if high > low.saturating_mul(LSM_PATCH_TIER_SIZE_RATIO) {
+                break;
+            }
+            smallest = low;
+            largest = high;
+            end += 1;
+        }
+        if end - start >= fanout {
+            return ordered[start..end.min(start + LSM_PATCH_TIER_MAX_INPUTS)]
+                .iter()
+                .map(|table| (*table).clone())
+                .collect();
+        }
+        start = end;
+    }
+    Vec::new()
+}
+
+/// Highest LSN a pass that reads no patch may apply global transitions through: just below the
+/// oldest live patch of the partition, so every operand that could change how a transition
+/// applies to one of the partition's keys is already in the base.
+fn sweep_bound(materialized_through_lsn: StrataLsn, live_patches: &[TableMeta]) -> StrataLsn {
+    live_patches
+        .iter()
+        .filter_map(|patch| patch.min_lsn)
+        .min()
+        .map_or(materialized_through_lsn, |min_lsn| {
+            materialized_through_lsn.min(min_lsn.saturating_sub(1))
+        })
+}
+
+/// Highest LSN a tier merge may apply global transitions through: just below the oldest live
+/// patch holding rows newer than the tier. Older rows are ordered before the tier by LSN either
+/// way; a newer unread patch could hold the lifetime change a transition must see first.
+fn tier_bound(
+    materialized_through_lsn: StrataLsn,
+    tier: &[TableMeta],
+    live_patches: &[TableMeta],
+) -> StrataLsn {
+    let tier_max_lsn = tier
+        .iter()
+        .filter_map(|patch| patch.max_lsn)
+        .max()
+        .unwrap_or_default();
+    live_patches
+        .iter()
+        .filter(|patch| patch.max_lsn.is_some_and(|max_lsn| max_lsn > tier_max_lsn))
+        .filter_map(|patch| patch.min_lsn)
+        .min()
+        .map_or(materialized_through_lsn, |min_lsn| {
+            materialized_through_lsn.min(min_lsn.saturating_sub(1))
+        })
+}
+
+#[cfg(test)]
+mod blob_compaction_tests {
+    use lsm::OperandFloor;
+
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    fn meta(id: u64, min_lsn: u64, max_lsn: u64, file_len: u64) -> TableMeta {
+        TableMeta {
+            id,
+            partition: 0,
+            relative_path: format!("patch-{id}.sst"),
+            first_key: b"a".to_vec(),
+            last_key: b"z".to_vec(),
+            min_lsn: Some(min_lsn),
+            max_lsn: Some(max_lsn),
+            merge_applied_through_lsn: None,
+            global_operand_floor: OperandFloor::Unknown,
+            record_count: 1,
+            file_len,
+            checksum: [0; 32],
+        }
+    }
+
+    fn base(id: u64, file_len: u64) -> TableMeta {
+        TableMeta {
+            min_lsn: None,
+            max_lsn: None,
+            ..meta(id, 0, 0, file_len)
+        }
+    }
+
+    #[test]
+    fn full_pass_waits_for_a_fraction_of_the_base() {
+        let floor = 64 * MIB;
+        let big_base = vec![base(1, 5 * 1024 * MIB)];
+        // 64 MiB of patches used to force a full pass; against a 5 GiB base it is a tier at most.
+        let sixteen = (0..4)
+            .map(|i| meta(10 + i, 100 + i, 100 + i, 16 * MIB))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            blob_compaction_shape(&sixteen, &big_base, floor),
+            Some(BlobCompactionShape::Tier(_))
+        ));
+        let half_gib = (0..4)
+            .map(|i| meta(10 + i, 100 + i, 100 + i, 128 * MIB))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blob_compaction_shape(&half_gib, &big_base, floor),
+            Some(BlobCompactionShape::Full)
+        );
+        // A small base keeps the floor: 64 MiB of patches over 100 MiB of base goes full.
+        assert_eq!(
+            blob_compaction_shape(&sixteen, &[base(1, 100 * MIB)], floor),
+            Some(BlobCompactionShape::Full)
+        );
+        assert_eq!(blob_compaction_shape(&[], &big_base, floor), None);
+    }
+
+    #[test]
+    fn tier_takes_the_oldest_run_of_comparable_neighbours() {
+        // Manifest order is by path, not LSN; the selector must sort by LSN itself.
+        let patches = vec![
+            meta(7, 70, 79, MIB / 2),
+            meta(6, 60, 69, MIB / 2),
+            meta(1, 10, 19, 30 * MIB),
+            meta(2, 20, 29, 7 * MIB),
+            meta(3, 30, 39, 7 * MIB),
+            meta(4, 40, 49, 8 * MIB),
+            meta(5, 50, 59, MIB / 2),
+            meta(8, 80, 89, MIB / 2),
+        ];
+        let tier = select_blob_patch_tier(&patches);
+        assert_eq!(
+            tier.iter().map(|table| table.id).collect::<Vec<_>>(),
+            [5, 6, 7, 8]
+        );
+
+        // Three 7-8 MiB patches are not enough for a merge, and the 30 MiB one is a different tier.
+        let short = patches[2..6].to_vec();
+        assert!(select_blob_patch_tier(&short).is_empty());
+        // Once they are four, the older run wins over a newer run of small patches.
+        let mut four = short.clone();
+        four.push(meta(9, 90, 99, 6 * MIB));
+        four.extend((0..4).map(|i| meta(20 + i, 200 + i * 10, 209 + i * 10, MIB / 2)));
+        assert_eq!(
+            select_blob_patch_tier(&four)
+                .iter()
+                .map(|table| table.id)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 9]
+        );
+    }
+
+    #[test]
+    fn tier_never_skips_a_patch_in_the_middle() {
+        // A big patch between two small ones splits them into separate runs.
+        let patches = vec![
+            meta(1, 10, 19, MIB),
+            meta(2, 20, 29, MIB),
+            meta(3, 30, 39, 40 * MIB),
+            meta(4, 40, 49, MIB),
+            meta(5, 50, 59, MIB),
+        ];
+        assert!(select_blob_patch_tier(&patches).is_empty());
+    }
+
+    #[test]
+    fn tier_accepts_pairs_once_the_partition_is_crowded() {
+        // Sizes go 1, 1, 8, 8, 64, 64 MiB and repeat: pairs of neighbours are comparable, but no
+        // run ever reaches the fanout.
+        let patch = |i: u64| meta(i + 1, i * 10, i * 10 + 9, MIB << ((i / 2) % 3 * 3));
+        let calm = (0..12).map(patch).collect::<Vec<_>>();
+        assert!(select_blob_patch_tier(&calm).is_empty());
+
+        let crowded = (0..LSM_PATCH_TIER_MAX_PATCHES as u64)
+            .map(patch)
+            .collect::<Vec<_>>();
+        let tier = select_blob_patch_tier(&crowded);
+        assert_eq!(
+            tier.iter().map(|table| table.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn tier_bounds_the_merge_input_count() {
+        let patches = (0..40u64)
+            .map(|i| meta(i + 1, i * 10, i * 10 + 9, MIB))
+            .collect::<Vec<_>>();
+        let tier = select_blob_patch_tier(&patches);
+        assert_eq!(tier.len(), LSM_PATCH_TIER_MAX_INPUTS);
+        assert_eq!(tier[0].id, 1);
+    }
+
+    #[test]
+    fn transition_bounds_stop_below_unread_patches() {
+        let live = vec![
+            meta(1, 10, 19, MIB),
+            meta(2, 20, 29, MIB),
+            meta(3, 30, 39, MIB),
+            meta(4, 40, 49, MIB),
+        ];
+        // A sweep reads no patch: it stops below the oldest one.
+        assert_eq!(sweep_bound(100, &live), 9);
+        assert_eq!(sweep_bound(5, &live), 5);
+        assert_eq!(sweep_bound(100, &[]), 100);
+        // A tier over patches 2-3 stops below patch 4; a tier ending at the newest patch may use
+        // the materialized frontier.
+        assert_eq!(tier_bound(100, &live[1..3], &live), 39);
+        assert_eq!(tier_bound(100, &live[2..4], &live), 100);
+        assert_eq!(tier_bound(35, &live[1..3], &live), 35);
     }
 }
 
@@ -1211,6 +1545,8 @@ fn compact_relocation_lsm_partition(
 
 #[cfg(test)]
 mod relocation_compaction_tests {
+    use lsm::OperandFloor;
+
     use super::*;
 
     fn meta(id: u64, file_len: u64) -> TableMeta {
@@ -1223,6 +1559,7 @@ mod relocation_compaction_tests {
             min_lsn: Some(id),
             max_lsn: Some(id),
             merge_applied_through_lsn: None,
+            global_operand_floor: OperandFloor::Unknown,
             record_count: 1,
             file_len,
             checksum: [0; 32],

@@ -9,10 +9,11 @@ use std::{
     mem,
     num::NonZeroUsize,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use crate::{Error, Result, StrataLsn, TableMeta, TableWriter};
+use crate::{Error, OperandFloorFn, Result, StrataLsn, TableMeta, TableWriter};
 
 /// Default logical byte capacity of one memtable generation.
 pub const DEFAULT_MEMTABLE_BUFFER_BYTES: usize = 1 << 30;
@@ -456,6 +457,7 @@ impl FrozenMemtable {
         id: u64,
         partition: u32,
         patch_format_id: &str,
+        classify_operands: Option<&OperandFloorFn>,
     ) -> Result<TableMeta> {
         if self.is_empty() {
             return Err(Error::InvalidTable(
@@ -464,6 +466,9 @@ impl FrozenMemtable {
         }
         let mut writer =
             TableWriter::create_patch(root, relative_path, id, partition, patch_format_id)?;
+        if let Some(classify) = classify_operands {
+            writer.track_operand_floor(Arc::clone(classify))?;
+        }
         let mut rows = self.generation.rows.iter().collect::<Vec<_>>();
         rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         for (key, history) in rows {
@@ -777,9 +782,9 @@ impl<'a> Iterator for MemtableEntries<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroUsize, time::Duration};
+    use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
-    use crate::{Error, StrataLsn, TableReader};
+    use crate::{Error, OperandFloor, OperandFloorFn, StrataLsn, TableReader};
 
     use super::{Memtable, MemtableRolloverPolicy, VERSION_BYTES};
 
@@ -960,7 +965,7 @@ mod tests {
         let frozen = active.rollover(2).unwrap();
 
         let meta = frozen
-            .flush(directory.path(), "mixed.sst", 8, 0, "patch-v1")
+            .flush(directory.path(), "mixed.sst", 8, 0, "patch-v1", None)
             .unwrap();
         let reader = TableReader::open_patch(directory.path(), &meta, "patch-v1").unwrap();
         assert_eq!(
@@ -975,6 +980,66 @@ mod tests {
             reader.get_patches(b"K1X2").unwrap(),
             vec![(lsn(2), b"V2Y2".to_vec())]
         );
+    }
+
+    #[test]
+    fn flush_records_the_global_operand_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        // Operands whose value starts with `L` depend on global state, at their own LSN.
+        let classify: OperandFloorFn = Arc::new(|lsn, value: &[u8]| {
+            Ok(value
+                .first()
+                .is_some_and(|byte| *byte == b'L')
+                .then_some(lsn))
+        });
+
+        let mut active = Memtable::new(1, 2048);
+        insert(&mut active, b"A", 1, b"plain");
+        insert(&mut active, b"B", 2, b"L-extend");
+        insert(&mut active, b"C", 3, b"L-extend");
+        let frozen = active.rollover(2).unwrap();
+        let meta = frozen
+            .flush(
+                directory.path(),
+                "mixed.sst",
+                8,
+                0,
+                "patch-v1",
+                Some(&classify),
+            )
+            .unwrap();
+        assert_eq!(meta.min_lsn, Some(lsn(1)));
+        assert_eq!(meta.global_operand_floor, OperandFloor::At(lsn(2)));
+
+        let mut active = Memtable::new(3, 2048);
+        insert(&mut active, b"A", 4, b"plain");
+        let frozen = active.rollover(4).unwrap();
+        let meta = frozen
+            .flush(
+                directory.path(),
+                "plain.sst",
+                9,
+                0,
+                "patch-v1",
+                Some(&classify),
+            )
+            .unwrap();
+        assert_eq!(meta.global_operand_floor, OperandFloor::None);
+
+        let mut active = Memtable::new(5, 2048);
+        insert(&mut active, b"B", 6, b"L-extend");
+        let frozen = active.rollover(6).unwrap();
+        let meta = frozen
+            .flush(
+                directory.path(),
+                "unclassified.sst",
+                10,
+                0,
+                "patch-v1",
+                None,
+            )
+            .unwrap();
+        assert_eq!(meta.global_operand_floor, OperandFloor::Unknown);
     }
 
     #[test]
@@ -1021,7 +1086,7 @@ mod tests {
         let frozen = active.rollover(2).unwrap();
 
         let meta = frozen
-            .flush(directory.path(), "memtable.sst", 9, 0, "key-ref-v1")
+            .flush(directory.path(), "memtable.sst", 9, 0, "key-ref-v1", None)
             .unwrap();
         let reader = TableReader::open_patch(directory.path(), &meta, "key-ref-v1").unwrap();
 

@@ -6,7 +6,7 @@ use std::{
 
 use core_types::{BlobKey, GarbageEvent, RecordRef, SegmentGcSummary, SegmentGcSummaryDelta};
 use index::StrataIndex;
-use lsm::{GarbageLog, GarbageRecord, Manifest, ManifestEdit, SegmentKey, TableMeta};
+use lsm::{GarbageLog, GarbageRecord, Manifest, ManifestEdit, OperandFloor, SegmentKey, TableMeta};
 use tempfile::tempdir;
 
 use crate::{GARBAGE_LOG_HEAD, GARBAGE_LOG_SWEEP_CURSOR, garbage_log_dir};
@@ -187,6 +187,7 @@ fn manifest_edit() -> ManifestEdit {
             min_lsn: None,
             max_lsn: None,
             merge_applied_through_lsn: None,
+            global_operand_floor: OperandFloor::Unknown,
             record_count: 1,
             file_len: 1,
             checksum: [1; 32],

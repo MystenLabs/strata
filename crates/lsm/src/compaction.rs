@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    CompactionReservation, Error, GarbageRecord, Manifest, ManifestEdit, MergeOperator, Result,
-    TableMeta, TableReader, TableStore, TableTarget, TableWriter, table::TableCursor,
+    CompactionReservation, Error, GarbageRecord, Manifest, ManifestEdit, MergeOperator,
+    OperandFloor, Result, TableMeta, TableReader, TableStore, TableTarget, TableWriter,
+    table::TableCursor,
 };
 
 /// Files reserved for one compaction and their complete key bounds.
@@ -53,6 +54,23 @@ pub fn select_base_compaction_inputs(
     base: &TableMeta,
 ) -> Result<Option<CompactionInputs>> {
     select_inputs(manifest, tables, partition, &[], Some(base), true, true)
+}
+
+/// Selects and reserves exactly one base SST for a base-only sweep, reading no patches.
+///
+/// Rewriting a base by itself is only sound when the merge applies global transitions no later
+/// than the LSN below which every live patch of the partition starts (see
+/// [`Manifest::writes_merged_through_lsn`]): any operand that could change how a transition
+/// applies to one of these keys is then already in the base. The caller bounds its merge snapshot
+/// accordingly and stamps the output's `merge_applied_through_lsn` with that bound. The output
+/// covers exactly the input's key range, so it cannot overlap a neighbouring base.
+pub fn select_base_sweep_inputs(
+    manifest: &Manifest,
+    tables: &Arc<TableStore>,
+    partition: u32,
+    base: &TableMeta,
+) -> Result<Option<CompactionInputs>> {
+    select_inputs(manifest, tables, partition, &[], Some(base), true, false)
 }
 
 /// Selects and reserves an overlap-closed patch set for patch-only compaction.
@@ -460,6 +478,15 @@ pub fn write_patch_compaction(
         .iter()
         .map(|table| TableReader::open_patch(root, table, &inputs.patch_format_id)?.into_cursor())
         .collect::<Result<Vec<_>>>()?;
+    // A partial merge keeps every operand's own LSN (a batch keeps the inner ones), so the merged
+    // output cannot hold a global-state operand older than the lowest input floor. Inheriting the
+    // inputs' floors is exact for untouched rows and conservative for reduced ones.
+    let operand_floor = inputs
+        .patches
+        .iter()
+        .map(|table| table.global_operand_floor)
+        .reduce(OperandFloor::merge)
+        .unwrap_or_default();
     let mut writer = None;
     let mut outputs = Vec::new();
     let mut records = Vec::new();
@@ -510,13 +537,10 @@ pub fn write_patch_compaction(
 
         if writer.is_none() {
             let (id, path) = next_output()?.into_patch_parts()?;
-            writer = Some(TableWriter::create_patch(
-                root,
-                path,
-                id,
-                partition,
-                &inputs.patch_format_id,
-            )?);
+            let mut opened =
+                TableWriter::create_patch(root, path, id, partition, &inputs.patch_format_id)?;
+            opened.set_operand_floor(operand_floor)?;
+            writer = Some(opened);
         }
         let current = writer.as_mut().expect("writer was opened above");
         match merged {

@@ -1,8 +1,8 @@
 use std::{num::NonZeroU32, path::Path, sync::Arc};
 
 use lsm::{
-    GarbageRecord, Manifest, ManifestEdit, MergeOperator, Replace, Result, Snapshot, StrataLsn,
-    TableMeta, TableStore, TableTarget, TableWriter, encode_inline_value,
+    GarbageRecord, Manifest, ManifestEdit, MergeOperator, OperandFloor, Replace, Result, Snapshot,
+    StrataLsn, TableMeta, TableStore, TableTarget, TableWriter, encode_inline_value,
     select_patch_compaction_inputs, select_patch_group_inputs, write_patch_compaction,
 };
 use tempfile::TempDir;
@@ -88,6 +88,52 @@ fn write_patch(root: &Path, path: &str, id: u64, sequence: u64, value: &[u8]) ->
     let mut writer = TableWriter::create_patch(root, path, id, 0, "patch-v1").unwrap();
     writer.add_patch(b"a", sequence, value).unwrap();
     writer.finish().unwrap()
+}
+
+/// The merged patch inherits the lowest floor of its inputs, and an unclassified input makes the
+/// output unclassified too.
+#[test]
+fn patch_compaction_inherits_the_operand_floor() {
+    let directory = TempDir::new().unwrap();
+    let mut early = write_patch(directory.path(), "early.sst", 2, 5, b"-5");
+    early.global_operand_floor = OperandFloor::None;
+    let mut late = write_patch(directory.path(), "late.sst", 3, 10, b"-10");
+    late.global_operand_floor = OperandFloor::At(10);
+    let unclassified = write_patch(directory.path(), "unclassified.sst", 4, 12, b"-12");
+    assert_eq!(unclassified.global_operand_floor, OperandFloor::Unknown);
+    let mut manifest = Manifest::empty("base-v1", "patch-v1", NonZeroU32::new(1).unwrap());
+    manifest
+        .apply(&ManifestEdit {
+            remove: Vec::new(),
+            add_base: Vec::new(),
+            add_patches: vec![early.clone(), late.clone(), unclassified.clone()],
+            materialized_through: None,
+            wal_retained_from: None,
+        })
+        .unwrap();
+    let tables = Arc::new(TableStore::new(directory.path()));
+
+    let inputs = select_patch_group_inputs(&manifest, &tables, 0, &[early, late])
+        .unwrap()
+        .unwrap();
+    let (edit, _) =
+        write_patch_compaction(&inputs, &Append, u64::MAX, || Ok(TableTarget::patch(5))).unwrap();
+    assert_eq!(
+        edit.add_patches[0].global_operand_floor,
+        OperandFloor::At(10)
+    );
+    manifest.apply(&edit).unwrap();
+
+    let merged = edit.add_patches[0].clone();
+    let inputs = select_patch_group_inputs(&manifest, &tables, 0, &[merged, unclassified])
+        .unwrap()
+        .unwrap();
+    let (edit, _) =
+        write_patch_compaction(&inputs, &Append, u64::MAX, || Ok(TableTarget::patch(6))).unwrap();
+    assert_eq!(
+        edit.add_patches[0].global_operand_floor,
+        OperandFloor::Unknown
+    );
 }
 
 /// A patch group merges exactly the patches it names. The unselected patch in the middle keeps

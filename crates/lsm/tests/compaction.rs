@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use lsm::{
-    Error, Manifest, ManifestEdit, TableMeta, TableStore, select_base_compaction_inputs,
-    select_compaction_inputs, select_patch_compaction_inputs,
+    Error, Manifest, ManifestEdit, OperandFloor, TableMeta, TableStore,
+    select_base_compaction_inputs, select_base_sweep_inputs, select_compaction_inputs,
+    select_patch_compaction_inputs,
 };
 use tempfile::TempDir;
 
@@ -176,6 +177,36 @@ fn base_seed_selects_a_cold_base_and_every_overlapping_patch() {
     assert!(!files.is_pinned(&separate));
 }
 
+#[test]
+fn base_sweep_selects_the_base_alone() {
+    let cold = table(1, "cold.sst", b"a", b"z", false);
+    let overlapping = table(2, "overlapping.sst", b"b", b"m", true);
+    let mut manifest =
+        Manifest::empty("base-v1", "patch-v1", std::num::NonZeroU32::new(1).unwrap());
+    manifest
+        .apply(&ManifestEdit {
+            remove: Vec::new(),
+            add_base: vec![cold.clone()],
+            add_patches: vec![overlapping.clone()],
+            materialized_through: None,
+            wal_retained_from: None,
+        })
+        .unwrap();
+
+    let directory = TempDir::new().unwrap();
+    let files = Arc::new(TableStore::new(directory.path()));
+    let inputs = select_base_sweep_inputs(&manifest, &files, 0, &cold)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(inputs.base, std::slice::from_ref(&cold));
+    assert!(inputs.patches.is_empty());
+    assert_eq!(inputs.first_key, cold.first_key);
+    assert_eq!(inputs.last_key, cold.last_key);
+    assert!(files.is_pinned(&cold));
+    assert!(!files.is_pinned(&overlapping));
+}
+
 fn table(id: u64, path: &str, first: &[u8], last: &[u8], patch: bool) -> TableMeta {
     TableMeta {
         id,
@@ -186,6 +217,7 @@ fn table(id: u64, path: &str, first: &[u8], last: &[u8], patch: bool) -> TableMe
         min_lsn: patch.then_some(1),
         max_lsn: patch.then_some(1),
         merge_applied_through_lsn: None,
+        global_operand_floor: OperandFloor::Unknown,
         record_count: 1,
         file_len: 1,
         checksum: [0; 32],
