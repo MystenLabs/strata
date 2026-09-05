@@ -29,9 +29,9 @@ mod table;
 mod table_format;
 
 pub use compaction::{
-    CompactionInputs, merge_compaction, select_base_compaction_inputs, select_compaction_inputs,
-    select_patch_compaction_inputs, select_patch_group_inputs, write_compaction,
-    write_patch_compaction,
+    CompactionInputs, merge_compaction, select_base_compaction_inputs, select_base_sweep_inputs,
+    select_compaction_inputs, select_patch_compaction_inputs, select_patch_group_inputs,
+    write_compaction, write_patch_compaction,
 };
 pub use core_types::{GarbageEvent, SegmentKey, StrataLsn};
 pub use engine::{
@@ -45,7 +45,7 @@ pub use garbage_log::{
     read_segment_garbage,
 };
 pub use iterator::LsmIter;
-pub use manifest::{Manifest, ManifestEdit, PartitionManifest, TableMeta};
+pub use manifest::{Manifest, ManifestEdit, OperandFloor, PartitionManifest, TableMeta};
 pub use memtable::{
     DEFAULT_MEMTABLE_BUFFER_BYTES, FrozenMemtable, Memtable, MemtableEntries, MemtableEntry,
     MemtableRolloverPolicy,
@@ -53,7 +53,9 @@ pub use memtable::{
 pub use merge::{MergeOperator, Replace};
 pub use segment;
 pub use snapshot::{CompactionReservation, LiveSnapshots, Snapshot, SnapshotPin, TableStore};
-pub use table::{BlockCacheStats, DEFAULT_BLOCK_CACHE_BYTES, TableReader, TableWriter};
+pub use table::{
+    BlockCacheStats, DEFAULT_BLOCK_CACHE_BYTES, OperandFloorFn, TableReader, TableWriter,
+};
 
 /// Current on-disk manifest and SST format version.
 pub const FORMAT_VERSION: u32 = 7;

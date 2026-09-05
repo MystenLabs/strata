@@ -25,8 +25,8 @@ mod reduce;
 mod snapshot;
 mod state;
 
-pub(crate) use format::BlobMutation;
 pub use format::{BlobLifetime, BlobState, BlobVersion};
+pub(crate) use format::{BlobMutation, global_operand_floor};
 pub(crate) use garbage::terminal_garbage_record;
 pub use merge::BlobMerge;
 pub(crate) use merge::BlobMergeWithRelocations;

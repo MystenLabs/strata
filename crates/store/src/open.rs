@@ -2,6 +2,7 @@
 //! LSM and WAL opening, crash-recovery orchestration, and worker spawning.
 
 use std::{
+    collections::HashMap,
     fs,
     num::NonZeroU32,
     sync::{Arc, Mutex, RwLock, atomic::AtomicU64, mpsc},
@@ -216,6 +217,8 @@ impl StrataStore {
             store_halt: store_halt.clone(),
             metrics: metrics.clone(),
             obsolete: Vec::new(),
+            patch_bytes_floor: config.lsm_compaction_patch_bytes,
+            sweep_credits: HashMap::new(),
         };
         let lsm_compact_handle = thread::Builder::new()
             .name(format!("strata-lsm-compact-{}", config.namespace))
@@ -517,13 +520,15 @@ fn open_lsm_with_options(
     let lsm_dir = config.namespace_dir().join("lsm");
     let last_lsn = next_lsn.checked_sub(1).filter(|lsn| *lsn != 0);
     let manifest = Arc::new(load_blob_lsm_manifest(config, index)?);
-    Ok(Arc::new(Lsm::from_parts(
+    let lsm = Lsm::from_parts(
         lsm_dir.join("tables"),
         manifest,
         recovered,
         last_lsn,
         options,
-    )?))
+    )?;
+    lsm.set_global_operand_floor(Arc::new(crate::blob_lsm::global_operand_floor))?;
+    Ok(Arc::new(lsm))
 }
 
 pub(crate) fn open_store_wal(

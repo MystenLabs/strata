@@ -3,13 +3,33 @@
 use std::collections::BTreeMap;
 
 use core_types::{BlobLifecycle, Epoch, RecordRef, ShardKey};
-use lsm::{Error, Result, StrataLsn, decode_record_ref, encode_record_ref};
+use lsm::{
+    Error, Result, StoredValue, StrataLsn, decode_record_ref, decode_value, encode_record_ref,
+};
 
 const VERSION: u8 = 3;
 const PUT: u8 = 1;
 const SET_LIFETIME: u8 = 2;
 const TOMBSTONE: u8 = 3;
 const BATCH: u8 = 4;
+
+/// Classifies one stored blob-LSM operand for the patch's global operand floor.
+///
+/// A lifetime change is the operand whose presence changes how a later epoch transition applies
+/// to the key, so a patch's floor is the lowest LSN of any lifetime change it holds. Puts and
+/// tombstones only create or end versions; a transition applied without seeing them errs on the
+/// side of keeping bytes, which a later merge corrects. Segment-backed puts carry no inline
+/// mutation at all.
+pub(crate) fn global_operand_floor(lsn: StrataLsn, value: &[u8]) -> Result<Option<StrataLsn>> {
+    match decode_value(value)? {
+        StoredValue::Blob { .. } => Ok(None),
+        StoredValue::Inline(bytes) => Ok(BlobMutationWithLSN::decode_inline(lsn, bytes)?
+            .into_iter()
+            .filter(|mutation| matches!(mutation.mutation, BlobMutation::SetLifetime { .. }))
+            .map(|mutation| mutation.lsn)
+            .min()),
+    }
+}
 
 /// One self-contained logical mutation to a blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

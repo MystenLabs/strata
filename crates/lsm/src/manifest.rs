@@ -26,9 +26,54 @@ pub struct TableMeta {
     /// table was produced and is not part of the immutable SST byte format.
     #[serde(default)]
     pub merge_applied_through_lsn: Option<StrataLsn>,
+    /// Lowest LSN of an operand in this patch whose merge outcome depends on global state.
+    ///
+    /// The store's lifetime change is the motivating operand: an epoch transition may only be
+    /// applied to a key once every earlier lifetime change for that key has been merged. A pass
+    /// that rewrites a base without reading the live patches must therefore stay below this floor,
+    /// and the global-write frontier is bounded by it rather than by every patch row. Base tables
+    /// and patches whose writer did not classify operands report `Unknown`, which is treated as the
+    /// table's `min_lsn`.
+    #[serde(default)]
+    pub global_operand_floor: OperandFloor,
     pub record_count: u64,
     pub file_len: u64,
     pub checksum: [u8; 32],
+}
+
+/// Where a patch's operands that depend on global state begin.
+///
+/// See [`TableMeta::global_operand_floor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OperandFloor {
+    /// The writer did not classify operands; the table's `min_lsn` bounds global frontiers.
+    #[default]
+    Unknown,
+    /// Every operand was classified and none depends on global state.
+    None,
+    /// The lowest LSN of an operand that depends on global state.
+    At(StrataLsn),
+}
+
+impl OperandFloor {
+    /// Combines the floors of tables merged into one output: unknown stays unknown, and otherwise
+    /// the lowest known floor wins.
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::None, floor) | (floor, Self::None) => floor,
+            (Self::At(left), Self::At(right)) => Self::At(left.min(right)),
+        }
+    }
+
+    /// Highest LSN this table proves free of unmerged global-state operands, given its `min_lsn`.
+    fn merged_through(self, min_lsn: StrataLsn) -> Option<StrataLsn> {
+        match self {
+            Self::Unknown => Some(min_lsn.saturating_sub(1)),
+            Self::None => None,
+            Self::At(lsn) => Some(lsn.saturating_sub(1)),
+        }
+    }
 }
 
 /// Live SST files for one hash partition.
@@ -161,6 +206,29 @@ impl Manifest {
                     .expect("validated patch tables have a minimum LSN")
                     .saturating_sub(1);
                 merged = merged.min(before_patch);
+            }
+        }
+        merged
+    }
+
+    /// Highest contiguous caller LSN below which every write that depends on global state has been
+    /// merged into a base table.
+    ///
+    /// This relaxes [`Self::writes_merged_through_lsn`] using each patch's
+    /// [`TableMeta::global_operand_floor`]: a live patch that holds only plain writes, such as new
+    /// versions and tombstones, does not hold back the frontier, because no epoch transition can
+    /// be misjudged by leaving those unmerged. Only lifetime changes and the like must be folded
+    /// before a transition at a later LSN may be trusted, so those are what bound it.
+    pub fn global_writes_merged_through_lsn(&self) -> StrataLsn {
+        let mut merged = self.materialized_through.unwrap_or_default();
+        for tables in self.partitions.values() {
+            for patch in &tables.patches {
+                let min_lsn = patch
+                    .min_lsn
+                    .expect("validated patch tables have a minimum LSN");
+                if let Some(through) = patch.global_operand_floor.merged_through(min_lsn) {
+                    merged = merged.min(through);
+                }
             }
         }
         merged
@@ -463,7 +531,7 @@ fn invalid_manifest<T>(reason: impl Into<String>) -> Result<T> {
 mod tests {
     use std::num::NonZeroU32;
 
-    use super::{Manifest, ManifestEdit, TableMeta};
+    use super::{Manifest, ManifestEdit, OperandFloor, TableMeta};
     fn base(id: u64, path: &str, first: &[u8], last: &[u8]) -> TableMeta {
         TableMeta {
             id,
@@ -474,6 +542,7 @@ mod tests {
             min_lsn: None,
             max_lsn: None,
             merge_applied_through_lsn: None,
+            global_operand_floor: OperandFloor::Unknown,
             record_count: 1,
             file_len: 1,
             checksum: [0; 32],
@@ -578,6 +647,63 @@ mod tests {
         // ...but not by cold bases: with no live patch, every write through the materialized
         // frontier has been merged, even though the bases were last re-read at 130 and 135.
         assert_eq!(manifest.writes_merged_through_lsn(), 140);
+    }
+
+    #[test]
+    fn global_write_frontier_is_bounded_only_by_global_operands() {
+        let mut plain = patch(3, "p.sst", b"b", b"b");
+        plain.min_lsn = Some(125);
+        plain.max_lsn = Some(140);
+        plain.global_operand_floor = OperandFloor::None;
+        let mut extension = patch(4, "q.sst", b"c", b"c");
+        extension.min_lsn = Some(150);
+        extension.max_lsn = Some(170);
+        extension.global_operand_floor = OperandFloor::At(160);
+        let mut unclassified = patch(5, "r.sst", b"d", b"d");
+        unclassified.min_lsn = Some(180);
+        unclassified.max_lsn = Some(190);
+
+        let mut manifest =
+            Manifest::empty("test-v1", "test-patches-v1", NonZeroU32::new(1).unwrap());
+        let mut initial = edit(&[], Vec::new(), vec![plain, extension, unclassified]);
+        initial.materialized_through = Some(200);
+        manifest.apply(&initial).unwrap();
+
+        // Every write frontier stops below the oldest patch...
+        assert_eq!(manifest.writes_merged_through_lsn(), 124);
+        // ...but the global one skips the plain patch, stops just below the LSN-160 lifetime
+        // change, and would stop below LSN 180 for a patch nobody classified.
+        assert_eq!(manifest.global_writes_merged_through_lsn(), 159);
+
+        manifest
+            .apply(&edit(&["q.sst"], Vec::new(), Vec::new()))
+            .unwrap();
+        assert_eq!(manifest.global_writes_merged_through_lsn(), 179);
+        manifest
+            .apply(&edit(&["r.sst"], Vec::new(), Vec::new()))
+            .unwrap();
+        assert_eq!(manifest.global_writes_merged_through_lsn(), 200);
+        assert_eq!(manifest.writes_merged_through_lsn(), 124);
+    }
+
+    #[test]
+    fn operand_floor_merge_keeps_the_weakest_claim() {
+        assert_eq!(
+            OperandFloor::None.merge(OperandFloor::At(7)),
+            OperandFloor::At(7)
+        );
+        assert_eq!(
+            OperandFloor::At(9).merge(OperandFloor::At(7)),
+            OperandFloor::At(7)
+        );
+        assert_eq!(
+            OperandFloor::None.merge(OperandFloor::None),
+            OperandFloor::None
+        );
+        assert_eq!(
+            OperandFloor::At(7).merge(OperandFloor::Unknown),
+            OperandFloor::Unknown
+        );
     }
 
     #[test]

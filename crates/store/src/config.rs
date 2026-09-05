@@ -18,6 +18,7 @@ pub const DEFAULT_GC_MIN_IO_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_LSM_PARTITION_COUNT: u32 = 1;
+pub const DEFAULT_LSM_COMPACTION_PATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Runtime configuration for one Strata store namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,11 @@ pub struct StrataStoreConfig {
     /// This is an on-disk compatibility setting. Reopening an existing namespace with a
     /// different value is rejected rather than silently routing keys to different tables.
     pub lsm_partition_count: u32,
+    /// Patch bytes per blob-LSM partition that trigger a full pass while the base is small, and
+    /// the size under which a whole partition is folded on the periodic tick. A larger base goes
+    /// full only once its patch tier reaches a fixed fraction of the base, so base bytes rewritten
+    /// per ingested byte stay bounded as the base grows.
+    pub lsm_compaction_patch_bytes: u64,
     pub recovery_policy: StrataRecoveryPolicy,
     pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     /// Whether background GC workers are started.

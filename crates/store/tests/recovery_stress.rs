@@ -444,6 +444,7 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         max_unsealed_segments: 3,
         segment_reader_cache_capacity: 8,
         lsm_partition_count: store::DEFAULT_LSM_PARTITION_COUNT,
+        lsm_compaction_patch_bytes: store::DEFAULT_LSM_COMPACTION_PATCH_BYTES,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
         gc_workers_enabled: true,

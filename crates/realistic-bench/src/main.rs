@@ -607,6 +607,7 @@ impl Config {
             lsm_partition_count: self
                 .strata_lsm_partitions
                 .unwrap_or(store::DEFAULT_LSM_PARTITION_COUNT),
+            lsm_compaction_patch_bytes: store::DEFAULT_LSM_COMPACTION_PATCH_BYTES,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             gc_workers_enabled: self.strata_gc && self.relocation_profile_reads == 0,

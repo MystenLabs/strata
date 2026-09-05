@@ -12,7 +12,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use crate::{Error, Result, StrataLsn, TableMeta, table_format::*};
+use crate::{Error, OperandFloor, Result, StrataLsn, TableMeta, table_format::*};
 
 const TARGET_BLOCK_BYTES: usize = 64 * 1024;
 pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -268,9 +268,55 @@ pub struct TableWriter {
     min_lsn: Option<StrataLsn>,
     max_lsn: Option<StrataLsn>,
     record_count: u64,
+    operand_floor: OperandFloorSource,
+}
+
+/// Classifies one patch operand for [`TableMeta::global_operand_floor`].
+///
+/// Given a row's LSN and encoded value, returns the lowest LSN at which the operand depends on
+/// global state, or `None` when it does not. A partial-merge batch may carry several inner
+/// mutations with their own LSNs, which is why the answer is an LSN rather than a flag.
+pub type OperandFloorFn = Arc<dyn Fn(StrataLsn, &[u8]) -> Result<Option<StrataLsn>> + Send + Sync>;
+
+enum OperandFloorSource {
+    /// Nobody classified the rows; the table reports `OperandFloor::Unknown`.
+    Untracked,
+    /// Every added row is classified as it is written.
+    Tracked {
+        classify: OperandFloorFn,
+        floor: Option<StrataLsn>,
+    },
+    /// The caller derived the floor from the inputs it merged.
+    Fixed(OperandFloor),
 }
 
 impl TableWriter {
+    /// Classifies every subsequently added patch row so the finished table carries an exact
+    /// [`TableMeta::global_operand_floor`]. Only patch writers carry operands.
+    pub fn track_operand_floor(&mut self, classify: OperandFloorFn) -> Result<()> {
+        if self.kind != TableKind::Patch {
+            return Err(Error::InvalidTable(
+                "only patch SSTs carry operands to classify".to_owned(),
+            ));
+        }
+        self.operand_floor = OperandFloorSource::Tracked {
+            classify,
+            floor: None,
+        };
+        Ok(())
+    }
+
+    /// Stamps a floor derived by the caller, for outputs merged from already-classified inputs.
+    pub fn set_operand_floor(&mut self, floor: OperandFloor) -> Result<()> {
+        if self.kind != TableKind::Patch {
+            return Err(Error::InvalidTable(
+                "only patch SSTs carry an operand floor".to_owned(),
+            ));
+        }
+        self.operand_floor = OperandFloorSource::Fixed(floor);
+        Ok(())
+    }
+
     pub fn create_base(
         root: impl AsRef<Path>,
         relative_path: impl Into<String>,
@@ -370,6 +416,7 @@ impl TableWriter {
             min_lsn: None,
             max_lsn: None,
             record_count: 0,
+            operand_floor: OperandFloorSource::Untracked,
         })
     }
 
@@ -418,6 +465,12 @@ impl TableWriter {
         value: &[u8],
     ) -> Result<()> {
         self.expect_lsn(lsn)?;
+        if let (Some(lsn), OperandFloorSource::Tracked { classify, floor }) =
+            (lsn, &mut self.operand_floor)
+            && let Some(operand_floor) = classify(lsn, value)?
+        {
+            *floor = Some(floor.map_or(operand_floor, |current| current.min(operand_floor)));
+        }
         let prefixed = !key_prefix.is_empty();
         if prefixed && key != joined(key_prefix, key_suffix)? {
             return Err(Error::InvalidTable(
@@ -676,6 +729,13 @@ impl TableWriter {
             // TableWriter knows the file's rows but not the merge snapshot that produced them.
             // The full-compaction caller stamps this manifest-only field before publication.
             merge_applied_through_lsn: None,
+            global_operand_floor: match self.operand_floor {
+                OperandFloorSource::Untracked => OperandFloor::Unknown,
+                OperandFloorSource::Tracked { floor, .. } => {
+                    floor.map_or(OperandFloor::None, OperandFloor::At)
+                }
+                OperandFloorSource::Fixed(floor) => floor,
+            },
             record_count: self.record_count,
             file_len,
             checksum: footer_checksum,
