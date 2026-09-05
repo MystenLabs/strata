@@ -8,6 +8,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
+    time::Instant,
 };
 
 use super::output::{
@@ -47,13 +48,27 @@ impl GcExecutor {
     /// Reconciles and publishes one prepared copy while excluding blob compaction. Foreground
     /// writes do not take this lock and do not enter this call path.
     pub(crate) fn submit_gc_publish(&self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
+        let scenario = Some(copy.plan.scenario);
         let admission_lock = Arc::clone(&self.compaction_admission_lock);
+        let started = Instant::now();
         let _admission_guard = admission_lock
             .write()
             .expect("compaction admission lock poisoned");
+        self.metrics
+            .record_gc_attempt_phase(scenario, "admission_wait", started.elapsed());
+        let started = Instant::now();
         self.drain_gc_reconciliation_log()?;
+        self.metrics
+            .record_gc_attempt_phase(scenario, "drain", started.elapsed());
+        let started = Instant::now();
         let publish = self.prepare_gc_publish(copy)?;
-        self.commit_gc_publish(publish)
+        self.metrics
+            .record_gc_attempt_phase(scenario, "revalidate", started.elapsed());
+        let started = Instant::now();
+        let result = self.commit_gc_publish(publish)?;
+        self.metrics
+            .record_gc_attempt_phase(scenario, "commit", started.elapsed());
+        Ok(result)
     }
 
     /// Folds all committed garbage into the per-segment overlays used for revalidation. Each
@@ -67,12 +82,15 @@ impl GcExecutor {
                     .lock()
                     .expect("garbage publication lock poisoned");
                 let relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
+                let started = Instant::now();
                 let swept = self.index.sweep_garbage_log(
                     garbage_log_dir(&self.config),
                     self.config.namespace_dir(),
                     GARBAGE_LOG_HEAD,
                     GARBAGE_LOG_SWEEP_CURSOR,
                 )?;
+                self.metrics
+                    .record_garbage_sweep("gc_publish", swept, started.elapsed());
                 (swept, relocation_lsn)
             };
             if !swept {

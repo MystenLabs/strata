@@ -6,7 +6,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use core_types::{
@@ -39,11 +39,26 @@ impl GcExecutor {
     pub(crate) fn run_once(&self, planner: &GcPlanner) -> Result<Option<GcPublishResult>> {
         self.gc_io_limiter
             .set_bytes_per_sec(self.gc_concurrency.active_io_bytes_per_sec());
-        let Some(prepared) = self.prepare_gc_plan(planner)? else {
+        let started = Instant::now();
+        let prepared = self.prepare_gc_plan(planner)?;
+        self.metrics.record_gc_attempt_phase(
+            prepared.as_ref().map(|prepared| prepared.plan.scenario),
+            "plan",
+            started.elapsed(),
+        );
+        let Some(prepared) = prepared else {
             return Ok(None);
         };
+        let scenario = prepared.plan.scenario;
+        let started = Instant::now();
         let copy = self.copy_prepared_gc_plan(prepared)?;
-        self.publish_prepared_gc_copy(copy).map(Some)
+        self.metrics
+            .record_gc_attempt_phase(Some(scenario), "copy", started.elapsed());
+        let started = Instant::now();
+        let result = self.publish_prepared_gc_copy(copy);
+        self.metrics
+            .record_gc_attempt_phase(Some(scenario), "publish", started.elapsed());
+        result.map(Some)
     }
 
     /// Deletes every segment of a dropped shard generation as one unit, no per-record accounting.

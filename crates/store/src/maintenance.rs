@@ -66,6 +66,7 @@ pub(crate) struct GarbageLogSweeper {
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) gc_txs: Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
     pub(crate) shutdown_rx: mpsc::Receiver<()>,
+    pub(crate) metrics: StrataStoreMetrics,
 }
 
 impl GarbageLogSweeper {
@@ -133,12 +134,16 @@ impl GarbageLogSweeper {
                     .transpose()?
                     .flatten()
                     .unwrap_or_default();
+                let started = Instant::now();
                 let swept = self.index.sweep_garbage_log(
                     &self.global_log_dir,
                     &self.namespace_dir,
                     GARBAGE_LOG_HEAD,
                     GARBAGE_LOG_SWEEP_CURSOR,
                 )?;
+                self.metrics
+                    .record_garbage_sweep("sweeper", swept, started.elapsed());
+                self.publish_garbage_log_backlog()?;
                 // A compaction publishes its new base frontiers and its garbage-log head in one
                 // batch. Only the iteration that observes no remaining frame may expose that
                 // coverage to GC: at this point every Expired event produced by those bases is in
@@ -161,6 +166,27 @@ impl GarbageLogSweeper {
             advanced = true;
         }
         Ok(advanced)
+    }
+
+    /// Exposes how far the sweep cursor trails the committed head, in bytes of the current log
+    /// file. Frames in older log files are not counted, so this is a lower bound while the head
+    /// has rolled to a newer file.
+    fn publish_garbage_log_backlog(&self) -> Result<()> {
+        let head = self
+            .index
+            .get_garbage_log_position(GARBAGE_LOG_HEAD)?
+            .unwrap_or_default();
+        let cursor = self
+            .index
+            .get_garbage_log_position(GARBAGE_LOG_SWEEP_CURSOR)?
+            .unwrap_or_default();
+        let backlog = if head.log_id == cursor.log_id {
+            head.offset.saturating_sub(cursor.offset)
+        } else {
+            head.offset
+        };
+        self.metrics.set_garbage_log_backlog_bytes(backlog);
+        Ok(())
     }
 
     /// Advances the durable frontier only when both merge coverage and garbage accounting agree.
