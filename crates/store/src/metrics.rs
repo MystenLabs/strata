@@ -139,6 +139,9 @@ struct PrometheusMetrics {
     gc_active_io_bytes_per_sec: IntGauge,
     gc_in_flight_workers: IntGauge,
     gc_admitted_total: IntCounter,
+    gc_attempt_phase_duration_seconds: HistogramVec,
+    garbage_sweep_duration_seconds: HistogramVec,
+    garbage_log_backlog_bytes: IntGauge,
     gc_run_failures_total: IntCounter,
     gc_run_failures_by_reason_total: IntCounterVec,
     gc_consecutive_run_failures: IntGauge,
@@ -813,6 +816,28 @@ impl StrataStoreMetrics {
                     &labels,
                     "gc_admitted_total",
                     "Total background Strata GC attempts admitted by the runtime concurrency tuner.",
+                )?,
+                gc_attempt_phase_duration_seconds: register_histogram_vec_with_buckets(
+                    registry,
+                    &labels,
+                    "gc_attempt_phase_duration_seconds",
+                    "Wall-clock seconds one GC attempt spent in each phase, by strategy: plan, copy, then within publish the admission-lock wait, garbage-log drain, revalidation, and commit.",
+                    &["strategy", "phase"],
+                    COMPACTION_DURATION_BUCKETS.to_vec(),
+                )?,
+                garbage_sweep_duration_seconds: register_histogram_vec_with_buckets(
+                    registry,
+                    &labels,
+                    "garbage_sweep_duration_seconds",
+                    "Wall-clock seconds of one bounded garbage-log sweep, by caller (sweeper thread or GC publish) and whether it folded any frame.",
+                    &["caller", "result"],
+                    COMPACTION_DURATION_BUCKETS.to_vec(),
+                )?,
+                garbage_log_backlog_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "garbage_log_backlog_bytes",
+                    "Bytes of committed garbage-log frames the sweeper has not folded into segment overlays yet (within the current log file).",
                 )?,
                 gc_run_failures_total: register_counter(
                     registry,
@@ -1520,6 +1545,40 @@ impl StrataStoreMetrics {
     pub(crate) fn record_gc_admitted(&self) {
         if let Some(metrics) = &self.inner {
             metrics.gc_admitted_total.inc();
+        }
+    }
+
+    pub(crate) fn record_gc_attempt_phase(
+        &self,
+        scenario: Option<GcScenario>,
+        phase: &'static str,
+        elapsed: Duration,
+    ) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .gc_attempt_phase_duration_seconds
+                .with_label_values(&[scenario.map_or("none", GcScenario::metric_label), phase])
+                .observe(duration_seconds(elapsed));
+        }
+    }
+
+    pub(crate) fn record_garbage_sweep(
+        &self,
+        caller: &'static str,
+        swept: bool,
+        elapsed: Duration,
+    ) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .garbage_sweep_duration_seconds
+                .with_label_values(&[caller, if swept { "swept" } else { "empty" }])
+                .observe(duration_seconds(elapsed));
+        }
+    }
+
+    pub(crate) fn set_garbage_log_backlog_bytes(&self, bytes: u64) {
+        if let Some(metrics) = &self.inner {
+            metrics.garbage_log_backlog_bytes.set(to_i64(bytes));
         }
     }
 

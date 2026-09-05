@@ -252,6 +252,7 @@ impl StrataStore {
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             gc_txs: Arc::clone(&gc_wake_txs),
             shutdown_rx: garbage_sweep_rx,
+            metrics: metrics.clone(),
         };
         let garbage_sweep_handle = thread::Builder::new()
             .name(format!("strata-garbage-sweeper-{}", config.namespace))
