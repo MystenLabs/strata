@@ -215,6 +215,7 @@ struct Config {
     strata_gc: bool,
     strata_gc_min_epoch_copy_distance: Option<Epoch>,
     strata_gc_workers: Option<usize>,
+    strata_lsm_partitions: Option<u32>,
     relocation_profile_reads: usize,
     relocation_profile_timeout: Duration,
     rocksdb_min_blob_size: u64,
@@ -273,6 +274,7 @@ impl Config {
             strata_gc: true,
             strata_gc_min_epoch_copy_distance: None,
             strata_gc_workers: None,
+            strata_lsm_partitions: None,
             relocation_profile_reads: DEFAULT_RELOCATION_PROFILE_READS,
             relocation_profile_timeout: DEFAULT_RELOCATION_PROFILE_TIMEOUT,
             rocksdb_min_blob_size: DEFAULT_ROCKSDB_MIN_BLOB_SIZE,
@@ -403,6 +405,17 @@ impl Config {
                 "--strata-gc-workers" => {
                     config.strata_gc_workers =
                         Some(parse_nonzero_usize(&next_value(&mut args, &arg)?)?)
+                }
+                "--strata-lsm-partitions" => {
+                    let count = parse_u64(&next_value(&mut args, &arg)?)?;
+                    config.strata_lsm_partitions = Some(
+                        u32::try_from(count)
+                            .ok()
+                            .filter(|count| *count > 0)
+                            .ok_or_else(|| {
+                                "--strata-lsm-partitions must be between 1 and u32::MAX".to_owned()
+                            })?,
+                    );
                 }
                 "--relocation-profile-reads" => {
                     config.relocation_profile_reads =
@@ -553,6 +566,9 @@ impl Config {
         if self.strata_gc_workers.is_some() && self.engine != EngineKind::Strata {
             return Err("--strata-gc-workers requires --engine strata".to_owned());
         }
+        if self.strata_lsm_partitions.is_some() && self.engine != EngineKind::Strata {
+            return Err("--strata-lsm-partitions requires --engine strata".to_owned());
+        }
         if self.relocation_profile_reads > 0 && self.relocation_profile_timeout.is_zero() {
             return Err("--relocation-profile-timeout must be non-zero".to_owned());
         }
@@ -588,7 +604,9 @@ impl Config {
             write_queue_capacity: self.queue_capacity,
             max_unsealed_segments: self.max_unsealed_segments,
             segment_reader_cache_capacity: DEFAULT_READER_CACHE_CAPACITY,
-            lsm_partition_count: store::DEFAULT_LSM_PARTITION_COUNT,
+            lsm_partition_count: self
+                .strata_lsm_partitions
+                .unwrap_or(store::DEFAULT_LSM_PARTITION_COUNT),
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             gc_workers_enabled: self.strata_gc && self.relocation_profile_reads == 0,
@@ -2842,6 +2860,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 config.store_config().gc_worker_count
             );
             println!(
+                "strata_lsm_partitions={}",
+                config.store_config().lsm_partition_count
+            );
+            println!(
                 "strata_gc_min_l0_rewrite_epoch_distance={}",
                 planner.min_l0_rewrite_epoch_distance
             );
@@ -4065,6 +4087,7 @@ strata:
   --strata-gc-min-epoch-copy-distance <epochs>
                                            minimum distance considered far for L0 usefulness and exact routing
   --strata-gc-workers <count>            GC workers started and admitted initially; default 1
+  --strata-lsm-partitions <count>        hash partitions for the main and relocation LSMs; default 1
   --relocation-profile-reads <count>    post-workload HDD relocation profile; disables background GC for deterministic setup
   --relocation-profile-timeout <time>   setup/healing deadline; default 10m
 
