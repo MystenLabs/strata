@@ -389,12 +389,14 @@ async fn lsm_manifest_edits_share_an_atomic_metadata_batch() {
         .put_lsm_manifest_batch(&mut batch, "blob", &manifest)
         .unwrap();
     batch.write_with_sync(true).unwrap();
+    let guard = index.lock_lsm_manifests();
     let mut batch = index.batch();
     index
-        .merge_lsm_manifest_batch(&mut batch, "blob", &edit)
+        .merge_lsm_manifest_batch(&mut batch, "blob", &edit, &guard)
         .unwrap();
     index.put_segment_state_batch(&mut batch, &state).unwrap();
     batch.write_with_sync(true).unwrap();
+    drop(guard);
 
     manifest.apply(&edit).unwrap();
     assert_eq!(index.get_lsm_manifest("blob").unwrap(), Some(manifest));

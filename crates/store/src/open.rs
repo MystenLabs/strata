@@ -22,8 +22,8 @@ use segment::{SegmentFactory, SegmentIdAllocator, SegmentIoObserver, SegmentWrit
 
 use crate::{
     BLOB_LSM_MANIFEST, DEFAULT_RELOCATION_CACHE_ENTRIES, Error, FIRST_SEGMENT_ID, GcPlanner,
-    INGEST_SEGMENT_OWNER, LSM_BASE_FORMAT, LSM_FILE_SYNC_WORKERS, LSM_MEMTABLE_MAX_AGE,
-    LSM_MEMTABLE_MAX_KEYS, LSM_PATCH_FORMAT, RELOCATION_LSM_BASE_FORMAT, RELOCATION_LSM_MANIFEST,
+    INGEST_SEGMENT_OWNER, LSM_BASE_FORMAT, LSM_FILE_SYNC_WORKERS, LSM_MEMTABLE_MAX_KEYS,
+    LSM_PATCH_FORMAT, RELOCATION_LSM_BASE_FORMAT, RELOCATION_LSM_MANIFEST,
     RELOCATION_LSM_PATCH_FORMAT, RETIRED_PROJECTION_DIR, Result, STANDALONE_SHARD, StoreHalt,
     StrataStore, StrataStoreConfig, StrataStoreMetrics, WriteCoordinator,
     file_sync::file_sync_channel,
@@ -502,7 +502,7 @@ pub(crate) fn open_lsm(
         LsmOptions {
             rollover_policy: Some(MemtableRolloverPolicy::new(
                 LSM_MEMTABLE_MAX_KEYS,
-                LSM_MEMTABLE_MAX_AGE,
+                config.lsm_memtable_max_age,
             )),
             ..LsmOptions::default()
         },
@@ -653,7 +653,7 @@ pub(crate) fn open_relocation_lsm(
         LsmOptions {
             rollover_policy: Some(MemtableRolloverPolicy::new(
                 LSM_MEMTABLE_MAX_KEYS,
-                LSM_MEMTABLE_MAX_AGE,
+                config.lsm_memtable_max_age,
             )),
             ..LsmOptions::default()
         },

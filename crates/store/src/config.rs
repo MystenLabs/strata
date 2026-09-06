@@ -19,6 +19,7 @@ pub const DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_LSM_PARTITION_COUNT: u32 = 1;
 pub const DEFAULT_LSM_COMPACTION_PATCH_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_LSM_MEMTABLE_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// Runtime configuration for one Strata store namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,11 @@ pub struct StrataStoreConfig {
     /// full only once its patch tier reaches a fixed fraction of the base, so base bytes rewritten
     /// per ingested byte stay bounded as the base grows.
     pub lsm_compaction_patch_bytes: u64,
+    /// Oldest an LSM memtable may grow before it is frozen and flushed into a patch SST. Every
+    /// partition of both LSMs flushes on this cadence, so with many partitions a longer age keeps
+    /// the patch count, and the fixed cost per compaction pass, in check; the writes-merged
+    /// frontier that gates clock expiry lags by at most this long.
+    pub lsm_memtable_max_age: Duration,
     pub recovery_policy: StrataRecoveryPolicy,
     pub sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy,
     /// Whether background GC workers are started.

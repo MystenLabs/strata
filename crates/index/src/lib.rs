@@ -103,6 +103,9 @@ pub struct StrataIndex {
     epoch_changes: DBMap<StrataLsn, Epoch>,
     /// Materialized file set for each LSM, updated through RocksDB merge operands.
     lsm_manifests: DBMap<String, Manifest>,
+    /// Serializes read-modify-write publication of the LSM manifests; see
+    /// [`StrataIndex::lock_lsm_manifests`].
+    manifest_publish_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// Last checksummed garbage-log frame committed by each named producer.
     garbage_log_positions: DBMap<String, GarbageLogPosition>,
     /// Committed prefix of each segment-local `.glog` file.

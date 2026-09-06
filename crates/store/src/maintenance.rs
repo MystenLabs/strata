@@ -757,13 +757,19 @@ impl LsmCompactor {
             epoch_changes,
             ..BlobCompactionSnapshot::default()
         };
-        let relocation_max_lsn = self
-            .relocations
-            .upgrade()
-            .map(|relocations| relocations.lsm().last_lsn())
-            .transpose()?
-            .flatten()
-            .unwrap_or_default();
+        // A tier merge heals nothing: its rows are younger than anything GC relocates, and with
+        // hashed keys the scan would walk the partition's whole relocation range on every merge.
+        // Full passes and sweeps, which rewrite old rows, carry the scan.
+        let relocation_max_lsn = if tier {
+            0
+        } else {
+            self.relocations
+                .upgrade()
+                .map(|relocations| relocations.lsm().last_lsn())
+                .transpose()?
+                .flatten()
+                .unwrap_or_default()
+        };
         let relocation_scan = match relocation_max_lsn {
             max_lsn if max_lsn != 0 => self
                 .relocations
@@ -922,14 +928,13 @@ pub(crate) fn publish_blob_lsm_edit(
     edit: &ManifestEdit,
 ) -> lsm::Result<LsmManifest> {
     let publish = || -> Result<LsmManifest> {
+        let guard = index.lock_lsm_manifests();
         let mut batch = index.batch();
-        index.merge_lsm_manifest_batch(&mut batch, BLOB_LSM_MANIFEST, edit)?;
+        let manifest =
+            index.merge_lsm_manifest_batch(&mut batch, BLOB_LSM_MANIFEST, edit, &guard)?;
         batch.write_with_sync(true).map_err(index::Error::from)?;
-        index
-            .get_lsm_manifest(BLOB_LSM_MANIFEST)?
-            .ok_or_else(|| Error::InvariantViolation {
-                reason: "published blob LSM manifest is missing".to_owned(),
-            })
+        drop(guard);
+        Ok(manifest)
     };
     publish().map_err(|error| lsm::Error::InvalidManifest {
         reason: format!("blob manifest publication failed: {error}"),
@@ -946,14 +951,13 @@ pub(crate) fn publish_relocation_lsm_edit(
     edit: &ManifestEdit,
 ) -> lsm::Result<LsmManifest> {
     let publish = || -> Result<LsmManifest> {
+        let guard = index.lock_lsm_manifests();
         let mut batch = index.batch();
-        index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, edit)?;
+        let manifest =
+            index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, edit, &guard)?;
         batch.write_with_sync(true).map_err(index::Error::from)?;
-        index
-            .get_lsm_manifest(RELOCATION_LSM_MANIFEST)?
-            .ok_or_else(|| Error::InvariantViolation {
-                reason: "published relocation LSM manifest is missing".to_owned(),
-            })
+        drop(guard);
+        Ok(manifest)
     };
     publish().map_err(|error| lsm::Error::InvalidManifest {
         reason: format!("relocation manifest publication failed: {error}"),
@@ -1544,9 +1548,11 @@ fn compact_relocation_lsm_partition(
         .chain(&edit.add_patches)
         .fold(0u64, |bytes, table| bytes.saturating_add(table.file_len));
 
+    let guard = index.lock_lsm_manifests();
     let mut batch = index.batch();
-    index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, &edit)?;
+    index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, &edit, &guard)?;
     batch.write_with_sync(true).map_err(index::Error::from)?;
+    drop(guard);
     relocations
         .lsm()
         .reload_manifest(|| read_relocation_lsm_manifest(index))?;

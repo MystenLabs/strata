@@ -474,11 +474,15 @@ impl GcExecutor {
             let garbage_position = garbage_log
                 .append(&relocation_garbage)
                 .map_err(Error::from)?;
+            // Held until this batch is written: the relocation manifest is published whole, so
+            // no other publisher may read it in between.
+            let manifest_guard = self.index.lock_lsm_manifests();
             let mut batch = self.index.batch();
             self.index.merge_lsm_manifest_batch(
                 &mut batch,
                 RELOCATION_LSM_MANIFEST,
                 &relocation_edit,
+                &manifest_guard,
             )?;
             for state in &output_plan.segment_states {
                 self.index.put_segment_state_batch(&mut batch, state)?;

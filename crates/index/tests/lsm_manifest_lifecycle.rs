@@ -83,6 +83,7 @@ async fn concurrent_compactions_survive_reopen_and_old_snapshots() {
 
     // A synced output whose batch never commits is an orphan, not part of the live manifest.
     let orphan = write_base(&lsm_root, 7, "orphan/z.sst", &[("z", "orphan")]);
+    let abandoned_guard = index.lock_lsm_manifests();
     let mut abandoned_batch = index.batch();
     index
         .merge_lsm_manifest_batch(
@@ -95,9 +96,11 @@ async fn concurrent_compactions_survive_reopen_and_old_snapshots() {
                 materialized_through: None,
                 wal_retained_from: None,
             },
+            &abandoned_guard,
         )
         .unwrap();
     drop(abandoned_batch);
+    drop(abandoned_guard);
     assert_eq!(index.get_lsm_manifest(LSM_NAME).unwrap(), Some(initial));
 
     let first_edit = ManifestEdit {
@@ -121,18 +124,20 @@ async fn concurrent_compactions_survive_reopen_and_old_snapshots() {
         wal_retained_from: None,
     };
 
-    // Both edits are prepared against the same live manifest, then published independently.
+    // Both edits are prepared independently and race to publish; the publication guard orders
+    // them, and whichever goes second applies to the manifest the first one wrote.
     let ready = Arc::new(Barrier::new(2));
     thread::scope(|scope| {
         let first_index = index.clone();
         let first_ready = ready.clone();
         let first = scope.spawn(move || {
             let _reservation = first_reservation;
+            first_ready.wait();
+            let guard = first_index.lock_lsm_manifests();
             let mut batch = first_index.batch();
             first_index
-                .merge_lsm_manifest_batch(&mut batch, LSM_NAME, &first_edit)
+                .merge_lsm_manifest_batch(&mut batch, LSM_NAME, &first_edit, &guard)
                 .unwrap();
-            first_ready.wait();
             batch.write_with_sync(true).unwrap();
         });
 
@@ -140,11 +145,12 @@ async fn concurrent_compactions_survive_reopen_and_old_snapshots() {
         let second_ready = ready;
         let second = scope.spawn(move || {
             let _reservation = second_reservation;
+            second_ready.wait();
+            let guard = second_index.lock_lsm_manifests();
             let mut batch = second_index.batch();
             second_index
-                .merge_lsm_manifest_batch(&mut batch, LSM_NAME, &second_edit)
+                .merge_lsm_manifest_batch(&mut batch, LSM_NAME, &second_edit, &guard)
                 .unwrap();
-            second_ready.wait();
             batch.write_with_sync(true).unwrap();
         });
 

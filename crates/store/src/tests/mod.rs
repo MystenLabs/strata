@@ -275,6 +275,7 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         segment_reader_cache_capacity: 16,
         lsm_partition_count: DEFAULT_LSM_PARTITION_COUNT,
         lsm_compaction_patch_bytes: DEFAULT_LSM_COMPACTION_PATCH_BYTES,
+        lsm_memtable_max_age: DEFAULT_LSM_MEMTABLE_MAX_AGE,
         recovery_policy: StrataRecoveryPolicy::PointInTime,
         sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
         gc_workers_enabled: true,
@@ -605,6 +606,7 @@ async fn store_wal_recovery_uses_the_blob_projection_frontier() {
     load_blob_lsm_manifest(&cfg, &index).unwrap();
     load_relocation_lsm_manifest(&cfg, &index).unwrap();
 
+    let guard = index.lock_lsm_manifests();
     let mut batch = index.batch();
     index
         .merge_lsm_manifest_batch(
@@ -617,6 +619,7 @@ async fn store_wal_recovery_uses_the_blob_projection_frontier() {
                 materialized_through: Some(100),
                 wal_retained_from: None,
             },
+            &guard,
         )
         .unwrap();
     index
@@ -630,12 +633,14 @@ async fn store_wal_recovery_uses_the_blob_projection_frontier() {
                 materialized_through: Some(80),
                 wal_retained_from: None,
             },
+            &guard,
         )
         .unwrap();
     index
         .put_store_wal_retained_from_batch(&mut batch, 3)
         .unwrap();
     batch.write().unwrap();
+    drop(guard);
 
     assert_eq!(
         store_wal_recovery_state(&cfg, &index).unwrap(),

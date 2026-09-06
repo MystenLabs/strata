@@ -158,6 +158,7 @@ impl StrataIndex {
             store_state,
             epoch_changes,
             lsm_manifests,
+            manifest_publish_lock: Arc::new(std::sync::Mutex::new(())),
             garbage_log_positions,
             segment_garbage_log_positions,
         })
