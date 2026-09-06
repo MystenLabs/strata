@@ -857,6 +857,22 @@ impl Lsm {
             self.check_running()?;
 
             let mut rolled = Vec::new();
+            // Consecutive operands of one key in one batch stay in one generation: the rollover
+            // policy is consulted before the first of them, never between them. A caller that
+            // writes a key's lifetime beside its put relies on both landing in the same patch,
+            // and an age deadline that fell between them would split every such pair at a flush
+            // boundary. Capacity exhaustion may still roll mid-batch; readers never see a batch
+            // prefix either way.
+            let mut previous_key: Option<(u32, Vec<u8>)> = None;
+            let mut continues_key = |partition: u32, key: &[u8]| {
+                let same = previous_key.as_ref().is_some_and(|(last_partition, last)| {
+                    *last_partition == partition && last.as_slice() == key
+                });
+                if !same {
+                    previous_key = Some((partition, key.to_vec()));
+                }
+                same
+            };
             for (index, mutation) in mutations.into_iter().enumerate() {
                 let lsn = lsns[index];
                 match mutation {
@@ -865,10 +881,15 @@ impl Lsm {
                         mut key,
                         value,
                     } => {
+                        let policy = !continues_key(partition, &key);
                         let mut value = encode_inline_value_owned(value);
-                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
-                            active.insert_active_owned(&mut key, lsn, &mut value)
-                        })?;
+                        state = self.insert_memtable(
+                            state,
+                            partition,
+                            policy,
+                            &mut rolled,
+                            |active| active.insert_active_owned(&mut key, lsn, &mut value),
+                        )?;
                     }
                     Mutation::PutPrefix {
                         partition,
@@ -879,15 +900,22 @@ impl Lsm {
                         let key_prefix_len = key_prefix.len();
                         key_prefix.reserve(key_suffix.len());
                         key_prefix.extend_from_slice(&key_suffix);
+                        let policy = !continues_key(partition, &key_prefix);
                         let mut value = encode_inline_value_owned(value);
-                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
-                            active.insert_prefix_active_owned(
-                                &mut key_prefix,
-                                key_prefix_len,
-                                lsn,
-                                &mut value,
-                            )
-                        })?;
+                        state = self.insert_memtable(
+                            state,
+                            partition,
+                            policy,
+                            &mut rolled,
+                            |active| {
+                                active.insert_prefix_active_owned(
+                                    &mut key_prefix,
+                                    key_prefix_len,
+                                    lsn,
+                                    &mut value,
+                                )
+                            },
+                        )?;
                     }
                     Mutation::PutBlob {
                         partition,
@@ -895,10 +923,15 @@ impl Lsm {
                         metadata,
                         record_ref,
                     } => {
+                        let policy = !continues_key(partition, &key);
                         let mut value = encode_blob_value_owned(metadata, record_ref);
-                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
-                            active.insert_active_owned(&mut key, lsn, &mut value)
-                        })?;
+                        state = self.insert_memtable(
+                            state,
+                            partition,
+                            policy,
+                            &mut rolled,
+                            |active| active.insert_active_owned(&mut key, lsn, &mut value),
+                        )?;
                     }
                     Mutation::PutBlobPrefix {
                         partition,
@@ -910,15 +943,22 @@ impl Lsm {
                         let key_prefix_len = key_prefix.len();
                         key_prefix.reserve(key_suffix.len());
                         key_prefix.extend_from_slice(&key_suffix);
+                        let policy = !continues_key(partition, &key_prefix);
                         let mut value = encode_blob_value_owned(metadata, record_ref);
-                        state = self.insert_memtable(state, partition, &mut rolled, |active| {
-                            active.insert_prefix_active_owned(
-                                &mut key_prefix,
-                                key_prefix_len,
-                                lsn,
-                                &mut value,
-                            )
-                        })?;
+                        state = self.insert_memtable(
+                            state,
+                            partition,
+                            policy,
+                            &mut rolled,
+                            |active| {
+                                active.insert_prefix_active_owned(
+                                    &mut key_prefix,
+                                    key_prefix_len,
+                                    lsn,
+                                    &mut value,
+                                )
+                            },
+                        )?;
                     }
                 }
             }
@@ -936,10 +976,13 @@ impl Lsm {
         result
     }
 
+    /// Inserts one row, rolling the partition's active memtable first when `policy_rollover` and
+    /// the rollover policy say so, or when the row does not fit.
     fn insert_memtable<'a>(
         &self,
         mut state: MutexGuard<'a, MemoryState>,
         partition: u32,
+        policy_rollover: bool,
         rolled: &mut Vec<RolledMemtable>,
         mut insert: impl FnMut(&mut Memtable) -> Result<()>,
     ) -> Result<MutexGuard<'a, MemoryState>> {
@@ -947,7 +990,7 @@ impl Lsm {
             let mut inserted = false;
             let wait_for_flush = {
                 let partition_state = state.partition_mut(partition)?;
-                if partition_state.active.rollover_due() {
+                if policy_rollover && partition_state.active.rollover_due() {
                     if partition_state.frozen.len() >= self.max_frozen_generations {
                         true
                     } else {
@@ -1806,6 +1849,27 @@ mod tests {
                 b"e".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn consecutive_operands_of_one_key_share_a_generation() {
+        let directory = TempDir::new().unwrap();
+        // One key per generation, one frozen generation at most: a policy rollover between the
+        // two operands below would block on the full frozen queue forever.
+        let lsm = open_with_rollover(&directory);
+        lsm.write(1, put(b"a", b"one")).unwrap();
+
+        let written = lsm
+            .write_batch(vec![
+                (2, put(b"k", b"lifetime")),
+                (3, put(b"k", b"payload")),
+            ])
+            .unwrap();
+
+        assert_eq!(written.rolled_memtables.len(), 1);
+        assert_eq!(lsm.frozen_generations(0).unwrap(), [1]);
+        let state = lock(&lsm.memory);
+        assert_eq!(state.partition(0).unwrap().active.get_all(b"k").len(), 2);
     }
 
     #[test]
