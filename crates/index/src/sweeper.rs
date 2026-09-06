@@ -10,12 +10,17 @@ use core_types::{
 };
 use lsm::{
     GarbageLog, GarbageRecord, SegmentGarbageLog, fold_segment_garbage, read_segment_garbage,
+    sync_segment_garbage_logs,
 };
 use typed_store::{Map, rocks::DBBatch};
 
-use crate::{Error, Result, StrataIndex};
+use crate::{Error, Result, StrataIndex, segment::gc_summary::apply_segment_gc_summary_delta};
 
 const MAX_SWEEP_FRAMES: usize = 256;
+/// Heap budget for folded overlays kept between sweeps (see `overlay_cache`). A mature
+/// one-gigabyte segment of 16 KiB records folds to about two megabytes, so this holds the
+/// overlays of several hundred such segments.
+pub(crate) const OVERLAY_CACHE_BYTES: usize = 1 << 30;
 
 impl StrataIndex {
     pub fn get_segment_garbage_log_position(&self, segment_id: SegmentId) -> Result<Option<u64>> {
@@ -182,6 +187,7 @@ impl StrataIndex {
             by_segment.remove(&segment_id);
         }
 
+        let mut appended = Vec::new();
         for (segment_id, records) in by_segment {
             let state = states
                 .remove(&segment_id)
@@ -190,17 +196,37 @@ impl StrataIndex {
                 .get(self.segment_garbage_log_positions(), &segment_id)?
                 .unwrap_or_default();
             let path = segment_garbage_log_path(namespace_dir.as_ref(), &state.path);
-            let existing = if committed == 0 {
-                Vec::new()
-            } else {
-                read_segment_garbage(&path, committed)?
+            let row = summaries
+                .remove(&segment_id)
+                .expect("summaries were resolved above");
+            let cached = self
+                .overlay_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(segment_id, committed);
+            let mut overlay = match cached {
+                Some((expected_row, mut overlay)) => {
+                    // Other publishers may have moved the row since this overlay was folded;
+                    // carry that movement into the cached summary so it matches a fresh fold.
+                    let drift = summary_delta_between(&expected_row, &row);
+                    apply_segment_gc_summary_delta(&mut overlay.summary, &drift).ok_or_else(
+                        || {
+                            Error::InvalidGarbageSweep(format!(
+                                "segment {segment_id} summary drift does not apply"
+                            ))
+                        },
+                    )?;
+                    overlay
+                }
+                None => {
+                    let existing = if committed == 0 {
+                        Vec::new()
+                    } else {
+                        read_segment_garbage(&path, committed)?
+                    };
+                    fold_segment_garbage(existing, row.clone())?
+                }
             };
-            let mut overlay = fold_segment_garbage(
-                existing,
-                summaries
-                    .remove(&segment_id)
-                    .expect("summaries were resolved above"),
-            )?;
             let before_summary = overlay.summary.clone();
             overlay.apply_merge_ops(records.iter().map(garbage_merge_op));
             // Garbage events describe idempotent state transitions, while their serialized
@@ -211,10 +237,21 @@ impl StrataIndex {
             // idempotency and commutativity with allocation-baseline merge operands.
             let summary_delta = summary_delta_between(&before_summary, &overlay.summary);
             let mut file = SegmentGarbageLog::open(path, committed)?;
-            let position = file.append(&records)?;
+            let position = file.append_unsynced(&records)?;
+            appended.push(file);
             batch.put(self.segment_garbage_log_positions(), &segment_id, &position)?;
             self.merge_segment_gc_summary_batch(batch.raw_batch_mut(), segment_id, &summary_delta)?;
+            let mut expected_row = row;
+            if apply_segment_gc_summary_delta(&mut expected_row, &summary_delta).is_some() {
+                self.overlay_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(segment_id, position, expected_row, overlay);
+            }
         }
+        // One filesystem sync covers every appended log; it must land before the positions
+        // that make those appends visible are committed below.
+        sync_segment_garbage_logs(namespace_dir.as_ref(), &appended)?;
         batch.put(self.garbage_log_positions(), &cursor_name, &next_cursor)?;
         batch.write_with_sync(true)?;
         GarbageLog::reclaim_before(global_log_dir, next_cursor)?;

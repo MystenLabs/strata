@@ -161,6 +161,9 @@ impl StrataIndex {
             manifest_publish_lock: Arc::new(std::sync::Mutex::new(())),
             garbage_log_positions,
             segment_garbage_log_positions,
+            overlay_cache: Arc::new(std::sync::Mutex::new(
+                crate::overlay_cache::OverlayCache::new(crate::sweeper::OVERLAY_CACHE_BYTES),
+            )),
         })
     }
 }

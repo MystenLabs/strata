@@ -431,16 +431,53 @@ impl SegmentGarbageLog {
     /// the other end instead, when fold_segment_garbage sorts the full history. The returned
     /// offset becomes meaningful only when the caller commits it as the segment's position row.
     pub fn append(&mut self, records: &[GarbageRecord]) -> Result<u64> {
+        let offset = self.append_unsynced(records)?;
+        self.sync()?;
+        Ok(offset)
+    }
+
+    /// Appends one frame without syncing it. The caller must [`Self::sync`] this log, or sync
+    /// its filesystem with [`sync_segment_garbage_logs`], before committing the returned offset.
+    pub fn append_unsynced(&mut self, records: &[GarbageRecord]) -> Result<u64> {
         let records = encode_records(records)?;
         let frame_len = encoded_frame_len(&records)?;
         write_frame(&mut self.file, &records, &self.path)?;
-        self.file
-            .sync_data()
-            .map_err(|source| io_error(&self.path, source))?;
         self.offset = self.offset.checked_add(frame_len).ok_or_else(|| {
             Error::InvalidGarbageLog("segment garbage offset overflow".to_owned())
         })?;
         Ok(self.offset)
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.file
+            .sync_data()
+            .map_err(|source| io_error(&self.path, source))
+    }
+}
+
+/// Makes every unsynced append to `logs` durable.
+///
+/// A sweep that touches a thousand segments would otherwise pay a thousand fsyncs. On Linux one
+/// `syncfs` on the directory holding the logs flushes them all in a single call; elsewhere each
+/// log is synced on its own.
+pub fn sync_segment_garbage_logs(directory: &Path, logs: &[SegmentGarbageLog]) -> Result<()> {
+    if logs.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let dir = File::open(directory).map_err(|source| io_error(directory, source))?;
+        // SAFETY: `syncfs` takes a valid open file descriptor and has no other preconditions.
+        if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+            return Err(io_error(directory, std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        logs.iter().try_for_each(SegmentGarbageLog::sync)
     }
 }
 

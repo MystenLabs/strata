@@ -42,7 +42,7 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use garbage_log::{
     GarbageLog, GarbageLogPosition, GarbageRecord, SegmentGarbageLog, fold_segment_garbage,
-    read_segment_garbage,
+    read_segment_garbage, sync_segment_garbage_logs,
 };
 pub use iterator::LsmIter;
 pub use manifest::{Manifest, ManifestEdit, OperandFloor, PartitionManifest, TableMeta};

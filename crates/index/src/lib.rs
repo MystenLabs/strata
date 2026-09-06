@@ -43,6 +43,7 @@ mod manifest;
 mod migration;
 mod open;
 mod options;
+mod overlay_cache;
 mod publication;
 mod segment;
 mod shard;
@@ -110,6 +111,8 @@ pub struct StrataIndex {
     garbage_log_positions: DBMap<String, GarbageLogPosition>,
     /// Committed prefix of each segment-local `.glog` file.
     segment_garbage_log_positions: DBMap<SegmentId, u64>,
+    /// Folded overlays the sweeper may reuse instead of re-reading a segment's whole log.
+    overlay_cache: std::sync::Arc<std::sync::Mutex<overlay_cache::OverlayCache>>,
 }
 
 #[cfg(test)]
