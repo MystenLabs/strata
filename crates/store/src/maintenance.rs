@@ -664,8 +664,6 @@ impl LsmCompactor {
         let partition_manifest = &compaction_manifest.partitions[&partition];
         let patches = &partition_manifest.patches;
         let base = &partition_manifest.base;
-        let patch_bytes = table_bytes(patches);
-        let base_bytes = table_bytes(base);
         // The LSM frontier proves that every earlier keyed mutation is represented in SSTs;
         // publication is the store-wide durability bound for RocksDB-only transitions.
         let materialized_through_lsn = manifest
@@ -682,17 +680,21 @@ impl LsmCompactor {
             .filter(|(lsn, _)| *lsn <= materialized_through_lsn)
             .collect::<Vec<_>>();
 
+        // Whether the whole store still fits under one patch threshold. A store that small is
+        // folded partition by partition on every tick, as it always was: the entire rewrite costs
+        // less than one patch threshold, and it keeps healing and garbage discovery prompt in
+        // tests and tiny deployments. Judged store-wide rather than per partition: with many
+        // partitions each one stays small for a long time, and folding all of them every second
+        // saturated the compactor with hundreds of passes a minute.
+        let small_store = compaction_manifest
+            .partitions
+            .values()
+            .map(|tables| table_bytes(&tables.base).saturating_add(table_bytes(&tables.patches)))
+            .fold(0u64, u64::saturating_add)
+            < self.patch_bytes_floor;
         let shape = match blob_compaction_shape(patches, base, self.patch_bytes_floor) {
             Some(shape) => shape,
-            None if force
-                && !patches.is_empty()
-                && base_bytes.saturating_add(patch_bytes) < self.patch_bytes_floor =>
-            {
-                // A partition this small is folded whole on the tick, as it always was: the entire
-                // rewrite costs less than one patch threshold, and it keeps healing and garbage
-                // discovery prompt for small stores.
-                BlobCompactionShape::Full
-            }
+            None if force && !patches.is_empty() && small_store => BlobCompactionShape::Full,
             None if force => {
                 let bound = sweep_bound(materialized_through_lsn, live_patches);
                 let target = epoch_changes

@@ -9,11 +9,10 @@ use std::{
     mem,
     num::NonZeroUsize,
     path::Path,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
-use crate::{Error, OperandFloorFn, Result, StrataLsn, TableMeta, TableWriter};
+use crate::{Error, OperandFloor, OperandFloorFn, Result, StrataLsn, TableMeta, TableWriter};
 
 /// Default logical byte capacity of one memtable generation.
 pub const DEFAULT_MEMTABLE_BUFFER_BYTES: usize = 1 << 30;
@@ -466,12 +465,19 @@ impl FrozenMemtable {
         }
         let mut writer =
             TableWriter::create_patch(root, relative_path, id, partition, patch_format_id)?;
-        if let Some(classify) = classify_operands {
-            writer.track_operand_floor(Arc::clone(classify))?;
-        }
         let mut rows = self.generation.rows.iter().collect::<Vec<_>>();
         rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut floor = OperandFloor::None;
         for (key, history) in rows {
+            if let Some(classify) = classify_operands {
+                let operands = history
+                    .versions()
+                    .map(|version| (version.lsn, version.value.as_slice()))
+                    .collect::<Vec<_>>();
+                if let Some(lsn) = classify(&operands)? {
+                    floor = floor.merge(OperandFloor::At(lsn));
+                }
+            }
             for version in history.versions() {
                 if version.key_prefix_len == 0 {
                     writer.add_patch(key, version.lsn, &version.value)?;
@@ -484,6 +490,9 @@ impl FrozenMemtable {
                     )?;
                 }
             }
+        }
+        if classify_operands.is_some() {
+            writer.set_operand_floor(floor)?;
         }
         writer.finish()
     }
@@ -985,18 +994,27 @@ mod tests {
     #[test]
     fn flush_records_the_global_operand_floor() {
         let directory = tempfile::tempdir().unwrap();
-        // Operands whose value starts with `L` depend on global state, at their own LSN.
-        let classify: OperandFloorFn = Arc::new(|lsn, value: &[u8]| {
-            Ok(value
-                .first()
-                .is_some_and(|byte| *byte == b'L')
-                .then_some(lsn))
+        // Operands whose value starts with `L` depend on global state at their own LSN, unless
+        // the same key also holds a `P` operand in this patch.
+        let classify: OperandFloorFn = Arc::new(|operands: &[(StrataLsn, &[u8])]| {
+            if operands
+                .iter()
+                .any(|(_, value)| value.first() == Some(&b'P'))
+            {
+                return Ok(None);
+            }
+            Ok(operands
+                .iter()
+                .filter(|(_, value)| value.first() == Some(&b'L'))
+                .map(|(lsn, _)| *lsn)
+                .min())
         });
 
         let mut active = Memtable::new(1, 2048);
         insert(&mut active, b"A", 1, b"plain");
         insert(&mut active, b"B", 2, b"L-extend");
         insert(&mut active, b"C", 3, b"L-extend");
+        insert(&mut active, b"C", 4, b"P-put");
         let frozen = active.rollover(2).unwrap();
         let meta = frozen
             .flush(
@@ -1009,10 +1027,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(meta.min_lsn, Some(lsn(1)));
+        // B's extension counts; C's does not because C is put in the same patch.
         assert_eq!(meta.global_operand_floor, OperandFloor::At(lsn(2)));
 
         let mut active = Memtable::new(3, 2048);
-        insert(&mut active, b"A", 4, b"plain");
+        insert(&mut active, b"A", 5, b"plain");
+        insert(&mut active, b"C", 6, b"L-extend");
+        insert(&mut active, b"C", 7, b"P-put");
         let frozen = active.rollover(4).unwrap();
         let meta = frozen
             .flush(
@@ -1027,7 +1048,7 @@ mod tests {
         assert_eq!(meta.global_operand_floor, OperandFloor::None);
 
         let mut active = Memtable::new(5, 2048);
-        insert(&mut active, b"B", 6, b"L-extend");
+        insert(&mut active, b"B", 8, b"L-extend");
         let frozen = active.rollover(6).unwrap();
         let meta = frozen
             .flush(
