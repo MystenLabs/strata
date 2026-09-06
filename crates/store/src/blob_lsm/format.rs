@@ -13,22 +13,41 @@ const SET_LIFETIME: u8 = 2;
 const TOMBSTONE: u8 = 3;
 const BATCH: u8 = 4;
 
-/// Classifies one stored blob-LSM operand for the patch's global operand floor.
+/// Classifies one key's stored blob-LSM operands for the patch's global operand floor.
 ///
 /// A lifetime change is the operand whose presence changes how a later epoch transition applies
 /// to the key, so a patch's floor is the lowest LSN of any lifetime change it holds. Puts and
 /// tombstones only create or end versions; a transition applied without seeing them errs on the
-/// side of keeping bytes, which a later merge corrects. Segment-backed puts carry no inline
-/// mutation at all.
-pub(crate) fn global_operand_floor(lsn: StrataLsn, value: &[u8]) -> Result<Option<StrataLsn>> {
-    match decode_value(value)? {
-        StoredValue::Blob { .. } => Ok(None),
-        StoredValue::Inline(bytes) => Ok(BlobMutationWithLSN::decode_inline(lsn, bytes)?
-            .into_iter()
-            .filter(|mutation| matches!(mutation.mutation, BlobMutation::SetLifetime { .. }))
-            .map(|mutation| mutation.lsn)
-            .min()),
+/// side of keeping bytes, which a later merge corrects.
+///
+/// A lifetime change in a patch that also puts the same key is discounted. The only rows a pass
+/// can misjudge by not reading this patch are the key's older versions, and the put retires those
+/// whichever side of the lifetime change it falls on: a transition applied to an older version
+/// before the put ends bytes the put ends anyway, and one applied after the put finds them ended.
+/// The store writes every blob's initial lifetime as such a pair, so without this rule every flush
+/// would hold the write-merge frontier back for as long as its patch lives. This assumes a key's
+/// versions live in one shard; a put on one shard does not retire a base version on another.
+pub(crate) fn global_operand_floor(operands: &[(StrataLsn, &[u8])]) -> Result<Option<StrataLsn>> {
+    let mut floor = None;
+    for &(lsn, value) in operands {
+        match decode_value(value)? {
+            StoredValue::Blob { .. } => return Ok(None),
+            StoredValue::Inline(bytes) => {
+                for mutation in BlobMutationWithLSN::decode_inline(lsn, bytes)? {
+                    match mutation.mutation {
+                        BlobMutation::Put { .. } => return Ok(None),
+                        BlobMutation::SetLifetime { .. } => {
+                            floor = Some(floor.map_or(mutation.lsn, |current: StrataLsn| {
+                                current.min(mutation.lsn)
+                            }));
+                        }
+                        BlobMutation::Tombstone { .. } => {}
+                    }
+                }
+            }
+        }
     }
+    Ok(floor)
 }
 
 /// One self-contained logical mutation to a blob.
