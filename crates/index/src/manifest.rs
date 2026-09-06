@@ -1,3 +1,5 @@
+use std::sync::MutexGuard;
+
 use lsm::{GarbageLogPosition, Manifest, ManifestEdit};
 use rocksdb::MergeOperands;
 use typed_store::{
@@ -6,6 +8,12 @@ use typed_store::{
 };
 
 use crate::{Error, Result, StrataIndex};
+
+/// Exclusive right to publish LSM manifests, held from preparing an edit until the batch carrying
+/// it has been written.
+pub struct LsmManifestPublishGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
 
 const MAX_NAME_BYTES: usize = 1024;
 
@@ -47,18 +55,41 @@ impl StrataIndex {
         Ok(())
     }
 
-    /// Adds one edit operand to an existing RocksDB batch.
+    /// Takes the manifest publication lock.
+    ///
+    /// Every publisher holds this from [`Self::merge_lsm_manifest_batch`] until the batch carrying
+    /// the edit has been written, so each publication reads the manifest the previous one wrote.
+    /// One lock covers every manifest: a batch may carry edits for several, and publications are
+    /// rare enough (a few per second) that serializing them across manifests costs nothing.
+    pub fn lock_lsm_manifests(&self) -> LsmManifestPublishGuard<'_> {
+        LsmManifestPublishGuard {
+            _guard: self
+                .manifest_publish_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+
+    /// Applies one edit to the live manifest and stages the whole result in an existing batch.
     ///
     /// Callers can place edits for several LSMs beside segment or frontier updates in the same
     /// batch. RocksDB then gives the complete publication one sequence number. The caller must keep
     /// the edit's input SSTs reserved until that batch commits; otherwise another publisher could
     /// invalidate the live-file check performed here.
+    ///
+    /// The manifest is written whole rather than as a merge operand. Operands made every read
+    /// re-apply every edit since RocksDB last compacted the key, so a busy compactor (hundreds of
+    /// tier merges a minute over many partitions) made each manifest read, and with it each pass,
+    /// slower for the life of the process. Writing the applied manifest keeps reads flat; the
+    /// publication guard keeps concurrent publishers from overwriting each other's edit, which is
+    /// what the merge operands used to allow lock-free. Returns the manifest as published.
     pub fn merge_lsm_manifest_batch(
         &self,
         batch: &mut DBBatch,
         name: &str,
         edit: &ManifestEdit,
-    ) -> Result<()> {
+        _guard: &LsmManifestPublishGuard<'_>,
+    ) -> Result<Manifest> {
         validate_name(name)?;
         edit.validate()
             .map_err(|error| Error::InvalidLsmManifest(error.to_string()))?;
@@ -68,13 +99,13 @@ impl StrataIndex {
         current
             .apply(edit)
             .map_err(|error| Error::InvalidLsmManifest(error.to_string()))?;
-        let operand =
-            bcs::to_bytes(edit).map_err(|error| Error::Serialization(error.to_string()))?;
-        batch.partial_merge_batch(self.lsm_manifests(), [(name.to_owned(), operand)])?;
-        Ok(())
+        batch.insert_batch(self.lsm_manifests(), [(name.to_owned(), &current)])?;
+        Ok(current)
     }
 }
 
+/// Merge operator kept for manifests written by earlier versions as operand chains; new
+/// publications write the manifest whole, which supersedes any operands before them.
 pub(crate) fn lsm_manifests_cf_options() -> rocksdb::Options {
     let mut options = default_db_options().options;
     options.set_merge_operator(

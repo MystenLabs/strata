@@ -29,8 +29,9 @@ impl StrataIndex {
             )));
         }
 
+        let guard = self.lock_lsm_manifests();
         let mut batch = self.batch();
-        self.merge_lsm_manifest_batch(&mut batch, lsm_name, edit)?;
+        self.merge_lsm_manifest_batch(&mut batch, lsm_name, edit, &guard)?;
         let position = if records.is_empty() {
             committed
         } else {
@@ -38,6 +39,7 @@ impl StrataIndex {
         };
         self.put_garbage_log_position_batch(&mut batch, garbage_log_name, position)?;
         batch.write_with_sync(true)?;
+        drop(guard);
         Ok(position)
     }
 }
