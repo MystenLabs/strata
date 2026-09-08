@@ -36,7 +36,7 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, atomic::AtomicU64, mpsc},
+    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
 };
 
 use core_types::{
@@ -45,7 +45,7 @@ use core_types::{
 };
 use gc_planner::{DestinationClass, GcCopyRecord, GcPlan, GcPlanner};
 use index::StrataIndex;
-use lsm::LiveSnapshots;
+use lsm::{LiveSnapshots, Lsm};
 
 use crate::{
     Error, GcIoLimiter, Result, SegmentIdAllocator, StoreHalt, StrataStore,
@@ -263,6 +263,8 @@ pub(crate) struct GcExecutor {
     pub(crate) config: crate::StrataStoreConfig,
     /// Metadata/index handle used for snapshots and validation.
     pub(crate) index: StrataIndex,
+    /// The blob LSM, consulted at publish for lifetimes the source overlay does not know yet.
+    pub(crate) lsm: Weak<Lsm>,
     /// Serializes GC output publication with shard-generation directory cleanup.
     pub(crate) publish_cleanup_lock: Arc<Mutex<()>>,
     /// Serializes whole-shard metadata removal with garbage-log publication and sweeping.
@@ -301,6 +303,7 @@ impl StrataStore {
         Ok(GcExecutor {
             config: self.config.clone(),
             index: self.index.clone(),
+            lsm: Arc::downgrade(&self.lsm()?),
             publish_cleanup_lock: Arc::clone(&self.gc_publish_cleanup_lock),
             garbage_publish_lock: Arc::clone(&self.garbage_publish_lock),
             compaction_admission_lock: Arc::clone(&self.compaction_admission_lock),

@@ -19,7 +19,7 @@ use super::output::{
 use crate::{
     Error, GARBAGE_LOG_HEAD, GARBAGE_LOG_SWEEP_CURSOR, GcPublishResult, GcStagedCopiedRecord,
     LSM_GARBAGE_LOG_MAX_BYTES, RELOCATION_LSM_MANIFEST, Result,
-    blob_lsm::terminal_garbage_record,
+    blob_lsm::{BlobMerge, BlobState, effective_lifecycle, terminal_garbage_record},
     fs_util::{segment_garbage_log_path, unlink_gc_segment_files},
     gc::{
         GcExecutor, GcPrepublishedCopy, GcPrepublishedOutputSegment, OverlayRecordClassifier,
@@ -28,14 +28,16 @@ use crate::{
     layout::segment_state_path,
     maintenance::{garbage_log_dir, read_relocation_lsm_manifest},
     metrics::GcKnownDelta,
+    partition::partition_for_key,
     relocation::RelocationEntry,
     shard_gc::shard_generation_is_obsolete,
 };
 use core_types::{
-    GarbageEvent, PlacementClass, SegmentFileState, SegmentGcRecordRange, SegmentId, SegmentState,
+    BlobKey, BlobLifecycle, GarbageEvent, PlacementClass, SegmentFileState, SegmentGcRecordRange,
+    SegmentId, SegmentState, ShardKey, StrataLsn,
 };
 use gc_planner::{GcAction, GcScenario};
-use lsm::{GarbageLog, SegmentGarbageLog};
+use lsm::{GarbageLog, SegmentGarbageLog, StoredValue, decode_value};
 
 #[derive(Debug)]
 struct GcPreparedPublish {
@@ -121,6 +123,34 @@ impl GcExecutor {
     /// An overlay range must either fully contain a record or not touch it at all — partial overlap is an error,
     /// because GC moves whole encoded records and can't split a payload's liveness.
     /// Example: A and D come out as survivors; B is skipped(Retired), C is skipped(Expired).
+    /// The lifecycle the main LSM currently holds for one payload, or `None` when the key has
+    /// no lifetime or the payload is no longer its live version.
+    fn lsm_lifecycle(
+        &self,
+        key: &BlobKey,
+        shard: ShardKey,
+        payload_lsn: StrataLsn,
+    ) -> Result<Option<BlobLifecycle>> {
+        let Some(lsm) = self.lsm.upgrade() else {
+            return Ok(None);
+        };
+        let partition = partition_for_key(key.as_bytes(), self.config.lsm_partition_count);
+        let Some(encoded) = lsm.get(partition, key.as_bytes(), &BlobMerge)? else {
+            return Ok(None);
+        };
+        let StoredValue::Inline(bytes) = decode_value(&encoded)? else {
+            return Err(Error::InvariantViolation {
+                reason: format!("materialized blob state for {key:?} is segment-backed"),
+            });
+        };
+        let state = BlobState::decode(bytes)?;
+        Ok(state
+            .versions
+            .get(&shard)
+            .filter(|version| version.lsn == payload_lsn)
+            .and_then(|version| effective_lifecycle(state.lifetime, version)))
+    }
+
     fn prepare_gc_publish(&self, mut copy: GcPrepublishedCopy) -> Result<GcPreparedPublish> {
         let reconciled_lsn = self.index.get_next_lsn()?.saturating_sub(1);
         if matches!(
@@ -185,7 +215,19 @@ impl GcExecutor {
                     OverlayRecordState::Retired => Some(GcSkippedCopiedRecordKind::Retired),
                     OverlayRecordState::Expired => Some(GcSkippedCopiedRecordKind::Expired),
                     OverlayRecordState::CopyEligible { lifecycle } => {
-                        record.source.lifecycle = lifecycle;
+                        // The overlay learns a lifetime only once the sweeper folds its hint.
+                        // The output summary written below is what lets the clock end this
+                        // copy later, and compaction forwards only lifetimes written after this
+                        // publish, so a copy whose lifetime the overlay does not know yet must
+                        // take it from the LSM now or never be judged at all.
+                        record.source.lifecycle = match lifecycle {
+                            Some(lifecycle) => Some(lifecycle),
+                            None => self.lsm_lifecycle(
+                                &record.source.key,
+                                record.source.shard,
+                                record.source.payload_lsn,
+                            )?,
+                        };
                         None
                     }
                 }

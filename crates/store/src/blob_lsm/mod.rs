@@ -31,6 +31,7 @@ pub(crate) use garbage::terminal_garbage_record;
 pub use merge::BlobMerge;
 pub(crate) use merge::BlobMergeWithRelocations;
 pub(crate) use snapshot::BlobCompactionSnapshot;
+pub(crate) use state::effective_lifecycle;
 
 #[cfg(test)]
 mod tests;
