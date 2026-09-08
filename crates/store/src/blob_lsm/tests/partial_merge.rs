@@ -216,14 +216,9 @@ fn partial_merge_expiry_targets_relocated_destination() {
         reduced[0].mutation,
         BlobMutation::SetLifetime { .. }
     ));
-    assert_eq!(garbage.len(), 1);
-    assert_eq!(garbage[0].lsn, 6);
-    assert_eq!(
-        garbage[0].event,
-        GarbageEvent::Expired {
-            record: destination
-        }
-    );
+    // Epoch expiry reports nothing per record, for the original or its relocated copy: the
+    // destination's own summary bucket ends at epoch 10 and the clock judges it.
+    assert!(garbage.is_empty(), "{garbage:?}");
 }
 
 #[test]
@@ -264,11 +259,13 @@ fn partial_merge_expires_patch_puts_before_and_after_a_lifetime() {
             },
         }]
     );
-    for record in [before, after] {
-        assert!(garbage.iter().any(|garbage| {
-            garbage.lsn == 4 && garbage.event == GarbageEvent::Expired { record }
-        }));
-    }
+    // Both puts left the output; neither expiry is reported per record.
+    assert!(
+        !garbage
+            .iter()
+            .any(|garbage| matches!(garbage.event, GarbageEvent::Expired { .. })),
+        "{garbage:?}"
+    );
 }
 
 #[test]
@@ -333,9 +330,12 @@ fn partial_merge_starts_a_new_bucket_after_lifetime_expiry() {
             mutation: BlobMutation::Put { record_ref, .. },
         } if record_ref == surviving
     ));
-    assert!(garbage.iter().any(|record| {
-        record.lsn == 3 && record.event == GarbageEvent::Expired { record: expired }
-    }));
+    assert!(
+        !garbage
+            .iter()
+            .any(|record| record.event.record() == expired),
+        "the ended version leaves without a per-record event: {garbage:?}"
+    );
     assert!(garbage.iter().any(|record| {
         record.lsn == 4
             && record.event
@@ -427,9 +427,12 @@ fn partial_merge_lifetime_survives_a_tombstone_for_a_future_put() {
     assert!(garbage.iter().any(|garbage| {
         garbage.lsn == 3 && garbage.event == GarbageEvent::Retired { record: first }
     }));
-    assert!(garbage.iter().any(|garbage| {
-        garbage.lsn == 5 && garbage.event == GarbageEvent::Expired { record: second }
-    }));
+    assert!(
+        !garbage
+            .iter()
+            .any(|garbage| garbage.event.record() == second),
+        "the version that expired at epoch 10 leaves without an event: {garbage:?}"
+    );
 }
 
 #[test]
@@ -635,9 +638,8 @@ fn partial_merge_expiry_precedes_a_later_tombstone() {
             },
         ]
     );
-    assert_eq!(garbage.len(), 1);
-    assert_eq!(garbage[0].lsn, 3);
-    assert_eq!(garbage[0].event, GarbageEvent::Expired { record });
+    // Expiry at LSN 3 emits nothing, and the tombstone at LSN 4 finds no version to retire.
+    assert!(garbage.is_empty(), "{garbage:?}");
 }
 
 #[test]

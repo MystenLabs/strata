@@ -71,6 +71,12 @@ impl StrataIndex {
             .collect::<std::result::Result<BTreeMap<ShardId, ShardInfo>, _>>()
             .map_err(Error::from)?;
 
+        // Compaction does not report epoch expiry per record; the planner judges known end
+        // epochs against the clock, capped by the write-merge frontier so no unmerged extension
+        // can still move a bucket. Hand it summaries with those buckets already moved to expired
+        // so every strict counter it reads (garbage ratio, bytes to copy, join eligibility) sees
+        // the same view as the clock-live helper.
+        let clock_expiry_epoch = writes_merged_epoch.map(|epoch| epoch.min(current_epoch));
         let mut segments = Vec::new();
         for result in self.segment_states.safe_iter_with_snapshot(&snapshot)? {
             let (_, state) = result?;
@@ -83,6 +89,10 @@ impl StrataIndex {
                 .segment_gc_summaries
                 .get_with_snapshot(&snapshot, &state.segment_id)?
                 .unwrap_or_default();
+            let summary = match clock_expiry_epoch {
+                Some(epoch) => summary.as_of_epoch(epoch),
+                None => summary,
+            };
             segments.push(SegmentSnapshot {
                 state,
                 summary,

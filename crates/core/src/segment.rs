@@ -206,6 +206,35 @@ impl SegmentGcSummary {
             .saturating_add(self.live_bytes.saturating_sub(classified.bytes));
         live
     }
+
+    /// The summary as the clock sees it at `epoch`: every histogram bucket ending at or before
+    /// it is moved from live to expired, which is exactly what per-record Expired events used to
+    /// do one record at a time.
+    ///
+    /// Compaction no longer emits those events for epoch expiry; a record's end epoch reaches the
+    /// summary once, as its lifetime hint, and the clock does the rest. The precondition is the
+    /// same as for [`Self::live_after_epoch`]: every write from before the transition to `epoch`
+    /// has been merged, so no extension can still move a bucket. Extension counts are left alone,
+    /// as they are for event-driven expiry.
+    pub fn as_of_epoch(&self, epoch: Epoch) -> Self {
+        let mut view = self.clone();
+        let mut ended = EpochBucket::default();
+        view.future_epoch_histogram.retain(|&end_epoch, bucket| {
+            if end_epoch <= epoch {
+                ended.refs = ended.refs.saturating_add(bucket.refs);
+                ended.bytes = ended.bytes.saturating_add(bucket.bytes);
+                false
+            } else {
+                true
+            }
+        });
+        view.live_bytes = view.live_bytes.saturating_sub(ended.bytes);
+        view.live_ref_count = view.live_ref_count.saturating_sub(ended.refs);
+        view.expired_bytes = view.expired_bytes.saturating_add(ended.bytes);
+        view.min_live_end_epoch = view.future_epoch_histogram.keys().next().copied();
+        view.max_live_end_epoch = view.future_epoch_histogram.keys().next_back().copied();
+        view
+    }
 }
 
 /// Stale tolerant segment local overlay used by GC copy planning.

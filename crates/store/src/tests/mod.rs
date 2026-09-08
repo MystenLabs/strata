@@ -3942,12 +3942,21 @@ async fn clock_expiry_deletes_exact_epoch_segment_before_the_cold_sweep() {
     );
     assert_eq!(snapshot.writes_merged_epoch, Some(43));
     assert_eq!(snapshot.clock_expiry_epoch(), Some(43));
+    // The stored summary still counts the record live; the snapshot hands the planner the
+    // clock's view of it.
+    let stored = store
+        .index()
+        .get_segment_gc_summary(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.live_ref_count, 1);
     let segment = snapshot
         .segments
         .iter()
         .find(|segment| segment.state.segment_id == FIRST_SEGMENT_ID)
         .unwrap();
-    assert_eq!(segment.summary.live_ref_count, 1);
+    assert_eq!(segment.summary.live_ref_count, 0);
+    assert_eq!(segment.summary.expired_bytes, stored.live_bytes);
     let plan = GcPlanner::new(store.config().gc_planner_config.clone())
         .plan(&snapshot)
         .unwrap();
@@ -4896,8 +4905,19 @@ async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
     assert!(initial_destination_overlay.lifetimes.is_empty());
     store.sync().unwrap();
     wait_for_lsm_gc(&store, publish_lsn.max(lifetime_touch_lsn).max(epoch_lsn));
+    // Epoch expiry is not reported per record, so the copy gains no expired range. Its summary
+    // knows the lifetime GC published it with, ending at epoch 43, and the clock ends it there.
     let destination_overlay = segment_overlay(&store, destination.segment_id);
-    assert!(gc_ranges_contain(&destination_overlay.expired, destination));
+    assert!(!gc_ranges_contain(
+        &destination_overlay.expired,
+        destination
+    ));
+    let stats = destination_overlay.summary;
+    assert_eq!(stats.future_epoch_histogram[&43].refs, 1);
+    assert_eq!(stats.live_ref_count, 1);
+    let judged = stats.as_of_epoch(43);
+    assert_eq!(judged.live_ref_count, 0);
+    assert_eq!(judged.expired_bytes, destination.len);
 }
 
 #[tokio::test]
@@ -5212,9 +5232,12 @@ async fn cold_base_sweep_updates_gc_summary_without_a_user_touch() {
     wait_for_expiry_accounting(&store, epoch_lsn);
 
     // No foreground mutation touched either key after the epoch change. Reaching the frontier
-    // proves a forced major compaction nevertheless visited the cold base, emitted key A's expiry,
-    // and waited for the sweeper to fold that event into this summary.
-    let stats = segment_summary(store.index(), ref_a.segment_id);
+    // proves the sweep re-read the cold base. Key A's expiry is not reported per record: the
+    // stored summary keeps its epoch-43 bucket, and the clock's view of it ends A.
+    let stored = segment_summary(store.index(), ref_a.segment_id);
+    assert_eq!(stored.live_ref_count, 2);
+    assert_eq!(stored.expired_bytes, 0);
+    let stats = stored.as_of_epoch(43);
     assert_eq!(stats.live_bytes, ref_b.len);
     assert_eq!(stats.live_ref_count, 1);
     assert_eq!(stats.expired_bytes, ref_a.len);
@@ -5238,9 +5261,9 @@ async fn cold_base_sweep_updates_gc_summary_without_a_user_touch() {
     store.sync().unwrap();
     wait_for_expiry_accounting(&store, last_epoch_lsn);
 
-    // The second cold sweep likewise expires B without manufacturing a patch just to wake
-    // compaction. At this point GC may safely consume the zero-live summary.
-    let stats = segment_summary(store.index(), ref_a.segment_id);
+    // The second cold sweep likewise re-reads B's base without manufacturing a patch just to
+    // wake compaction; the clock's view of the summary is now empty and GC may consume it.
+    let stats = segment_summary(store.index(), ref_a.segment_id).as_of_epoch(50);
     assert_eq!(stats.live_bytes, 0);
     assert_eq!(stats.live_ref_count, 0);
     assert_eq!(stats.expired_bytes, ref_a.len + ref_b.len);
@@ -5298,7 +5321,7 @@ async fn cold_base_sweep_rereads_one_base_without_reading_patches() {
     assert!(partition.patches.is_empty(), "{:?}", partition.patches);
     assert_eq!(partition.base.len(), 1);
     assert!(partition.base[0].merge_applied_through_lsn.unwrap() >= epoch_lsn);
-    let stats = segment_summary(store.index(), ref_a.segment_id);
+    let stats = segment_summary(store.index(), ref_a.segment_id).as_of_epoch(43);
     assert_eq!(stats.live_bytes, ref_b.len);
     assert_eq!(stats.live_ref_count, 1);
     assert_eq!(stats.expired_bytes, ref_a.len);
@@ -5385,10 +5408,14 @@ async fn compaction_expiry_does_not_revive_blob_on_extension() {
     store.sync().unwrap();
     wait_for_lsm_gc(&store, extend_lsn);
 
-    let stats = segment_summary(store.index(), record_ref.segment_id);
-    assert_eq!(stats.expired_bytes, record_ref.len);
+    // The extension does not revive the record. Either the transition already dropped the
+    // version, in which case the summary keeps its epoch-43 bucket for the clock to end, or
+    // the extension found the version and retired it as a write; both leave nothing live and
+    // no bucket at 50.
+    let stats = segment_summary(store.index(), record_ref.segment_id).as_of_epoch(43);
     assert_eq!(stats.live_bytes, 0);
     assert_eq!(stats.live_ref_count, 0);
+    assert_eq!(stats.retired_bytes + stats.expired_bytes, record_ref.len);
     assert_eq!(stats.future_epoch_histogram.get(&50), None);
     assert_eq!(stats.min_live_end_epoch, None);
 }
@@ -5444,7 +5471,8 @@ async fn snapshot_compaction_expires_future_epoch_bucket_for_exact_epoch_segment
 
     let stats = segment_summary(store.index(), record_ref.segment_id);
     assert_eq!(stats.future_epoch_histogram.get(&43), None);
-    assert_eq!(stats.expired_bytes, record_ref.len);
+    assert_eq!(stats.retired_bytes, record_ref.len);
+    assert_eq!(stats.expired_bytes, 0);
     assert_eq!(stats.live_bytes, 0);
     assert_eq!(stats.live_ref_count, 0);
 }

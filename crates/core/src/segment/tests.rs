@@ -546,6 +546,59 @@ fn reference_fold_of_a_small_record_segment_for_comparison() {
 }
 
 #[test]
+fn as_of_epoch_moves_ended_buckets_to_expired() {
+    let summary = SegmentGcSummary {
+        total_bytes: 100,
+        live_bytes: 70,
+        retired_bytes: 30,
+        expired_bytes: 0,
+        live_ref_count: 7,
+        unknown_lifetime_bytes: 10,
+        unknown_lifetime_ref_count: 1,
+        min_live_end_epoch: Some(40),
+        max_live_end_epoch: Some(50),
+        future_epoch_histogram: BTreeMap::from([
+            (40, EpochBucket { refs: 2, bytes: 20 }),
+            (43, EpochBucket { refs: 3, bytes: 30 }),
+            (50, EpochBucket { refs: 1, bytes: 10 }),
+        ]),
+        extension_count_histogram: BTreeMap::from([(0, 6), (1, 1)]),
+    };
+
+    let view = summary.as_of_epoch(43);
+    assert_eq!(view.live_bytes, 20, "unknown 10 + epoch-50 bucket 10");
+    assert_eq!(view.live_ref_count, 2);
+    assert_eq!(view.expired_bytes, 50);
+    assert_eq!(view.retired_bytes, 30);
+    assert_eq!(view.total_bytes, 100);
+    assert_eq!(
+        view.future_epoch_histogram,
+        BTreeMap::from([(50, EpochBucket { refs: 1, bytes: 10 })])
+    );
+    assert_eq!(view.min_live_end_epoch, Some(50));
+    assert_eq!(view.max_live_end_epoch, Some(50));
+    assert_eq!(
+        view.extension_count_histogram,
+        summary.extension_count_histogram
+    );
+    // The view agrees with the incremental helper and is idempotent.
+    assert_eq!(
+        summary.live_after_epoch(43),
+        EpochBucket {
+            refs: view.live_ref_count,
+            bytes: view.live_bytes
+        }
+    );
+    assert_eq!(view.as_of_epoch(43), view);
+    assert_eq!(summary.as_of_epoch(39), summary);
+    let all = summary.as_of_epoch(50);
+    assert_eq!(all.live_bytes, 10);
+    assert_eq!(all.live_ref_count, 1);
+    assert!(all.future_epoch_histogram.is_empty());
+    assert_eq!(all.min_live_end_epoch, None);
+}
+
+#[test]
 fn live_after_epoch_discounts_ended_buckets_and_keeps_the_unclassified_remainder() {
     let mut summary = SegmentGcSummary {
         total_bytes: 1_000,

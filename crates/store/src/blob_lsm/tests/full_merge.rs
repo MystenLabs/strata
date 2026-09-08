@@ -77,10 +77,12 @@ fn lifetime_expiry_and_tombstone_match_store_visibility() {
     let (version, lifecycle) = state.resolve(shard, 10).unwrap();
     assert_eq!(version.record_ref, after_expiry);
     assert_eq!(lifecycle.unwrap().logical_end_epoch, 20);
+    // The lifetime written at epoch 10, after the first one ended, retires the ended version;
+    // it is a write, so it may say so per record, unlike an epoch transition.
     assert!(
-        garbage
-            .iter()
-            .any(|record| record.event == GarbageEvent::Expired { record: first })
+        garbage.iter().any(
+            |record| record.lsn == 3 && record.event == GarbageEvent::Retired { record: first }
+        )
     );
     assert!(garbage.iter().any(|record| {
         record.event

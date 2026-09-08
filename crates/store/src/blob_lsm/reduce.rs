@@ -30,28 +30,21 @@ struct PatchBucket {
 
 enum PatchEvent {
     Mutation(usize),
-    ChangeEpoch {
-        lsn: StrataLsn,
-        epoch: Epoch,
-        emit_garbage: bool,
-    },
+    ChangeEpoch { epoch: Epoch },
 }
 
 fn merge_patch_events<'a>(
     mutations: &'a [BlobMutationWithLSN],
     snapshot: Option<&'a BlobCompactionSnapshot>,
 ) -> impl Iterator<Item = PatchEvent> + 'a {
-    let (epoch_changes, emit_garbage_from_lsn) = match snapshot {
+    let epoch_changes = match snapshot {
         Some(snapshot) => {
             let end = snapshot
                 .epoch_changes
                 .partition_point(|(lsn, _)| *lsn <= snapshot.materialized_through_lsn);
-            (
-                &snapshot.epoch_changes[..end],
-                snapshot.emit_garbage_from_lsn,
-            )
+            &snapshot.epoch_changes[..end]
         }
-        None => (&[][..], StrataLsn::default()),
+        None => &[][..],
     };
 
     let mut mutation_index = 0;
@@ -71,12 +64,8 @@ fn merge_patch_events<'a>(
             mutation_index += 1;
             Some(event)
         } else {
-            let (lsn, epoch) = epoch_changes[epoch_change_index];
-            let event = PatchEvent::ChangeEpoch {
-                lsn,
-                epoch,
-                emit_garbage: lsn >= emit_garbage_from_lsn,
-            };
+            let (_, epoch) = epoch_changes[epoch_change_index];
+            let event = PatchEvent::ChangeEpoch { epoch };
             epoch_change_index += 1;
             Some(event)
         }
@@ -162,20 +151,8 @@ pub(crate) fn reduce_patch_mutations(
     for event in merge_patch_events(&mutations, snapshot) {
         let mutation_index = match event {
             PatchEvent::Mutation(mutation_index) => mutation_index,
-            PatchEvent::ChangeEpoch {
-                lsn,
-                epoch,
-                emit_garbage,
-            } => {
-                change_patch_epoch(
-                    key,
-                    lsn,
-                    epoch,
-                    emit_garbage,
-                    &mut buckets,
-                    relocations,
-                    emit,
-                )?;
+            PatchEvent::ChangeEpoch { epoch } => {
+                expire_patch_buckets(epoch, &mut buckets);
                 if current_lifetime.is_some_and(|hint| hint.lifecycle.logical_end_epoch <= epoch) {
                     // Future mutations start a new bucket generation and do not inherit an expired
                     // lifetime. The SetLifetime remains in the output as a base barrier.
@@ -307,15 +284,11 @@ fn replace_patch_bucket(
     Ok(())
 }
 
-fn change_patch_epoch(
-    key: &[u8],
-    transition_lsn: StrataLsn,
-    epoch: Epoch,
-    emit_garbage: bool,
-    buckets: &mut BTreeMap<ShardKey, PatchBucket>,
-    relocations: &[RelocationEntry],
-    emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
-) -> Result<()> {
+/// Drops every bucket whose proven lifetime ended at or before `epoch`.
+///
+/// Epoch expiry emits no per-record event (see `BlobState::apply`): the clock judges the segment
+/// summary's end-epoch buckets, for the original record and for any relocated copy.
+fn expire_patch_buckets(epoch: Epoch, buckets: &mut BTreeMap<ShardKey, PatchBucket>) {
     let expired_shards = buckets
         .iter()
         .filter_map(|(&shard, bucket)| {
@@ -327,24 +300,10 @@ fn change_patch_epoch(
         .collect::<Vec<_>>();
 
     for shard in expired_shards {
-        let bucket = buckets
+        buckets
             .remove(&shard)
             .expect("expired shard was collected from its bucket");
-        if emit_garbage && let Some(version) = bucket.put {
-            let (version, event_lsn) =
-                resolve_event_version(key, shard, version, transition_lsn, relocations);
-            emit(terminal_garbage_record(
-                key,
-                event_lsn,
-                version.record_ref,
-                None,
-                GarbageEvent::Expired {
-                    record: version.record_ref,
-                },
-            )?)?;
-        }
     }
-    Ok(())
 }
 
 fn resolve_event_version(

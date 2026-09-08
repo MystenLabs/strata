@@ -133,9 +133,9 @@ fn snapshot_compaction_expires_versions_at_the_first_reaching_epoch() {
     let (state, garbage) = compact_state(state, snapshot);
 
     assert!(state.unwrap().versions.is_empty());
-    assert_eq!(garbage.len(), 1);
-    assert_eq!(garbage[0].lsn, 12);
-    assert_eq!(garbage[0].event, GarbageEvent::Expired { record });
+    // The version is dropped at the first transition that reaches its end epoch, but its
+    // expiry is not reported per record: the segment summary's bucket and the clock decide.
+    assert!(garbage.is_empty(), "{garbage:?}");
 }
 
 #[test]

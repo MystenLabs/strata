@@ -82,22 +82,15 @@ impl BlobState {
             let Some(lifecycle) = lifecycle else {
                 continue;
             };
-            let Some(transition) = snapshot.expiry(lifecycle.logical_end_epoch) else {
+            if snapshot.expiry(lifecycle.logical_end_epoch).is_none() {
                 continue;
-            };
-            self.versions.remove(&shard);
-            if transition.emit_garbage {
-                emit_record(
-                    key,
-                    transition.lsn,
-                    version,
-                    Some(lifecycle),
-                    GarbageEvent::Expired {
-                        record: version.record_ref,
-                    },
-                    emit,
-                )?;
             }
+            // Epoch expiry emits no per-record event. The record's end epoch reached its segment
+            // summary as a lifetime hint when the put was first merged, and GC judges that bucket
+            // against the clock behind the write-merge frontier. Reporting each expired record
+            // here made every full pass over a random-key base scatter an event into every live
+            // segment, which is what the sweeper could not keep up with.
+            self.versions.remove(&shard);
         }
         Ok(())
     }
@@ -159,13 +152,17 @@ impl BlobState {
         };
 
         if previous_expired {
+            // A lifetime written after the previous one ended does not revive the ended
+            // versions. This is a write, not an epoch transition, and it happens once per key, so
+            // it may say so per record: the partial merge reports the same versions as retired
+            // when a later put replaces them, and the two paths must agree.
             for version in self.versions.values() {
                 emit_record(
                     key,
                     lsn,
                     *version,
                     effective_lifecycle(previous, version),
-                    GarbageEvent::Expired {
+                    GarbageEvent::Retired {
                         record: version.record_ref,
                     },
                     emit,
@@ -208,7 +205,7 @@ impl BlobState {
     }
 }
 
-pub(super) fn effective_lifecycle(
+pub(crate) fn effective_lifecycle(
     lifetime: Option<BlobLifetime>,
     version: &BlobVersion,
 ) -> Option<BlobLifecycle> {

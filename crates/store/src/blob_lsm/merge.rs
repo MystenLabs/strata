@@ -169,6 +169,23 @@ impl MergeOperator for BlobMergeWithRelocations {
             return Err(invalid("materialized blob state cannot be segment-backed"));
         };
         let mut state = BlobState::decode(bytes)?;
+        // A key whose lifetime ended at a transition this merge applied lost its versions to the
+        // clock, not to a write. Its relocated copies carry the same end epoch in their own
+        // segment summaries, so they need no retirement event either; emitting one per expired
+        // relocated record would recreate the per-record expiry burst this design removes.
+        let expired_by_clock = state.lifetime.is_some_and(|lifetime| {
+            self.snapshot
+                .expiry(lifetime.lifecycle.logical_end_epoch)
+                .is_some()
+        });
+        // GC publication stamps each copy's segment summary with the lifecycle the key had at
+        // publish time, so a destination only needs to hear about a lifetime written after that.
+        // Forwarding on every heal would touch every destination segment once per full pass.
+        let lifetime_changed_after = |publish_lsn: StrataLsn| {
+            state
+                .lifetime
+                .is_some_and(|lifetime| lifetime.lsn > publish_lsn)
+        };
         for relocation in relocations {
             let lifecycle = state
                 .versions
@@ -186,7 +203,9 @@ impl MergeOperator for BlobMergeWithRelocations {
                 if version.record_ref != relocation.to {
                     version.record_ref = relocation.to;
                     self.healed_references.fetch_add(1, Ordering::Relaxed);
-                    if let Some(lifecycle) = lifecycle {
+                    if let Some(lifecycle) = lifecycle
+                        && lifetime_changed_after(relocation.publish_lsn)
+                    {
                         emit_lifetime_change(
                             key,
                             relocation.publish_lsn,
@@ -201,6 +220,7 @@ impl MergeOperator for BlobMergeWithRelocations {
                 && input_record_refs
                     .get(&(relocation.shard, relocation.payload_lsn))
                     .is_some_and(|record_ref| *record_ref != relocation.to)
+                && !expired_by_clock
             {
                 // GC may conservatively publish a copy whose tombstone, overwrite, or expiry had
                 // not reached the garbage log yet. Once a complete blob compaction proves that the
