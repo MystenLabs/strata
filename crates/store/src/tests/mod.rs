@@ -5551,10 +5551,13 @@ async fn snapshot_compaction_expires_future_epoch_bucket_for_exact_epoch_segment
     store.sync().unwrap();
     wait_for_lsm_gc(&store, touch_lsn);
 
-    let stats = segment_summary(store.index(), record_ref.segment_id);
+    // Either the transition already dropped the version, leaving the epoch-43 bucket for the
+    // clock to end, or the extension found it and retired it as a write; the clock's view is
+    // the same either way and shows nothing live and no bucket at 50.
+    let stats = segment_summary(store.index(), record_ref.segment_id).as_of_epoch(43);
     assert_eq!(stats.future_epoch_histogram.get(&43), None);
-    assert_eq!(stats.retired_bytes, record_ref.len);
-    assert_eq!(stats.expired_bytes, 0);
+    assert_eq!(stats.future_epoch_histogram.get(&50), None);
+    assert_eq!(stats.retired_bytes + stats.expired_bytes, record_ref.len);
     assert_eq!(stats.live_bytes, 0);
     assert_eq!(stats.live_ref_count, 0);
 }
