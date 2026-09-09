@@ -36,7 +36,7 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
+    sync::{Arc, Mutex, Weak, atomic::AtomicU64, mpsc},
 };
 
 use core_types::{
@@ -270,7 +270,7 @@ pub(crate) struct GcExecutor {
     /// Serializes whole-shard metadata removal with garbage-log publication and sweeping.
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
     /// Excludes blob-LSM compaction while one relocation view is reconciled and activated.
-    pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
+    pub(crate) compaction_admission_lock: Arc<parking_lot::RwLock<()>>,
     /// Relocation L0s and cache used directly by the GC publication lane.
     pub(crate) relocations: Arc<RelocationStore>,
     pub(crate) relocation_cache: Arc<RelocationCache>,

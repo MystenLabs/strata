@@ -284,10 +284,7 @@ impl StrataStore {
         if !rolled {
             return Ok(false);
         }
-        let admission_lock = Arc::clone(&self.compaction_admission_lock);
-        let _admission_guard = admission_lock
-            .read()
-            .expect("compaction admission lock poisoned");
+        let _admission_guard = self.compaction_admission_lock.read();
         flush_relocation_lsm(
             &self.index,
             &self.relocations,

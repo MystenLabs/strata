@@ -148,7 +148,7 @@ mod writer;
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
+    sync::{Arc, Mutex, Weak, atomic::AtomicU64, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -301,7 +301,13 @@ pub struct StrataStore {
     gc_handles: Vec<JoinHandle<()>>,
     pub(crate) gc_publish_cleanup_lock: Arc<Mutex<()>>,
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
-    pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
+    /// Blob-LSM compaction passes hold this shared, one partition at a time; GC publication holds
+    /// it exclusively while it reconciles and activates a relocation view. It is parking_lot's
+    /// lock on purpose: a writer there claims the lock before waiting for readers to drain, so a
+    /// publish is admitted after the pass in progress. std's RwLock wakes a waiting writer only
+    /// after clearing its waiting bit, and the compactor's immediate re-acquire at the next
+    /// partition boundary won that race every time, starving GC for a whole burst of passes.
+    pub(crate) compaction_admission_lock: Arc<parking_lot::RwLock<()>>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,

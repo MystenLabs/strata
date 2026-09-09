@@ -25,7 +25,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
+    sync::{Arc, Mutex, Weak, atomic::AtomicU64, mpsc},
     time::{Duration, Instant},
 };
 
@@ -445,7 +445,7 @@ pub(crate) struct LsmCompactor {
     pub(crate) relocation_cache: Weak<RelocationCache>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) garbage_log_dir: PathBuf,
-    pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
+    pub(crate) compaction_admission_lock: Arc<parking_lot::RwLock<()>>,
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
     pub(crate) wake_rx: mpsc::Receiver<()>,
     pub(crate) store_halt: StoreHalt,
@@ -510,10 +510,10 @@ impl LsmCompactor {
     /// Every GC publish adds one patch SST to the relocation manifest, so a busy GC period grows
     /// a long patch chain that every relocation lookup must walk. Count pressure merges a size
     /// tier of patches among themselves; only once the patch tier is a set fraction of the base
-    /// does a full pass fold it into new base tables (see `relocation_compaction_shape`). The
-    /// admission lock is taken in read mode to exclude GC publication for the duration —
+    /// does a full pass fold it into new base tables (see `relocation_compaction_shape`). Each
+    /// partition pass holds the admission lock shared to exclude GC publication for its duration —
     /// activation edits the same manifest, and the merge-batch's live-file validation must not
-    /// race it.
+    /// race it — and a waiting publish gets in between partitions.
     ///
     /// The sample-then-advance dance around `durable_relocation_lsn` is the same trick the
     /// sweeper's drain uses, for the same reason: compact_relocation_lsm publishes its manifest
@@ -539,13 +539,10 @@ impl LsmCompactor {
             return Ok(());
         }
 
-        let admission_lock = Arc::clone(&self.compaction_admission_lock);
-        let _admission_guard = admission_lock
-            .read()
-            .expect("compaction admission lock poisoned");
         let relocation_lsn = relocations.lsm().last_lsn()?.unwrap_or_default();
         let mut compacted = false;
         for (partition, shape) in pressured {
+            let _admission_guard = self.compaction_admission_lock.read();
             compacted |= compact_relocation_lsm_partition(
                 &self.index,
                 &relocations,
@@ -564,9 +561,10 @@ impl LsmCompactor {
 
     /// One blob-LSM compaction pass, from admission to installed manifest, in code order.
     ///
-    /// Admission and thresholds. The admission lock is taken in read mode: compactions may run
-    /// beside each other conceptually, but GC publication takes it in write mode, so a relocation
-    /// view can never be reconciled and activated while a compaction is mid-flight (the TODO
+    /// Admission and thresholds. The admission lock is held shared for one partition pass:
+    /// passes may run beside each other conceptually, but GC publication holds it exclusively, so
+    /// a relocation view can never be reconciled and activated while a pass is mid-flight, and a
+    /// publish that asks during a pass is admitted before the next partition starts (the TODO
     /// below describes the finer-grained future). Then `blob_compaction_shape` decides from
     /// pressure alone: the patch tier goes into the base only once it reaches a fixed fraction of
     /// the base (or the configured floor while the base is small), and otherwise a run of
@@ -627,9 +625,7 @@ impl LsmCompactor {
         // That would remove this GC/compaction exclusion and let GC initialize a destination from
         // a known source lifecycle instead of waiting for compaction to seed its baseline.
         let admission_lock = Arc::clone(&self.compaction_admission_lock);
-        let _admission_guard = admission_lock
-            .read()
-            .expect("compaction admission lock poisoned");
+        let _admission_guard = admission_lock.read();
         let manifest = lsm.manifest();
         let published_lsn = self.index.get_committed_lsn()?;
         let mut compaction_manifest = (*manifest).clone();

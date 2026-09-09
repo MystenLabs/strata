@@ -51,11 +51,8 @@ impl GcExecutor {
     /// writes do not take this lock and do not enter this call path.
     pub(crate) fn submit_gc_publish(&self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
         let scenario = Some(copy.plan.scenario);
-        let admission_lock = Arc::clone(&self.compaction_admission_lock);
         let started = Instant::now();
-        let _admission_guard = admission_lock
-            .write()
-            .expect("compaction admission lock poisoned");
+        let _admission_guard = self.compaction_admission_lock.write();
         self.metrics
             .record_gc_attempt_phase(scenario, "admission_wait", started.elapsed());
         let started = Instant::now();

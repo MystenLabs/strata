@@ -16,6 +16,7 @@ core.workspace = true
 gc.workspace = true
 index.workspace = true
 lsm.workspace = true
+parking_lot.workspace = true
 segment.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
