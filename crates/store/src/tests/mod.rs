@@ -4979,12 +4979,29 @@ async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
             .is_some_and(|relocation| relocation.to == destination)
     );
 
+    // The copy's summary is seeded with the lifecycle it was published with, so the clock can
+    // end it without any event reaching the destination.
     let initial_destination_overlay = segment_overlay(&store, destination.segment_id);
     assert!(!gc_ranges_contain(
         &initial_destination_overlay.expired,
         destination
     ));
-    assert!(initial_destination_overlay.lifetimes.is_empty());
+    assert!(initial_destination_overlay.lifetimes.iter().any(|entry| {
+        entry.range == SegmentGcRecordRange::from(destination)
+            && entry.lifecycle.logical_end_epoch == 43
+    }));
+    assert_eq!(
+        initial_destination_overlay.summary.unknown_lifetime_bytes,
+        0
+    );
+    assert_eq!(
+        initial_destination_overlay
+            .summary
+            .future_epoch_histogram
+            .get(&43)
+            .map(|bucket| bucket.refs),
+        Some(1)
+    );
     store.sync().unwrap();
     wait_for_lsm_gc(&store, publish_lsn.max(lifetime_touch_lsn).max(epoch_lsn));
     // Epoch expiry is not reported per record, so the copy gains no expired range. Its summary
@@ -5077,10 +5094,17 @@ async fn gc_publish_forwards_lagging_lifetime_then_retires_destination() {
             .is_some_and(|relocation| relocation.to == destination)
     );
 
-    // Output publication starts unknown even though the pending main-LSM patch already contains
-    // lifetime 50. Compaction heals the main-LSM ref and emits SetLifecycle for the destination.
+    // The overlay had no lifetime for B when the copy was taken, so publication took the
+    // extension to 50 from the LSM and seeded the copy with it.
     let initial_destination_overlay = segment_overlay(&store, destination.segment_id);
-    assert!(initial_destination_overlay.lifetimes.is_empty());
+    assert!(initial_destination_overlay.lifetimes.iter().any(|entry| {
+        entry.range == SegmentGcRecordRange::from(destination)
+            && entry.lifecycle.logical_end_epoch == 50
+    }));
+    assert_eq!(
+        initial_destination_overlay.summary.unknown_lifetime_bytes,
+        0
+    );
     store.sync().unwrap();
     wait_for_lsm_gc(&store, publish_lsn.max(lifetime_b_lsn));
     let destination_overlay = segment_overlay(&store, destination.segment_id);

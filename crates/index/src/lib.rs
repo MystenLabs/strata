@@ -60,6 +60,12 @@ pub use indexed_batch::IndexedBatch;
 #[cfg(test)]
 pub(crate) use open::metric_conf_with_suffix;
 
+/// Column-family names and options for one index prefix, for tools that open the same RocksDB
+/// read-only (for example as a secondary instance) and must register the same merge operators.
+pub fn cf_options_for_prefix(cf_prefix: &str) -> Vec<(String, rocksdb::Options)> {
+    options::cf_options(&cf::StrataIndexCfNames::new(cf_prefix))
+}
+
 use core_types::{
     Epoch, SegmentGcSummary, SegmentId, SegmentState, ShardCleanupJob, ShardId, ShardInfo,
     ShardKey, StoreStateKey, StrataLsn,

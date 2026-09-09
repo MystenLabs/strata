@@ -236,7 +236,31 @@ pub(crate) fn initial_gc_output_metadata(
                         record.to.segment_id
                     ),
                 })?;
-        add_initial_gc_output_record(summary, record.to, None, None)?;
+        // Seed the copy with the lifecycle it was published with. The clock ends the copy by
+        // this bucket, and compaction forwards a lifetime to it only when one is written after
+        // this publish; a copy seeded as unknown would never be judged. The same lifecycle goes
+        // into the output's own garbage log so its overlay agrees with the summary: a later
+        // forwarded hint for the same lifecycle then changes nothing instead of counting twice.
+        // It is stamped at the payload's own LSN, like a skipped copy's event, so it sorts before
+        // and never collides with a hint compaction forwards at the publish LSN.
+        add_initial_gc_output_record(summary, record.to, record.source.lifecycle, None)?;
+        if let Some(lifecycle) = record.source.lifecycle {
+            garbage
+                .entry(record.to.segment_id)
+                .or_default()
+                .push(GarbageRecord {
+                    key: SegmentKey {
+                        segment_id: record.to.segment_id,
+                        blob_key: record.source.key.clone(),
+                    },
+                    lsn: record.source.payload_lsn,
+                    event: GarbageEvent::SetLifecycle {
+                        record: record.to,
+                        lifecycle: Some(lifecycle),
+                    },
+                    summary_delta: Default::default(),
+                });
+        }
     }
 
     for skipped in skipped {
