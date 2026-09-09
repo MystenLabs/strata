@@ -8140,6 +8140,7 @@ dependencies = [
  "gc",
  "index",
  "lsm",
+ "parking_lot 0.12.5",
  "prometheus",
  "segment",
  "sha2 0.10.9",

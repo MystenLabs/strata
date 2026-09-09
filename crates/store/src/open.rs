@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     num::NonZeroU32,
-    sync::{Arc, Mutex, RwLock, atomic::AtomicU64, mpsc},
+    sync::{Arc, Mutex, atomic::AtomicU64, mpsc},
     thread::{self, JoinHandle},
     time::Instant,
 };
@@ -180,7 +180,7 @@ impl StrataStore {
         // Recovery may have promoted a fully synced WAL tail beyond the pre-recovery frontier.
         // Initialize subscriptions from the checkpoint published above, not the earlier read.
         let store_halt = StoreHalt::new(index.get_committed_lsn()?);
-        let compaction_admission_lock = Arc::new(RwLock::new(()));
+        let compaction_admission_lock = Arc::new(parking_lot::RwLock::new(()));
         let garbage_publish_lock = Arc::new(Mutex::new(()));
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
