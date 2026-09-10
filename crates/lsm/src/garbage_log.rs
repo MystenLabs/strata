@@ -83,7 +83,7 @@ impl GarbageRecord {
     /// strictly ascending), the fold's sort, and the fold's conflict detection — two *different*
     /// events comparing equal here would be two contradictory claims about the same bytes at the
     /// same logical moment.
-    pub(crate) fn cmp_position(&self, other: &Self) -> Ordering {
+    pub fn cmp_position(&self, other: &Self) -> Ordering {
         self.key
             .cmp(&other.key)
             .then_with(|| self.lsn.cmp(&other.lsn))

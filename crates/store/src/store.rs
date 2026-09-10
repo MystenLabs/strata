@@ -284,7 +284,6 @@ impl StrataStore {
         if !rolled {
             return Ok(false);
         }
-        let _admission_guard = self.compaction_admission_lock.read();
         flush_relocation_lsm(
             &self.index,
             &self.relocations,

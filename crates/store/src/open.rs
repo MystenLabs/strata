@@ -40,7 +40,7 @@ use crate::{
         publish_recovered_store_checkpoint, reconcile_orphan_ingest_segment_files,
         recover_store_wal_prefix, recover_unsealed_segments,
     },
-    relocation::{RelocationCache, RelocationEntry, RelocationStore},
+    relocation::{RelocationActivations, RelocationCache, RelocationEntry, RelocationStore},
     seal::{active_segment_durable_offset, seal_recovered_segments, verify_sealed_segments},
     segment_state::{
         SegmentAllocationTracker, publish_active_segment_state, unsealed_ingest_segment_count,
@@ -178,7 +178,8 @@ impl StrataStore {
         let gc_claims = Arc::new(GcSourceClaims::default());
         let gc_io_limiter = Arc::new(GcIoLimiter::new(config.gc_io_bytes_per_sec));
         let store_halt = StoreHalt::default();
-        let compaction_admission_lock = Arc::new(parking_lot::RwLock::new(()));
+        let compaction_pause_lock = Arc::new(parking_lot::RwLock::new(()));
+        let relocation_activations = Arc::new(RelocationActivations::default());
         let garbage_publish_lock = Arc::new(Mutex::new(()));
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
@@ -209,7 +210,8 @@ impl StrataStore {
             relocation_cache: Arc::downgrade(&relocation_cache),
             durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
             garbage_log_dir: garbage_log_dir(&config),
-            compaction_admission_lock: Arc::clone(&compaction_admission_lock),
+            compaction_pause_lock: Arc::clone(&compaction_pause_lock),
+            relocation_activations: Arc::clone(&relocation_activations),
             garbage_publish_lock: Arc::clone(&garbage_publish_lock),
             wake_rx: lsm_compact_rx,
             store_halt: store_halt.clone(),
@@ -325,7 +327,7 @@ impl StrataStore {
                     lsm: Arc::downgrade(&lsm),
                     publish_cleanup_lock: Arc::clone(&gc_publish_cleanup_lock),
                     garbage_publish_lock: Arc::clone(&garbage_publish_lock),
-                    compaction_admission_lock: Arc::clone(&compaction_admission_lock),
+                    relocation_activations: Arc::clone(&relocation_activations),
                     relocations: Arc::clone(&relocations),
                     relocation_cache: Arc::clone(&relocation_cache),
                     durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
@@ -401,7 +403,8 @@ impl StrataStore {
             gc_handles,
             gc_publish_cleanup_lock,
             garbage_publish_lock,
-            compaction_admission_lock,
+            compaction_pause_lock,
+            relocation_activations,
             durable_relocation_lsn,
             gc_claims,
             gc_concurrency,

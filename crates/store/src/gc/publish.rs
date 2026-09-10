@@ -47,14 +47,23 @@ struct GcPreparedPublish {
 }
 
 impl GcExecutor {
-    /// Reconciles and publishes one prepared copy while excluding blob compaction. Foreground
-    /// writes do not take this lock and do not enter this call path.
+    /// Reconciles and publishes one prepared copy under the garbage-publication lock, held from
+    /// the drain through the activation batch. Compaction passes run beside this freely; only
+    /// their frame publication waits, and it waits for at most this one publish. Holding the lock
+    /// across all three steps is what makes the drained overlays exactly the state the batch is
+    /// judged against: no compaction frame can land between revalidation and activation, and a
+    /// frame that lands after finds this activation in the relocation activation table and is
+    /// redirected to the new copies. Foreground writes do not take this lock and do not enter
+    /// this call path.
     pub(crate) fn submit_gc_publish(&self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
         let scenario = Some(copy.plan.scenario);
         let started = Instant::now();
-        let _admission_guard = self.compaction_admission_lock.write();
+        let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
+        let _publish_guard = garbage_publish_lock
+            .lock()
+            .expect("garbage publication lock poisoned");
         self.metrics
-            .record_gc_attempt_phase(scenario, "admission_wait", started.elapsed());
+            .record_gc_attempt_phase(scenario, "publish_lock_wait", started.elapsed());
         let started = Instant::now();
         self.drain_gc_reconciliation_log()?;
         self.metrics
@@ -70,28 +79,21 @@ impl GcExecutor {
         Ok(result)
     }
 
-    /// Folds all committed garbage into the per-segment overlays used for revalidation. Each
-    /// bounded sweep owns the publication lock only for its own synced metadata batch. That sync
-    /// also makes any earlier relocation activation durable.
+    /// Folds all committed garbage into the per-segment overlays used for revalidation. The
+    /// caller holds the garbage-publication lock; each bounded sweep's synced metadata batch also
+    /// makes any earlier relocation activation durable.
     fn drain_gc_reconciliation_log(&self) -> Result<()> {
-        let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
         loop {
-            let (swept, relocation_lsn) = {
-                let _publish_guard = garbage_publish_lock
-                    .lock()
-                    .expect("garbage publication lock poisoned");
-                let relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
-                let started = Instant::now();
-                let swept = self.index.sweep_garbage_log(
-                    garbage_log_dir(&self.config),
-                    self.config.namespace_dir(),
-                    GARBAGE_LOG_HEAD,
-                    GARBAGE_LOG_SWEEP_CURSOR,
-                )?;
-                self.metrics
-                    .record_garbage_sweep("gc_publish", swept, started.elapsed());
-                (swept, relocation_lsn)
-            };
+            let relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
+            let started = Instant::now();
+            let swept = self.index.sweep_garbage_log(
+                garbage_log_dir(&self.config),
+                self.config.namespace_dir(),
+                GARBAGE_LOG_HEAD,
+                GARBAGE_LOG_SWEEP_CURSOR,
+            )?;
+            self.metrics
+                .record_garbage_sweep("gc_publish", swept, started.elapsed());
             if !swept {
                 break;
             }
@@ -247,8 +249,9 @@ impl GcExecutor {
     ///
     /// 1. Write, fsync, and rename one relocation patch SST. It has an independent relocation-LSM
     ///    sequence; GC does not reserve foreground LSNs or touch the main WAL.
-    /// 2. Under the garbage-publication lock, atomically add that table to the relocation manifest
-    ///    and publish output/source/garbage metadata with a synced batch.
+    /// 2. Under the garbage-publication lock (held by the caller since the drain), atomically add
+    ///    that table to the relocation manifest and publish output/source/garbage metadata with a
+    ///    synced batch.
     ///
     /// A crash before activation leaves an orphan SST that startup removes. A crash after activation
     /// can recover it because the SST was durable first. The activation batch itself advances
@@ -494,12 +497,9 @@ impl GcExecutor {
         }
         let (activation_sequence, relocation_edit) =
             self.relocations.prepare_l0(&relocation_entries)?;
-        let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
         let mut skipped_output_delta = GcKnownDelta::default();
+        // The caller holds the garbage-publication lock through this closure.
         let commit_result = (|| {
-            let _garbage_publish_guard = garbage_publish_lock
-                .lock()
-                .expect("garbage publication lock poisoned");
             let committed_garbage = self
                 .index
                 .get_garbage_log_position(GARBAGE_LOG_HEAD)?
@@ -591,6 +591,14 @@ impl GcExecutor {
             {
                 return Err(GcPublishCommitError::IndexCommit(error));
             }
+            // Still under the publication lock: a compaction pass that publishes after this
+            // point redirects the events it aimed at these sources to the new copies.
+            self.relocation_activations.record(
+                activation_sequence,
+                published_records
+                    .iter()
+                    .map(|record| (record.source.key.clone(), record.source.from, record.to)),
+            );
             self.relocations
                 .lsm()
                 .reload_manifest(|| read_relocation_lsm_manifest(&self.index))

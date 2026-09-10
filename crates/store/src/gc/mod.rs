@@ -52,7 +52,7 @@ use crate::{
     layout::relative_segment_path,
     metrics::StrataStoreMetrics,
     reader_cache::SegmentReaderCache,
-    relocation::{RelocationCache, RelocationStore},
+    relocation::{RelocationActivations, RelocationCache, RelocationStore},
 };
 
 mod copy;
@@ -269,8 +269,9 @@ pub(crate) struct GcExecutor {
     pub(crate) publish_cleanup_lock: Arc<Mutex<()>>,
     /// Serializes whole-shard metadata removal with garbage-log publication and sweeping.
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
-    /// Excludes blob-LSM compaction while one relocation view is reconciled and activated.
-    pub(crate) compaction_admission_lock: Arc<parking_lot::RwLock<()>>,
+    /// Where a publish records its activations so an in-flight compaction pass can redirect the
+    /// garbage events it aimed at the old copies.
+    pub(crate) relocation_activations: Arc<RelocationActivations>,
     /// Relocation L0s and cache used directly by the GC publication lane.
     pub(crate) relocations: Arc<RelocationStore>,
     pub(crate) relocation_cache: Arc<RelocationCache>,
@@ -306,7 +307,7 @@ impl StrataStore {
             lsm: Arc::downgrade(&self.lsm()?),
             publish_cleanup_lock: Arc::clone(&self.gc_publish_cleanup_lock),
             garbage_publish_lock: Arc::clone(&self.garbage_publish_lock),
-            compaction_admission_lock: Arc::clone(&self.compaction_admission_lock),
+            relocation_activations: Arc::clone(&self.relocation_activations),
             relocations: Arc::clone(&self.relocations),
             relocation_cache: Arc::clone(&self.relocation_cache),
             durable_relocation_lsn: Arc::clone(&self.durable_relocation_lsn),
