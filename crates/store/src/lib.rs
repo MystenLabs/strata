@@ -302,13 +302,15 @@ pub struct StrataStore {
     gc_handles: Vec<JoinHandle<()>>,
     pub(crate) gc_publish_cleanup_lock: Arc<Mutex<()>>,
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
-    /// Blob-LSM compaction passes hold this shared, one partition at a time; GC publication holds
-    /// it exclusively while it reconciles and activates a relocation view. It is parking_lot's
-    /// lock on purpose: a writer there claims the lock before waiting for readers to drain, so a
-    /// publish is admitted after the pass in progress. std's RwLock wakes a waiting writer only
-    /// after clearing its waiting bit, and the compactor's immediate re-acquire at the next
-    /// partition boundary won that race every time, starving GC for a whole burst of passes.
-    pub(crate) compaction_admission_lock: Arc<parking_lot::RwLock<()>>,
+    /// Held shared by every blob-LSM compaction pass. Nothing in the store takes it exclusively;
+    /// tests do, to hold the compactor still while they stage a scenario. parking_lot's lock so a
+    /// waiting writer is admitted after the pass in progress rather than losing the wake-up race
+    /// to the compactor's immediate re-acquire at the next partition boundary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) compaction_pause_lock: Arc<parking_lot::RwLock<()>>,
+    /// Relocations GC activated while a compaction pass was in flight; see
+    /// `relocation::RelocationActivations`.
+    pub(crate) relocation_activations: Arc<relocation::RelocationActivations>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,

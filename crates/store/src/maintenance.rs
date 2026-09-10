@@ -39,13 +39,13 @@ use crate::{
     blob_lsm::{BlobCompactionSnapshot, BlobMergeWithRelocations},
     gc::GcCommand,
     metrics::MainCompactionKind,
-    relocation::{RelocationCache, RelocationMerge, RelocationStore},
+    relocation::{RelocationActivations, RelocationCache, RelocationMerge, RelocationStore},
     wal::WalReclaimer,
 };
-use core_types::SegmentFileState;
+use core_types::{BlobKey, GarbageEvent, RecordRef, SegmentFileState};
 use index::StrataIndex;
 use lsm::{
-    GarbageLog, Lsm, Manifest as LsmManifest, ManifestEdit, StrataLsn, TableMeta,
+    GarbageLog, GarbageRecord, Lsm, Manifest as LsmManifest, ManifestEdit, StrataLsn, TableMeta,
     select_base_sweep_inputs, select_compaction_inputs, select_patch_group_inputs,
     write_compaction, write_patch_compaction,
 };
@@ -445,7 +445,8 @@ pub(crate) struct LsmCompactor {
     pub(crate) relocation_cache: Weak<RelocationCache>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) garbage_log_dir: PathBuf,
-    pub(crate) compaction_admission_lock: Arc<parking_lot::RwLock<()>>,
+    pub(crate) compaction_pause_lock: Arc<parking_lot::RwLock<()>>,
+    pub(crate) relocation_activations: Arc<RelocationActivations>,
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
     pub(crate) wake_rx: mpsc::Receiver<()>,
     pub(crate) store_halt: StoreHalt,
@@ -510,10 +511,10 @@ impl LsmCompactor {
     /// Every GC publish adds one patch SST to the relocation manifest, so a busy GC period grows
     /// a long patch chain that every relocation lookup must walk. Count pressure merges a size
     /// tier of patches among themselves; only once the patch tier is a set fraction of the base
-    /// does a full pass fold it into new base tables (see `relocation_compaction_shape`). Each
-    /// partition pass holds the admission lock shared to exclude GC publication for its duration —
-    /// activation edits the same manifest, and the merge-batch's live-file validation must not
-    /// race it — and a waiting publish gets in between partitions.
+    /// does a full pass fold it into new base tables (see `relocation_compaction_shape`). GC
+    /// activation edits the same manifest concurrently; both publish whole manifests under the
+    /// index's manifest lock, where the edit's live-file validation runs, so neither needs to
+    /// exclude the other.
     ///
     /// The sample-then-advance dance around `durable_relocation_lsn` is the same trick the
     /// sweeper's drain uses, for the same reason: compact_relocation_lsm publishes its manifest
@@ -542,7 +543,6 @@ impl LsmCompactor {
         let relocation_lsn = relocations.lsm().last_lsn()?.unwrap_or_default();
         let mut compacted = false;
         for (partition, shape) in pressured {
-            let _admission_guard = self.compaction_admission_lock.read();
             compacted |= compact_relocation_lsm_partition(
                 &self.index,
                 &relocations,
@@ -561,11 +561,11 @@ impl LsmCompactor {
 
     /// One blob-LSM compaction pass, from admission to installed manifest, in code order.
     ///
-    /// Admission and thresholds. The admission lock is held shared for one partition pass:
-    /// passes may run beside each other conceptually, but GC publication holds it exclusively, so
-    /// a relocation view can never be reconciled and activated while a pass is mid-flight, and a
-    /// publish that asks during a pass is admitted before the next partition starts (the TODO
-    /// below describes the finer-grained future). Then `blob_compaction_shape` decides from
+    /// Admission and thresholds. A pass excludes nothing: GC keeps reconciling and activating
+    /// relocations while it runs. What the pass does first is note the relocation LSM's last
+    /// sequence, its *watermark*, and register itself with the relocation activation table, so
+    /// that every activation newer than the watermark is kept until the pass has published (see
+    /// the redirect step below). Then `blob_compaction_shape` decides from
     /// pressure alone: the patch tier goes into the base only once it reaches a fixed fraction of
     /// the base (or the configured floor while the base is small), and otherwise a run of
     /// comparably sized consecutive patches is merged among itself. With random keys every patch
@@ -603,7 +603,12 @@ impl LsmCompactor {
     /// events the sweeper later folds into S7's overlay, which is how the GC planner ever learns
     /// S7 is worth collecting.
     ///
-    /// Publication. Under the garbage-publication lock: open the global garbage log at
+    /// Publication. Under the garbage-publication lock, first the redirect: the merge aimed each
+    /// event at the copy its rows pointed to, and a relocation GC activated after the watermark
+    /// may have moved that copy — key "a" retired at S7 offset 100, but now living at S42 — so
+    /// every such event is re-pointed at its destination through the activation table (S7 is on
+    /// its way out and needs nothing; S42's summary would otherwise count the copy live forever).
+    /// Then open the global garbage log at
     /// its committed head, then publish_lsm_compaction appends the garbage frame (synced) and
     /// commits the manifest edit plus the frame's end position in one synced RocksDB batch —
     /// SSTs first became durable in write_compaction, so the manifest never references bytes that
@@ -619,13 +624,20 @@ impl LsmCompactor {
     }
 
     fn compact_partition(&mut self, lsm: &Lsm, partition: u32, force: bool) -> Result<()> {
-        // TODO: Replace this coarse admission barrier with late relocation resolution at garbage
-        // publication time. Carry shard/payload identity and the original transition LSN so an
-        // already-built compaction can retarget every event through the latest relocation map.
-        // That would remove this GC/compaction exclusion and let GC initialize a destination from
-        // a known source lifecycle instead of waiting for compaction to seed its baseline.
-        let admission_lock = Arc::clone(&self.compaction_admission_lock);
-        let _admission_guard = admission_lock.read();
+        let pause_lock = Arc::clone(&self.compaction_pause_lock);
+        let _pause_guard = pause_lock.read();
+        // The relocation view this pass heals against ends here. Whatever GC activates from now
+        // until the frame below is published is invisible to the merge and is redirected at
+        // publication instead; the registration keeps those activations available until then.
+        let relocation_watermark = self
+            .relocations
+            .upgrade()
+            .map(|relocations| relocations.lsm().last_lsn())
+            .transpose()?
+            .flatten()
+            .unwrap_or_default();
+        let activations = Arc::clone(&self.relocation_activations);
+        let _pass_registration = activations.begin_pass(relocation_watermark);
         let manifest = lsm.manifest();
         let published_lsn = self.index.get_committed_lsn()?;
         let mut compaction_manifest = (*manifest).clone();
@@ -758,16 +770,7 @@ impl LsmCompactor {
         // A tier merge heals nothing: its rows are younger than anything GC relocates, and with
         // hashed keys the scan would walk the partition's whole relocation range on every merge.
         // Full passes and sweeps, which rewrite old rows, carry the scan.
-        let relocation_max_lsn = if tier {
-            0
-        } else {
-            self.relocations
-                .upgrade()
-                .map(|relocations| relocations.lsm().last_lsn())
-                .transpose()?
-                .flatten()
-                .unwrap_or_default()
-        };
+        let relocation_max_lsn = if tier { 0 } else { relocation_watermark };
         let relocation_scan = match relocation_max_lsn {
             max_lsn if max_lsn != 0 => self
                 .relocations
@@ -778,7 +781,7 @@ impl LsmCompactor {
                 .transpose()?,
             _ => None,
         };
-        let (edit, garbage, healed_references) = if tier {
+        let (edit, mut garbage, healed_references) = if tier {
             let merge = BlobMergeWithRelocations::new(relocation_scan, epoch_snapshot);
             // One output per tier merge whatever its size, so tiers keep growing geometrically
             // instead of splitting into equal files that would be merged again and again.
@@ -826,6 +829,11 @@ impl LsmCompactor {
             .garbage_publish_lock
             .lock()
             .expect("garbage publication lock poisoned");
+        let redirected = redirect_garbage_to_current_copies(&mut garbage, |key, from| {
+            activations.resolve(key, from, relocation_watermark)
+        });
+        self.metrics
+            .record_main_compaction_redirected_garbage(redirected);
         let committed = self
             .index
             .get_garbage_log_position(GARBAGE_LOG_HEAD)?
@@ -1180,6 +1188,84 @@ fn tier_bound(
         .map_or(materialized_through_lsn, |min_lsn| {
             materialized_through_lsn.min(min_lsn.saturating_sub(1))
         })
+}
+
+/// Re-points garbage events whose copies GC moved after the emitting pass read its relocation
+/// view. `current` answers, for a key and the copy the merge named, where those bytes live now
+/// (following any chain of moves), or `None` when they have not moved since that view. The frame
+/// stays strictly ordered for the log's append check. Returns how many events moved.
+fn redirect_garbage_to_current_copies(
+    garbage: &mut [GarbageRecord],
+    current: impl Fn(&BlobKey, RecordRef) -> Option<RecordRef>,
+) -> u64 {
+    let mut redirected = 0;
+    for record in garbage.iter_mut() {
+        let Some(to) = current(&record.key.blob_key, record.event.record()) else {
+            continue;
+        };
+        record.key.segment_id = to.segment_id;
+        match &mut record.event {
+            GarbageEvent::Retired { record }
+            | GarbageEvent::Expired { record }
+            | GarbageEvent::SetLifecycle { record, .. } => *record = to,
+        }
+        redirected += 1;
+    }
+    if redirected > 0 {
+        garbage.sort_by(GarbageRecord::cmp_position);
+    }
+    redirected
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use core_types::{
+        BlobKey, GarbageEvent, RecordRef, SegmentGcSummaryDelta, SegmentId, SegmentKey,
+    };
+    use lsm::GarbageRecord;
+
+    use super::redirect_garbage_to_current_copies;
+
+    fn at(segment: SegmentId, offset: u64) -> RecordRef {
+        RecordRef {
+            segment_id: segment,
+            offset,
+            len: 100,
+        }
+    }
+
+    fn retired(key: &str, lsn: u64, record: RecordRef) -> GarbageRecord {
+        GarbageRecord {
+            key: SegmentKey {
+                segment_id: record.segment_id,
+                blob_key: BlobKey::new(key.as_bytes()).unwrap(),
+            },
+            lsn,
+            event: GarbageEvent::Retired { record },
+            summary_delta: SegmentGcSummaryDelta::default(),
+        }
+    }
+
+    /// Key "a" was retired at S7 by the merge; GC moved it to S42 while the pass ran. The event
+    /// follows the bytes, the untouched event stays, and the frame is back in log order.
+    #[test]
+    fn moved_copies_take_their_events_along() {
+        let mut garbage = vec![retired("a", 10, at(7, 100)), retired("b", 11, at(7, 200))];
+        let redirected = redirect_garbage_to_current_copies(&mut garbage, |key, from| {
+            (key.as_bytes() == b"a" && from == at(7, 100)).then_some(at(42, 0))
+        });
+        assert_eq!(redirected, 1);
+        assert_eq!(garbage[0].key.segment_id, 7);
+        assert_eq!(garbage[0].event.record(), at(7, 200));
+        assert_eq!(garbage[1].key.segment_id, 42);
+        assert_eq!(garbage[1].event.record(), at(42, 0));
+        assert_eq!(garbage[1].lsn, 10);
+        assert!(
+            garbage
+                .windows(2)
+                .all(|pair| pair[0].cmp_position(&pair[1]).is_lt())
+        );
+    }
 }
 
 #[cfg(test)]

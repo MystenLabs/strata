@@ -3141,44 +3141,6 @@ async fn put_overwrite_materializes_the_latest_lsm_version() {
     assert_eq!(latest.record_ref.segment_id, FIRST_SEGMENT_ID);
 }
 
-/// The compactor re-takes the admission lock the instant it leaves it, at every partition
-/// boundary. A GC publish must still get in after the pass in progress, which is why the lock is
-/// parking_lot's and not std's (see the field's doc on `StrataStore`).
-#[test]
-fn gc_publish_is_admitted_after_the_compaction_pass_in_progress() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    let lock = Arc::new(parking_lot::RwLock::new(()));
-    let passes = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let compactor = {
-        let (lock, passes, stop) = (Arc::clone(&lock), Arc::clone(&passes), Arc::clone(&stop));
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                let _pass = lock.read();
-                std::thread::sleep(Duration::from_millis(5));
-                passes.fetch_add(1, Ordering::AcqRel);
-            }
-        })
-    };
-    while passes.load(Ordering::Acquire) < 3 {
-        std::thread::yield_now();
-    }
-    let mut worst = 0;
-    for _ in 0..20 {
-        let asked_at = passes.load(Ordering::Acquire);
-        let publish = lock.write();
-        worst = worst.max(passes.load(Ordering::Acquire) - asked_at);
-        drop(publish);
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    stop.store(true, Ordering::Release);
-    compactor.join().unwrap();
-    assert!(
-        worst <= 1,
-        "GC publish waited for {worst} compaction passes"
-    );
-}
-
 #[tokio::test]
 async fn main_compaction_does_not_wait_for_a_newer_overlapping_patch() {
     init_typed_store_metrics();
@@ -3190,7 +3152,7 @@ async fn main_compaction_does_not_wait_for_a_newer_overlapping_patch() {
     let store = try_open_standalone_store(cfg, metrics).unwrap();
     let lsm = store.lsm().unwrap();
 
-    let compaction_guard = store.compaction_admission_lock.write();
+    let compaction_guard = store.compaction_pause_lock.write();
     let value = encode_inline_value(
         &BlobMutation::Tombstone {
             shard: STANDALONE_SHARD,
@@ -4033,7 +3995,7 @@ async fn clock_expiry_deletes_exact_epoch_segment_before_the_cold_sweep() {
     assert_eq!(summary.future_epoch_histogram[&43].refs, 1);
 
     // Hold the compactor out so no stale-base sweep can produce the Expired event.
-    let admission_guard = store.store.compaction_admission_lock.write();
+    let admission_guard = store.store.compaction_pause_lock.write();
 
     let (_, epoch_lsn) = store.increment_epoch().unwrap();
     store.sync().unwrap();

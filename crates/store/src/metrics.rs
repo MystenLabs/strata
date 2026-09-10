@@ -68,6 +68,7 @@ struct PrometheusMetrics {
     relocation_lookups_total: IntCounterVec,
     relocation_lookup_duration_seconds: Histogram,
     main_compaction_healed_references_total: IntCounter,
+    main_compaction_redirected_garbage_total: IntCounter,
     main_compaction_duration_seconds: Histogram,
     main_compaction_input_bytes_total: IntCounter,
     main_compaction_output_bytes_total: IntCounter,
@@ -373,6 +374,12 @@ impl StrataStoreMetrics {
                     &labels,
                     "relocation_lookup_duration_seconds",
                     "Relocation LSM point lookup latency in seconds.",
+                )?,
+                main_compaction_redirected_garbage_total: register_counter(
+                    registry,
+                    &labels,
+                    "main_compaction_redirected_garbage_total",
+                    "Garbage events a blob compaction pass re-pointed at a GC destination because the copy moved while the pass ran.",
                 )?,
                 main_compaction_healed_references_total: register_counter(
                     registry,
@@ -821,7 +828,7 @@ impl StrataStoreMetrics {
                     registry,
                     &labels,
                     "gc_attempt_phase_duration_seconds",
-                    "Wall-clock seconds one GC attempt spent in each phase, by strategy: plan, copy, then within publish the admission-lock wait, garbage-log drain, revalidation, and commit.",
+                    "Wall-clock seconds one GC attempt spent in each phase, by strategy: plan, copy, then within publish the garbage-publication-lock wait, garbage-log drain, revalidation, and commit.",
                     &["strategy", "phase"],
                     COMPACTION_DURATION_BUCKETS.to_vec(),
                 )?,
@@ -1145,6 +1152,14 @@ impl StrataStoreMetrics {
             .relocation_cache_requests_total
             .with_label_values(&[if hit { "hit" } else { "miss" }])
             .inc();
+    }
+
+    pub(crate) fn record_main_compaction_redirected_garbage(&self, events: u64) {
+        if let Some(metrics) = &self.inner {
+            metrics
+                .main_compaction_redirected_garbage_total
+                .inc_by(events);
+        }
     }
 
     pub(crate) fn record_main_compaction(
