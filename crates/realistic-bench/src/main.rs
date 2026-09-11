@@ -216,6 +216,8 @@ struct Config {
     segment_max_bytes: u64,
     strata_gc: bool,
     strata_gc_min_epoch_copy_distance: Option<Epoch>,
+    /// Overrides the planner's per-plan copy cap for dead-ref rewrites (bytes).
+    strata_gc_max_copy_bytes_per_plan: Option<u64>,
     strata_gc_workers: Option<usize>,
     strata_lsm_partitions: Option<u32>,
     strata_memtable_max_age: Option<Duration>,
@@ -277,6 +279,7 @@ impl Config {
             segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
             strata_gc: true,
             strata_gc_min_epoch_copy_distance: None,
+            strata_gc_max_copy_bytes_per_plan: None,
             strata_gc_workers: None,
             strata_lsm_partitions: None,
             strata_memtable_max_age: None,
@@ -409,6 +412,10 @@ impl Config {
                 "--strata-gc-min-epoch-copy-distance" => {
                     config.strata_gc_min_epoch_copy_distance =
                         Some(parse_u64(&next_value(&mut args, &arg)?)?)
+                }
+                "--strata-gc-max-copy-bytes-per-plan" => {
+                    config.strata_gc_max_copy_bytes_per_plan =
+                        Some(parse_size(&next_value(&mut args, &arg)?)? as u64)
                 }
                 "--strata-gc-workers" => {
                     config.strata_gc_workers =
@@ -590,6 +597,9 @@ impl Config {
         if self.strata_memtable_max_age.is_some() && self.engine != EngineKind::Strata {
             return Err("--strata-memtable-max-age requires --engine strata".to_owned());
         }
+        if self.strata_gc_max_copy_bytes_per_plan.is_some() && self.engine != EngineKind::Strata {
+            return Err("--strata-gc-max-copy-bytes-per-plan requires --engine strata".to_owned());
+        }
         if self.relocation_profile_reads > 0 && self.relocation_profile_timeout.is_zero() {
             return Err("--relocation-profile-timeout must be non-zero".to_owned());
         }
@@ -617,6 +627,9 @@ impl Config {
         if let Some(distance) = self.strata_gc_min_epoch_copy_distance {
             gc_planner_config.min_l0_rewrite_epoch_distance = distance;
             gc_planner_config.min_exact_epoch_distance = distance;
+        }
+        if let Some(cap) = self.strata_gc_max_copy_bytes_per_plan {
+            gc_planner_config.max_copy_bytes_per_plan = cap;
         }
         StrataStoreConfig {
             root_dir: self.root_dir.clone(),
@@ -2930,6 +2943,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "strata_gc_min_exact_epoch_distance={}",
                 planner.min_exact_epoch_distance
+            );
+            println!(
+                "strata_gc_max_copy_bytes_per_plan={}",
+                planner.max_copy_bytes_per_plan
             );
             println!(
                 "relocation_profile_reads={}",
