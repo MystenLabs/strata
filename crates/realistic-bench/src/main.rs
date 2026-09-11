@@ -183,6 +183,8 @@ struct Config {
     duration: Duration,
     lifetime_mode: LifetimeMode,
     retention: Duration,
+    /// Half-width, in percent of `retention`, of the uniform per-key jitter applied to it.
+    retention_jitter_percent: u64,
     epoch_duration: Duration,
     future_epochs: Epoch,
     lifetime_seed: u64,
@@ -243,6 +245,7 @@ impl Config {
             duration: DEFAULT_DURATION,
             lifetime_mode: LifetimeMode::Retention,
             retention: DEFAULT_RETENTION,
+            retention_jitter_percent: 0,
             epoch_duration: DEFAULT_EPOCH_DURATION,
             future_epochs: DEFAULT_FUTURE_EPOCHS,
             lifetime_seed: DEFAULT_LIFETIME_SEED,
@@ -308,6 +311,9 @@ impl Config {
                     config.lifetime_mode = LifetimeMode::parse(&next_value(&mut args, &arg)?)?
                 }
                 "--retention" => config.retention = parse_duration(&next_value(&mut args, &arg)?)?,
+                "--retention-jitter-percent" => {
+                    config.retention_jitter_percent = parse_u64(&next_value(&mut args, &arg)?)?
+                }
                 "--epoch-duration" => {
                     config.epoch_duration = parse_duration(&next_value(&mut args, &arg)?)?
                 }
@@ -503,6 +509,9 @@ impl Config {
             if duration.is_zero() {
                 return Err(format!("{name} must be non-zero"));
             }
+        }
+        if self.retention_jitter_percent > 100 {
+            return Err("--retention-jitter-percent must not exceed 100".to_owned());
         }
         if self.lifetime_mode == LifetimeMode::Epoch {
             if self.epoch_duration.is_zero() {
@@ -1813,6 +1822,27 @@ fn make_key(id: u64, hashed: bool) -> Result<BlobKey, String> {
     BlobKey::new(bytes).map_err(|error| error.to_string())
 }
 
+/// The retention one key gets: the configured retention, widened by a uniform jitter of up to
+/// `retention_jitter_percent` either way, drawn from the lifetime seed and the key id so a run is
+/// reproducible. Without jitter every key is deleted in write order and whole segments die
+/// together; with it, deletion order decorrelates from write order, segments become partially
+/// dead, and GC has to copy the survivors out. That is the workload that exercises relocation
+/// under tombstone-discovered garbage.
+fn jittered_retention(config: &Config, key_id: u64) -> Duration {
+    if config.retention_jitter_percent == 0 {
+        return config.retention;
+    }
+    let mut rng = SplitMix64::new(
+        config
+            .lifetime_seed
+            .wrapping_add(key_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+    );
+    // Uniform in [-1, 1], scaled to the configured half-width.
+    let unit = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+    let factor = 1.0 + unit * config.retention_jitter_percent as f64 / 100.0;
+    config.retention.mul_f64(factor.max(0.0))
+}
+
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -1935,9 +1965,11 @@ fn run_writer(worker_index: usize, context: Arc<WorkloadContext>) {
                             assignment.logical_end_epoch,
                         )
                     }
-                    None => {
-                        KeyRecord::with_retention(key, acknowledged_at, context.config.retention)
-                    }
+                    None => KeyRecord::with_retention(
+                        key,
+                        acknowledged_at,
+                        jittered_retention(&context.config, id),
+                    ),
                 };
                 context
                     .model
@@ -2813,6 +2845,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     match config.lifetime_mode {
         LifetimeMode::Retention => {
             println!("retention_seconds={:.3}", config.retention.as_secs_f64());
+            println!(
+                "retention_jitter_percent={}",
+                config.retention_jitter_percent
+            );
         }
         LifetimeMode::Epoch => {
             println!(
@@ -4171,6 +4207,39 @@ mod tests {
         assert!(config.sync_interval.is_zero());
         assert_eq!(config.controller_debounce_windows, 3);
         assert_eq!(config.rocksdb_max_subcompactions, 1);
+    }
+
+    /// Jitter is reproducible per key, bounded by the configured half-width, and spread across
+    /// it rather than clustered; zero jitter leaves the retention untouched.
+    #[test]
+    fn retention_jitter_is_bounded_reproducible_and_spread() {
+        let mut config = Config::parse(
+            [
+                "--engine",
+                "strata",
+                "--root",
+                "/tmp/x",
+                "--retention",
+                "100s",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("configuration should parse");
+        assert_eq!(jittered_retention(&config, 7), Duration::from_secs(100));
+        config.retention_jitter_percent = 50;
+        let first = jittered_retention(&config, 7);
+        assert_eq!(first, jittered_retention(&config, 7));
+        let samples = (0..1000u64)
+            .map(|id| jittered_retention(&config, id).as_secs_f64())
+            .collect::<Vec<_>>();
+        assert!(samples.iter().all(|s| (50.0..=150.0).contains(s)));
+        let below = samples.iter().filter(|s| **s < 75.0).count();
+        let above = samples.iter().filter(|s| **s > 125.0).count();
+        assert!(
+            below > 150 && above > 150,
+            "jitter clustered: {below} below, {above} above"
+        );
     }
 
     #[test]
