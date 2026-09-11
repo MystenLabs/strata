@@ -333,6 +333,18 @@ pub enum GcAction {
         /// Replacement class, currently expected to be `PlacementClass::Spillover`.
         placement_class: PlacementClass,
     },
+    /// Change placement metadata for several segments in one commit.
+    ///
+    /// The batched form of `ReclassifySegment`. Every ingest segment whose accounted lifetimes
+    /// show no useful retention value is reclassified together, so a steady stream of new ingest
+    /// segments costs GC one publish slot per planning cycle instead of one per segment. The
+    /// executor skips any segment that is no longer sealed or was reclassified by an earlier plan.
+    ReclassifySegments {
+        /// Segments whose placement class should change.
+        segment_ids: Vec<SegmentId>,
+        /// Replacement class, currently expected to be `PlacementClass::Spillover`.
+        placement_class: PlacementClass,
+    },
 }
 
 impl GcAction {
@@ -344,6 +356,7 @@ impl GcAction {
             Self::MoveLiveBytes { .. } => "move_live_bytes",
             Self::MoveLiveBytesFromSources { .. } => "move_live_bytes_from_sources",
             Self::ReclassifySegment { .. } => "reclassify_segment",
+            Self::ReclassifySegments { .. } => "reclassify_segments",
         }
     }
 }
@@ -446,47 +459,60 @@ impl GcPlanner {
         }]
     }
 
+    /// Ingest segments worth rewriting become one copy plan each; those with no useful lifetime
+    /// value are gathered into a single reclassification plan. One plan for all of them matters:
+    /// under steady ingest there is always a fresh segment to reclassify, and reclassifying them
+    /// one publish at a time starved the rewrites that actually reclaim space.
     fn l0_candidates(&self, snapshot: &GcSnapshot) -> Vec<GcPlan> {
-        snapshot
+        let mut plans = Vec::new();
+        let mut reclassify = Vec::new();
+        let mut reclassify_score: i128 = 0;
+        for segment in snapshot
             .segments
             .iter()
             .filter(|segment| segment.eligible_source(snapshot.published_lsn))
             .filter(|segment| segment.state.placement_class == PlacementClass::Ingest)
             .filter(|segment| self.l0_lifetimes_accounted(snapshot, segment))
-            .filter_map(|segment| {
-                let copied_bytes = segment.summary.live_bytes;
-                let useful_bytes = self.l0_rewrite_useful_bytes(snapshot, segment);
-                if !self.l0_rewrite_is_useful(copied_bytes, useful_bytes) {
-                    return Some(GcPlan {
-                        scenario: GcScenario::L0Compaction,
-                        action: GcAction::ReclassifySegment {
-                            segment_id: segment.segment_id(),
-                            placement_class: PlacementClass::Spillover,
-                        },
-                        copied_bytes: 0,
-                        expected_reclaim_bytes: 0,
-                        score: i128::from(segment.summary.total_bytes),
-                    });
-                }
-                if copied_bytes > self.config.max_l0_copy_bytes_per_plan {
-                    return None;
-                }
-                let routes = self.route_segment_live_bytes(snapshot, segment);
-                if copied_bytes > 0 && routes.is_empty() {
-                    return None;
-                }
-                Some(GcPlan {
-                    scenario: GcScenario::L0Compaction,
-                    action: GcAction::MoveLiveBytes {
-                        source_segment_id: segment.segment_id(),
-                        routes,
-                    },
-                    copied_bytes,
-                    expected_reclaim_bytes: segment.summary.total_bytes,
-                    score: score_rewrite(useful_bytes, copied_bytes, 1_500),
-                })
-            })
-            .collect()
+        {
+            let copied_bytes = segment.summary.live_bytes;
+            let useful_bytes = self.l0_rewrite_useful_bytes(snapshot, segment);
+            if !self.l0_rewrite_is_useful(copied_bytes, useful_bytes) {
+                reclassify.push(segment.segment_id());
+                reclassify_score += i128::from(segment.summary.total_bytes);
+                continue;
+            }
+            if copied_bytes > self.config.max_l0_copy_bytes_per_plan {
+                continue;
+            }
+            let routes = self.route_segment_live_bytes(snapshot, segment);
+            if copied_bytes > 0 && routes.is_empty() {
+                continue;
+            }
+            plans.push(GcPlan {
+                scenario: GcScenario::L0Compaction,
+                action: GcAction::MoveLiveBytes {
+                    source_segment_id: segment.segment_id(),
+                    routes,
+                },
+                copied_bytes,
+                expected_reclaim_bytes: segment.summary.total_bytes,
+                score: score_rewrite(useful_bytes, copied_bytes, 1_500),
+            });
+        }
+        if !reclassify.is_empty() {
+            reclassify.sort_unstable();
+            plans.push(GcPlan {
+                scenario: GcScenario::L0Compaction,
+                action: GcAction::ReclassifySegments {
+                    segment_ids: reclassify,
+                    placement_class: PlacementClass::Spillover,
+                },
+                copied_bytes: 0,
+                expected_reclaim_bytes: 0,
+                score: reclassify_score,
+            });
+        }
+        plans
     }
 
     fn l0_lifetimes_accounted(&self, snapshot: &GcSnapshot, segment: &SegmentSnapshot) -> bool {
@@ -1038,8 +1064,8 @@ mod tests {
                 )]))
                 .unwrap()
                 .action,
-            GcAction::ReclassifySegment {
-                segment_id: 1,
+            GcAction::ReclassifySegments {
+                segment_ids: vec![1],
                 placement_class: PlacementClass::Spillover,
             }
         );
@@ -1075,8 +1101,8 @@ mod tests {
                 )]))
                 .unwrap()
                 .action,
-            GcAction::ReclassifySegment {
-                segment_id: 1,
+            GcAction::ReclassifySegments {
+                segment_ids: vec![1],
                 placement_class: PlacementClass::Spillover,
             }
         );
@@ -1133,8 +1159,8 @@ mod tests {
         assert_eq!(plan.copied_bytes, 0);
         assert_eq!(
             plan.action,
-            GcAction::ReclassifySegment {
-                segment_id: 1,
+            GcAction::ReclassifySegments {
+                segment_ids: vec![1],
                 placement_class: PlacementClass::Spillover,
             }
         );

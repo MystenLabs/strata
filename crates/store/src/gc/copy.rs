@@ -1229,7 +1229,8 @@ fn copy_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
         }
         GcAction::DeleteSegment { .. }
         | GcAction::DeleteSegments { .. }
-        | GcAction::ReclassifySegment { .. } => {}
+        | GcAction::ReclassifySegment { .. }
+        | GcAction::ReclassifySegments { .. } => {}
     }
     source_ids
 }
@@ -1248,6 +1249,9 @@ fn gc_plan_source_segment_ids(plan: &GcPlan) -> BTreeSet<SegmentId> {
         }
         GcAction::ReclassifySegment { segment_id, .. } => {
             source_ids.insert(*segment_id);
+        }
+        GcAction::ReclassifySegments { segment_ids, .. } => {
+            source_ids.extend(segment_ids.iter().copied());
         }
         GcAction::MoveLiveBytes { .. } | GcAction::MoveLiveBytesFromSources { .. } => {}
     }

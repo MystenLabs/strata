@@ -253,7 +253,8 @@ fn route_table(plan: &GcPlan) -> Result<RouteTable, GcSelectionError> {
         }
         GcAction::DeleteSegment { .. }
         | GcAction::DeleteSegments { .. }
-        | GcAction::ReclassifySegment { .. } => {
+        | GcAction::ReclassifySegment { .. }
+        | GcAction::ReclassifySegments { .. } => {
             return Err(GcSelectionError::NoCopyAction);
         }
     };
