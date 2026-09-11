@@ -157,6 +157,7 @@ impl GcExecutor {
             GcAction::DeleteSegment { .. }
                 | GcAction::DeleteSegments { .. }
                 | GcAction::ReclassifySegment { .. }
+                | GcAction::ReclassifySegments { .. }
         ) {
             return Ok(GcPreparedPublish {
                 copy,
@@ -356,7 +357,8 @@ impl GcExecutor {
         match &copy.plan.action {
             GcAction::DeleteSegment { .. }
             | GcAction::DeleteSegments { .. }
-            | GcAction::ReclassifySegment { .. } => {
+            | GcAction::ReclassifySegment { .. }
+            | GcAction::ReclassifySegments { .. } => {
                 if !copy.outputs.is_empty() || !copy.copied_records.is_empty() {
                     return Err(Error::GcInvalidPlan(
                         "metadata action cannot include staged outputs or copied records",
@@ -678,6 +680,12 @@ impl GcExecutor {
             } => {
                 self.reclassify_gc_segment(*segment_id, *placement_class)?;
             }
+            GcAction::ReclassifySegments {
+                segment_ids,
+                placement_class,
+            } => {
+                self.reclassify_gc_segments(segment_ids, *placement_class)?;
+            }
             GcAction::MoveLiveBytes { .. } | GcAction::MoveLiveBytesFromSources { .. } => {
                 return Err(Error::GcInvalidPlan(
                     "copy action must use the copy publish path",
@@ -942,6 +950,33 @@ impl GcExecutor {
         let mut batch = self.index.batch();
         self.index.put_segment_state_batch(&mut batch, &state)?;
         batch.write_with_sync(true).map_err(index::Error::from)?;
+        Ok(())
+    }
+
+    /// Reclassifies a batch in one synced commit. A segment that is no longer sealed (another
+    /// worker relocated it after this plan's snapshot) or already carries the class is skipped,
+    /// not an error: a stale snapshot re-planning the same batch must cost nothing.
+    fn reclassify_gc_segments(
+        &self,
+        segment_ids: &[SegmentId],
+        placement_class: PlacementClass,
+    ) -> Result<()> {
+        let mut batch = self.index.batch();
+        let mut changed = 0usize;
+        for segment_id in segment_ids {
+            let Some(mut state) = self.index.get_segment_state(*segment_id)? else {
+                continue;
+            };
+            if state.state != SegmentFileState::Sealed || state.placement_class == placement_class {
+                continue;
+            }
+            state.placement_class = placement_class;
+            self.index.put_segment_state_batch(&mut batch, &state)?;
+            changed += 1;
+        }
+        if changed > 0 {
+            batch.write_with_sync(true).map_err(index::Error::from)?;
+        }
         Ok(())
     }
 
