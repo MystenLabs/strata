@@ -172,6 +172,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
 };
+use tokio::sync::watch;
 use wal::Wal;
 #[cfg(test)]
 use wal::WalEntry;
@@ -300,16 +301,63 @@ pub struct StrataStore {
     metrics: StrataStoreMetrics,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Latest crash-durable store LSN, or a terminal failure that prevents further publication.
+///
+/// Subscribers receive the current value immediately and are notified when it changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurabilityProgress {
+    /// Every operation through this LSN survives a crash.
+    pub published_lsn: StrataLsn,
+    /// Set when this store instance can no longer accept or durably publish new writes.
+    pub halt_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct StoreHalt {
     reason: Arc<Mutex<Option<String>>>,
+    durability_tx: watch::Sender<DurabilityProgress>,
+}
+
+impl Default for StoreHalt {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl StoreHalt {
+    fn new(published_lsn: StrataLsn) -> Self {
+        let (durability_tx, _) = watch::channel(DurabilityProgress {
+            published_lsn,
+            halt_reason: None,
+        });
+        Self {
+            reason: Arc::new(Mutex::new(None)),
+            durability_tx,
+        }
+    }
+
+    fn subscribe_durability_progress(&self) -> watch::Receiver<DurabilityProgress> {
+        self.durability_tx.subscribe()
+    }
+
+    fn publish_lsn(&self, published_lsn: StrataLsn) {
+        self.durability_tx.send_if_modified(|progress| {
+            if published_lsn <= progress.published_lsn {
+                return false;
+            }
+            progress.published_lsn = published_lsn;
+            true
+        });
+    }
+
     fn halt(&self, reason: impl Into<String>) {
         let mut guard = self.reason.lock().expect("store halt lock poisoned");
         if guard.is_none() {
-            *guard = Some(reason.into());
+            let reason = reason.into();
+            *guard = Some(reason.clone());
+            self.durability_tx.send_modify(|progress| {
+                progress.halt_reason = Some(reason);
+            });
         }
     }
 

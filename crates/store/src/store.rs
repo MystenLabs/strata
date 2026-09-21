@@ -9,6 +9,7 @@ use std::{
 use core_types::{BlobKey, Epoch, SegmentId, ShardId, ShardInfo, ShardKey, StrataLsn};
 use index::StrataIndex;
 use lsm::Lsm;
+use tokio::sync::watch;
 
 #[cfg(test)]
 use crate::STANDALONE_SHARD;
@@ -305,6 +306,16 @@ impl StrataStore {
     /// (e.g. the Walrus event cursor) gate on before acknowledging work as done.
     pub fn published_lsn(&self) -> Result<StrataLsn> {
         Ok(self.index.get_committed_lsn()?)
+    }
+
+    /// Subscribes to the crash-durable LSN frontier without polling the index.
+    ///
+    /// The receiver starts with the current frontier, including after recovery. A write with
+    /// LSN `n` is durable once `published_lsn >= n`. If the store halts, `halt_reason` is set;
+    /// an already-running sync may still advance the durable frontier. The channel closes on
+    /// store shutdown.
+    pub fn subscribe_durability_progress(&self) -> watch::Receiver<crate::DurabilityProgress> {
+        self.store_halt.subscribe_durability_progress()
     }
 
     /// Enqueues work for the writer and records queue metrics around the send.

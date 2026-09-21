@@ -1453,6 +1453,62 @@ async fn epoch_change_is_published_by_the_store_checkpoint() {
 
     assert_eq!(store.published_lsn().unwrap(), epoch_lsn);
 }
+
+#[tokio::test]
+async fn durability_progress_notifies_subscribers_and_starts_at_recovered_lsn() {
+    async fn wait_for_lsn(
+        receiver: &mut tokio::sync::watch::Receiver<DurabilityProgress>,
+        lsn: StrataLsn,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let progress = receiver.borrow_and_update().clone();
+                assert_eq!(progress.halt_reason, None);
+                if progress.published_lsn >= lsn {
+                    return;
+                }
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("background sync did not notify durability subscribers");
+    }
+
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "durability-notifier");
+    let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+    let mut first = store.subscribe_durability_progress();
+    let mut second = store.subscribe_durability_progress();
+    assert_eq!(first.borrow().published_lsn, 0);
+    assert_eq!(second.borrow().published_lsn, 0);
+
+    let key = BlobKey::new(b"notified".to_vec()).unwrap();
+    let lsn = store.put(&key, b"payload").unwrap();
+    tokio::join!(
+        wait_for_lsn(&mut first, lsn),
+        wait_for_lsn(&mut second, lsn)
+    );
+    assert!(store.published_lsn().unwrap() >= lsn);
+
+    drop(first);
+    drop(second);
+    drop(store);
+    let reopened = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+    let mut after_recovery = reopened.subscribe_durability_progress();
+    assert_eq!(
+        after_recovery.borrow().published_lsn,
+        reopened.published_lsn().unwrap()
+    );
+    assert!(after_recovery.borrow().published_lsn >= lsn);
+
+    reopened.store_halt.halt("injected terminal failure");
+    after_recovery.changed().await.unwrap();
+    assert_eq!(
+        after_recovery.borrow().halt_reason.as_deref(),
+        Some("injected terminal failure")
+    );
+}
 #[tokio::test]
 async fn sync_publishes_new_allocations_without_overwriting_garbage() {
     init_typed_store_metrics();

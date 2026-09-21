@@ -433,6 +433,9 @@ impl WriteCoordinator {
             |profile, elapsed| profile.index_batch_commit += elapsed,
             || batch.write_with_sync(true).map_err(index::Error::from),
         )?;
+        // Segment and store-WAL fsyncs, followed by the synced index checkpoint, have all
+        // completed. Notify subscribers at this exact durability boundary, not at put visibility.
+        self.store_halt.publish_lsn(commit.target_lsn);
         for (tracker, bytes, records) in allocation_marks {
             tracker.mark_published(bytes, records);
         }
