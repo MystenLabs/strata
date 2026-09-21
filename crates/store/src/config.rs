@@ -88,6 +88,35 @@ pub enum SealedSegmentIntegrityPolicy {
 }
 
 impl StrataStoreConfig {
+    /// Creates a store configuration with production defaults for a namespace under `root_dir`.
+    ///
+    /// Callers must supply the directory and namespace because these determine where durable data
+    /// lives; the remaining settings can be overridden on the returned configuration.
+    pub fn new(root_dir: impl Into<PathBuf>, namespace: impl Into<String>) -> Self {
+        Self {
+            root_dir: root_dir.into(),
+            namespace: namespace.into(),
+            segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
+            write_queue_capacity: 1024,
+            max_unsealed_segments: 8,
+            segment_reader_cache_capacity: DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+            lsm_partition_count: DEFAULT_LSM_PARTITION_COUNT,
+            recovery_policy: StrataRecoveryPolicy::PointInTime,
+            sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
+            gc_workers_enabled: true,
+            gc_interval: DEFAULT_GC_INTERVAL,
+            gc_worker_count: DEFAULT_GC_WORKER_COUNT,
+            gc_initial_worker_count: DEFAULT_GC_INITIAL_WORKER_COUNT,
+            gc_tuning_window_cycles: DEFAULT_GC_TUNING_WINDOW_CYCLES,
+            gc_sync_impact_threshold: DEFAULT_GC_SYNC_IMPACT_THRESHOLD,
+            gc_io_bytes_per_sec: DEFAULT_GC_IO_BYTES_PER_SEC,
+            gc_min_io_bytes_per_sec: DEFAULT_GC_MIN_IO_BYTES_PER_SEC,
+            gc_planner_config: GcPlannerConfig::default(),
+            shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
+            starting_epoch: 0,
+        }
+    }
+
     pub fn namespace_dir(&self) -> PathBuf {
         self.root_dir.join(&self.namespace)
     }

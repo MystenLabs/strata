@@ -115,7 +115,11 @@ impl StrataStore {
             .map_err(|_| Error::WriteResponseDropped)?
     }
 
-    /// Durably fences a logical shard generation and schedules asynchronous reclamation.
+    /// Fences a logical shard generation and schedules asynchronous reclamation.
+    ///
+    /// Like `put`, this returns once the drop is visible, not necessarily crash-durable. Call
+    /// `sync` before deleting separately stored shard control state. Keeping sync separate lets
+    /// callers batch multiple drops and writes into one durable checkpoint.
     pub fn drop_shard(&self, shard_id: ShardId) -> Result<()> {
         let (response_tx, response_rx) = mpsc::channel();
         self.send_write_command(WriteCommand::DropShard(DropShardRequest {
