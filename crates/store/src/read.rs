@@ -278,6 +278,52 @@ impl StrataStore {
         Ok(self.live_record_ref(STANDALONE_SHARD, key)?.is_some())
     }
 
+    /// Returns whether `key` has a readable version in every requested active shard.
+    ///
+    /// The blob LSM is resolved once regardless of the number of shards. This is useful for
+    /// callers such as Walrus that need to check one blob across all assigned shards without
+    /// repeating the LSM merge for each shard. An empty shard set is complete by definition.
+    pub fn contains_in_shards(&self, key: &BlobKey, shard_ids: &[ShardId]) -> Result<bool> {
+        if shard_ids.is_empty() {
+            return Ok(true);
+        }
+
+        let shards = shard_ids
+            .iter()
+            .map(|&shard_id| self.readable_shard_key(shard_id))
+            .collect::<Result<Vec<_>>>()?;
+        let lsm = self.lsm()?;
+        let partition = partition_for_key(key.as_bytes(), self.config.lsm_partition_count);
+        let Some(encoded) = lsm.get(partition, key.as_bytes(), &BlobMerge)? else {
+            return Ok(false);
+        };
+        let StoredValue::Inline(bytes) = decode_value(&encoded)? else {
+            return Err(Error::InvariantViolation {
+                reason: format!("materialized blob state for {key:?} is segment-backed"),
+            });
+        };
+        let state = LsmBlobState::decode(bytes)?;
+        let current_epoch = self.current_epoch()?;
+
+        for shard in shards {
+            let Some((version, _)) = state.resolve(shard, current_epoch) else {
+                return Ok(false);
+            };
+            match self.segment_state_for_read(shard, version.record_ref)? {
+                Some(segment) if segment.state != SegmentFileState::Deleted => {}
+                Some(_) => {
+                    // GC can move a record before its blob row is compacted. The regular read
+                    // path follows the relocation and retries a stale reference once.
+                    if self.live_record_ref(shard, key)?.is_none() {
+                        return Ok(false);
+                    }
+                }
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn live_record_ref(
         &self,
         shard: ShardKey,

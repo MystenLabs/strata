@@ -1329,6 +1329,32 @@ async fn tombstone_only_hides_the_target_shard_generation() {
 }
 
 #[tokio::test]
+async fn contains_in_shards_resolves_one_blob_across_active_shards() {
+    init_typed_store_metrics();
+    let dir = tempdir().unwrap();
+    let store =
+        StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
+    store.add_shard(10).unwrap();
+    store.add_shard(20).unwrap();
+    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+
+    assert!(store.contains_in_shards(&key, &[]).unwrap());
+    assert!(!store.contains_in_shards(&key, &[10, 20]).unwrap());
+    store.put(10, &key, b"first").unwrap();
+    assert!(store.contains_in_shards(&key, &[10]).unwrap());
+    assert!(!store.contains_in_shards(&key, &[10, 20]).unwrap());
+    store.put(20, &key, b"second").unwrap();
+    assert!(store.contains_in_shards(&key, &[10, 20]).unwrap());
+    store.tombstone(10, &key).unwrap();
+    assert!(!store.contains_in_shards(&key, &[10, 20]).unwrap());
+    assert!(store.contains_in_shards(&key, &[20]).unwrap());
+    store.drop_shard(20).unwrap();
+    assert!(store.contains_in_shards(&key, &[20]).is_err());
+    store.add_shard(20).unwrap();
+    assert!(!store.contains_in_shards(&key, &[20]).unwrap());
+}
+
+#[tokio::test]
 async fn store_batch_buffers_ops_until_write_and_returns_global_lsns() {
     init_typed_store_metrics();
     let dir = tempdir().unwrap();
