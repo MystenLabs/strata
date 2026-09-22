@@ -2,10 +2,9 @@
 //! maintenance, and shard add/drop. The heavier commit paths live in sibling
 //! files, each holding one `impl WriteCoordinator` block split by concern.
 
-use std::{
-    sync::mpsc,
-    time::{Duration, Instant},
-};
+#[cfg(not(msim))]
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use core_types::{ShardCleanupJob, ShardCleanupState, ShardId, ShardInfo, ShardKey, ShardState};
 
@@ -22,8 +21,15 @@ const MAX_GROUPED_BATCHES: usize = 16;
 const MAX_GROUPED_OPERATIONS: usize = 256;
 const MAX_GROUPED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
+enum TryWriteCommand {
+    Command(WriteCommand),
+    Empty,
+    Disconnected,
+}
+
 impl WriteCoordinator {
     /// Main compatibility loop for store metadata publication and administrative operations.
+    #[cfg(not(msim))]
     pub(crate) fn run(mut self) {
         let mut deferred = None;
         loop {
@@ -36,15 +42,10 @@ impl WriteCoordinator {
                 self.halt_writer_error("scheduled writer maintenance", &error);
             }
             let timeout = self.next_maintenance_timeout();
-            let command = match deferred.take() {
-                Some(command) => command,
+            let (command, dequeue) = match deferred.take() {
+                Some(command) => (command, false),
                 None => match self.write_rx.recv_timeout(timeout) {
-                    Ok(command) => {
-                        if !matches!(command, WriteCommand::SyncDone) {
-                            self.metrics.dequeue_write_command();
-                        }
-                        command
-                    }
+                    Ok(command) => (command, true),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if let Err(error) = self.process_scheduled_maintenance() {
                             self.halt_writer_error("scheduled writer maintenance", &error);
@@ -54,83 +55,174 @@ impl WriteCoordinator {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 },
             };
-            if matches!(command, WriteCommand::Shutdown) {
+            if dequeue && !matches!(command, WriteCommand::SyncDone) {
+                self.metrics.dequeue_write_command();
+            }
+            if !self.process_command(command, &mut deferred) {
                 break;
-            }
-            if let Some(error) = self.store_halt.error()
-                && !matches!(command, WriteCommand::SyncDone)
-            {
-                Self::send_command_error(command, error);
-                continue;
-            }
-            match command {
-                WriteCommand::AddShard(request) => {
-                    self.process_add_shard(request);
-                }
-                WriteCommand::Batch(first) => {
-                    let mut operation_count = first.ops.len();
-                    let mut payload_bytes = first
-                        .ops
-                        .iter()
-                        .filter_map(|op| match op {
-                            BatchOp::Put { payload, .. } => Some(payload.len()),
-                            _ => None,
-                        })
-                        .sum::<usize>();
-                    let mut requests = vec![first];
-
-                    while requests.len() < MAX_GROUPED_BATCHES {
-                        match self.write_rx.try_recv() {
-                            Ok(command) => {
-                                if !matches!(command, WriteCommand::SyncDone) {
-                                    self.metrics.dequeue_write_command();
-                                }
-                                match command {
-                                    WriteCommand::Batch(request) => {
-                                        let next_operations = request.ops.len();
-                                        let next_payload_bytes = request
-                                            .ops
-                                            .iter()
-                                            .filter_map(|op| match op {
-                                                BatchOp::Put { payload, .. } => Some(payload.len()),
-                                                _ => None,
-                                            })
-                                            .sum::<usize>();
-                                        if operation_count.saturating_add(next_operations)
-                                            > MAX_GROUPED_OPERATIONS
-                                            || payload_bytes.saturating_add(next_payload_bytes)
-                                                > MAX_GROUPED_PAYLOAD_BYTES
-                                        {
-                                            deferred = Some(WriteCommand::Batch(request));
-                                            break;
-                                        }
-                                        operation_count += next_operations;
-                                        payload_bytes += next_payload_bytes;
-                                        requests.push(request);
-                                    }
-                                    command => {
-                                        deferred = Some(command);
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => break,
-                        }
-                    }
-                    self.process_batch_group(requests);
-                }
-                WriteCommand::DropShard(request) => {
-                    self.process_drop_shard(request);
-                }
-                WriteCommand::Sync(request) => {
-                    self.process_sync(request);
-                }
-                WriteCommand::SyncDone => self.process_sync_done(),
-                WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
             }
         }
         drop(self.write_rx);
+    }
+
+    /// Simulator loop. Tokio owns the coordinator and its timer/command wakeups; each finite
+    /// mutation step runs in the deterministic blocking pool so RocksDB and file operations do
+    /// not block the single simulated executor thread.
+    #[cfg(msim)]
+    pub(crate) async fn run(mut self) {
+        let mut deferred = None;
+        loop {
+            let timeout = self.next_maintenance_timeout();
+            let (command, dequeue) = match deferred.take() {
+                Some(command) => (Some(command), false),
+                None => {
+                    let command = tokio::select! {
+                        command = self.write_rx.recv() => command,
+                        () = tokio::time::sleep(timeout) => None,
+                    };
+                    (command, true)
+                }
+            };
+            // `None` can mean either timer expiry or a closed queue. Distinguish a closed queue
+            // before moving the coordinator into the blocking step.
+            if command.is_none() && self.write_rx.is_closed() && self.write_rx.is_empty() {
+                break;
+            }
+
+            let step = tokio::task::spawn_blocking(move || {
+                self.process_sync_done();
+                if self.next_maintenance_timeout().is_zero()
+                    && let Err(error) = self.process_scheduled_maintenance()
+                {
+                    self.halt_writer_error("scheduled writer maintenance", &error);
+                }
+                let keep_running = match command {
+                    Some(command) => {
+                        if dequeue && !matches!(command, WriteCommand::SyncDone) {
+                            self.metrics.dequeue_write_command();
+                        }
+                        self.process_command(command, &mut deferred)
+                    }
+                    None => {
+                        if let Err(error) = self.process_scheduled_maintenance() {
+                            self.halt_writer_error("scheduled writer maintenance", &error);
+                        }
+                        true
+                    }
+                };
+                (self, deferred, keep_running)
+            })
+            .await;
+
+            match step {
+                Ok((next, next_deferred, keep_running)) => {
+                    self = next;
+                    deferred = next_deferred;
+                    if !keep_running {
+                        break;
+                    }
+                }
+                Err(error) if error.is_cancelled() => return,
+                Err(error) => panic!("Strata writer task failed: {error}"),
+            }
+        }
+        drop(self.write_rx);
+    }
+
+    fn process_command(
+        &mut self,
+        command: WriteCommand,
+        deferred: &mut Option<WriteCommand>,
+    ) -> bool {
+        if matches!(command, WriteCommand::Shutdown) {
+            return false;
+        }
+        if let Some(error) = self.store_halt.error()
+            && !matches!(command, WriteCommand::SyncDone)
+        {
+            Self::send_command_error(command, error);
+            return true;
+        }
+        match command {
+            WriteCommand::AddShard(request) => self.process_add_shard(request),
+            WriteCommand::Batch(first) => {
+                let mut operation_count = first.ops.len();
+                let mut payload_bytes = first
+                    .ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        BatchOp::Put { payload, .. } => Some(payload.len()),
+                        _ => None,
+                    })
+                    .sum::<usize>();
+                let mut requests = vec![first];
+
+                while requests.len() < MAX_GROUPED_BATCHES {
+                    match self.try_receive_write_command() {
+                        TryWriteCommand::Command(command) => {
+                            if !matches!(command, WriteCommand::SyncDone) {
+                                self.metrics.dequeue_write_command();
+                            }
+                            match command {
+                                WriteCommand::Batch(request) => {
+                                    let next_operations = request.ops.len();
+                                    let next_payload_bytes = request
+                                        .ops
+                                        .iter()
+                                        .filter_map(|op| match op {
+                                            BatchOp::Put { payload, .. } => Some(payload.len()),
+                                            _ => None,
+                                        })
+                                        .sum::<usize>();
+                                    if operation_count.saturating_add(next_operations)
+                                        > MAX_GROUPED_OPERATIONS
+                                        || payload_bytes.saturating_add(next_payload_bytes)
+                                            > MAX_GROUPED_PAYLOAD_BYTES
+                                    {
+                                        *deferred = Some(WriteCommand::Batch(request));
+                                        break;
+                                    }
+                                    operation_count += next_operations;
+                                    payload_bytes += next_payload_bytes;
+                                    requests.push(request);
+                                }
+                                command => {
+                                    *deferred = Some(command);
+                                    break;
+                                }
+                            }
+                        }
+                        TryWriteCommand::Empty | TryWriteCommand::Disconnected => break,
+                    }
+                }
+                self.process_batch_group(requests);
+            }
+            WriteCommand::DropShard(request) => self.process_drop_shard(request),
+            WriteCommand::Sync(request) => self.process_sync(request),
+            WriteCommand::SyncDone => self.process_sync_done(),
+            WriteCommand::Shutdown => unreachable!("shutdown is handled before dispatch"),
+        }
+        true
+    }
+
+    #[cfg(not(msim))]
+    fn try_receive_write_command(&mut self) -> TryWriteCommand {
+        match self.write_rx.try_recv() {
+            Ok(command) => TryWriteCommand::Command(command),
+            Err(mpsc::TryRecvError::Empty) => TryWriteCommand::Empty,
+            Err(mpsc::TryRecvError::Disconnected) => TryWriteCommand::Disconnected,
+        }
+    }
+
+    #[cfg(msim)]
+    fn try_receive_write_command(&mut self) -> TryWriteCommand {
+        match self.write_rx.try_recv() {
+            Ok(command) => TryWriteCommand::Command(command),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => TryWriteCommand::Empty,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                TryWriteCommand::Disconnected
+            }
+        }
     }
 
     fn process_sync_done(&mut self) {

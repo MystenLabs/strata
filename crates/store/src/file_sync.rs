@@ -4,17 +4,29 @@ use std::{
     fmt,
     fs::File,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, Sender},
-    },
+    sync::Arc,
+};
+
+#[cfg(not(msim))]
+use std::sync::{
+    Mutex,
+    mpsc::{self, Receiver, Sender},
+};
+
+#[cfg(msim)]
+use tokio::sync::{
+    Mutex,
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 
 use crate::{Error, Result};
 
 type Completion = Box<dyn FnOnce(Result<()>) + Send + 'static>;
 
+#[cfg(not(msim))]
 pub type FileSyncSender = Sender<FileSyncTask>;
+#[cfg(msim)]
+pub type FileSyncSender = UnboundedSender<FileSyncTask>;
 
 /// One file sync followed by a caller-owned completion action.
 pub struct FileSyncTask {
@@ -41,6 +53,18 @@ impl FileSyncTask {
     pub(crate) fn complete(self, result: Result<()>) {
         (self.completion)(result);
     }
+
+    fn run(self) {
+        let Self {
+            path,
+            file,
+            completion,
+        } = self;
+        let result = file
+            .sync_data()
+            .map_err(|source| Error::Io { path, source });
+        completion(result);
+    }
 }
 
 impl fmt::Debug for FileSyncTask {
@@ -57,7 +81,10 @@ pub fn file_sync_channel() -> (FileSyncSender, FileSyncer) {
     // Submission must never put filesystem latency or a full maintenance queue on the foreground
     // writer. The store permits only one durability publication at a time and independently caps
     // unsealed segments, which bounds the number of outstanding tasks without a bounded channel.
+    #[cfg(not(msim))]
     let (sender, receiver) = mpsc::channel();
+    #[cfg(msim)]
+    let (sender, receiver) = mpsc::unbounded_channel();
     (
         sender,
         FileSyncer {
@@ -69,7 +96,10 @@ pub fn file_sync_channel() -> (FileSyncSender, FileSyncer) {
 /// One worker over a shared file-sync task receiver.
 #[derive(Clone)]
 pub struct FileSyncer {
+    #[cfg(not(msim))]
     receiver: Arc<Mutex<Receiver<FileSyncTask>>>,
+    #[cfg(msim)]
+    receiver: Arc<Mutex<UnboundedReceiver<FileSyncTask>>>,
 }
 
 impl FileSyncer {
@@ -77,26 +107,39 @@ impl FileSyncer {
     ///
     /// Clones may run concurrently. The receiver lock is released before syncing the file and
     /// invoking its completion action.
+    #[cfg(not(msim))]
     pub fn run(self) {
         while let Some(task) = self.recv() {
-            let FileSyncTask {
-                path,
-                file,
-                completion,
-            } = task;
-            let result = file
-                .sync_data()
-                .map_err(|source| Error::Io { path, source });
-            completion(result);
+            task.run();
         }
     }
 
+    #[cfg(not(msim))]
     fn recv(&self) -> Option<FileSyncTask> {
         self.receiver
             .lock()
             .expect("file sync receiver lock poisoned")
             .recv()
             .ok()
+    }
+
+    /// Receives on the simulated executor and performs only the finite file sync in the
+    /// deterministic blocking pool. The completion callback therefore re-enters the writer from
+    /// an msim-owned task instead of an unmanaged native worker thread.
+    #[cfg(msim)]
+    pub async fn run(self) {
+        while let Some(task) = self.recv().await {
+            match tokio::task::spawn_blocking(move || task.run()).await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => return,
+                Err(error) => panic!("Strata file-sync task failed: {error}"),
+            }
+        }
+    }
+
+    #[cfg(msim)]
+    async fn recv(&self) -> Option<FileSyncTask> {
+        self.receiver.lock().await.recv().await
     }
 }
 

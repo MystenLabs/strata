@@ -8139,6 +8139,7 @@ dependencies = [
  "gc",
  "index",
  "lsm",
+ "msim",
  "prometheus",
  "segment",
  "sha2 0.10.9",

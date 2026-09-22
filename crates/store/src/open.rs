@@ -5,7 +5,7 @@ use std::{
     fs,
     num::NonZeroU32,
     sync::{Arc, Mutex, RwLock, atomic::AtomicU64, mpsc},
-    thread::{self, JoinHandle},
+    thread,
     time::Instant,
 };
 
@@ -20,11 +20,12 @@ use lsm::{
 use segment::{SegmentFactory, SegmentIdAllocator, SegmentIoObserver, SegmentWriter};
 
 use crate::{
-    BLOB_LSM_MANIFEST, DEFAULT_RELOCATION_CACHE_ENTRIES, Error, FIRST_SEGMENT_ID, GcPlanner,
-    INGEST_SEGMENT_OWNER, LSM_BASE_FORMAT, LSM_FILE_SYNC_WORKERS, LSM_MEMTABLE_MAX_AGE,
-    LSM_MEMTABLE_MAX_KEYS, LSM_PATCH_FORMAT, RELOCATION_LSM_BASE_FORMAT, RELOCATION_LSM_MANIFEST,
-    RELOCATION_LSM_PATCH_FORMAT, RETIRED_PROJECTION_DIR, Result, STANDALONE_SHARD, StoreHalt,
-    StrataStore, StrataStoreConfig, StrataStoreMetrics, WriteCoordinator,
+    BLOB_LSM_MANIFEST, DEFAULT_RELOCATION_CACHE_ENTRIES, Error, FIRST_SEGMENT_ID,
+    FileSyncTaskHandle, GcPlanner, INGEST_SEGMENT_OWNER, LSM_BASE_FORMAT, LSM_FILE_SYNC_WORKERS,
+    LSM_MEMTABLE_MAX_AGE, LSM_MEMTABLE_MAX_KEYS, LSM_PATCH_FORMAT, RELOCATION_LSM_BASE_FORMAT,
+    RELOCATION_LSM_MANIFEST, RELOCATION_LSM_PATCH_FORMAT, RETIRED_PROJECTION_DIR, Result,
+    STANDALONE_SHARD, StoreHalt, StrataStore, StrataStoreConfig, StrataStoreMetrics,
+    WriteCoordinator,
     file_sync::file_sync_channel,
     fs_util::{sync_parent_dir, unlink_gc_segment_file},
     gc::{
@@ -46,6 +47,7 @@ use crate::{
     },
     wal::Wal,
     wal_format::StoreWalMutation,
+    write_command_channel,
 };
 
 /// Aggregates authoritative per-segment GC summaries for metric initialization.
@@ -256,7 +258,7 @@ impl StrataStore {
             .name(format!("strata-garbage-sweeper-{}", config.namespace))
             .spawn(move || garbage_sweeper.run())
             .map_err(|source| Error::ThreadSpawn { source })?;
-        let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
+        let (write_tx, write_rx) = write_command_channel(config.write_queue_capacity);
         let (durability_ready_tx, durability_ready_rx) = mpsc::channel();
         let reader_cache = Arc::new(SegmentReaderCache::new(
             config.segment_reader_cache_capacity,
@@ -303,10 +305,13 @@ impl StrataStore {
             store_halt: store_halt.clone(),
             metrics: metrics.clone(),
         };
+        #[cfg(not(msim))]
         let writer_handle = thread::Builder::new()
             .name(format!("strata-writer-{}", config.namespace))
             .spawn(move || coordinator.run())
             .map_err(|source| Error::ThreadSpawn { source })?;
+        #[cfg(msim)]
+        let writer_handle = tokio::spawn(coordinator.run());
         let configured_gc_workers = if config.gc_workers_enabled {
             config.gc_worker_count
         } else {
@@ -526,27 +531,34 @@ fn open_lsm_with_options(
     )?))
 }
 
+pub(crate) type OpenStoreWal = (
+    Wal,
+    Vec<(StrataLsn, LsmMutation)>,
+    Vec<RelocationEntry>,
+    Vec<FileSyncTaskHandle>,
+);
+
 pub(crate) fn open_store_wal(
     config: &StrataStoreConfig,
     index: &StrataIndex,
     next_lsn: StrataLsn,
     checkpoint: Option<StoreCheckpoint>,
-) -> Result<(
-    Wal,
-    Vec<(StrataLsn, LsmMutation)>,
-    Vec<RelocationEntry>,
-    Vec<JoinHandle<()>>,
-)> {
+) -> Result<OpenStoreWal> {
     let (sync_tx, syncer) = file_sync_channel();
     let mut sync_handles = Vec::with_capacity(LSM_FILE_SYNC_WORKERS);
     for worker in 0..LSM_FILE_SYNC_WORKERS {
         let syncer = syncer.clone();
+        #[cfg(msim)]
+        let _ = worker;
+        #[cfg(not(msim))]
         sync_handles.push(
             thread::Builder::new()
                 .name(format!("strata-file-sync-{}-{worker}", config.namespace))
                 .spawn(move || syncer.run())
                 .map_err(|source| Error::ThreadSpawn { source })?,
         );
+        #[cfg(msim)]
+        sync_handles.push(tokio::spawn(syncer.run()));
     }
     drop(syncer);
 

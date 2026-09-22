@@ -126,7 +126,10 @@ impl SyncAndCommit {
             }
         }
         if self.sync_done_tx.send(Arc::clone(self)).is_ok() {
+            #[cfg(not(msim))]
             let _ = self.wake_tx.try_send(WriteCommand::SyncDone);
+            #[cfg(msim)]
+            let _ = self.wake_tx.send(WriteCommand::SyncDone);
         }
     }
 }
@@ -134,7 +137,7 @@ impl SyncAndCommit {
 impl WriteCoordinator {
     /// Starts one sync and commit without waiting for physical I/O.
     ///
-    /// Capturing happens on the writer thread, so `target_lsn`, the WAL position, segment offsets,
+    /// Capturing happens on the writer coordinator, so `target_lsn`, the WAL position, segment offsets,
     /// and allocation counters describe one coherent prefix. Later writes may append to the same
     /// active files; syncing more bytes than the captured offsets is harmless because the metadata
     /// publication claims only this snapshot.
@@ -298,7 +301,7 @@ impl WriteCoordinator {
         Ok(())
     }
 
-    /// Finishes the metadata half of a completed file sync on the serialized writer thread.
+    /// Finishes the metadata half of a completed file sync on the serialized writer coordinator.
     pub(crate) fn commit_after_sync(
         &mut self,
         commit: Arc<SyncAndCommit>,

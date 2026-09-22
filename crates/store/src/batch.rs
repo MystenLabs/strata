@@ -1,4 +1,4 @@
-//! The write protocol between `StrataStore` and the writer thread: command and
+//! The write protocol between `StrataStore` and the writer coordinator: command and
 //! request types, the public batch builder and its result/profile types, and the
 //! prepared-batch forms the writer commits.
 

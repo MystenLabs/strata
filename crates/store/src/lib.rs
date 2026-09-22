@@ -113,7 +113,7 @@
 //!
 //! - [`store`]: runtime API of `StrataStore` (writes, shards, epochs, sync, shutdown)
 //! - [`open`] / [`recovery`]: `StrataStore::open`, config validation, crash recovery
-//! - [`batch`]: the write protocol between `StrataStore` and the writer thread
+//! - [`batch`]: the write protocol between `StrataStore` and the writer coordinator
 //! - [`writer`]: the foreground commit, rollover, and sync coordinator
 //! - [`gc`]: GC worker admission, copy execution, publication, and output accounting
 //! - [`maintenance`]: background workers (garbage-log sweeper, LSM flusher/compactor)
@@ -149,7 +149,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64, mpsc},
-    thread::JoinHandle,
+    thread::JoinHandle as ThreadJoinHandle,
     time::{Duration, Instant},
 };
 
@@ -167,6 +167,38 @@ use index::StrataIndex;
 use lsm::ManifestEdit;
 use lsm::{LiveSnapshots, Lsm};
 use segment::{SegmentFactory, SegmentIdAllocator, SegmentWriter};
+
+#[cfg(not(msim))]
+type WriteCommandSender = mpsc::SyncSender<WriteCommand>;
+#[cfg(not(msim))]
+type WriteCommandReceiver = mpsc::Receiver<WriteCommand>;
+#[cfg(msim)]
+type WriteCommandSender = tokio::sync::mpsc::UnboundedSender<WriteCommand>;
+#[cfg(msim)]
+type WriteCommandReceiver = tokio::sync::mpsc::UnboundedReceiver<WriteCommand>;
+
+#[cfg(not(msim))]
+type WriterTaskHandle = ThreadJoinHandle<()>;
+#[cfg(msim)]
+type WriterTaskHandle = tokio::task::JoinHandle<()>;
+
+#[cfg(not(msim))]
+type FileSyncTaskHandle = ThreadJoinHandle<()>;
+#[cfg(msim)]
+type FileSyncTaskHandle = tokio::task::JoinHandle<()>;
+
+#[cfg(not(msim))]
+fn write_command_channel(capacity: usize) -> (WriteCommandSender, WriteCommandReceiver) {
+    mpsc::sync_channel(capacity)
+}
+
+#[cfg(msim)]
+fn write_command_channel(_capacity: usize) -> (WriteCommandSender, WriteCommandReceiver) {
+    // The simulator-owned coordinator must never make a blocking-pool caller wait while holding
+    // its execution quantum. Backpressure remains covered by the production bounded queue; msim
+    // uses an unbounded wakeable queue so the coordinator can receive on the simulated executor.
+    tokio::sync::mpsc::unbounded_channel()
+}
 #[cfg(test)]
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -272,19 +304,19 @@ pub struct StrataStore {
     pub(crate) config: StrataStoreConfig,
     pub(crate) index: StrataIndex,
     lsm: Weak<Lsm>,
-    pub(crate) write_tx: Option<mpsc::SyncSender<WriteCommand>>,
-    writer_handle: Option<JoinHandle<()>>,
+    pub(crate) write_tx: Option<WriteCommandSender>,
+    writer_handle: Option<WriterTaskHandle>,
     lsm_flush_tx: Option<mpsc::Sender<()>>,
     lsm_compact_tx: Option<mpsc::Sender<()>>,
     wal_reclaim_tx: Option<mpsc::SyncSender<()>>,
-    lsm_flush_handle: Option<JoinHandle<()>>,
-    lsm_compact_handle: Option<JoinHandle<()>>,
-    wal_reclaim_handle: Option<JoinHandle<()>>,
-    lsm_sync_handles: Vec<JoinHandle<()>>,
+    lsm_flush_handle: Option<ThreadJoinHandle<()>>,
+    lsm_compact_handle: Option<ThreadJoinHandle<()>>,
+    wal_reclaim_handle: Option<ThreadJoinHandle<()>>,
+    lsm_sync_handles: Vec<FileSyncTaskHandle>,
     garbage_sweep_tx: Option<mpsc::Sender<()>>,
-    garbage_sweep_handle: Option<JoinHandle<()>>,
+    garbage_sweep_handle: Option<ThreadJoinHandle<()>>,
     pub(crate) gc_txs: Vec<mpsc::Sender<GcCommand>>,
-    gc_handles: Vec<JoinHandle<()>>,
+    gc_handles: Vec<ThreadJoinHandle<()>>,
     pub(crate) gc_publish_cleanup_lock: Arc<Mutex<()>>,
     pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
     pub(crate) compaction_admission_lock: Arc<RwLock<()>>,
@@ -391,7 +423,7 @@ struct WriteCoordinator {
     segment_factory: SegmentFactory,
     segment_sync_tx: FileSyncSender,
     pending_segment_syncs: Vec<SegmentSync>,
-    internal_write_tx: mpsc::SyncSender<WriteCommand>,
+    internal_write_tx: WriteCommandSender,
     sync_done_tx: mpsc::Sender<Arc<SyncAndCommit>>,
     sync_done_rx: mpsc::Receiver<Arc<SyncAndCommit>>,
     sync_and_commit_in_flight: Option<StrataLsn>,
@@ -408,7 +440,7 @@ struct WriteCoordinator {
     lsm_flush_tx: mpsc::Sender<()>,
     lsm_compact_tx: mpsc::Sender<()>,
     wal_reclaim_tx: mpsc::SyncSender<()>,
-    write_rx: mpsc::Receiver<WriteCommand>,
+    write_rx: WriteCommandReceiver,
     ingest_owner: SegmentOwner,
     gc_concurrency: Arc<GcConcurrencyController>,
     store_halt: StoreHalt,
@@ -471,7 +503,7 @@ struct SyncAndCommit {
     ///Some(Ok(profile)): all segment and WAL syncs completed with these timings
     file_sync_result: Mutex<Option<Result<FileSyncProfile>>>,
     sync_done_tx: mpsc::Sender<Arc<SyncAndCommit>>,
-    wake_tx: mpsc::SyncSender<WriteCommand>,
+    wake_tx: WriteCommandSender,
 }
 
 #[cfg(test)]

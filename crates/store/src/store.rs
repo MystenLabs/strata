@@ -21,6 +21,29 @@ use crate::{
     maintenance::flush_relocation_lsm,
 };
 
+#[cfg(not(msim))]
+fn recv_writer_response<T>(
+    receiver: &mpsc::Receiver<T>,
+) -> std::result::Result<T, mpsc::RecvError> {
+    receiver.recv()
+}
+
+/// Synchronous Strata calls run inside `spawn_blocking` in simulator builds. Yielding the blocking
+/// quantum while the Tokio-owned coordinator makes progress avoids pinning the simulator on an OS
+/// channel wait.
+#[cfg(msim)]
+fn recv_writer_response<T>(
+    receiver: &mpsc::Receiver<T>,
+) -> std::result::Result<T, mpsc::RecvError> {
+    loop {
+        match receiver.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(mpsc::TryRecvError::Empty) => msim::task::yield_blocking(),
+            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+        }
+    }
+}
+
 impl StrataStore {
     pub fn config(&self) -> &StrataStoreConfig {
         &self.config
@@ -110,9 +133,7 @@ impl StrataStore {
             shard_id,
             response_tx,
         }))?;
-        response_rx
-            .recv()
-            .map_err(|_| Error::WriteResponseDropped)?
+        recv_writer_response(&response_rx).map_err(|_| Error::WriteResponseDropped)?
     }
 
     /// Fences a logical shard generation and schedules asynchronous reclamation.
@@ -126,9 +147,7 @@ impl StrataStore {
             shard_id,
             response_tx,
         }))?;
-        response_rx
-            .recv()
-            .map_err(|_| Error::WriteResponseDropped)??;
+        recv_writer_response(&response_rx).map_err(|_| Error::WriteResponseDropped)??;
         Ok(())
     }
 
@@ -139,7 +158,7 @@ impl StrataStore {
     /// machine loses power before `sync`, recovery may roll the blob back while the upstream event
     /// cursor has already advanced.
     ///
-    /// All mutations are funneled through one writer thread (see `WriteCoordinator`), so this
+    /// All mutations are funneled through one writer coordinator (see `WriteCoordinator`), so this
     /// just packages the request and blocks on the response channel.
     pub fn put(&self, shard_id: ShardId, key: &BlobKey, payload: &[u8]) -> Result<StrataLsn> {
         self.put_arc(shard_id, key.clone(), Arc::from(payload))
@@ -191,7 +210,8 @@ impl StrataStore {
         Ok(result.first_lsn().unwrap_or(0))
     }
 
-    /// Sends a prepared list of operations to the single writer and waits for the committed result.
+    /// Sends a prepared list of operations to the single writer coordinator and waits for the
+    /// committed result.
     ///
     /// LSNs, segment offsets, and epoch rows must be allocated together by
     /// the owner of the active writer. If callers wrote directly to the index from many threads,
@@ -205,9 +225,8 @@ impl StrataStore {
             profile,
         });
         let queue_send = self.send_write_command(command)?;
-        let result = response_rx
-            .recv()
-            .map_err(|_| Error::WriteResponseDropped)??;
+        let result =
+            recv_writer_response(&response_rx).map_err(|_| Error::WriteResponseDropped)??;
         self.finish_write_profile(profile_rx, queue_send)?;
         Ok(result)
     }
@@ -266,9 +285,7 @@ impl StrataStore {
             profile,
         });
         let queue_send = self.send_write_command(command)?;
-        response_rx
-            .recv()
-            .map_err(|_| Error::WriteResponseDropped)??;
+        recv_writer_response(&response_rx).map_err(|_| Error::WriteResponseDropped)??;
         self.finish_sync_profile(profile_rx, queue_send)?;
         Ok(())
     }
@@ -363,7 +380,8 @@ impl StrataStore {
         let Some(profile_rx) = profile_rx else {
             return Ok(());
         };
-        let mut profile = profile_rx.recv().map_err(|_| Error::WriteResponseDropped)?;
+        let mut profile =
+            recv_writer_response(&profile_rx).map_err(|_| Error::WriteResponseDropped)?;
         profile.queue_send = queue_send;
         profile.queue_wait = profile.queue_wait.saturating_sub(queue_send);
         self.metrics.record_write_profile(profile);
@@ -378,7 +396,8 @@ impl StrataStore {
         let Some(profile_rx) = profile_rx else {
             return Ok(());
         };
-        let mut profile = profile_rx.recv().map_err(|_| Error::WriteResponseDropped)?;
+        let mut profile =
+            recv_writer_response(&profile_rx).map_err(|_| Error::WriteResponseDropped)?;
         profile.queue_send = queue_send;
         profile.queue_wait = profile.queue_wait.saturating_sub(queue_send);
         self.metrics.record_sync_profile(profile);
@@ -404,22 +423,42 @@ impl Drop for StrataStore {
             let _ = write_tx.send(WriteCommand::Shutdown);
         }
         if let Some(writer_handle) = self.writer_handle.take() {
+            #[cfg(not(msim))]
             let _ = writer_handle.join();
+            #[cfg(msim)]
+            writer_handle.abort();
         }
+        // In msim the aborted coordinator is dropped by the Tokio executor after this `Drop`
+        // returns. It still owns clones of these maintenance senders until then, so joining their
+        // native compatibility threads here would wait on work that only the blocked executor can
+        // perform. Detaching the handles lets the threads exit when coordinator cancellation closes
+        // the channels; moving these maintenance loops under Tokio is intentionally a later step.
         self.wal_reclaim_tx.take();
         if let Some(wal_reclaim_handle) = self.wal_reclaim_handle.take() {
+            #[cfg(not(msim))]
             let _ = wal_reclaim_handle.join();
+            #[cfg(msim)]
+            drop(wal_reclaim_handle);
         }
         self.lsm_flush_tx.take();
         if let Some(lsm_flush_handle) = self.lsm_flush_handle.take() {
+            #[cfg(not(msim))]
             let _ = lsm_flush_handle.join();
+            #[cfg(msim)]
+            drop(lsm_flush_handle);
         }
         self.lsm_compact_tx.take();
         if let Some(lsm_compact_handle) = self.lsm_compact_handle.take() {
+            #[cfg(not(msim))]
             let _ = lsm_compact_handle.join();
+            #[cfg(msim)]
+            drop(lsm_compact_handle);
         }
         for sync_handle in self.lsm_sync_handles.drain(..) {
+            #[cfg(not(msim))]
             let _ = sync_handle.join();
+            #[cfg(msim)]
+            sync_handle.abort();
         }
     }
 }

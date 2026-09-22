@@ -22,6 +22,12 @@ tokio.workspace = true
 typed-store.workspace = true
 xxhash-rust.workspace = true
 
+[target.'cfg(msim)'.dependencies]
+msim = { git = "https://github.com/MystenLabs/mysten-sim.git", rev = "6b8e1e8cdce408e73d46538773fc85a56c082db7" }
+
 [dev-dependencies]
 index = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(msim)'] }
