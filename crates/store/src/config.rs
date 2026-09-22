@@ -113,6 +113,8 @@ impl StrataStoreConfig {
             max_unsealed_segments: 8,
             segment_reader_cache_capacity: DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
             lsm_partition_count: DEFAULT_LSM_PARTITION_COUNT,
+            lsm_compaction_patch_bytes: DEFAULT_LSM_COMPACTION_PATCH_BYTES,
+            lsm_memtable_max_age: DEFAULT_LSM_MEMTABLE_MAX_AGE,
             recovery_policy: StrataRecoveryPolicy::PointInTime,
             sealed_segment_integrity_policy: SealedSegmentIntegrityPolicy::MetadataOnly,
             gc_workers_enabled: true,
