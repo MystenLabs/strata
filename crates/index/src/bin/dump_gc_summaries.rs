@@ -71,6 +71,85 @@ fn main() {
         summaries.len()
     );
 
+    // Garbage-ratio histogram over sealed, non-ingest segments, plus the oldest few in detail:
+    // what the dead-ref planner sees when it asks whether a segment is worth rewriting.
+    let mut ratio_buckets = [0usize; 11];
+    let mut ratio_bytes = [0u64; 11];
+    let mut oldest = Vec::new();
+    for (id, state) in &states {
+        if state.state != SegmentFileState::Sealed
+            || state.placement_class == PlacementClass::Ingest
+        {
+            continue;
+        }
+        let summary = summaries.get(id).cloned().unwrap_or_default();
+        let garbage = summary.retired_bytes.saturating_add(summary.expired_bytes);
+        let ratio = if summary.total_bytes == 0 {
+            0
+        } else {
+            (garbage * 10 / summary.total_bytes).min(10) as usize
+        };
+        ratio_buckets[ratio] += 1;
+        ratio_bytes[ratio] += garbage;
+        if oldest.len() < limit {
+            oldest.push((*id, state.placement_class, summary));
+        }
+    }
+    println!("sealed non-ingest segments by garbage ratio (bucket: count, garbage_MB):");
+    for (bucket, count) in ratio_buckets.iter().enumerate() {
+        if *count > 0 {
+            println!(
+                "  {}0-{}0%: {count} segments, {} MB garbage",
+                bucket,
+                bucket + 1,
+                ratio_bytes[bucket] >> 20
+            );
+        }
+    }
+    // What the dead-ref planner would select from these summaries alone, with every frontier
+    // wide open: if this finds candidates the live planner does not, a frontier or a claim is
+    // holding them back.
+    let planner = gc_planner::GcPlanner::new(gc_planner::GcPlannerConfig {
+        max_copy_bytes_per_plan: 1 << 30,
+        ..gc_planner::GcPlannerConfig::default()
+    });
+    let open_snapshot = gc_planner::GcSnapshot {
+        current_epoch: cutoff,
+        expiry_accounted_epoch: Some(cutoff),
+        writes_merged_epoch: Some(cutoff),
+        lifecycle_accounted_lsn: Some(u64::MAX),
+        published_lsn: u64::MAX,
+        segments: states
+            .iter()
+            .filter(|(_, state)| state.state != SegmentFileState::Deleted)
+            .map(|(id, state)| gc_planner::SegmentSnapshot {
+                state: state.clone(),
+                summary: summaries.get(id).cloned().unwrap_or_default(),
+                claimed: false,
+            })
+            .collect(),
+    };
+    let plans = planner.plans(&open_snapshot);
+    let mut by_scenario: BTreeMap<String, usize> = BTreeMap::new();
+    for plan in &plans {
+        *by_scenario.entry(format!("{:?}", plan.scenario)).or_default() += 1;
+    }
+    println!("planner (frontiers wide open, 1 GiB cap): {} plans by scenario {:?}", plans.len(), by_scenario);
+    for plan in plans.iter().take(5) {
+        println!("  {:?} copied_MB={} reclaim_MB={} score={} action={}", plan.scenario, plan.copied_bytes >> 20, plan.expected_reclaim_bytes >> 20, plan.score, plan.action.metric_label());
+    }
+    println!("oldest {} sealed non-ingest segments: id class total_MB live_MB retired_MB expired_MB live_refs", oldest.len());
+    for (id, class, summary) in &oldest {
+        println!(
+            "  {id} {class:?} {} {} {} {} {}",
+            summary.total_bytes >> 20,
+            summary.live_bytes >> 20,
+            summary.retired_bytes >> 20,
+            summary.expired_bytes >> 20,
+            summary.live_ref_count
+        );
+    }
+
     // Aggregate by (placement, state) for live segments.
     let mut by_class: BTreeMap<String, (usize, u64, u64, u64, u64, u64, u64)> = BTreeMap::new();
     let mut examples = Vec::new();

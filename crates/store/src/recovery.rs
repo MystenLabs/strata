@@ -1,6 +1,3 @@
-//! Crash recovery: store-WAL prefix replay, unsealed-segment reconciliation and
-//! truncation, operation rollback, and recovered-checkpoint publication.
-
 use std::{collections::BTreeSet, fs, path::Path};
 
 use core_types::{

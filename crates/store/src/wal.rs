@@ -1,37 +1,4 @@
 //! Store-owned rolling write-ahead log.
-//!
-//! This is the store's own operation log — not RocksDB's internal WAL. Every foreground
-//! operation (put, tombstone, lifetime, epoch change, shard drop) is appended here as one
-//! encoded StoreWalMutation at its LSN, in the fixed publication order the commit path
-//! enforces: segment bytes first, then this WAL, then the LSM memtable, then the RocksDB
-//! batch. At open, replaying the retained prefix is how both keyed LSM projections rebuild
-//! their memtables; after a crash, this log is the store's evidence of what happened since the
-//! last durability publish.
-//!
-//! The trust model is the same family as the garbage log — the WAL never believes its own file
-//! lengths, only the store checkpoint: a (file, offset) pair written atomically with
-//! PublishedLsn by a synced durability publish. But there is one deep difference, and it is why
-//! recovery here is an order of magnitude more involved: bytes past the checkpoint are *not*
-//! automatically garbage. The writer appends and commits in RocksDB before anything is fsynced,
-//! so a crash can leave the WAL tail holding complete frames for LSNs that RocksDB committed
-//! but never published. Store recovery picks the true final LSN, and this module either
-//! *promotes* a complete tail up to exactly that LSN — fsyncing it first, because nothing ever
-//! proved those bytes durable — or reports the tail unprovable so recovery rolls the store back
-//! instead. Promote or roll back, never guess: that split is the whole design.
-//!
-//! Durability is asynchronous by construction. `append` writes into the page cache, tracks
-//! pending bytes for the pressure trigger, and returns; `sync_data` captures the exact current
-//! position plus a task for the background file-sync worker, rolling oversized files at that
-//! same captured boundary. Rolled files are reclaimed once *both* LSM projections have
-//! materialized their contents into durable SSTs — the WAL prefix a projection might still
-//! replay is never deleted.
-//!
-//! Physical format, shared by every `wal-<id>.log` in the numbered chain: a 12-byte file header
-//! (magic `STRWAL01`, version), then frames. A frame is a 12-byte prefix (u64 payload length,
-//! u32 entry count), per entry a 12-byte header (u64 LSN, u32 payload length) followed by the
-//! payload, and a trailing 32-byte SHA-256 over all of it. One appended batch is one frame —
-//! never split across files — LSNs increase strictly across the entire log, and every durable
-//! position names an exact frame boundary.
 
 use std::{
     fs::{self, File, OpenOptions},

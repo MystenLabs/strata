@@ -50,5 +50,5 @@ store = { path = "crates/store" }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }
-typed-store = { path = "/Users/sadhansood/dev/walrus/crates/typed-store" }
+typed-store = { git = "https://github.com/MystenLabs/walrus.git", rev = "1cfa6f7ab8565e8078233a39ddddc6ff5bae2bd7" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
