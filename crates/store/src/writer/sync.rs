@@ -431,7 +431,7 @@ impl WriteCoordinator {
         profile_phase(
             Some(&mut phases),
             |profile, elapsed| profile.index_batch_commit += elapsed,
-            || batch.write_with_sync(true).map_err(index::Error::from),
+            || batch.write_with_sync(true),
         )?;
         // Segment and store-WAL fsyncs, followed by the synced index checkpoint, have all
         // completed. Notify subscribers at this exact durability boundary, not at put visibility.

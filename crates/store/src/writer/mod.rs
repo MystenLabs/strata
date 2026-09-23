@@ -255,7 +255,7 @@ impl WriteCoordinator {
         let mut batch = self.index.batch();
         self.index
             .put_shard_info_batch(&mut batch, shard_id, info)?;
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
         Ok(info.key(shard_id))
     }
 
@@ -324,7 +324,7 @@ impl WriteCoordinator {
                 },
             )?;
             self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-            batch.write().map_err(index::Error::from)?;
+            batch.write()?;
             Ok::<(), Error>(())
         })();
 

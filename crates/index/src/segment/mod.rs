@@ -1,15 +1,15 @@
 pub(crate) mod gc_summary;
 
+use crate::port::map::IndexBatch;
 use core_types::{SegmentId, SegmentOwner, SegmentState, ShardKey};
-use typed_store::{Map, rocks::DBBatch};
 
-use crate::{Error, Result};
+use crate::Result;
 
 use super::StrataIndex;
 
 impl StrataIndex {
     pub fn get_segment_state(&self, segment_id: SegmentId) -> Result<Option<SegmentState>> {
-        Ok(self.segment_states.get(&segment_id)?)
+        self.segment_states.get(&segment_id)
     }
 
     pub fn get_segment_state_for_shard(
@@ -29,10 +29,12 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn put_segment_state_batch(&self, batch: &mut DBBatch, state: &SegmentState) -> Result<()> {
-        batch
-            .insert_batch(self.segment_states(), [(&state.segment_id, state)])
-            .map_err(Error::from)?;
+    pub fn put_segment_state_batch(
+        &self,
+        batch: &mut IndexBatch,
+        state: &SegmentState,
+    ) -> Result<()> {
+        batch.insert_batch(self.segment_states(), [(&state.segment_id, state)])?;
         Ok(())
     }
 
@@ -49,16 +51,14 @@ impl StrataIndex {
 
     pub fn put_segment_published_at_lsn_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         segment_id: SegmentId,
         published_at_lsn: core_types::StrataLsn,
     ) -> Result<()> {
-        batch
-            .insert_batch(
-                self.segment_publication_lsns(),
-                [(&segment_id, &published_at_lsn)],
-            )
-            .map_err(Error::from)?;
+        batch.insert_batch(
+            self.segment_publication_lsns(),
+            [(&segment_id, &published_at_lsn)],
+        )?;
         Ok(())
     }
 
@@ -66,8 +66,7 @@ impl StrataIndex {
         let mut states = self
             .segment_states
             .safe_iter()?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         states.sort_by_key(|(segment_id, state)| (*segment_id, state.owner));
         Ok(states)
     }
@@ -86,6 +85,5 @@ impl StrataIndex {
                 Err(error) => Some(Err(error)),
             })
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
     }
 }

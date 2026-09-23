@@ -1,0 +1,4 @@
+# One shared build directory for the main workspace and the excluded bench workspaces, so
+# binaries stay at target/release/<name> regardless of which manifest was built.
+[build]
+target-dir = "target"

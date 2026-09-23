@@ -1,15 +1,15 @@
 use std::collections::BTreeMap;
 
+use crate::port::map::IndexBatch;
 use core_types::{SegmentFileState, SegmentOwner, ShardId, ShardInfo, ShardKey, ShardState};
-use typed_store::{Map, rocks::DBBatch};
 
-use crate::{Error, Result};
+use crate::Result;
 
 use super::StrataIndex;
 
 impl StrataIndex {
     pub fn get_shard_info(&self, shard_id: ShardId) -> Result<Option<ShardInfo>> {
-        Ok(self.shards.get(&shard_id)?)
+        self.shards.get(&shard_id)
     }
 
     pub fn put_shard_info(&self, shard_id: ShardId, info: ShardInfo) -> Result<()> {
@@ -21,13 +21,11 @@ impl StrataIndex {
 
     pub fn put_shard_info_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         shard_id: ShardId,
         info: ShardInfo,
     ) -> Result<()> {
-        batch
-            .insert_batch(self.shards(), [(&shard_id, &info)])
-            .map_err(Error::from)?;
+        batch.insert_batch(self.shards(), [(&shard_id, &info)])?;
         Ok(())
     }
 
@@ -35,12 +33,11 @@ impl StrataIndex {
         self.shards
             .safe_iter()?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
     }
 
     pub fn remove_shard_keyed_metadata_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         shard: ShardKey,
     ) -> Result<()> {
         // Keep a small Deleted state tombstone after removing the shard generation's files.
@@ -57,8 +54,7 @@ impl StrataIndex {
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
-            .collect::<std::result::Result<BTreeMap<_, _>, _>>()
-            .map_err(Error::from)?;
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
         for state in segment_states.values_mut() {
             state.state = SegmentFileState::Deleted;
             self.put_segment_state_batch(batch, state)?;
@@ -80,8 +76,7 @@ impl StrataIndex {
                     Ok(_) => None,
                     Err(error) => Some(Err(error)),
                 })
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)?;
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             batch.delete_batch(&self.gc_reclaim_pending, reclaim_pending_keys)?;
             let reclaim_strategy_keys = self
                 .gc_reclaim_strategies
@@ -91,8 +86,7 @@ impl StrataIndex {
                     Ok(_) => None,
                     Err(error) => Some(Err(error)),
                 })
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)?;
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             batch.delete_batch(&self.gc_reclaim_strategies, reclaim_strategy_keys)?;
         }
 

@@ -194,7 +194,7 @@ impl GcExecutor {
             completed.state = ShardCleanupState::ShardOwnedReclaimed;
             self.index
                 .put_shard_cleanup_job_batch(&mut batch, completed)?;
-            batch.write_with_sync(true).map_err(index::Error::from)?;
+            batch.write_with_sync(true)?;
             cleaned += 1;
         }
         Ok(cleaned)
@@ -491,7 +491,7 @@ impl GcExecutor {
                 self.index
                     .put_segment_state_batch(&mut batch, &output.pending_state(&self.config))?;
             }
-            batch.write_with_sync(true).map_err(index::Error::from)?;
+            batch.write_with_sync(true)?;
             Ok::<_, Error>(())
         })();
 
@@ -992,7 +992,7 @@ fn abandon_prepublished_outputs(
     for output in outputs {
         index.put_segment_state_batch(&mut batch, &output.deleted_state(config))?;
     }
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     remove_gc_prepublished_output_files(config, outputs)
 }
 

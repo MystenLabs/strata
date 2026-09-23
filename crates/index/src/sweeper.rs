@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::port::map::IndexBatch;
 use core_types::{
     GarbageEvent, SegmentFileState, SegmentGcLifetimeUpdate, SegmentGcOverlay,
     SegmentGcOverlayMergeOp, SegmentGcRecordRange, SegmentGcSummary, SegmentGcSummaryDelta,
@@ -12,7 +13,6 @@ use lsm::{
     GarbageLog, GarbageRecord, SegmentGarbageLog, fold_segment_garbage, read_segment_garbage,
     sync_segment_garbage_logs,
 };
-use typed_store::{Map, rocks::DBBatch};
 
 use crate::{Error, Result, StrataIndex, segment::gc_summary::apply_segment_gc_summary_delta};
 
@@ -24,12 +24,12 @@ pub(crate) const OVERLAY_CACHE_BYTES: usize = 1 << 30;
 
 impl StrataIndex {
     pub fn get_segment_garbage_log_position(&self, segment_id: SegmentId) -> Result<Option<u64>> {
-        Ok(self.segment_garbage_log_positions.get(&segment_id)?)
+        self.segment_garbage_log_positions.get(&segment_id)
     }
 
     pub fn put_segment_garbage_log_position_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         segment_id: SegmentId,
         position: u64,
     ) -> Result<()> {
@@ -46,19 +46,19 @@ impl StrataIndex {
         namespace_dir: impl AsRef<Path>,
         segment_id: SegmentId,
     ) -> Result<Option<SegmentGcOverlay>> {
-        let snapshot = self.db.snapshot();
+        let snapshot = self.db.snapshot()?;
         let Some(state) = self
             .segment_states
-            .get_with_snapshot(&snapshot, &segment_id)?
+            .get_with_snapshot(snapshot.as_ref(), &segment_id)?
         else {
             return Ok(None);
         };
         let summary = self
             .segment_gc_summaries
-            .get_with_snapshot(&snapshot, &segment_id)?;
+            .get_with_snapshot(snapshot.as_ref(), &segment_id)?;
         let committed = self
             .segment_garbage_log_positions
-            .get_with_snapshot(&snapshot, &segment_id)?;
+            .get_with_snapshot(snapshot.as_ref(), &segment_id)?;
         let summary = summary.unwrap_or_default();
         let committed = committed.unwrap_or_default();
         let ops = if committed == 0 {
@@ -76,16 +76,16 @@ impl StrataIndex {
         namespace_dir: impl AsRef<Path>,
         segment_id: SegmentId,
     ) -> Result<Vec<GarbageRecord>> {
-        let snapshot = self.db.snapshot();
+        let snapshot = self.db.snapshot()?;
         let Some(state) = self
             .segment_states
-            .get_with_snapshot(&snapshot, &segment_id)?
+            .get_with_snapshot(snapshot.as_ref(), &segment_id)?
         else {
             return Ok(Vec::new());
         };
         let committed = self
             .segment_garbage_log_positions
-            .get_with_snapshot(&snapshot, &segment_id)?
+            .get_with_snapshot(snapshot.as_ref(), &segment_id)?
             .unwrap_or_default();
         if committed == 0 {
             return Ok(Vec::new());
@@ -114,7 +114,7 @@ impl StrataIndex {
         let global_log_dir = global_log_dir.as_ref();
         let head_name = head_name.to_owned();
         let cursor_name = cursor_name.to_owned();
-        let mut batch = self.indexed_batch();
+        let mut batch = self.indexed_batch()?;
         let Some(head) = batch.get(self.garbage_log_positions(), &head_name)? else {
             return Ok(false);
         };

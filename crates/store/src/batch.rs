@@ -398,7 +398,7 @@ impl PendingRollover {
     pub(crate) fn apply_batch(
         &self,
         index: &StrataIndex,
-        batch: &mut typed_store::rocks::DBBatch,
+        batch: &mut index::port::map::IndexBatch,
     ) -> Result<()> {
         let published_at_lsn =
             self.old_segment_state

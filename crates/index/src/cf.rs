@@ -54,7 +54,11 @@ impl StrataIndexCfNames {
         }
     }
 
-    pub(crate) fn as_strs(&self) -> [&str; 12] {
+    /// Every column family Strata owns under this prefix.
+    ///
+    /// Public because an embedder hosting these families in its own database needs to know which
+    /// ones belong to Strata.
+    pub fn as_strs(&self) -> [&str; 12] {
         [
             self.segment_states.as_str(),
             self.segment_publication_lsns.as_str(),

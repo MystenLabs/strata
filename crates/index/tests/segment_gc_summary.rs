@@ -3,13 +3,11 @@ use std::collections::BTreeMap;
 use core_types::{EpochBucket, SegmentGcSummary, SegmentGcSummaryDelta};
 use index::StrataIndex;
 use tempfile::TempDir;
-use typed_store::DBMetrics;
 
 const SEGMENT_ID: u64 = 17;
 
 #[tokio::test]
 async fn summary_deltas_merge_survive_reopen_and_ignore_abandoned_batches() {
-    DBMetrics::get();
     let directory = TempDir::new().unwrap();
     let metric_suffix = directory.path().display().to_string();
     let index = StrataIndex::open_path(directory.path(), "strata", &metric_suffix).unwrap();

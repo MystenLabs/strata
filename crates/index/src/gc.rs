@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::port::map::IndexBatch;
 use core_types::{Epoch, SegmentId, SegmentOwner, ShardId, ShardInfo, StoreStateKey, StrataLsn};
 use gc_planner::{GcSnapshot, SegmentSnapshot};
-use typed_store::Map;
-use typed_store::rocks::DBBatch;
 
 use crate::{Error, Result};
 
@@ -30,46 +29,47 @@ impl StrataIndex {
     /// `None` means the namespace has not published a current epoch yet, so epoch-sensitive GC
     /// planning should not run.
     pub fn build_gc_snapshot(&self) -> Result<Option<GcSnapshot>> {
-        let snapshot = self.db.snapshot();
+        let snapshot = self.db.snapshot()?;
         let Some(current_epoch) = self
             .store_state
-            .get_with_snapshot(&snapshot, &StoreStateKey::CurrentEpoch)?
+            .get_with_snapshot(snapshot.as_ref(), &StoreStateKey::CurrentEpoch)?
         else {
             return Ok(None);
         };
         let published_lsn = self
             .store_state
-            .get_with_snapshot(&snapshot, &StoreStateKey::CommittedLsn)?
+            .get_with_snapshot(snapshot.as_ref(), &StoreStateKey::CommittedLsn)?
             .unwrap_or_default();
         let expiry_accounted_lsn = self
             .store_state
-            .get_with_snapshot(&snapshot, &StoreStateKey::BlobExpiryAccountedLsn)?;
+            .get_with_snapshot(snapshot.as_ref(), &StoreStateKey::BlobExpiryAccountedLsn)?;
         // Epoch history and the frontiers are read from the same RocksDB snapshot as the segment
         // summaries below. For example, frontier LSN 120 maps to epoch 50 only when the
         // `(120, 50)` history row is visible here; this prevents a newly published epoch pointer
         // from being paired with counters from before its expiry sweep.
         let expiry_accounted_epoch = match expiry_accounted_lsn {
             Some(lsn) => latest_epoch_at_or_before(
-                self.epoch_changes.safe_iter_with_snapshot(&snapshot)?,
+                self.epoch_changes
+                    .safe_iter_with_snapshot(snapshot.as_ref())?,
                 lsn,
             )?,
             None => None,
         };
         let writes_merged_lsn = self
             .store_state
-            .get_with_snapshot(&snapshot, &StoreStateKey::BlobWritesMergedLsn)?;
+            .get_with_snapshot(snapshot.as_ref(), &StoreStateKey::BlobWritesMergedLsn)?;
         let writes_merged_epoch = match writes_merged_lsn {
             Some(lsn) => latest_epoch_at_or_before(
-                self.epoch_changes.safe_iter_with_snapshot(&snapshot)?,
+                self.epoch_changes
+                    .safe_iter_with_snapshot(snapshot.as_ref())?,
                 lsn,
             )?,
             None => None,
         };
         let shard_infos = self
             .shards
-            .safe_iter_with_snapshot(&snapshot)?
-            .collect::<std::result::Result<BTreeMap<ShardId, ShardInfo>, _>>()
-            .map_err(Error::from)?;
+            .safe_iter_with_snapshot(snapshot.as_ref())?
+            .collect::<std::result::Result<BTreeMap<ShardId, ShardInfo>, _>>()?;
 
         // Compaction does not report epoch expiry per record; the planner judges known end
         // epochs against the clock, capped by the write-merge frontier so no unmerged extension
@@ -78,7 +78,10 @@ impl StrataIndex {
         // the same view as the clock-live helper.
         let clock_expiry_epoch = writes_merged_epoch.map(|epoch| epoch.min(current_epoch));
         let mut segments = Vec::new();
-        for result in self.segment_states.safe_iter_with_snapshot(&snapshot)? {
+        for result in self
+            .segment_states
+            .safe_iter_with_snapshot(snapshot.as_ref())?
+        {
             let (_, state) = result?;
             if let SegmentOwner::Shard(shard) = state.owner
                 && shard_generation_is_obsolete(shard, &shard_infos)
@@ -87,7 +90,7 @@ impl StrataIndex {
             }
             let summary = self
                 .segment_gc_summaries
-                .get_with_snapshot(&snapshot, &state.segment_id)?
+                .get_with_snapshot(snapshot.as_ref(), &state.segment_id)?
                 .unwrap_or_default();
             let summary = match clock_expiry_epoch {
                 Some(epoch) => summary.as_of_epoch(epoch),
@@ -118,21 +121,22 @@ impl StrataIndex {
     /// newly published epoch pointer cannot be paired with an older frontier. `None` means no
     /// frontier has been published yet, which disables clock-based expiry.
     pub fn clock_expiry_epoch(&self) -> Result<Option<Epoch>> {
-        let snapshot = self.db.snapshot();
+        let snapshot = self.db.snapshot()?;
         let Some(current_epoch) = self
             .store_state
-            .get_with_snapshot(&snapshot, &StoreStateKey::CurrentEpoch)?
+            .get_with_snapshot(snapshot.as_ref(), &StoreStateKey::CurrentEpoch)?
         else {
             return Ok(None);
         };
         let Some(writes_merged_lsn) = self
             .store_state
-            .get_with_snapshot(&snapshot, &StoreStateKey::BlobWritesMergedLsn)?
+            .get_with_snapshot(snapshot.as_ref(), &StoreStateKey::BlobWritesMergedLsn)?
         else {
             return Ok(None);
         };
         Ok(latest_epoch_at_or_before(
-            self.epoch_changes.safe_iter_with_snapshot(&snapshot)?,
+            self.epoch_changes
+                .safe_iter_with_snapshot(snapshot.as_ref())?,
             writes_merged_lsn,
         )?
         .map(|epoch| epoch.min(current_epoch)))
@@ -142,20 +146,16 @@ impl StrataIndex {
     /// source can be unlinked.
     pub fn put_gc_reclaim_pending_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         source_segment_id: SegmentId,
         activation_lsn: StrataLsn,
         output_bytes: u64,
         strategy: &str,
     ) -> Result<()> {
         let key = (source_segment_id, activation_lsn);
-        batch
-            .insert_batch(self.gc_reclaim_pending(), [(&key, &output_bytes)])
-            .map_err(Error::from)?;
+        batch.insert_batch(self.gc_reclaim_pending(), [(&key, &output_bytes)])?;
         let strategy = strategy.to_owned();
-        batch
-            .insert_batch(self.gc_reclaim_strategies(), [(&key, &strategy)])
-            .map_err(Error::from)?;
+        batch.insert_batch(self.gc_reclaim_strategies(), [(&key, &strategy)])?;
         Ok(())
     }
 
@@ -165,7 +165,6 @@ impl StrataIndex {
         self.gc_reclaim_pending
             .safe_iter()?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
     }
 
     pub fn get_gc_reclaim_activation_lsn(
@@ -184,7 +183,7 @@ impl StrataIndex {
     /// Removes and sums published-output attribution for deleted source segments in one scan.
     pub fn remove_gc_reclaim_pending_for_sources_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         source_segment_ids: &[SegmentId],
     ) -> Result<BTreeMap<SegmentId, GcReclaimAttribution>> {
         let rows = self.iter_gc_reclaim_pending()?;
@@ -233,7 +232,7 @@ impl StrataIndex {
     /// recovery rollback.
     pub fn remove_gc_reclaim_pending_from_lsn_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         rollback_from: StrataLsn,
     ) -> Result<usize> {
         let keys = self

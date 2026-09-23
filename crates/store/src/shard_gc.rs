@@ -27,7 +27,7 @@ pub(crate) fn remove_shard_retention_generation(
     if !segment_ids.is_empty() {
         let mut batch = index.batch();
         index.remove_shard_keyed_metadata_batch(&mut batch, shard)?;
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
     }
 
     let shard_dir = shard_retention_dir(config, shard);

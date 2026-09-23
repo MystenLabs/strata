@@ -241,7 +241,7 @@ impl GarbageLogSweeper {
             self.index
                 .put_blob_writes_merged_lsn_batch(&mut batch, writes_candidate)?;
         }
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
         Ok(true)
     }
 }
@@ -417,7 +417,7 @@ impl WalReclaimWorker {
             let mut batch = self.index.batch();
             self.index
                 .put_store_wal_retained_from_batch(&mut batch, retained_from.max(current))?;
-            batch.write_with_sync(true).map_err(index::Error::from)?;
+            batch.write_with_sync(true)?;
         }
         self.metrics
             .record_wal_reclaim_phase("boundary_sync", started.elapsed());
@@ -938,7 +938,7 @@ pub(crate) fn publish_blob_lsm_edit(
         let mut batch = index.batch();
         let manifest =
             index.merge_lsm_manifest_batch(&mut batch, BLOB_LSM_MANIFEST, edit, &guard)?;
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
         drop(guard);
         Ok(manifest)
     };
@@ -961,7 +961,7 @@ pub(crate) fn publish_relocation_lsm_edit(
         let mut batch = index.batch();
         let manifest =
             index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, edit, &guard)?;
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
         drop(guard);
         Ok(manifest)
     };
@@ -1635,7 +1635,7 @@ fn compact_relocation_lsm_partition(
     let guard = index.lock_lsm_manifests();
     let mut batch = index.batch();
     index.merge_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, &edit, &guard)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     drop(guard);
     relocations
         .lsm()

@@ -8,7 +8,6 @@ use lsm::{
     select_compaction_inputs, write_compaction,
 };
 use tempfile::TempDir;
-use typed_store::DBMetrics;
 
 const LSM_NAME: &str = "lsm";
 const LOG_NAME: &str = "segment-ref";
@@ -36,7 +35,6 @@ impl MergeOperator for Replace {
 
 #[tokio::test]
 async fn compaction_garbage_records_are_synced_before_the_manifest_is_published() {
-    DBMetrics::get();
     let directory = TempDir::new().unwrap();
     let db_path = directory.path().join("index");
     let lsm_path = directory.path().join("lsm");

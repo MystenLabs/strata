@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, Once, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -18,9 +18,6 @@ use store::{
     StrataRecoveryPolicy, StrataStore, StrataStoreConfig, StrataStoreMetrics,
 };
 use tempfile::tempdir;
-use typed_store::DBMetrics;
-
-static INIT_TYPED_STORE_METRICS: Once = Once::new();
 
 const NAMESPACE: &str = "default";
 const SEED: u64 = 0x51ed_5eed_f00d_cafe;
@@ -46,8 +43,6 @@ enum WorkerEvent {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "crash-loop stress test; set STRATA_RECOVERY_STRESS_ITERS for longer runs"]
 async fn crash_loop_recovers_synced_puts() {
-    init_typed_store_metrics();
-
     let iterations = env_usize("STRATA_RECOVERY_STRESS_ITERS").unwrap_or(12);
     let dir = tempdir().unwrap();
     let root_dir = dir.path().to_path_buf();
@@ -82,12 +77,6 @@ async fn crash_loop_recovers_synced_puts() {
             &stderr,
         );
     }
-}
-
-fn init_typed_store_metrics() {
-    INIT_TYPED_STORE_METRICS.call_once(|| {
-        DBMetrics::get();
-    });
 }
 
 fn spawn_worker(root_dir: &Path, run_id: u64) -> Child {

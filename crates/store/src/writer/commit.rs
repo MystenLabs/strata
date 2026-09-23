@@ -622,7 +622,7 @@ impl WriteCoordinator {
                 .put_segment_state_batch(&mut batch, &self.active_segment_state)?;
         }
         self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-        batch.write().map_err(index::Error::from)?;
+        batch.write()?;
         Ok(())
     }
 

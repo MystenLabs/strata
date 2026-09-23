@@ -691,7 +691,7 @@ pub(crate) fn load_blob_lsm_manifest(
     let manifest = LsmManifest::empty(LSM_BASE_FORMAT, LSM_PATCH_FORMAT, partition_count);
     let mut batch = index.batch();
     index.put_lsm_manifest_batch(&mut batch, BLOB_LSM_MANIFEST, &manifest)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     Ok(manifest)
 }
 
@@ -722,7 +722,7 @@ pub(crate) fn load_relocation_lsm_manifest(
     );
     let mut batch = index.batch();
     index.put_lsm_manifest_batch(&mut batch, RELOCATION_LSM_MANIFEST, &manifest)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     Ok(manifest)
 }
 
@@ -769,7 +769,7 @@ pub(crate) fn ensure_epoch_initialized(
         index.put_epoch_change_batch(&mut batch, 0, current_epoch)?;
     }
     index.put_current_epoch_batch(&mut batch, current_epoch)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     Ok(current_epoch)
 }
 
@@ -782,7 +782,7 @@ fn ensure_blob_compaction_garbage_cutover(index: &StrataIndex) -> Result<StrataL
     let lsn = 1;
     let mut batch = index.batch();
     index.put_blob_compaction_garbage_from_lsn_batch(&mut batch, lsn)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     Ok(lsn)
 }
 
@@ -927,6 +927,6 @@ fn cleanup_pending_gc_outputs(config: &StrataStoreConfig, index: &StrataIndex) -
         state.state = SegmentFileState::Deleted;
         index.put_segment_state_batch(&mut batch, &state)?;
     }
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     Ok(())
 }

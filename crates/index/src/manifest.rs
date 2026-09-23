@@ -1,11 +1,8 @@
 use std::sync::MutexGuard;
 
+use crate::port::{map::IndexBatch, options::default_db_options};
 use lsm::{GarbageLogPosition, Manifest, ManifestEdit};
 use rocksdb::MergeOperands;
-use typed_store::{
-    Map,
-    rocks::{DBBatch, default_db_options},
-};
 
 use crate::{Error, Result, StrataIndex};
 
@@ -20,13 +17,13 @@ const MAX_NAME_BYTES: usize = 1024;
 impl StrataIndex {
     pub fn get_garbage_log_position(&self, name: &str) -> Result<Option<GarbageLogPosition>> {
         validate_name(name)?;
-        Ok(self.garbage_log_positions.get(&name.to_owned())?)
+        self.garbage_log_positions.get(&name.to_owned())
     }
 
     /// Stages the end of the last synced frame accepted by the caller.
     pub fn put_garbage_log_position_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         name: &str,
         position: GarbageLogPosition,
     ) -> Result<()> {
@@ -37,13 +34,13 @@ impl StrataIndex {
 
     pub fn get_lsm_manifest(&self, name: &str) -> Result<Option<Manifest>> {
         validate_name(name)?;
-        Ok(self.lsm_manifests.get(&name.to_owned())?)
+        self.lsm_manifests.get(&name.to_owned())
     }
 
     /// Stores a validated materialized manifest in an existing RocksDB batch.
     pub fn put_lsm_manifest_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         name: &str,
         manifest: &Manifest,
     ) -> Result<()> {
@@ -85,7 +82,7 @@ impl StrataIndex {
     /// what the merge operands used to allow lock-free. Returns the manifest as published.
     pub fn merge_lsm_manifest_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         name: &str,
         edit: &ManifestEdit,
         _guard: &LsmManifestPublishGuard<'_>,
@@ -107,7 +104,7 @@ impl StrataIndex {
 /// Merge operator kept for manifests written by earlier versions as operand chains; new
 /// publications write the manifest whole, which supersedes any operands before them.
 pub(crate) fn lsm_manifests_cf_options() -> rocksdb::Options {
-    let mut options = default_db_options().options;
+    let mut options = default_db_options();
     options.set_merge_operator(
         "strata-lsm-manifest-merge",
         |_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands| {

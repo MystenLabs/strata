@@ -238,7 +238,7 @@ pub(crate) fn recover_store_wal_prefix(
                 active_segment_offset: 0,
             },
         )?;
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
     }
 
     let rollback_from = published_lsn
@@ -540,7 +540,7 @@ fn apply_recovered_segment_prefix(
         )?;
     }
 
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     metrics.record_recovered_records(recovered_record_count, prefix.recovered_write_offset);
     Ok(())
 }
@@ -570,7 +570,7 @@ fn discard_unsealed_segment(
 
     let mut batch = index.batch();
     index.put_segment_state_batch(&mut batch, &state)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
 
     let path = segment_path(config, segment_id);
     match fs::remove_file(&path) {
@@ -639,7 +639,7 @@ fn rollback_operations_from(
         .ok_or(Error::EpochNotInitialized)?;
     index.put_current_epoch_batch(&mut batch, current_epoch)?;
     index.put_next_lsn_batch(&mut batch, rollback_from)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     metrics.set_next_lsn(rollback_from);
     metrics.set_current_epoch(current_epoch);
     metrics.record_rollback(rollback_from, rollback_ops);
@@ -684,7 +684,7 @@ pub(crate) fn publish_recovered_store_checkpoint(
     let published_lsn = recovered_lsn;
     index.put_commit_lsn_batch(&mut batch, published_lsn)?;
     index.put_store_checkpoint_batch(&mut batch, checkpoint)?;
-    batch.write_with_sync(true).map_err(index::Error::from)?;
+    batch.write_with_sync(true)?;
     metrics.set_published_lsn(published_lsn);
     Ok(())
 }

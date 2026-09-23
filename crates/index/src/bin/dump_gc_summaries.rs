@@ -132,13 +132,29 @@ fn main() {
     let plans = planner.plans(&open_snapshot);
     let mut by_scenario: BTreeMap<String, usize> = BTreeMap::new();
     for plan in &plans {
-        *by_scenario.entry(format!("{:?}", plan.scenario)).or_default() += 1;
+        *by_scenario
+            .entry(format!("{:?}", plan.scenario))
+            .or_default() += 1;
     }
-    println!("planner (frontiers wide open, 1 GiB cap): {} plans by scenario {:?}", plans.len(), by_scenario);
+    println!(
+        "planner (frontiers wide open, 1 GiB cap): {} plans by scenario {:?}",
+        plans.len(),
+        by_scenario
+    );
     for plan in plans.iter().take(5) {
-        println!("  {:?} copied_MB={} reclaim_MB={} score={} action={}", plan.scenario, plan.copied_bytes >> 20, plan.expected_reclaim_bytes >> 20, plan.score, plan.action.metric_label());
+        println!(
+            "  {:?} copied_MB={} reclaim_MB={} score={} action={}",
+            plan.scenario,
+            plan.copied_bytes >> 20,
+            plan.expected_reclaim_bytes >> 20,
+            plan.score,
+            plan.action.metric_label()
+        );
     }
-    println!("oldest {} sealed non-ingest segments: id class total_MB live_MB retired_MB expired_MB live_refs", oldest.len());
+    println!(
+        "oldest {} sealed non-ingest segments: id class total_MB live_MB retired_MB expired_MB live_refs",
+        oldest.len()
+    );
     for (id, class, summary) in &oldest {
         println!(
             "  {id} {class:?} {} {} {} {} {}",
