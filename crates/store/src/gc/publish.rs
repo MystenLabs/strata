@@ -390,7 +390,7 @@ impl GcExecutor {
                 self.index
                     .put_segment_state_batch(&mut batch, &output.deleted_state(&self.config))?;
             }
-            batch.write().map_err(index::Error::from)?;
+            batch.write()?;
             return Ok(GcPublishResult {
                 reconciled_lsn,
                 output_segments: Vec::new(),
@@ -438,14 +438,11 @@ impl GcExecutor {
         // share the latest durable blob frontier as their logical ordering fence; the relocation
         // LSM assigns its own sequence to the immutable table below.
         let publish_lsn = self.index.get_committed_lsn()?;
-        let published_records = match assign_gc_publish_fence(
+        let published_records = assign_gc_publish_fence(
             publish_lsn,
             &survivors,
             &output_plan.staged_to_final_segment_id,
-        ) {
-            Ok(records) => records,
-            Err(error) => return Err(error),
-        };
+        )?;
         apply_gc_output_lsn_bounds(&mut output_plan.segment_states, &published_records);
         let relocation_entries = published_records
             .iter()
@@ -586,11 +583,7 @@ impl GcExecutor {
                 }
             }
 
-            if let Err(error) = batch
-                .write_with_sync(true)
-                .map_err(index::Error::from)
-                .map_err(Error::from)
-            {
+            if let Err(error) = batch.write_with_sync(true).map_err(Error::from) {
                 return Err(GcPublishCommitError::IndexCommit(error));
             }
             // Still under the publication lock: a compaction pass that publishes after this
@@ -823,7 +816,7 @@ impl GcExecutor {
             for state in &states_to_commit {
                 self.index.put_segment_state_batch(&mut batch, state)?;
             }
-            batch.write_with_sync(true).map_err(index::Error::from)?;
+            batch.write_with_sync(true)?;
             for summary in &summaries_to_remove {
                 self.metrics.remove_gc_known_summary(summary);
             }
@@ -845,7 +838,7 @@ impl GcExecutor {
             let attribution_by_source = self
                 .index
                 .remove_gc_reclaim_pending_for_sources_batch(&mut batch, &source_segment_ids)?;
-            batch.write().map_err(index::Error::from)?;
+            batch.write()?;
             for (segment_id, source_bytes) in unlinked_segments {
                 let attribution = attribution_by_source.get(&segment_id).cloned().unwrap_or(
                     index::GcReclaimAttribution {
@@ -949,7 +942,7 @@ impl GcExecutor {
         state.placement_class = placement_class;
         let mut batch = self.index.batch();
         self.index.put_segment_state_batch(&mut batch, &state)?;
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
         Ok(())
     }
 
@@ -975,7 +968,7 @@ impl GcExecutor {
             changed += 1;
         }
         if changed > 0 {
-            batch.write_with_sync(true).map_err(index::Error::from)?;
+            batch.write_with_sync(true)?;
         }
         Ok(())
     }

@@ -1,5 +1,5 @@
+use crate::port::map::IndexBatch;
 use core_types::{Epoch, StoreCheckpoint, StoreStateKey, StrataLsn, WalPosition};
-use typed_store::{Map, rocks::DBBatch};
 
 use crate::{Error, Result};
 
@@ -18,13 +18,12 @@ impl StrataIndex {
     }
 
     pub fn get_current_epoch(&self) -> Result<Option<Epoch>> {
-        Ok(self.store_state.get(&StoreStateKey::CurrentEpoch)?)
+        self.store_state.get(&StoreStateKey::CurrentEpoch)
     }
 
     pub fn get_blob_compaction_garbage_from_lsn(&self) -> Result<Option<StrataLsn>> {
-        Ok(self
-            .store_state
-            .get(&StoreStateKey::BlobCompactionGarbageFromLsn)?)
+        self.store_state
+            .get(&StoreStateKey::BlobCompactionGarbageFromLsn)
     }
 
     /// Returns the durable expiry-accounting frontier consumed by GC planning.
@@ -33,19 +32,17 @@ impl StrataIndex {
     /// different from LSN 0: an upgraded store with old base SSTs must sweep those bases before GC
     /// treats even an old exact-epoch directory as expiry-complete.
     pub fn get_blob_expiry_accounted_lsn(&self) -> Result<Option<StrataLsn>> {
-        Ok(self
-            .store_state
-            .get(&StoreStateKey::BlobExpiryAccountedLsn)?)
+        self.store_state.get(&StoreStateKey::BlobExpiryAccountedLsn)
     }
 
     /// Returns the durable write-merge frontier: every blob mutation below it has been merged
     /// into a base table and its garbage swept into the segment summaries.
     pub fn get_blob_writes_merged_lsn(&self) -> Result<Option<StrataLsn>> {
-        Ok(self.store_state.get(&StoreStateKey::BlobWritesMergedLsn)?)
+        self.store_state.get(&StoreStateKey::BlobWritesMergedLsn)
     }
 
     pub fn get_store_wal_retained_from(&self) -> Result<Option<u64>> {
-        Ok(self.store_state.get(&StoreStateKey::StoreWalRetainedFrom)?)
+        self.store_state.get(&StoreStateKey::StoreWalRetainedFrom)
     }
 
     pub fn get_store_checkpoint(&self) -> Result<Option<StoreCheckpoint>> {
@@ -77,16 +74,14 @@ impl StrataIndex {
         }))
     }
 
-    pub fn put_next_lsn_batch(&self, batch: &mut DBBatch, next_lsn: StrataLsn) -> Result<()> {
-        batch
-            .insert_batch(self.store_state(), [(&StoreStateKey::NextLsn, &next_lsn)])
-            .map_err(Error::from)?;
+    pub fn put_next_lsn_batch(&self, batch: &mut IndexBatch, next_lsn: StrataLsn) -> Result<()> {
+        batch.insert_batch(self.store_state(), [(&StoreStateKey::NextLsn, &next_lsn)])?;
         Ok(())
     }
 
     pub fn put_commit_lsn_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         published_lsn: StrataLsn,
     ) -> Result<()> {
         // Publication is the Store fence for foreground writes and blob-version compaction.
@@ -99,7 +94,7 @@ impl StrataIndex {
 
     pub fn put_store_wal_retained_from_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         first_log_id: u64,
     ) -> Result<()> {
         batch.insert_batch(
@@ -111,7 +106,7 @@ impl StrataIndex {
 
     pub fn put_store_checkpoint_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         checkpoint: StoreCheckpoint,
     ) -> Result<()> {
         batch.insert_batch(
@@ -135,16 +130,14 @@ impl StrataIndex {
         Ok(())
     }
 
-    pub fn put_current_epoch_batch(&self, batch: &mut DBBatch, epoch: Epoch) -> Result<()> {
-        batch
-            .insert_batch(self.store_state(), [(&StoreStateKey::CurrentEpoch, &epoch)])
-            .map_err(Error::from)?;
+    pub fn put_current_epoch_batch(&self, batch: &mut IndexBatch, epoch: Epoch) -> Result<()> {
+        batch.insert_batch(self.store_state(), [(&StoreStateKey::CurrentEpoch, &epoch)])?;
         Ok(())
     }
 
     pub fn put_blob_compaction_garbage_from_lsn_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         lsn: StrataLsn,
     ) -> Result<()> {
         batch.insert_batch(
@@ -162,7 +155,7 @@ impl StrataIndex {
     /// per-segment counters.
     pub fn put_blob_expiry_accounted_lsn_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         lsn: StrataLsn,
     ) -> Result<()> {
         batch.insert_batch(
@@ -176,7 +169,7 @@ impl StrataIndex {
     /// rule as the expiry frontier.
     pub fn put_blob_writes_merged_lsn_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         lsn: StrataLsn,
     ) -> Result<()> {
         batch.insert_batch(
@@ -188,18 +181,16 @@ impl StrataIndex {
 
     pub fn put_epoch_change_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         lsn: StrataLsn,
         epoch: Epoch,
     ) -> Result<()> {
-        batch
-            .insert_batch(self.epoch_changes(), [(&lsn, &epoch)])
-            .map_err(Error::from)?;
+        batch.insert_batch(self.epoch_changes(), [(&lsn, &epoch)])?;
         Ok(())
     }
 
     pub fn get_epoch_change(&self, lsn: StrataLsn) -> Result<Option<Epoch>> {
-        Ok(self.epoch_changes.get(&lsn)?)
+        self.epoch_changes.get(&lsn)
     }
 
     pub fn latest_epoch_at_lsn(&self, max_lsn: StrataLsn) -> Result<Option<(StrataLsn, Epoch)>> {
@@ -222,15 +213,14 @@ impl StrataIndex {
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         changes.sort_by_key(|(lsn, _)| *lsn);
         Ok(changes)
     }
 
     pub fn remove_epoch_changes_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         lsns: &[StrataLsn],
     ) -> Result<()> {
         for lsn in lsns {

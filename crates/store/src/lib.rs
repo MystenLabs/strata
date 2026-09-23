@@ -162,7 +162,6 @@ use core_types::{SegmentId, SegmentOwner, SegmentState, ShardKey, StrataLsn, Wal
 use file_sync::FileSyncSender;
 #[cfg(test)]
 use file_sync::file_sync_channel;
-use index::StrataIndex;
 #[cfg(test)]
 use lsm::ManifestEdit;
 use lsm::{LiveSnapshots, Lsm};
@@ -188,6 +187,13 @@ pub use config::{
     SealedSegmentIntegrityPolicy, StrataRecoveryPolicy, StrataStoreConfig,
 };
 pub use error::{Error, Result};
+/// The metadata index and its storage port.
+///
+/// Re-exported so an embedder can reach [`StrataStore::from_index`] and, if it wants Strata's
+/// column families inside a RocksDB instance it already runs, implement
+/// [`index::port::IndexDb`] over that instance without depending on this workspace's internals.
+pub use index::{StrataIndex, port as index_port};
+
 #[cfg(test)]
 use gc::GcConcurrencyConfig;
 use gc::{GcCommand, GcConcurrencyController, GcSourceClaims};

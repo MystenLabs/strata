@@ -3,7 +3,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     ops::Deref,
     path::Path,
-    sync::{Arc, Mutex, Once, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -12,13 +12,10 @@ use core_types::{BlobLifecycle, EpochBucket, FIXED_RECORD_HEADER_LEN, SegmentGcR
 use gc_planner::{
     DestinationClass, GcAction, GcCopyRecord, GcPlanner, GcPlannerConfig, GcScenario,
 };
+use index::port::{IndexDb, RocksBackend, options::default_db_options};
 use lsm::{TableWriter, encode_inline_value};
 use prometheus::Registry;
 use tempfile::tempdir;
-use typed_store::{
-    DBMetrics,
-    rocks::{MetricConf, open_cf},
-};
 
 use super::*;
 use crate::{
@@ -27,7 +24,6 @@ use crate::{
 
 mod garbage_log;
 
-static INIT_TYPED_STORE_METRICS: Once = Once::new();
 const TEST_KEY_LEN: u64 = 6;
 const TEST_PAYLOAD_LEN: u64 = 9;
 const TEST_RECORD_LEN: u64 = FIXED_RECORD_HEADER_LEN as u64 + TEST_KEY_LEN + TEST_PAYLOAD_LEN;
@@ -126,7 +122,6 @@ fn lsm_blob_ref(store: &StrataStore, key: &BlobKey) -> RecordRef {
 }
 #[tokio::test]
 async fn open_cleans_stale_pending_gc_output() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     ensure_ingest_dir(&cfg).unwrap();
@@ -170,7 +165,6 @@ async fn open_cleans_stale_pending_gc_output() {
 
 #[tokio::test]
 async fn open_cleans_stale_gc_staging_dirs() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let staging_attempt = cfg.namespace_dir().join("gc-staging").join("123-456-0");
@@ -225,7 +219,6 @@ fn try_open_standalone_store(
 
 #[tokio::test]
 async fn payload_updates_cannot_reuse_an_old_relocation() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob".to_vec()).unwrap();
     let store = try_open_standalone_store(
@@ -258,11 +251,6 @@ async fn payload_updates_cannot_reuse_an_old_relocation() {
     );
     store.tombstone(&key).unwrap();
     assert_eq!(store.relocation_cache.len(), 1);
-}
-fn init_typed_store_metrics() {
-    INIT_TYPED_STORE_METRICS.call_once(|| {
-        DBMetrics::get();
-    });
 }
 
 fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
@@ -548,7 +536,6 @@ fn seal_first_segment(config: &StrataStoreConfig) -> SegmentState {
 
 #[tokio::test]
 async fn standalone_put_get_round_trip() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -564,7 +551,6 @@ async fn standalone_put_get_round_trip() {
 
 #[tokio::test]
 async fn store_wal_routes_payload_and_metadata_without_fake_lsm_rows() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "lsm-write-path");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -599,7 +585,6 @@ async fn store_wal_routes_payload_and_metadata_without_fake_lsm_rows() {
 
 #[tokio::test]
 async fn store_wal_recovery_uses_the_blob_projection_frontier() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "store-wal-frontier");
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
@@ -650,7 +635,6 @@ async fn store_wal_recovery_uses_the_blob_projection_frontier() {
 
 #[tokio::test]
 async fn configured_partition_count_is_shared_by_both_lsms() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "configured-lsm-partitions");
     cfg.lsm_partition_count = 4;
@@ -720,7 +704,6 @@ async fn configured_partition_count_is_shared_by_both_lsms() {
 
 #[tokio::test]
 async fn synced_store_checkpoint_reopens_the_existing_wal_prefix() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "lsm-checkpoint");
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -769,7 +752,6 @@ async fn synced_store_checkpoint_reopens_the_existing_wal_prefix() {
 
 #[tokio::test]
 async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_bytes() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "relocation-reclaim");
     cfg.gc_workers_enabled = false;
@@ -1212,7 +1194,6 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
 
 #[tokio::test]
 async fn recovered_store_tail_promotes_the_matching_wal_tail() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "lsm-replay-base");
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -1253,7 +1234,6 @@ async fn recovered_store_tail_promotes_the_matching_wal_tail() {
 }
 #[tokio::test]
 async fn store_writes_logical_shard_into_record_header() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "record-shard");
     let index = open_test_index(dir.path().join("shared-index"), cfg.index_cf_prefix());
@@ -1282,7 +1262,6 @@ async fn store_writes_logical_shard_into_record_header() {
 }
 #[tokio::test]
 async fn concurrent_logical_shard_puts_use_one_global_sequence() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store = Arc::new(
         StrataStore::open(
@@ -1329,7 +1308,6 @@ async fn concurrent_logical_shard_puts_use_one_global_sequence() {
 }
 #[tokio::test]
 async fn tombstone_only_hides_the_target_shard_generation() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
@@ -1355,7 +1333,6 @@ async fn tombstone_only_hides_the_target_shard_generation() {
 
 #[tokio::test]
 async fn contains_in_shards_resolves_one_blob_across_active_shards() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
@@ -1381,7 +1358,6 @@ async fn contains_in_shards_resolves_one_blob_across_active_shards() {
 
 #[tokio::test]
 async fn store_batch_buffers_ops_until_write_and_returns_global_lsns() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
@@ -1425,7 +1401,6 @@ async fn store_batch_buffers_ops_until_write_and_returns_global_lsns() {
 
 #[tokio::test]
 async fn store_batch_can_mix_epoch_changes_with_blob_ops() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
@@ -1466,7 +1441,6 @@ async fn store_batch_can_mix_epoch_changes_with_blob_ops() {
 }
 #[tokio::test]
 async fn epoch_change_is_published_by_the_store_checkpoint() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"semantic-materialization".to_vec()).unwrap();
     let cfg = config(dir.path(), "default");
@@ -1499,7 +1473,6 @@ async fn durability_progress_notifies_subscribers_and_starts_at_recovered_lsn() 
         .expect("background sync did not notify durability subscribers");
     }
 
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "durability-notifier");
     let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
@@ -1536,7 +1509,6 @@ async fn durability_progress_notifies_subscribers_and_starts_at_recovered_lsn() 
 }
 #[tokio::test]
 async fn sync_publishes_new_allocations_without_overwriting_garbage() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "allocation-baseline");
     cfg.gc_workers_enabled = false;
@@ -1595,7 +1567,6 @@ async fn sync_publishes_new_allocations_without_overwriting_garbage() {
 
 #[tokio::test]
 async fn foreground_sync_does_not_wait_for_garbage_publication() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store = Arc::new(
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap(),
@@ -1624,7 +1595,6 @@ async fn foreground_sync_does_not_wait_for_garbage_publication() {
 
 #[tokio::test]
 async fn shard_drop_is_visible_immediately_and_durable_after_sync() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"shard-drop-materialization".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -1656,7 +1626,6 @@ async fn shard_drop_is_visible_immediately_and_durable_after_sync() {
 }
 #[tokio::test]
 async fn store_rejects_missing_and_inactive_logical_shards() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "single-store");
     let index = open_test_index(dir.path().join("shared-index"), cfg.index_cf_prefix());
@@ -1698,7 +1667,6 @@ async fn store_rejects_missing_and_inactive_logical_shards() {
 
 #[tokio::test]
 async fn store_add_after_drop_bumps_generation_and_hides_old_versions() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
@@ -1748,7 +1716,6 @@ async fn store_add_after_drop_bumps_generation_and_hides_old_versions() {
 
 #[tokio::test]
 async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.gc_workers_enabled = false;
@@ -1823,7 +1790,6 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
 
 #[tokio::test]
 async fn drop_shard_does_not_wait_for_gc_claims() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store = Arc::new(
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap(),
@@ -1865,7 +1831,6 @@ async fn drop_shard_does_not_wait_for_gc_claims() {
 
 #[tokio::test]
 async fn reopen_finishes_durable_shard_drop_cleanup() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.gc_interval = Duration::from_secs(3600);
@@ -1954,7 +1919,6 @@ async fn reopen_finishes_durable_shard_drop_cleanup() {
 
 #[tokio::test]
 async fn store_drop_missing_shard_fails() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
@@ -1969,7 +1933,6 @@ async fn store_drop_missing_shard_fails() {
 
 #[tokio::test]
 async fn store_can_drop_default_logical_shard() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let store = StrataStore::open(cfg.clone(), StrataStoreMetrics::default()).unwrap();
@@ -2017,7 +1980,6 @@ async fn store_can_drop_default_logical_shard() {
 
 #[tokio::test]
 async fn halted_store_rejects_writer_commands() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
@@ -2042,7 +2004,6 @@ async fn halted_store_rejects_writer_commands() {
 
 #[tokio::test]
 async fn new_store_records_starting_epoch_as_lsn_zero_genesis() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
@@ -2061,7 +2022,6 @@ async fn new_store_records_starting_epoch_as_lsn_zero_genesis() {
 
 #[tokio::test]
 async fn reopen_uses_persisted_epoch_instead_of_config_starting_epoch() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     {
@@ -2080,7 +2040,6 @@ async fn reopen_uses_persisted_epoch_instead_of_config_starting_epoch() {
 
 #[tokio::test]
 async fn increment_epoch_consumes_lsn_and_is_metadata_durable() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2100,7 +2059,6 @@ async fn increment_epoch_consumes_lsn_and_is_metadata_durable() {
 
 #[tokio::test]
 async fn get_with_options_can_skip_checksum_verification() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2140,7 +2098,6 @@ async fn get_with_options_can_skip_checksum_verification() {
 
 #[tokio::test]
 async fn get_blob_range_reads_payload_slice() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2157,7 +2114,6 @@ async fn get_blob_range_reads_payload_slice() {
 
 #[tokio::test]
 async fn cached_reader_is_evictable_when_segment_is_deleted() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2193,7 +2149,6 @@ async fn cached_reader_is_evictable_when_segment_is_deleted() {
 
 #[tokio::test]
 async fn read_retries_once_when_not_found_segment_was_deleted() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2280,7 +2235,6 @@ async fn read_retries_once_when_not_found_segment_was_deleted() {
 
 #[tokio::test]
 async fn stream_blob_reads_payload_slice() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2299,7 +2253,6 @@ async fn stream_blob_reads_payload_slice() {
 
 #[tokio::test]
 async fn read_range_missing_and_tombstone_return_none() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let missing = BlobKey::new(b"missing".to_vec()).unwrap();
     let tombstoned = BlobKey::new(b"tombstoned".to_vec()).unwrap();
@@ -2319,7 +2272,6 @@ async fn read_range_missing_and_tombstone_return_none() {
 
 #[tokio::test]
 async fn read_range_rejects_out_of_bounds_range() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2338,16 +2290,16 @@ async fn read_range_rejects_out_of_bounds_range() {
 
 #[tokio::test]
 async fn store_from_index_does_not_create_local_index_dir() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let db_dir = tempdir().unwrap();
-    let db = open_cf(
-        db_dir.path(),
-        None,
-        MetricConf::new("strata_store_test"),
-        &["existing"],
-    )
-    .unwrap();
+    let db: std::sync::Arc<dyn IndexDb> = std::sync::Arc::new(
+        RocksBackend::open(
+            db_dir.path(),
+            Some(default_db_options()),
+            &[("existing".to_owned(), default_db_options())],
+        )
+        .unwrap(),
+    );
     let index = StrataIndex::from_db(db, "strata/shard-99").unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store = StrataStore::from_index(
@@ -2366,7 +2318,6 @@ async fn store_from_index_does_not_create_local_index_dir() {
 
 #[tokio::test]
 async fn get_missing_returns_none() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"missing".to_vec()).unwrap();
     let store =
@@ -2379,7 +2330,6 @@ async fn get_missing_returns_none() {
 
 #[tokio::test]
 async fn point_in_time_recovery_removes_orphan_segment_file_before_opening_active_writer() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let orphan_path = segment_path(&cfg, FIRST_SEGMENT_ID);
@@ -2398,7 +2348,6 @@ async fn point_in_time_recovery_removes_orphan_segment_file_before_opening_activ
 
 #[tokio::test]
 async fn absolute_consistency_rejects_orphan_segment_file() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.recovery_policy = StrataRecoveryPolicy::AbsoluteConsistency;
@@ -2418,7 +2367,6 @@ async fn absolute_consistency_rejects_orphan_segment_file() {
 
 #[tokio::test]
 async fn tombstone_hides_payload() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2443,7 +2391,6 @@ async fn tombstone_hides_payload() {
 
 #[tokio::test]
 async fn metrics_track_core_store_operations() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let missing = BlobKey::new(b"missing".to_vec()).unwrap();
@@ -2635,7 +2582,6 @@ async fn metrics_track_core_store_operations() {
 
 #[tokio::test]
 async fn metrics_track_seal_backpressure_waits() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.max_unsealed_segments = 2;
@@ -2746,7 +2692,6 @@ async fn metrics_track_seal_backpressure_waits() {
 }
 #[tokio::test]
 async fn set_blob_lifetime_missing_or_tombstoned_blob_records_metadata() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let missing = BlobKey::new(b"missing".to_vec()).unwrap();
     let tombstoned = BlobKey::new(b"tombstoned".to_vec()).unwrap();
@@ -2768,7 +2713,6 @@ async fn set_blob_lifetime_missing_or_tombstoned_blob_records_metadata() {
 
 #[tokio::test]
 async fn read_after_lifetime_update_chain_resolves_latest_lifetime() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2794,7 +2738,6 @@ async fn read_after_lifetime_update_chain_resolves_latest_lifetime() {
 
 #[tokio::test]
 async fn store_set_blob_lifetime_preserves_payload_and_updates_lifecycle() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2815,7 +2758,6 @@ async fn store_set_blob_lifetime_preserves_payload_and_updates_lifecycle() {
 
 #[tokio::test]
 async fn set_blob_lifetime_rejects_current_or_past_epoch() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2840,7 +2782,6 @@ async fn set_blob_lifetime_rejects_current_or_past_epoch() {
 
 #[tokio::test]
 async fn expired_lifetime_hides_blob_reads_before_gc() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2859,7 +2800,6 @@ async fn expired_lifetime_hides_blob_reads_before_gc() {
 
 #[tokio::test]
 async fn later_lifetime_before_expiry_keeps_current_blob_visible() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2880,7 +2820,6 @@ async fn later_lifetime_before_expiry_keeps_current_blob_visible() {
 
 #[tokio::test]
 async fn new_put_after_policy_expiry_does_not_inherit_stale_lifetime() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2900,7 +2839,6 @@ async fn new_put_after_policy_expiry_does_not_inherit_stale_lifetime() {
 
 #[tokio::test]
 async fn lifetime_update_after_expiry_applies_only_to_future_put() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2924,7 +2862,6 @@ async fn lifetime_update_after_expiry_applies_only_to_future_put() {
 
 #[tokio::test]
 async fn reopen_reads_existing_data() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     {
@@ -2944,7 +2881,6 @@ async fn reopen_reads_existing_data() {
 
 #[tokio::test]
 async fn sync_advances_durable_offset_after_segment_fsync() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -2977,7 +2913,6 @@ async fn sync_advances_durable_offset_after_segment_fsync() {
 
 #[tokio::test]
 async fn put_after_sync_preserves_durable_offset() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key_1 = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_2 = BlobKey::new(b"blob-b".to_vec()).unwrap();
@@ -3006,7 +2941,6 @@ async fn put_after_sync_preserves_durable_offset() {
 
 #[tokio::test]
 async fn recovery_keeps_complete_unsynced_record_that_survived() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -3030,7 +2964,6 @@ async fn recovery_keeps_complete_unsynced_record_that_survived() {
 }
 #[tokio::test]
 async fn recovery_truncates_partial_tail() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -3060,7 +2993,6 @@ async fn recovery_truncates_partial_tail() {
 }
 #[tokio::test]
 async fn recovery_removes_epoch_changes_after_rolled_back_blob_lsn() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -3089,7 +3021,6 @@ async fn recovery_removes_epoch_changes_after_rolled_back_blob_lsn() {
 
 #[tokio::test]
 async fn recovery_rolls_back_lost_overwrite_to_previous_entry() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -3124,7 +3055,6 @@ async fn recovery_rolls_back_lost_overwrite_to_previous_entry() {
 
 #[tokio::test]
 async fn put_overwrite_materializes_the_latest_lsm_version() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -3143,7 +3073,6 @@ async fn put_overwrite_materializes_the_latest_lsm_version() {
 
 #[tokio::test]
 async fn main_compaction_does_not_wait_for_a_newer_overlapping_patch() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.gc_workers_enabled = false;
@@ -3225,7 +3154,6 @@ async fn main_compaction_does_not_wait_for_a_newer_overlapping_patch() {
 
 #[tokio::test]
 async fn blob_lsm_materializes_overwrite_and_lifetime() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -3265,7 +3193,6 @@ async fn blob_lsm_materializes_overwrite_and_lifetime() {
 }
 #[tokio::test]
 async fn blob_lsm_leaves_unknown_lifetime_put_copy_eligible() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -3285,7 +3212,6 @@ async fn blob_lsm_leaves_unknown_lifetime_put_copy_eligible() {
 }
 #[tokio::test]
 async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let store =
         try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
@@ -3348,7 +3274,6 @@ async fn gc_prepare_plan_skips_claimed_source_and_uses_next_candidate() {
 }
 #[tokio::test]
 async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -3433,7 +3358,6 @@ async fn gc_prepare_plan_scans_real_segment_and_selects_live_records() {
 
 #[tokio::test]
 async fn gc_copy_uses_planning_snapshot_overlay_across_concurrent_retirement() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 4 - 1;
@@ -3516,7 +3440,6 @@ async fn gc_copy_uses_planning_snapshot_overlay_across_concurrent_retirement() {
 
 #[tokio::test]
 async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -3640,7 +3563,6 @@ async fn gc_copy_splits_mixed_ingest_records_into_shard_retention_segments() {
 
 #[tokio::test]
 async fn gc_publish_skips_copy_prepared_before_shard_drop() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -3708,7 +3630,6 @@ async fn gc_publish_skips_copy_prepared_before_shard_drop() {
 
 #[tokio::test]
 async fn gc_publish_empty_delete_plan_deletes_segment_file() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -3779,7 +3700,6 @@ async fn gc_publish_empty_delete_plan_deletes_segment_file() {
 
 #[tokio::test]
 async fn gc_publish_empty_delete_plan_batches_multiple_segment_files() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -3862,7 +3782,6 @@ async fn gc_publish_empty_delete_plan_batches_multiple_segment_files() {
 
 #[tokio::test]
 async fn gc_worker_request_runs_production_gc_plan() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -3908,7 +3827,6 @@ async fn gc_worker_request_runs_production_gc_plan() {
 
 #[tokio::test]
 async fn cold_epoch_expiry_enables_gc_after_the_accounting_frontier() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -3964,7 +3882,6 @@ async fn cold_epoch_expiry_enables_gc_after_the_accounting_frontier() {
 /// admission lock so the strict frontier provably stays behind while the decision is made.
 #[tokio::test]
 async fn clock_expiry_deletes_exact_epoch_segment_before_the_cold_sweep() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -4061,7 +3978,6 @@ async fn clock_expiry_deletes_exact_epoch_segment_before_the_cold_sweep() {
 
 #[tokio::test]
 async fn gc_worker_count_broadcasts_request_to_parallel_workers() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -4129,7 +4045,6 @@ async fn gc_worker_count_broadcasts_request_to_parallel_workers() {
 
 #[tokio::test]
 async fn gc_publish_reclassify_plan_updates_segment_placement() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     // This test drives prepare/copy/publish itself and intentionally creates only index metadata
@@ -4250,7 +4165,6 @@ async fn gc_publish_reclassify_plan_updates_segment_placement() {
 
 #[tokio::test]
 async fn join_multiple_fully_evacuates_and_deletes_every_source() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -4410,7 +4324,6 @@ async fn join_multiple_fully_evacuates_and_deletes_every_source() {
 
 #[tokio::test]
 async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -4717,7 +4630,6 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
 
 #[tokio::test]
 async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 4 - 1;
@@ -4818,7 +4730,6 @@ async fn gc_publish_pre_commit_failure_removes_renamed_output_segment() {
 
 #[tokio::test]
 async fn gc_publish_tombstoned_pending_copy_retires_destination_after_forwarding() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -4905,7 +4816,6 @@ async fn gc_publish_tombstoned_pending_copy_retires_destination_after_forwarding
 
 #[tokio::test]
 async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -5017,7 +4927,6 @@ async fn gc_publish_pending_epoch_change_expires_relocated_destination() {
 
 #[tokio::test]
 async fn gc_publish_forwards_lagging_lifetime_then_retires_destination() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -5131,7 +5040,6 @@ async fn relocation_patch_tier_merges_patches_without_rewriting_the_base() {
     };
     use crate::relocation::RelocationEntry;
 
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "relocation-tier");
     cfg.gc_workers_enabled = false;
@@ -5278,7 +5186,6 @@ async fn relocation_patch_tier_merges_patches_without_rewriting_the_base() {
 
 #[tokio::test]
 async fn blob_lsm_retire_removes_lifetime_hint() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -5306,7 +5213,6 @@ async fn blob_lsm_retire_removes_lifetime_hint() {
 
 #[tokio::test]
 async fn cold_base_sweep_updates_gc_summary_without_a_user_touch() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
@@ -5377,7 +5283,6 @@ async fn cold_base_sweep_updates_gc_summary_without_a_user_touch() {
 
 #[tokio::test]
 async fn cold_base_sweep_rereads_one_base_without_reading_patches() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
@@ -5431,7 +5336,6 @@ async fn cold_base_sweep_rereads_one_base_without_reading_patches() {
 
 #[tokio::test]
 async fn continuous_compaction_wakes_do_not_starve_cold_base_sweep() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let mut cfg = config(dir.path(), "default");
@@ -5484,7 +5388,6 @@ async fn continuous_compaction_wakes_do_not_starve_cold_base_sweep() {
 
 #[tokio::test]
 async fn compaction_expiry_does_not_revive_blob_on_extension() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -5524,7 +5427,6 @@ async fn compaction_expiry_does_not_revive_blob_on_extension() {
 
 #[tokio::test]
 async fn snapshot_compaction_expires_future_epoch_bucket_for_exact_epoch_segment() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
     let store =
@@ -5584,7 +5486,6 @@ async fn snapshot_compaction_expires_future_epoch_bucket_for_exact_epoch_segment
 
 #[tokio::test]
 async fn put_assigns_monotonic_lsn_across_reopen() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -5616,7 +5517,6 @@ async fn put_assigns_monotonic_lsn_across_reopen() {
 
 #[tokio::test]
 async fn recovery_rolls_back_unpublished_ops_missing_from_store_wal() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5637,7 +5537,6 @@ async fn recovery_rolls_back_unpublished_ops_missing_from_store_wal() {
 
 #[tokio::test]
 async fn recovery_rejects_missing_store_wal_for_published_lsn() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
@@ -5655,7 +5554,6 @@ async fn recovery_rejects_missing_store_wal_for_published_lsn() {
 }
 #[tokio::test]
 async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
@@ -5733,7 +5631,6 @@ async fn point_in_time_recovery_discards_higher_segments_after_lower_gap() {
 }
 #[tokio::test]
 async fn unsealed_segment_count_includes_open_and_sealing_segments() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let index = open_test_index(dir.path().join("index"), "strata/default");
 
@@ -5747,7 +5644,6 @@ async fn unsealed_segment_count_includes_open_and_sealing_segments() {
 
 #[tokio::test]
 async fn recovery_seals_rolled_segments_before_starting_workers() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     ensure_ingest_dir(&cfg).unwrap();
@@ -5776,7 +5672,6 @@ async fn recovery_seals_rolled_segments_before_starting_workers() {
 
 #[tokio::test]
 async fn reopen_detects_missing_sealed_segment() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -5796,7 +5691,6 @@ async fn reopen_detects_missing_sealed_segment() {
 
 #[tokio::test]
 async fn reopen_detects_sealed_segment_length_mismatch() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -5825,7 +5719,6 @@ async fn reopen_detects_sealed_segment_length_mismatch() {
 
 #[tokio::test]
 async fn metadata_only_reopen_does_not_hash_sealed_segment_bytes() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -5854,7 +5747,6 @@ async fn metadata_only_reopen_does_not_hash_sealed_segment_bytes() {
 
 #[tokio::test]
 async fn checksum_reopen_detects_sealed_segment_hash_mismatch() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -5881,7 +5773,6 @@ async fn checksum_reopen_detects_sealed_segment_hash_mismatch() {
 
 #[tokio::test]
 async fn recovery_seal_error_leaves_segment_unsealed() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let index = open_test_index(cfg.standalone_index_dir(), cfg.index_cf_prefix());
@@ -5895,7 +5786,6 @@ async fn recovery_seal_error_leaves_segment_unsealed() {
 
 #[tokio::test]
 async fn rollover_switches_active_segment_and_durability_seals_old_segment() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -5947,7 +5837,6 @@ async fn rollover_switches_active_segment_and_durability_seals_old_segment() {
 
 #[tokio::test]
 async fn one_batch_can_publish_multiple_rollovers_without_staging_new_segment_states() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;
@@ -5989,7 +5878,6 @@ async fn one_batch_can_publish_multiple_rollovers_without_staging_new_segment_st
 
 #[tokio::test]
 async fn segment_pressure_syncs_active_segment_without_rollover() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.max_unsealed_segments = 3;
@@ -6160,7 +6048,6 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
 
 #[tokio::test]
 async fn reopen_after_rollover_appends_to_highest_open_segment() {
-    init_typed_store_metrics();
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path(), "default");
     cfg.segment_max_bytes = TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD;

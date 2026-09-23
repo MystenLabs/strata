@@ -11,14 +11,13 @@ use tempfile::tempdir;
 
 use crate::{GARBAGE_LOG_HEAD, GARBAGE_LOG_SWEEP_CURSOR, garbage_log_dir};
 
-use super::{StrataStoreMetrics, config, init_typed_store_metrics, try_open_standalone_store};
+use super::{StrataStoreMetrics, config, try_open_standalone_store};
 
 const LSM_NAME: &str = "primary";
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[tokio::test]
 async fn running_store_periodically_sweeps_a_committed_frame() {
-    init_typed_store_metrics();
     let directory = tempdir().unwrap();
     let mut store_config = config(directory.path(), "garbage-sweeper");
     store_config.gc_workers_enabled = false;
@@ -32,7 +31,6 @@ async fn running_store_periodically_sweeps_a_committed_frame() {
 
 #[tokio::test]
 async fn store_open_sweeps_an_already_committed_global_frame() {
-    init_typed_store_metrics();
     let directory = tempdir().unwrap();
     let mut store_config = config(directory.path(), "garbage-recovery");
     store_config.gc_workers_enabled = false;
@@ -53,7 +51,6 @@ async fn store_open_sweeps_an_already_committed_global_frame() {
 
 #[tokio::test]
 async fn garbage_sweep_waits_until_allocation_covers_the_record() {
-    init_typed_store_metrics();
     let directory = tempdir().unwrap();
     let mut store_config = config(directory.path(), "garbage-allocation-gate");
     store_config.gc_workers_enabled = false;

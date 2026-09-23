@@ -20,7 +20,6 @@ parking_lot.workspace = true
 segment.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-typed-store.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]

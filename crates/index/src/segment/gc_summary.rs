@@ -1,11 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::port::{map::IndexBatch, options::default_db_options};
 use core_types::{SegmentGcSummary, SegmentGcSummaryDelta, SegmentId};
 use rocksdb::MergeOperands;
-use typed_store::{
-    Map,
-    rocks::{DBBatch, default_db_options},
-};
 
 use crate::{Error, Result, StrataIndex};
 
@@ -14,12 +11,12 @@ impl StrataIndex {
         &self,
         segment_id: SegmentId,
     ) -> Result<Option<SegmentGcSummary>> {
-        Ok(self.segment_gc_summaries.get(&segment_id)?)
+        self.segment_gc_summaries.get(&segment_id)
     }
 
     pub fn put_segment_gc_summary_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         segment_id: SegmentId,
         summary: &SegmentGcSummary,
     ) -> Result<()> {
@@ -29,7 +26,7 @@ impl StrataIndex {
 
     pub fn merge_segment_gc_summary_batch(
         &self,
-        batch: &mut DBBatch,
+        batch: &mut IndexBatch,
         segment_id: SegmentId,
         delta: &SegmentGcSummaryDelta,
     ) -> Result<()> {
@@ -44,7 +41,7 @@ impl StrataIndex {
 }
 
 pub(crate) fn segment_gc_summaries_cf_options() -> rocksdb::Options {
-    let mut options = default_db_options().options;
+    let mut options = default_db_options();
     options.set_merge_operator(
         "strata-segment-gc-summary-merge",
         |_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands| {

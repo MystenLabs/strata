@@ -7,9 +7,9 @@ use core_types::{
 use core_types::{StoreCheckpoint, WalPosition};
 use lsm::{Manifest, ManifestEdit, OperandFloor, TableMeta};
 use tempfile::tempdir;
-use typed_store::{Map, rocks::open_cf};
 
 use super::*;
+use crate::port::{IndexDb, RocksBackend, options::default_db_options};
 
 fn open_test_index(dir: &tempfile::TempDir) -> StrataIndex {
     StrataIndex::open_path(dir.path(), "strata", dir.path().display().to_string()).unwrap()
@@ -50,9 +50,8 @@ fn lsm_table(id: u64, path: &str) -> TableMeta {
     }
 }
 
-#[tokio::test]
-async fn open_path_persists_live_metadata_across_reopen() {
-    init_typed_store_metrics();
+#[test]
+fn open_path_persists_live_metadata_across_reopen() {
     let dir = tempdir().unwrap();
     let state = segment_state(7);
     {
@@ -80,28 +79,30 @@ async fn open_path_persists_live_metadata_across_reopen() {
     );
 }
 
-#[tokio::test]
-async fn from_db_creates_only_the_live_column_families() {
-    init_typed_store_metrics();
+/// The embedding seam: Strata attaches its families to a handle someone else opened, leaving the
+/// families it does not own untouched.
+#[test]
+fn from_db_creates_only_the_live_column_families() {
     let dir = tempdir().unwrap();
-    let db = open_cf(
-        dir.path(),
-        None,
-        metric_conf_with_suffix("strata_index_test", dir.path().display().to_string()),
-        &["existing"],
-    )
-    .unwrap();
+    let db: Arc<dyn IndexDb> = Arc::new(
+        RocksBackend::open(
+            dir.path(),
+            Some(default_db_options()),
+            &[("existing".to_owned(), default_db_options())],
+        )
+        .unwrap(),
+    );
 
     let index = StrataIndex::from_db(db, "embedded").unwrap();
     for name in index.cf_names().as_strs() {
-        assert!(index.db().cf_handle(name).is_some(), "missing {name}");
+        assert!(index.db().cf_exists(name), "missing {name}");
     }
+    assert!(index.db().cf_exists("existing"));
     assert_eq!(index.cf_names().as_strs().len(), 12);
 }
 
-#[tokio::test]
-async fn shard_cleanup_jobs_are_independent_metadata() {
-    init_typed_store_metrics();
+#[test]
+fn shard_cleanup_jobs_are_independent_metadata() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     let shard = ShardKey {
@@ -137,9 +138,8 @@ async fn shard_cleanup_jobs_are_independent_metadata() {
     assert!(index.get_shard_cleanup_job(shard).unwrap().is_none());
 }
 
-#[tokio::test]
-async fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
-    init_typed_store_metrics();
+#[test]
+fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     assert!(index.build_gc_snapshot().unwrap().is_none());
@@ -216,9 +216,8 @@ async fn gc_snapshot_uses_epoch_shards_segments_and_summaries() {
     assert_eq!(index.clock_expiry_epoch().unwrap(), Some(10));
 }
 
-#[tokio::test]
-async fn gc_reclaim_pending_rows_survive_until_removed() {
-    init_typed_store_metrics();
+#[test]
+fn gc_reclaim_pending_rows_survive_until_removed() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     let mut batch = index.batch();
@@ -277,9 +276,8 @@ async fn gc_reclaim_pending_rows_survive_until_removed() {
     );
 }
 
-#[tokio::test]
-async fn segment_state_and_publication_lsn_round_trip() {
-    init_typed_store_metrics();
+#[test]
+fn segment_state_and_publication_lsn_round_trip() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     let first = segment_state(1);
@@ -300,9 +298,8 @@ async fn segment_state_and_publication_lsn_round_trip() {
     assert_eq!(index.get_segment_published_at_lsn(1).unwrap(), 42);
 }
 
-#[tokio::test]
-async fn store_frontiers_and_checkpoint_round_trip() {
-    init_typed_store_metrics();
+#[test]
+fn store_frontiers_and_checkpoint_round_trip() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     assert_eq!(index.get_next_lsn().unwrap(), 1);
@@ -334,9 +331,8 @@ async fn store_frontiers_and_checkpoint_round_trip() {
     assert_eq!(index.get_store_checkpoint().unwrap(), Some(checkpoint));
 }
 
-#[tokio::test]
-async fn epoch_changes_track_genesis_and_ordered_updates() {
-    init_typed_store_metrics();
+#[test]
+fn epoch_changes_track_genesis_and_ordered_updates() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     let mut batch = index.batch();
@@ -356,9 +352,8 @@ async fn epoch_changes_track_genesis_and_ordered_updates() {
     assert_eq!(index.latest_epoch_at_lsn(5).unwrap(), Some((0, 42)));
 }
 
-#[tokio::test]
-async fn lsm_manifest_edits_share_an_atomic_metadata_batch() {
-    init_typed_store_metrics();
+#[test]
+fn lsm_manifest_edits_share_an_atomic_metadata_batch() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     let mut manifest = Manifest::empty(
@@ -403,9 +398,8 @@ async fn lsm_manifest_edits_share_an_atomic_metadata_batch() {
     assert_eq!(index.get_segment_state(17).unwrap(), Some(state));
 }
 
-#[tokio::test]
-async fn segment_summary_merge_operands_preserve_concurrent_allocation_and_expiry() {
-    init_typed_store_metrics();
+#[test]
+fn segment_summary_merge_operands_preserve_concurrent_allocation_and_expiry() {
     let dir = tempdir().unwrap();
     let index = open_test_index(&dir);
     let segment_id = 7;

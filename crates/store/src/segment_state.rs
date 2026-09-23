@@ -90,7 +90,7 @@ pub(crate) fn publish_active_segment_state(
             next_lsn,
         )?;
     }
-    batch.write().map_err(index::Error::from)?;
+    batch.write()?;
     Ok(state)
 }
 
@@ -175,7 +175,7 @@ pub(crate) fn active_segment_state_from_path(
 
 pub(crate) fn publish_segment_allocation_delta(
     index: &StrataIndex,
-    batch: &mut typed_store::rocks::DBBatch,
+    batch: &mut index::port::map::IndexBatch,
     segment_id: SegmentId,
     allocation_bytes: u64,
     allocation_records: u64,

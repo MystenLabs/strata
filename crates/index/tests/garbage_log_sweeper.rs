@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Once};
+use std::collections::BTreeMap;
 
 use core_types::{
     BlobKey, BlobLifecycle, EpochBucket, PlacementClass, RecordRef, SegmentFileState,
@@ -11,21 +11,12 @@ use lsm::{
     read_segment_garbage,
 };
 use tempfile::TempDir;
-use typed_store::DBMetrics;
 
 const HEAD: &str = "segment-ref";
 const CURSOR: &str = "segment-ref-sweep";
-static INIT_TYPED_STORE_METRICS: Once = Once::new();
-
-fn init_typed_store_metrics() {
-    INIT_TYPED_STORE_METRICS.call_once(|| {
-        DBMetrics::get();
-    });
-}
 
 #[tokio::test]
 async fn sweep_copies_details_before_publishing_summaries_and_cursor() {
-    init_typed_store_metrics();
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),
@@ -170,7 +161,6 @@ async fn sweep_copies_details_before_publishing_summaries_and_cursor() {
 
 #[tokio::test]
 async fn repeated_lifecycle_restatement_is_idempotent_for_summary_merges() {
-    init_typed_store_metrics();
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),
@@ -244,7 +234,6 @@ async fn repeated_lifecycle_restatement_is_idempotent_for_summary_merges() {
 
 #[tokio::test]
 async fn sweep_discards_events_for_wholesale_deleted_segments() {
-    init_typed_store_metrics();
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),
@@ -286,7 +275,6 @@ async fn sweep_discards_events_for_wholesale_deleted_segments() {
 
 #[tokio::test]
 async fn sweep_reclaims_a_global_log_after_crossing_its_boundary() {
-    init_typed_store_metrics();
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),
@@ -332,7 +320,6 @@ async fn sweep_reclaims_a_global_log_after_crossing_its_boundary() {
 
 #[tokio::test]
 async fn sweep_stops_at_the_frame_batch_limit() {
-    init_typed_store_metrics();
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),
@@ -394,7 +381,6 @@ async fn sweep_stops_at_the_frame_batch_limit() {
 
 #[tokio::test]
 async fn sweep_waits_for_the_segment_baseline() {
-    init_typed_store_metrics();
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),
@@ -436,7 +422,6 @@ async fn sweep_waits_for_the_segment_baseline() {
 
 #[tokio::test]
 async fn completed_cursor_finishes_reclamation_after_restart() {
-    init_typed_store_metrics();
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),

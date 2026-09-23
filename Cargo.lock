@@ -3626,7 +3626,9 @@ name = "index"
 version = "0.1.0"
 dependencies = [
  "bcs",
+ "bincode",
  "core",
+ "fdlimit",
  "gc",
  "lsm",
  "rocksdb",
@@ -8147,7 +8149,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "typed-store",
  "xxhash-rust",
 ]
 

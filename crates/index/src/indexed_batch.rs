@@ -1,63 +1,64 @@
 use std::collections::BTreeMap;
 
-use serde::{Serialize, de::DeserializeOwned};
-use typed_store::{
-    Map,
-    rocks::{DBBatch, DBMap, RocksDBSnapshot},
+use crate::port::{
+    IndexSnapshot, TypedMap,
+    codec::{decode_key, decode_value, encode_key, encode_value},
+    map::IndexBatch,
 };
+use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{Error, Result, StrataIndex};
+use crate::{Result, StrataIndex};
 
 /// Atomic RocksDB batch with point read-your-writes semantics.
 ///
 /// Reads use the snapshot captured when the batch was created, then overlay staged puts and
 /// deletes. All writes must go through this type or they will not be visible to [`Self::get`].
 pub struct IndexedBatch<'a> {
-    snapshot: RocksDBSnapshot<'a>,
-    batch: DBBatch,
+    snapshot: Box<dyn IndexSnapshot + 'a>,
+    batch: IndexBatch,
     staged: BTreeMap<(String, Vec<u8>), Option<Vec<u8>>>,
 }
 
 impl StrataIndex {
-    pub fn indexed_batch(&self) -> IndexedBatch<'_> {
-        IndexedBatch {
-            snapshot: self.db.snapshot(),
+    pub fn indexed_batch(&self) -> Result<IndexedBatch<'_>> {
+        Ok(IndexedBatch {
+            snapshot: self.db.snapshot()?,
             batch: self.batch(),
             staged: BTreeMap::new(),
-        }
+        })
     }
 }
 
 impl IndexedBatch<'_> {
-    pub(crate) fn raw_batch_mut(&mut self) -> &mut DBBatch {
+    pub(crate) fn raw_batch_mut(&mut self) -> &mut IndexBatch {
         &mut self.batch
     }
 
-    pub fn get<K, V>(&self, map: &DBMap<K, V>, key: &K) -> Result<Option<V>>
+    pub fn get<K, V>(&self, map: &TypedMap<K, V>, key: &K) -> Result<Option<V>>
     where
         K: Serialize + DeserializeOwned,
         V: Serialize + DeserializeOwned,
     {
         let index_key = index_key(map, key)?;
         if let Some(value) = self.staged.get(&index_key) {
-            return value.as_deref().map(decode).transpose();
+            return value.as_deref().map(decode_value).transpose();
         }
-        Ok(map.get_with_snapshot(&self.snapshot, key)?)
+        map.get_with_snapshot(self.snapshot.as_ref(), key)
     }
 
-    pub fn put<K, V>(&mut self, map: &DBMap<K, V>, key: &K, value: &V) -> Result<()>
+    pub fn put<K, V>(&mut self, map: &TypedMap<K, V>, key: &K, value: &V) -> Result<()>
     where
         K: Serialize + DeserializeOwned,
         V: Serialize + DeserializeOwned,
     {
         let index_key = index_key(map, key)?;
-        let encoded = encode(value)?;
+        let encoded = encode_value(value)?;
         self.batch.insert_batch(map, [(key, value)])?;
         self.staged.insert(index_key, Some(encoded));
         Ok(())
     }
 
-    pub fn delete<K, V>(&mut self, map: &DBMap<K, V>, key: &K) -> Result<()>
+    pub fn delete<K, V>(&mut self, map: &TypedMap<K, V>, key: &K) -> Result<()>
     where
         K: Serialize + DeserializeOwned,
         V: Serialize + DeserializeOwned,
@@ -70,7 +71,7 @@ impl IndexedBatch<'_> {
 
     pub fn update<K, V>(
         &mut self,
-        map: &DBMap<K, V>,
+        map: &TypedMap<K, V>,
         key: &K,
         update: impl FnOnce(Option<V>) -> Result<Option<V>>,
     ) -> Result<()>
@@ -84,14 +85,14 @@ impl IndexedBatch<'_> {
         }
     }
 
-    pub fn touched_keys<K, V>(&self, map: &DBMap<K, V>) -> Result<Vec<K>>
+    pub fn touched_keys<K, V>(&self, map: &TypedMap<K, V>) -> Result<Vec<K>>
     where
         K: Serialize + DeserializeOwned,
     {
         self.staged
             .iter()
             .filter(|((cf, _), _)| cf == map.cf_name())
-            .map(|((_, key), _)| decode(key))
+            .map(|((_, key), _)| decode_key(key))
             .collect()
     }
 
@@ -100,37 +101,27 @@ impl IndexedBatch<'_> {
     }
 
     pub fn write(self) -> Result<()> {
-        self.batch.write().map_err(Error::from)
+        self.batch.write()
     }
 
     pub fn write_with_sync(self, sync: bool) -> Result<()> {
-        self.batch.write_with_sync(sync).map_err(Error::from)
+        self.batch.write_with_sync(sync)
     }
 }
 
-fn index_key<K: Serialize, V>(map: &DBMap<K, V>, key: &K) -> Result<(String, Vec<u8>)> {
-    Ok((map.cf_name().to_owned(), encode(key)?))
-}
-
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    bcs::to_bytes(value).map_err(|error| Error::Serialization(error.to_string()))
-}
-
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    bcs::from_bytes(bytes).map_err(|error| Error::Serialization(error.to_string()))
+fn index_key<K: Serialize, V>(map: &TypedMap<K, V>, key: &K) -> Result<(String, Vec<u8>)> {
+    Ok((map.cf_name().to_owned(), encode_key(key)?))
 }
 
 #[cfg(test)]
 mod tests {
     use core_types::SegmentGcSummary;
     use tempfile::tempdir;
-    use typed_store::Map;
 
-    use crate::{StrataIndex, init_typed_store_metrics};
+    use crate::StrataIndex;
 
-    #[tokio::test]
-    async fn reads_staged_writes_and_commits_across_maps() {
-        init_typed_store_metrics();
+    #[test]
+    fn reads_staged_writes_and_commits_across_maps() {
         let dir = tempdir().unwrap();
         let index = StrataIndex::open_path(
             dir.path(),
@@ -153,7 +144,7 @@ mod tests {
         index.segment_gc_summaries().insert(&1, &first).unwrap();
         index.segment_gc_summaries().insert(&2, &second).unwrap();
 
-        let mut batch = index.indexed_batch();
+        let mut batch = index.indexed_batch().unwrap();
         batch
             .update(index.segment_gc_summaries(), &1, |summary| {
                 let mut summary = summary.unwrap();
@@ -204,9 +195,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn reads_untouched_values_from_its_creation_snapshot() {
-        init_typed_store_metrics();
+    #[test]
+    fn reads_untouched_values_from_its_creation_snapshot() {
         let dir = tempdir().unwrap();
         let index = StrataIndex::open_path(
             dir.path(),
@@ -224,7 +214,7 @@ mod tests {
         };
         index.segment_gc_summaries().insert(&1, &original).unwrap();
 
-        let batch = index.indexed_batch();
+        let batch = index.indexed_batch().unwrap();
         index.segment_gc_summaries().insert(&1, &later).unwrap();
 
         assert_eq!(

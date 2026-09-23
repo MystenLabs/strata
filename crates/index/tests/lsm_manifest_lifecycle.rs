@@ -11,7 +11,6 @@ use lsm::{
     TableStore, TableWriter,
 };
 use tempfile::TempDir;
-use typed_store::DBMetrics;
 
 const LSM_NAME: &str = "lsm";
 const SCHEMA_ID: &str = "lsm-v1";
@@ -36,7 +35,6 @@ impl MergeOperator for Replace {
 
 #[tokio::test]
 async fn concurrent_compactions_survive_reopen_and_old_snapshots() {
-    DBMetrics::get();
     let directory = TempDir::new().unwrap();
     let lsm_root = directory.path().join("lsm");
     let db_path = directory.path().join("index");

@@ -1,10 +1,8 @@
 use core_types::{ShardCleanupJob, ShardCleanupState, ShardKey};
 use serde::{Deserialize, Serialize};
-use typed_store::{
-    Map, TypedStoreError,
-    rocks::{DBMap, ReadWriteOptions, RocksDB},
-};
+use std::sync::Arc;
 
+use crate::port::{IndexDb, TypedMap};
 use crate::{Result, StrataIndexCfNames};
 
 const RETIRED_CF_BASENAMES: [&str; 6] = [
@@ -33,9 +31,9 @@ enum LegacyProjectionValue {
 }
 
 pub(crate) fn migrate_and_drop_retired_cfs(
-    db: &std::sync::Arc<RocksDB>,
+    db: &Arc<dyn IndexDb>,
     cf_names: &StrataIndexCfNames,
-    shard_cleanup_jobs: &DBMap<ShardKey, ShardCleanupJob>,
+    shard_cleanup_jobs: &TypedMap<ShardKey, ShardCleanupJob>,
 ) -> Result<()> {
     let prefix = cf_names
         .segment_states
@@ -50,14 +48,11 @@ pub(crate) fn migrate_and_drop_retired_cfs(
     };
     let legacy_projection_cf = qualify("accounting_index");
 
-    if db.cf_handle(&legacy_projection_cf).is_some() {
-        let legacy = DBMap::<LegacyProjectionKey, LegacyProjectionValue>::reopen_with_class(
-            db,
-            Some(&legacy_projection_cf),
-            Some("retired_projection_index"),
-            &ReadWriteOptions::default(),
-            true,
-        )?;
+    if db.cf_exists(&legacy_projection_cf) {
+        let legacy = TypedMap::<LegacyProjectionKey, LegacyProjectionValue>::new(
+            Arc::clone(db),
+            &legacy_projection_cf,
+        );
         let mut jobs = Vec::new();
         for row in legacy.safe_iter()? {
             let Ok((_, LegacyProjectionValue::ShardCleanupJob(mut job))) = row else {
@@ -77,9 +72,8 @@ pub(crate) fn migrate_and_drop_retired_cfs(
 
     for basename in RETIRED_CF_BASENAMES {
         let name = qualify(basename);
-        if db.cf_handle(&name).is_some() {
-            db.drop_cf(&name)
-                .map_err(|error| TypedStoreError::RocksDBError(error.into_string()))?;
+        if db.cf_exists(&name) {
+            db.drop_cf(&name)?;
         }
     }
     Ok(())
@@ -88,36 +82,28 @@ pub(crate) fn migrate_and_drop_retired_cfs(
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
-    use typed_store::rocks::{DBMap, ReadWriteOptions, open_cf};
 
     use super::*;
-    use crate::{StrataIndex, init_typed_store_metrics, metric_conf_with_suffix};
+    use crate::StrataIndex;
+    use crate::port::{RocksBackend, options::default_db_options};
 
-    #[tokio::test]
-    async fn open_migrates_cleanup_jobs_before_dropping_retired_families() {
-        init_typed_store_metrics();
+    #[test]
+    fn open_migrates_cleanup_jobs_before_dropping_retired_families() {
         let dir = tempdir().unwrap();
         let prefix = "strata";
         let retired_names = RETIRED_CF_BASENAMES.map(|basename| format!("{prefix}/{basename}"));
-        let retired_name_refs = retired_names.iter().map(String::as_str).collect::<Vec<_>>();
-        let db = open_cf(
-            dir.path(),
-            None,
-            metric_conf_with_suffix(
-                "strata_index_migration_test",
-                dir.path().display().to_string(),
-            ),
-            &retired_name_refs,
-        )
-        .unwrap();
-        let legacy = DBMap::<LegacyProjectionKey, LegacyProjectionValue>::reopen_with_class(
-            &db,
-            Some(&format!("{prefix}/accounting_index")),
-            Some("retired_projection_index"),
-            &ReadWriteOptions::default(),
-            true,
-        )
-        .unwrap();
+        let retired_cf_options = retired_names
+            .iter()
+            .map(|name| (name.clone(), default_db_options()))
+            .collect::<Vec<_>>();
+        let db: Arc<dyn IndexDb> = Arc::new(
+            RocksBackend::open(dir.path(), Some(default_db_options()), &retired_cf_options)
+                .unwrap(),
+        );
+        let legacy = TypedMap::<LegacyProjectionKey, LegacyProjectionValue>::new(
+            Arc::clone(&db),
+            format!("{prefix}/accounting_index"),
+        );
         let shard = ShardKey {
             id: 17,
             generation: 4,
@@ -147,7 +133,7 @@ mod tests {
         );
         for name in retired_names {
             assert!(
-                index.db().cf_handle(&name).is_none(),
+                !index.db().cf_exists(&name),
                 "retired column family survived migration: {name}"
             );
         }

@@ -79,7 +79,7 @@ pub(crate) fn seal_recovered_segments(
         state.sealed_len = Some(state.write_offset);
         let mut batch = index.batch();
         index.put_segment_state_batch(&mut batch, &state)?;
-        batch.write_with_sync(true).map_err(index::Error::from)?;
+        batch.write_with_sync(true)?;
         metrics.record_segment_sealed();
     }
     metrics.set_unsealed_segments(unsealed_ingest_segment_count(index)?);
