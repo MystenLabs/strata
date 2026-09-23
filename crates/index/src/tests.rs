@@ -109,24 +109,17 @@ fn shard_cleanup_jobs_are_independent_metadata() {
         id: 17,
         generation: 4,
     };
-    let mut batch = index.batch();
-    index
-        .put_shard_cleanup_job_batch(
-            &mut batch,
-            ShardCleanupJob {
-                shard,
-                drop_lsn: 42,
-                state: ShardCleanupState::PendingMaterialization,
-            },
-        )
-        .unwrap();
-    batch.write_with_sync(true).unwrap();
-
     let expected = ShardCleanupJob {
         shard,
         drop_lsn: 42,
         state: ShardCleanupState::ReadyForGc,
     };
+    let mut batch = index.batch();
+    index
+        .put_shard_cleanup_job_batch(&mut batch, expected)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
     assert_eq!(index.get_shard_cleanup_job(shard).unwrap(), Some(expected));
     assert_eq!(index.iter_shard_cleanup_jobs().unwrap(), vec![expected]);
 

@@ -72,8 +72,6 @@ pub struct ShardKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShardCleanupState {
-    /// Legacy value promoted to `ReadyForGc` when old metadata is opened.
-    PendingMaterialization,
     ReadyForGc,
     /// Shard-owned files and their GC metadata have been removed. The job remains as the durable
     /// generation tombstone used by later snapshot-driven blob-LSM compactions.

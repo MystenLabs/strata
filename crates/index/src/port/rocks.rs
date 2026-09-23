@@ -168,10 +168,6 @@ impl IndexDb for RocksBackend {
         self.db.create_cf(cf, options).map_err(rocks_error)
     }
 
-    fn drop_cf(&self, cf: &str) -> Result<()> {
-        self.db.drop_cf(cf).map_err(rocks_error)
-    }
-
     fn flush_wal(&self, sync: bool) -> Result<()> {
         self.db.flush_wal(sync).map_err(rocks_error)
     }

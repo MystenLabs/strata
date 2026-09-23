@@ -41,7 +41,6 @@ mod gc;
 mod global;
 mod indexed_batch;
 mod manifest;
-mod migration;
 mod open;
 mod options;
 mod overlay_cache;

@@ -67,15 +67,12 @@ GC
 This ordering keeps untouched or not-yet-swept bytes live by default. A segment becomes reclaimable
 only from durable garbage records and summaries.
 
-## Upgrade cleanup
+## Retired families
 
-Opening an older `StrataIndex` performs a one-way schema migration:
+The projection engine's column families (`blob_versions`, `segment_ref_events`,
+`segment_gc_overlay`, `gc_relocations`, `unaccounted_lsn_ops`, `accounting_index`) and its
+`accounting-index` run/log directory are gone, along with the retired `strata-accounting` crate,
+its runtime APIs, configuration, metrics, and serialized helper types.
 
-1. copy shard cleanup jobs out of the old projection family;
-2. promote jobs that were waiting for the retired worker to `ReadyForGc`;
-3. drop `blob_versions`, `segment_ref_events`, `segment_gc_overlay`, `gc_relocations`,
-   `unaccounted_lsn_ops`, and `accounting_index`;
-4. on store open, remove the obsolete `accounting-index` run/log directory.
-
-The retired `strata-accounting` crate, runtime APIs, configuration, metrics, and serialized helper
-types are not part of the workspace.
+Open no longer migrates or drops them: a database written by a version that still had those
+families is not readable by this one.

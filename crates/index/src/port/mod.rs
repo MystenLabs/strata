@@ -71,9 +71,6 @@ pub trait IndexDb: Send + Sync + Debug {
     /// Creates a column family that does not exist yet.
     fn create_cf(&self, cf: &str, options: &rocksdb::Options) -> Result<()>;
 
-    /// Drops a column family, used by retired-family migration.
-    fn drop_cf(&self, cf: &str) -> Result<()>;
-
     /// Flushes the write-ahead log, optionally fsyncing it.
     fn flush_wal(&self, sync: bool) -> Result<()>;
 }

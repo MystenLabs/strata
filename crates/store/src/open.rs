@@ -24,8 +24,8 @@ use crate::{
     BLOB_LSM_MANIFEST, DEFAULT_RELOCATION_CACHE_ENTRIES, Error, FIRST_SEGMENT_ID, GcPlanner,
     INGEST_SEGMENT_OWNER, LSM_BASE_FORMAT, LSM_FILE_SYNC_WORKERS, LSM_MEMTABLE_MAX_KEYS,
     LSM_PATCH_FORMAT, RELOCATION_LSM_BASE_FORMAT, RELOCATION_LSM_MANIFEST,
-    RELOCATION_LSM_PATCH_FORMAT, RETIRED_PROJECTION_DIR, Result, STANDALONE_SHARD, StoreHalt,
-    StrataStore, StrataStoreConfig, StrataStoreMetrics, WriteCoordinator,
+    RELOCATION_LSM_PATCH_FORMAT, Result, STANDALONE_SHARD, StoreHalt, StrataStore,
+    StrataStoreConfig, StrataStoreMetrics, WriteCoordinator,
     file_sync::file_sync_channel,
     fs_util::{sync_parent_dir, unlink_gc_segment_file},
     gc::{
@@ -120,7 +120,6 @@ impl StrataStore {
         metrics: StrataStoreMetrics,
     ) -> Result<Self> {
         validate_config(&config)?;
-        cleanup_retired_projection_dir(&config)?;
         ensure_ingest_dir(&config)?;
         cleanup_stale_gc_staging_dirs(&config)?;
         ensure_default_shard_registered(&index)?;
@@ -432,33 +431,6 @@ fn cleanup_stale_gc_staging_dirs(config: &StrataStoreConfig) -> Result<()> {
             source,
         }),
     }
-}
-
-/// Removes files owned exclusively by the retired projection engine.
-///
-/// The exact namespace child is fixed by the old layout. Refusing non-directories avoids following
-/// a replacement symlink or deleting an unexpected file.
-pub(crate) fn cleanup_retired_projection_dir(config: &StrataStoreConfig) -> Result<()> {
-    let path = config.namespace_dir().join(RETIRED_PROJECTION_DIR);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => return Err(Error::Io { path, source }),
-    };
-    if !metadata.file_type().is_dir() {
-        return Err(Error::Io {
-            path,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "retired projection path is not a directory",
-            ),
-        });
-    }
-    fs::remove_dir_all(&path).map_err(|source| Error::Io {
-        path: path.clone(),
-        source,
-    })?;
-    sync_parent_dir(&path)
 }
 
 /// Opens the segment chosen for appends, creating it only if recovery did not already leave a file

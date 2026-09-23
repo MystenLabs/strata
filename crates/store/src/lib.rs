@@ -266,7 +266,6 @@ const LSM_OBSOLETE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const LSM_BASE_FORMAT: &str = "store-base-v2";
 const LSM_PATCH_FORMAT: &str = "store-patch-v2";
 const BLOB_LSM_MANIFEST: &str = "blob";
-const RETIRED_PROJECTION_DIR: &str = "accounting-index";
 const RELOCATION_LSM_BASE_FORMAT: &str = "relocation-base-v1";
 const RELOCATION_LSM_PATCH_FORMAT: &str = "relocation-patch-v1";
 const RELOCATION_LSM_MANIFEST: &str = "relocation";
@@ -280,9 +279,8 @@ pub(crate) const INGEST_SEGMENT_OWNER: SegmentOwner = SegmentOwner::Store;
 
 #[cfg(test)]
 use open::{
-    cleanup_retired_projection_dir, ensure_epoch_initialized, ensure_ingest_dir,
-    load_blob_lsm_manifest, load_relocation_lsm_manifest, open_lsm, open_store_wal,
-    store_wal_recovery_state,
+    ensure_epoch_initialized, ensure_ingest_dir, load_blob_lsm_manifest,
+    load_relocation_lsm_manifest, open_lsm, open_store_wal, store_wal_recovery_state,
 };
 #[cfg(test)]
 use read::{ResolvedBlobVersion, resolve_blob_version};

@@ -3,7 +3,6 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use crate::Result;
 use crate::port::{IndexDb, RocksBackend, TypedMap, options::default_db_options};
 
-use super::migration::migrate_and_drop_retired_cfs;
 use super::options::cf_options;
 use super::{StrataIndex, StrataIndexCfNames};
 
@@ -55,7 +54,6 @@ impl StrataIndex {
         let garbage_log_positions = TypedMap::new(Arc::clone(&db), &cf_names.garbage_log_positions);
         let segment_garbage_log_positions =
             TypedMap::new(Arc::clone(&db), &cf_names.segment_garbage_log_positions);
-        migrate_and_drop_retired_cfs(&db, &cf_names, &shard_cleanup_jobs)?;
         Ok(Self {
             db,
             cf_names,

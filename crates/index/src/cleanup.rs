@@ -1,5 +1,5 @@
 use crate::port::map::IndexBatch;
-use core_types::{ShardCleanupJob, ShardCleanupState, ShardKey};
+use core_types::{ShardCleanupJob, ShardKey};
 
 use crate::{Result, StrataIndex};
 
@@ -11,11 +11,8 @@ impl StrataIndex {
     pub fn put_shard_cleanup_job_batch(
         &self,
         batch: &mut IndexBatch,
-        mut job: ShardCleanupJob,
+        job: ShardCleanupJob,
     ) -> Result<()> {
-        if job.state == ShardCleanupState::PendingMaterialization {
-            job.state = ShardCleanupState::ReadyForGc;
-        }
         batch.insert_batch(self.shard_cleanup_jobs(), [(&job.shard, &job)])?;
         Ok(())
     }

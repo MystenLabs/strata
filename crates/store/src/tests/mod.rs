@@ -29,19 +29,6 @@ const TEST_PAYLOAD_LEN: u64 = 9;
 const TEST_RECORD_LEN: u64 = FIXED_RECORD_HEADER_LEN as u64 + TEST_KEY_LEN + TEST_PAYLOAD_LEN;
 const TEST_SEGMENT_MAX_BYTES_ONE_FULL_RECORD: u64 = TEST_RECORD_LEN * 2 - 1;
 
-#[test]
-fn retired_projection_files_are_removed_without_following_other_paths() {
-    let dir = tempdir().unwrap();
-    let cfg = config(dir.path(), "default");
-    let retired = cfg.namespace_dir().join(RETIRED_PROJECTION_DIR);
-    std::fs::create_dir_all(&retired).unwrap();
-    std::fs::write(retired.join("delta-000001.run"), b"obsolete").unwrap();
-
-    cleanup_retired_projection_dir(&cfg).unwrap();
-
-    assert!(!retired.exists());
-}
-
 fn open_test_index(path: impl AsRef<Path>, cf_prefix: impl AsRef<str>) -> StrataIndex {
     let path = path.as_ref();
     StrataIndex::open_path(path, cf_prefix, path.display().to_string()).unwrap()
