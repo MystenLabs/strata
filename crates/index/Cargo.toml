@@ -21,9 +21,6 @@ lsm.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# Only used by the storage-port compatibility tests, which check that the port reads and
-# writes exactly what the previous wrapper did. Not a dependency of the library itself.
-typed-store.workspace = true
 core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio.workspace = true

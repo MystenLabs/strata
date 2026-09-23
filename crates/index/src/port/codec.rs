@@ -63,23 +63,31 @@ mod tests {
 
     use super::*;
 
-    /// The port must produce byte-identical keys to the encoding the index shipped with, or every
-    /// existing database becomes unreadable. This pins the encoding against typed-store's
-    /// `be_fix_int_ser`, which wrote every key currently on disk.
+    /// The encoding is a durable format, so it is pinned to exact bytes here rather than only
+    /// round-tripped. These vectors were produced by the encoding that wrote every key currently on
+    /// disk; `port-compat` additionally cross-checks them against that implementation directly.
     #[test]
-    fn keys_match_the_encoding_already_on_disk() {
-        fn assert_same<K: Serialize>(key: &K) {
-            let ours = encode_key(key).unwrap();
-            let theirs = typed_store::rocks::be_fix_int_ser(key).unwrap();
-            assert_eq!(ours, theirs);
+    fn keys_encode_to_their_documented_bytes() {
+        fn assert_bytes<K: Serialize>(key: &K, expected: &str) {
+            assert_eq!(hex(&encode_key(key).unwrap()), expected);
         }
 
-        assert_same(&0u64);
-        assert_same(&1u64);
-        assert_same(&u64::MAX);
-        assert_same(&(7u64, 9u64));
-        assert_same(&"lsm-manifest-name".to_owned());
-        assert_same(&(42 as SegmentId, 1234 as StrataLsn));
+        assert_bytes(&0u64, "0000000000000000");
+        assert_bytes(&1u64, "0000000000000001");
+        assert_bytes(&u64::MAX, "ffffffffffffffff");
+        assert_bytes(&(7u64, 9u64), "00000000000000070000000000000009");
+        assert_bytes(
+            &"lsm-manifest-name".to_owned(),
+            "00000000000000116c736d2d6d616e69666573742d6e616d65",
+        );
+        assert_bytes(
+            &(42 as SegmentId, 1234 as StrataLsn),
+            "000000000000002a00000000000004d2",
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     /// Big-endian fixed-width keys must sort numerically under RocksDB's byte comparison, which is

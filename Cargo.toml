@@ -16,14 +16,20 @@ store.workspace = true
 [workspace]
 members = [
     ".",
-    "crates/bench",
     "crates/core",
     "crates/gc",
     "crates/index",
     "crates/lsm",
-    "crates/realistic-bench",
     "crates/segment",
     "crates/store",
+]
+# Each of these is its own workspace. They depend on `typed-store`, which lives inside the
+# MystenLabs/walrus repository, so keeping them out of this workspace keeps that git dependency out
+# of this lockfile: building or testing Strata never fetches walrus.
+exclude = [
+    "crates/bench",
+    "crates/port-compat",
+    "crates/realistic-bench",
 ]
 resolver = "3"
 
@@ -52,5 +58,4 @@ store = { path = "crates/store" }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
-typed-store = { git = "https://github.com/MystenLabs/walrus.git", rev = "0b21e9f546fc1acb8fc7234e62628743e4b6c10f" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

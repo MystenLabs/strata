@@ -1,23 +1,17 @@
-//! Behavioural tests for the storage port.
+//! Behavioural tests for the storage port's own backend.
 //!
-//! The important ones are the compatibility tests: they open one physical database with both the
-//! storage wrapper the index ships with today and the port's own backend, and check that each can
-//! read what the other wrote. If those pass, adopting the port is not a format migration.
+//! Cross-checks against the wrapper the index previously used live in the `port-compat` crate,
+//! which is outside this workspace so that its `typed-store` dependency -- and the walrus git
+//! repository it comes from -- stays out of this lockfile.
 
 use std::sync::Arc;
 
 use core_types::{SegmentId, StrataLsn};
 use tempfile::tempdir;
-use typed_store::{
-    Map as _,
-    rocks::{DBMap, MetricConf, ReadWriteOptions, open_cf_opts},
-};
 
-use super::{
-    IndexDb, RocksBackend, TypedMap, init_typed_store_metrics, options::default_db_options,
-};
+use super::{IndexDb, RocksBackend, TypedMap, options::default_db_options};
 
-const CF: &str = "port_compat";
+const CF: &str = "port_behaviour";
 
 fn open_port(path: &std::path::Path) -> Arc<dyn IndexDb> {
     Arc::new(
@@ -28,67 +22,6 @@ fn open_port(path: &std::path::Path) -> Arc<dyn IndexDb> {
         )
         .unwrap(),
     )
-}
-
-fn open_wrapper(path: &std::path::Path) -> DBMap<SegmentId, StrataLsn> {
-    init_typed_store_metrics();
-    let options = typed_store::rocks::default_db_options().options;
-    let db = open_cf_opts(
-        path,
-        Some(options.clone()),
-        MetricConf::new("port_compat"),
-        &[(CF, options)],
-    )
-    .unwrap();
-    DBMap::reopen_with_class(&db, Some(CF), Some(CF), &ReadWriteOptions::default(), true).unwrap()
-}
-
-// Uses typed-store, whose metrics require a Tokio reactor; the port itself does not.
-#[tokio::test]
-async fn port_reads_rows_written_by_the_current_wrapper() {
-    let dir = tempdir().unwrap();
-    let rows: Vec<(SegmentId, StrataLsn)> = vec![(0, 0), (1, 10), (256, 20), (u64::MAX, 30)];
-
-    {
-        let map = open_wrapper(dir.path());
-        for (key, value) in &rows {
-            map.insert(key, value).unwrap();
-        }
-    }
-
-    let map: TypedMap<SegmentId, StrataLsn> = TypedMap::new(open_port(dir.path()), CF);
-    for (key, value) in &rows {
-        assert_eq!(map.get(key).unwrap(), Some(*value), "key {key}");
-    }
-    // Scan order must still be numeric, which is what the segment and LSN sweeps depend on.
-    assert_eq!(
-        map.safe_iter()
-            .unwrap()
-            .collect::<crate::Result<Vec<_>>>()
-            .unwrap(),
-        rows
-    );
-}
-
-// Uses typed-store, whose metrics require a Tokio reactor; the port itself does not.
-#[tokio::test]
-async fn the_current_wrapper_reads_rows_written_by_the_port() {
-    let dir = tempdir().unwrap();
-    let rows: Vec<(SegmentId, StrataLsn)> = vec![(0, 0), (7, 70), (u64::MAX, 99)];
-
-    {
-        let map: TypedMap<SegmentId, StrataLsn> = TypedMap::new(open_port(dir.path()), CF);
-        let mut batch = map.batch();
-        batch
-            .insert_batch(&map, rows.iter().map(|(key, value)| (key, value)))
-            .unwrap();
-        batch.write_with_sync(true).unwrap();
-    }
-
-    let map = open_wrapper(dir.path());
-    for (key, value) in &rows {
-        assert_eq!(map.get(key).unwrap(), Some(*value), "key {key}");
-    }
 }
 
 #[test]

@@ -1,25 +1,138 @@
-//! Proof that an embedder running its own typed-store RocksDB can host Strata's index.
+//! Compatibility evidence for Strata's storage port.
 //!
-//! This is the walrus integration path written out. `TypedStoreBackend` is the adapter walrus would
-//! own: it wraps an `Arc<typed_store::rocks::RocksDB>` — the same handle walrus already builds its
-//! own `DBMap`s from — and implements [`IndexDb`] by delegating to the `rocksdb` instance inside
-//! it. Strata's column families then live in walrus's database, alongside walrus's own, in one
-//! process with one block cache and one write-ahead log.
+//! This crate is outside the repository's main workspace on purpose. Everything here depends on
+//! `typed-store`, which lives inside the MystenLabs/walrus repository; keeping it out of the main
+//! workspace means building or testing Strata never fetches walrus, while these checks still run in
+//! CI as their own step.
 //!
-//! Nothing here is part of Strata's shipped code. It lives in tests to keep the seam honest: if a
-//! port change makes the adapter impossible to write, this file stops compiling.
+//! Two things are verified:
+//!
+//! * the port reads and writes byte-for-byte what the wrapper the index previously used did, so an
+//!   existing database is still readable, and
+//! * an embedder running its own typed-store RocksDB can host Strata's index, which is the
+//!   integration path that motivated the port.
 
-use std::sync::Arc;
-
+use core_types::{SegmentId, StrataLsn};
+use index::port::{
+    IndexDb, IndexSnapshot, IndexWriteBatch, KeyValue, RocksBackend, TypedMap, codec::encode_key,
+    options::default_db_options,
+};
+use index::{Error, Result, StrataIndex};
 use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, WriteBatch, WriteOptions};
+use serde::Serialize;
+use std::sync::Arc;
 use tempfile::tempdir;
 use typed_store::{
     Map as _,
     rocks::{DBMap, MetricConf, ReadWriteOptions, RocksDB, open_cf_opts},
 };
 
-use super::{IndexDb, IndexSnapshot, IndexWriteBatch, KeyValue, init_typed_store_metrics};
-use crate::{Error, Result, StrataIndex};
+const CF: &str = "port_compat";
+
+/// typed-store's metrics register lazily on first use.
+///
+/// This must be a single shared guard: `DBMetrics::init` constructs its collectors *before* storing
+/// them in its `OnceCell`, so two threads reaching first use concurrently both register against
+/// `prometheus::default_registry()` and the loser panics with `AlreadyReg`.
+fn init_typed_store_metrics() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        typed_store::DBMetrics::get();
+    });
+}
+
+fn open_port(path: &std::path::Path) -> Arc<dyn IndexDb> {
+    Arc::new(
+        RocksBackend::open(
+            path,
+            Some(default_db_options()),
+            &[(CF.to_owned(), default_db_options())],
+        )
+        .unwrap(),
+    )
+}
+
+fn open_wrapper(path: &std::path::Path) -> DBMap<SegmentId, StrataLsn> {
+    init_typed_store_metrics();
+    let options = typed_store::rocks::default_db_options().options;
+    let db = open_cf_opts(
+        path,
+        Some(options.clone()),
+        MetricConf::new("port_compat"),
+        &[(CF, options)],
+    )
+    .unwrap();
+    DBMap::reopen_with_class(&db, Some(CF), Some(CF), &ReadWriteOptions::default(), true).unwrap()
+}
+
+/// The port's key encoding must be byte-identical to the one that wrote every key on disk. The index
+/// crate pins the same vectors as literals; this checks those literals against the real thing.
+#[test]
+fn key_encoding_matches_the_previous_wrapper_exactly() {
+    fn assert_same<K: Serialize>(key: &K) {
+        assert_eq!(
+            encode_key(key).unwrap(),
+            typed_store::rocks::be_fix_int_ser(key).unwrap()
+        );
+    }
+
+    assert_same(&0u64);
+    assert_same(&1u64);
+    assert_same(&u64::MAX);
+    assert_same(&(7u64, 9u64));
+    assert_same(&"lsm-manifest-name".to_owned());
+    assert_same(&(42 as SegmentId, 1234 as StrataLsn));
+}
+
+#[tokio::test]
+async fn port_reads_rows_written_by_the_previous_wrapper() {
+    let dir = tempdir().unwrap();
+    let rows: Vec<(SegmentId, StrataLsn)> = vec![(0, 0), (1, 10), (256, 20), (u64::MAX, 30)];
+
+    {
+        let map = open_wrapper(dir.path());
+        for (key, value) in &rows {
+            map.insert(key, value).unwrap();
+        }
+    }
+
+    let map: TypedMap<SegmentId, StrataLsn> = TypedMap::new(open_port(dir.path()), CF);
+    for (key, value) in &rows {
+        assert_eq!(map.get(key).unwrap(), Some(*value), "key {key}");
+    }
+    // Scan order must still be numeric, which is what the segment and LSN sweeps depend on.
+    assert_eq!(
+        map.safe_iter()
+            .unwrap()
+            .collect::<index::Result<Vec<_>>>()
+            .unwrap(),
+        rows
+    );
+}
+
+#[tokio::test]
+async fn the_previous_wrapper_reads_rows_written_by_the_port() {
+    let dir = tempdir().unwrap();
+    let rows: Vec<(SegmentId, StrataLsn)> = vec![(0, 0), (7, 70), (u64::MAX, 99)];
+
+    {
+        let map: TypedMap<SegmentId, StrataLsn> = TypedMap::new(open_port(dir.path()), CF);
+        let mut batch = map.batch();
+        batch
+            .insert_batch(&map, rows.iter().map(|(key, value)| (key, value)))
+            .unwrap();
+        batch.write_with_sync(true).unwrap();
+    }
+
+    let map = open_wrapper(dir.path());
+    for (key, value) in &rows {
+        assert_eq!(map.get(key).unwrap(), Some(*value), "key {key}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The embedding path: the adapter an embedder owns, and Strata running on top of it.
+// ---------------------------------------------------------------------------------------------
 
 type Raw = DBWithThreadMode<MultiThreaded>;
 

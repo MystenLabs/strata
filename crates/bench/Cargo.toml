@@ -1,9 +1,9 @@
 [package]
 name = "bench"
 version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/walrus-foundation/strata"
 default-run = "bench"
 
 [features]
@@ -21,3 +21,22 @@ segment.workspace = true
 store.workspace = true
 tokio.workspace = true
 typed-store.workspace = true
+
+[workspace]
+# Own workspace: keeps `typed-store` -- and therefore the walrus git dependency it comes from --
+# out of the main workspace's lockfile entirely. See the repository README for how to build these.
+members = ["."]
+resolver = "3"
+
+[workspace.dependencies]
+bcs = "0.1.6"
+libc = "0.2"
+prometheus = "0.14.0"
+rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "multi-threaded-cf", "snappy", "zlib", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_with = "3.20"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
+typed-store = { git = "https://github.com/MystenLabs/walrus.git", rev = "0b21e9f546fc1acb8fc7234e62628743e4b6c10f" }
+core = { path = "../core" }
+segment = { path = "../segment" }
+store = { path = "../store" }

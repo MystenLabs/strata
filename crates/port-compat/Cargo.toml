@@ -1,0 +1,27 @@
+[package]
+name = "port-compat"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/walrus-foundation/strata"
+publish = false
+
+# Deliberately its own workspace, excluded from the repository root. Everything here exists to check
+# Strata's storage port against `typed-store`, which lives inside the MystenLabs/walrus repository.
+# Keeping it out of the main workspace keeps that git dependency out of the main lockfile, so
+# building or testing Strata never fetches walrus, while the compatibility evidence is still run in
+# CI as its own step.
+[workspace]
+members = ["."]
+resolver = "3"
+
+[dependencies]
+
+[dev-dependencies]
+index = { path = "../index" }
+core = { path = "../core" }
+rocksdb = { version = "0.22.0", default-features = false, features = ["lz4", "multi-threaded-cf", "snappy", "zlib", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
+typed-store = { git = "https://github.com/MystenLabs/walrus.git", rev = "0b21e9f546fc1acb8fc7234e62628743e4b6c10f" }
