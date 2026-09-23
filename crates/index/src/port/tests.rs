@@ -13,15 +13,9 @@ use typed_store::{
     rocks::{DBMap, MetricConf, ReadWriteOptions, open_cf_opts},
 };
 
-use super::{IndexDb, RocksBackend, TypedMap, options::default_db_options};
-
-/// typed-store registers RocksDB metrics on a Tokio-backed sampler the first time it is used.
-fn init_typed_store_metrics() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        typed_store::DBMetrics::get();
-    });
-}
+use super::{
+    IndexDb, RocksBackend, TypedMap, init_typed_store_metrics, options::default_db_options,
+};
 
 const CF: &str = "port_compat";
 

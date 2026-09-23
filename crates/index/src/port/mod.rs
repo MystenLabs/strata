@@ -25,7 +25,24 @@ pub mod options;
 pub mod rocks;
 
 #[cfg(test)]
+mod embed_tests;
+#[cfg(test)]
 mod tests;
+
+/// Initializes typed-store's metrics exactly once per process, for the tests that compare against
+/// it.
+///
+/// This has to be a single shared guard rather than one per test module. `DBMetrics::init`
+/// constructs its collectors *before* storing them in its `OnceCell`, so two threads reaching it
+/// concurrently both register against `prometheus::default_registry()` and the loser panics with
+/// `AlreadyReg`. One `Once` serializes the construction.
+#[cfg(test)]
+pub(crate) fn init_typed_store_metrics() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        typed_store::DBMetrics::get();
+    });
+}
 
 use std::fmt::Debug;
 
