@@ -59,8 +59,10 @@ pub(super) const FILE_SUFFIX: &str = ".glog";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GarbageLogPosition {
     /// Zero means no garbage-log frame has been committed yet.
+    #[serde(rename = "l")]
     pub log_id: u64,
     /// Exclusive byte offset of the last committed frame in `log_id`.
+    #[serde(rename = "o")]
     pub offset: u64,
 }
 

@@ -36,7 +36,9 @@ pub enum ShardState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardInfo {
+    #[serde(rename = "g")]
     pub current_generation: ShardGeneration,
+    #[serde(rename = "s")]
     pub state: ShardState,
 }
 
@@ -66,7 +68,9 @@ impl ShardInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ShardKey {
+    #[serde(rename = "i")]
     pub id: ShardId,
+    #[serde(rename = "g")]
     pub generation: ShardGeneration,
 }
 
@@ -81,7 +85,10 @@ pub enum ShardCleanupState {
 /// Durable progress for asynchronously reclaiming one dropped shard generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardCleanupJob {
+    #[serde(rename = "sh")]
     pub shard: ShardKey,
+    #[serde(rename = "dl")]
     pub drop_lsn: StrataLsn,
+    #[serde(rename = "st")]
     pub state: ShardCleanupState,
 }
