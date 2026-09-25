@@ -11,7 +11,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::Result;
 
 use super::{
-    IndexDb, IndexSnapshot, IndexWriteBatch,
+    IndexDb, IndexSnapshot, IndexWriteBatch, RowCursor,
     codec::{decode_key, decode_value, encode_key, encode_value},
 };
 
@@ -105,11 +105,11 @@ where
     /// Scans the whole family in key order.
     ///
     /// Keys sort numerically because [`encode_key`] is big-endian and fixed-width.
+    ///
+    /// Decoding happens straight from the bytes the backend holds, so a scan allocates only what
+    /// `K` and `V` themselves need.
     pub fn safe_iter(&self) -> Result<impl Iterator<Item = Result<(K, V)>> + '_> {
-        Ok(self.db.iter(&self.cf)?.map(|row| {
-            let (key, value) = row?;
-            Ok((decode_key(&key)?, decode_value(&value)?))
-        }))
+        Ok(RowIter::new(self.db.scan(&self.cf)?))
     }
 
     /// Scans the whole family in key order, as of a captured snapshot.
@@ -117,15 +117,61 @@ where
         &'a self,
         snapshot: &'a dyn IndexSnapshot,
     ) -> Result<impl Iterator<Item = Result<(K, V)>> + 'a> {
-        Ok(snapshot.iter(&self.cf)?.map(|row| {
-            let (key, value) = row?;
-            Ok((decode_key(&key)?, decode_value(&value)?))
-        }))
+        Ok(RowIter::new(snapshot.scan(&self.cf)?))
     }
 
     /// Reports whether the family holds no rows.
     pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.db.iter(&self.cf)?.next().is_none())
+        Ok(!self.db.scan(&self.cf)?.next_row()?)
+    }
+}
+
+/// Presents a [`RowCursor`] as an ordinary iterator of decoded rows.
+///
+/// This is where the cursor's split between advancing and reading is hidden again, so call sites
+/// keep using `for`, `filter_map` and `collect` as before.
+struct RowIter<'a, K, V> {
+    cursor: Box<dyn RowCursor + 'a>,
+    finished: bool,
+    _marker: PhantomData<fn() -> (K, V)>,
+}
+
+impl<'a, K, V> RowIter<'a, K, V> {
+    fn new(cursor: Box<dyn RowCursor + 'a>) -> Self {
+        Self {
+            cursor,
+            finished: false,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<K, V> Iterator for RowIter<'_, K, V>
+where
+    K: DeserializeOwned,
+    V: DeserializeOwned,
+{
+    type Item = Result<(K, V)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        match self.cursor.next_row() {
+            Ok(true) => {
+                let (key, value) = self.cursor.row();
+                Some(decode_key(key).and_then(|key| decode_value(value).map(|value| (key, value))))
+            }
+            Ok(false) => {
+                self.finished = true;
+                None
+            }
+            // A failed advance ends the scan; reporting it once avoids looping on the error.
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
     }
 }
 

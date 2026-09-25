@@ -3,13 +3,13 @@
 use std::{path::Path, sync::Arc};
 
 use rocksdb::{
-    BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded,
-    WriteBatch, WriteOptions,
+    BoundColumnFamily, ColumnFamilyDescriptor, DBAccess, DBRawIteratorWithThreadMode,
+    DBWithThreadMode, MultiThreaded, ReadOptions, WriteBatch, WriteOptions,
 };
 
 use crate::{Error, Result};
 
-use super::{IndexDb, IndexSnapshot, IndexWriteBatch, KeyValue, options::default_db_options};
+use super::{IndexDb, IndexSnapshot, IndexWriteBatch, RowCursor, options::default_db_options};
 
 type Db = DBWithThreadMode<MultiThreaded>;
 
@@ -135,15 +135,13 @@ impl IndexDb for RocksBackend {
             .map_err(rocks_error)
     }
 
-    fn iter<'a>(&'a self, cf: &str) -> Result<Box<dyn Iterator<Item = Result<KeyValue>> + 'a>> {
-        // `iterator_cf` only borrows the handle for the call itself; the returned iterator borrows
-        // the database, so the scan stays lazy and never materializes the whole family.
+    fn scan<'a>(&'a self, cf: &str) -> Result<Box<dyn RowCursor + 'a>> {
+        // `raw_iterator_cf_opt` hands back the bytes RocksDB already holds. The higher-level
+        // `iterator_cf` boxes both key and value on every row, which is two allocations per row
+        // before anything is even decoded.
         let handle = cf_handle(&self.db, cf)?;
-        let iter = self.db.iterator_cf(&handle, IteratorMode::Start);
-        Ok(Box::new(iter.map(|row| {
-            row.map(|(key, value)| (key.to_vec(), value.to_vec()))
-                .map_err(rocks_error)
-        })))
+        let iter = self.db.raw_iterator_cf_opt(&handle, ReadOptions::default());
+        Ok(Box::new(RawCursor::new(iter)))
     }
 
     fn snapshot<'a>(&'a self) -> Result<Box<dyn IndexSnapshot + 'a>> {
@@ -179,13 +177,12 @@ struct RocksSnapshot<'a> {
 }
 
 impl IndexSnapshot for RocksSnapshot<'_> {
-    fn iter<'a>(&'a self, cf: &str) -> Result<Box<dyn Iterator<Item = Result<KeyValue>> + 'a>> {
+    fn scan<'a>(&'a self, cf: &str) -> Result<Box<dyn RowCursor + 'a>> {
         let handle = cf_handle(self.db, cf)?;
-        let iter = self.snapshot.iterator_cf(&handle, IteratorMode::Start);
-        Ok(Box::new(iter.map(|row| {
-            row.map(|(key, value)| (key.to_vec(), value.to_vec()))
-                .map_err(rocks_error)
-        })))
+        let iter = self
+            .snapshot
+            .raw_iterator_cf_opt(&handle, ReadOptions::default());
+        Ok(Box::new(RawCursor::new(iter)))
     }
 
     fn get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -230,6 +227,47 @@ impl IndexWriteBatch for RocksWriteBatch {
         self.db
             .write_opt(self.batch, &write_options(sync))
             .map_err(rocks_error)
+    }
+}
+
+/// Wraps a RocksDB raw iterator as a [`RowCursor`].
+///
+/// The first advance seeks to the first key; later ones step forward. A raw iterator reports
+/// exhaustion and I/O failure the same way -- by going invalid -- so `status` distinguishes them.
+struct RawCursor<'a, D: DBAccess> {
+    iter: DBRawIteratorWithThreadMode<'a, D>,
+    started: bool,
+}
+
+impl<'a, D: DBAccess> RawCursor<'a, D> {
+    fn new(iter: DBRawIteratorWithThreadMode<'a, D>) -> Self {
+        Self {
+            iter,
+            started: false,
+        }
+    }
+}
+
+impl<D: DBAccess> RowCursor for RawCursor<'_, D> {
+    fn next_row(&mut self) -> Result<bool> {
+        if self.started {
+            self.iter.next();
+        } else {
+            self.iter.seek_to_first();
+            self.started = true;
+        }
+        if self.iter.valid() {
+            return Ok(true);
+        }
+        self.iter.status().map_err(rocks_error)?;
+        Ok(false)
+    }
+
+    fn row(&self) -> (&[u8], &[u8]) {
+        (
+            self.iter.key().unwrap_or_default(),
+            self.iter.value().unwrap_or_default(),
+        )
     }
 }
 
