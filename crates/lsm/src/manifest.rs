@@ -10,12 +10,19 @@ use crate::{Error, FORMAT_VERSION, Result, StrataLsn, table::validate_relative_p
 /// Metadata for one immutable SST file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableMeta {
+    #[serde(rename = "i")]
     pub id: u64,
+    #[serde(rename = "pt")]
     pub partition: u32,
+    #[serde(rename = "rp")]
     pub relative_path: String,
+    #[serde(rename = "fk")]
     pub first_key: Vec<u8>,
+    #[serde(rename = "lk")]
     pub last_key: Vec<u8>,
+    #[serde(rename = "ml")]
     pub min_lsn: Option<StrataLsn>,
+    #[serde(rename = "xl")]
     pub max_lsn: Option<StrataLsn>,
     /// Highest external LSN whose merge-time global state was applied to every row in this base.
     ///
@@ -25,6 +32,7 @@ pub struct TableMeta {
     /// considered for every key in the table. The field is manifest-only; it describes how the
     /// table was produced and is not part of the immutable SST byte format.
     #[serde(default)]
+    #[serde(rename = "ma")]
     pub merge_applied_through_lsn: Option<StrataLsn>,
     /// Lowest LSN of an operand in this patch whose merge outcome depends on global state.
     ///
@@ -35,9 +43,13 @@ pub struct TableMeta {
     /// and patches whose writer did not classify operands report `Unknown`, which is treated as the
     /// table's `min_lsn`.
     #[serde(default)]
+    #[serde(rename = "gf")]
     pub global_operand_floor: OperandFloor,
+    #[serde(rename = "rc")]
     pub record_count: u64,
+    #[serde(rename = "fl")]
     pub file_len: u64,
+    #[serde(rename = "ck")]
     pub checksum: [u8; 32],
 }
 
@@ -82,26 +94,37 @@ impl OperandFloor {
 /// by each record's `StrataLsn`, never by their order in this vector.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PartitionManifest {
+    #[serde(rename = "b")]
     pub base: Vec<TableMeta>,
+    #[serde(rename = "p")]
     pub patches: Vec<TableMeta>,
 }
 
 /// Materialized live SST set for one LSM instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    #[serde(rename = "fv")]
     pub format_version: u32,
+    #[serde(rename = "g")]
     pub generation: u64,
     /// Identifies the complete logical meaning of this LSM, including base bytes and merge policy.
+    #[serde(rename = "si")]
     pub schema_id: String,
     /// Identifies key bytes, patch bytes, and partitioning as one adoption-compatibility contract.
+    #[serde(rename = "pf")]
     pub patch_format_id: String,
+    #[serde(rename = "pc")]
     pub partition_count: u32,
+    #[serde(rename = "nt")]
     pub next_table_id: u64,
     /// Highest contiguous caller LSN fully represented by this manifest.
+    #[serde(rename = "mt")]
     pub materialized_through: Option<StrataLsn>,
     /// Legacy store-WAL retention field, kept so existing manifests remain readable.
     /// New stores persist this boundary as store state in RocksDB; the LSM does not update it.
+    #[serde(rename = "wr")]
     pub wal_retained_from: u64,
+    #[serde(rename = "ps")]
     pub partitions: BTreeMap<u32, PartitionManifest>,
 }
 
@@ -112,12 +135,17 @@ pub struct Manifest {
 /// the original manifest is left unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEdit {
+    #[serde(rename = "rm")]
     pub remove: Vec<String>,
+    #[serde(rename = "ab")]
     pub add_base: Vec<TableMeta>,
+    #[serde(rename = "ap")]
     pub add_patches: Vec<TableMeta>,
     /// Advances the contiguous caller-LSN prefix represented by the resulting manifest.
+    #[serde(rename = "mt")]
     pub materialized_through: Option<StrataLsn>,
     /// Advances the first caller-log file required by recovery.
+    #[serde(rename = "wr")]
     pub wal_retained_from: Option<u64>,
 }
 

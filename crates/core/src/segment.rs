@@ -114,27 +114,38 @@ pub struct SegmentGcLiveRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SegmentGcSummary {
     /// Total encoded bytes represented for this segment by the GC overlay fold.
+    #[serde(rename = "tb")]
     pub total_bytes: u64,
     /// Bytes currently protected by live refs.
+    #[serde(rename = "lb")]
     pub live_bytes: u64,
     /// Bytes permanently retired by overwrite, tombstone, shard drop, or completed relocation.
+    #[serde(rename = "rb")]
     pub retired_bytes: u64,
     /// Bytes whose lifecycle has ended and are collectable unless already permanently retired.
+    #[serde(rename = "eb")]
     pub expired_bytes: u64,
     /// Number of currently live physical refs in this segment.
+    #[serde(rename = "lr")]
     pub live_ref_count: u64,
     /// Live bytes without a known end epoch, routed to spillover by default.
+    #[serde(rename = "ub")]
     pub unknown_lifetime_bytes: u64,
     /// Number of live refs without a known end epoch.
+    #[serde(rename = "ur")]
     pub unknown_lifetime_ref_count: u64,
     /// Earliest end epoch among live refs with known lifetimes.
+    #[serde(rename = "mn")]
     pub min_live_end_epoch: Option<Epoch>,
     /// Latest end epoch among live refs with known lifetimes.
+    #[serde(rename = "mx")]
     pub max_live_end_epoch: Option<Epoch>,
     /// Live bytes and ref counts grouped by logical end epoch for placement planning.
+    #[serde(rename = "fh")]
     pub future_epoch_histogram: BTreeMap<Epoch, EpochBucket>,
     /// Extension counts of refs added live to this segment. Refs stay in their bucket after they
     /// expire: per-epoch extension counts are not tracked, so expiry sweeps cannot remove them.
+    #[serde(rename = "xh")]
     pub extension_count_histogram: BTreeMap<u32, u64>,
 }
 
@@ -144,15 +155,25 @@ pub struct SegmentGcSummary {
 /// references out of their previous state; positive values move them into their new state.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SegmentGcSummaryDelta {
+    #[serde(rename = "tb")]
     pub total_bytes: i128,
+    #[serde(rename = "lb")]
     pub live_bytes: i128,
+    #[serde(rename = "rb")]
     pub retired_bytes: i128,
+    #[serde(rename = "eb")]
     pub expired_bytes: i128,
+    #[serde(rename = "lr")]
     pub live_ref_count: i128,
+    #[serde(rename = "ub")]
     pub unknown_lifetime_bytes: i128,
+    #[serde(rename = "ur")]
     pub unknown_lifetime_ref_count: i128,
+    #[serde(rename = "eby")]
     pub epoch_bytes: BTreeMap<Epoch, i128>,
+    #[serde(rename = "erf")]
     pub epoch_refs: BTreeMap<Epoch, i128>,
+    #[serde(rename = "xc")]
     pub extension_counts: BTreeMap<u32, i128>,
 }
 
@@ -784,27 +805,42 @@ pub enum SegmentFileState {
 /// Durable metadata for one segment file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentState {
+    #[serde(rename = "ow")]
     pub owner: SegmentOwner,
+    #[serde(rename = "sid")]
     pub segment_id: SegmentId,
+    #[serde(rename = "vid")]
     pub volume_id: VolumeId,
+    #[serde(rename = "p")]
     pub path: String,
+    #[serde(rename = "pc")]
     pub placement_class: PlacementClass,
+    #[serde(rename = "st")]
     pub state: SegmentFileState,
+    #[serde(rename = "wo")]
     pub write_offset: u64,
+    #[serde(rename = "do")]
     pub durable_offset: u64,
+    #[serde(rename = "ml")]
     pub min_lsn: Option<StrataLsn>,
+    #[serde(rename = "xl")]
     pub max_lsn: Option<StrataLsn>,
     /// Exclusive logical checkpoint boundary assigned when an ingest segment is rolled over.
+    #[serde(rename = "sb")]
     pub sealed_before_lsn: Option<StrataLsn>,
+    #[serde(rename = "sl")]
     pub sealed_len: Option<u64>,
     /// SHA-256 digest of the sealed bytes, present only after the segment is finalized.
+    #[serde(rename = "sh")]
     pub sealed_sha256: Option<[u8; 32]>,
 }
 
 /// Live refs and bytes in one segment that expire at one logical end epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EpochBucket {
+    #[serde(rename = "r")]
     pub refs: u64,
+    #[serde(rename = "b")]
     pub bytes: u64,
 }
 
