@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
 
-use crate::port::{map::IndexBatch, options::default_db_options};
+use crate::port::{
+    codec::{decode_in_merge, encode_in_merge, encode_value},
+    map::IndexBatch,
+    options::default_db_options,
+};
 use core_types::{SegmentGcSummary, SegmentGcSummaryDelta, SegmentId};
 use rocksdb::MergeOperands;
 
-use crate::{Error, Result, StrataIndex};
+use crate::{Result, StrataIndex};
 
 impl StrataIndex {
     pub fn get_segment_gc_summary(
@@ -33,8 +37,7 @@ impl StrataIndex {
         if delta == &SegmentGcSummaryDelta::default() {
             return Ok(());
         }
-        let operand =
-            bcs::to_bytes(delta).map_err(|error| Error::Serialization(error.to_string()))?;
+        let operand = encode_value(delta)?;
         batch.partial_merge_batch(self.segment_gc_summaries(), [(&segment_id, operand)])?;
         Ok(())
     }
@@ -43,9 +46,9 @@ impl StrataIndex {
 pub(crate) fn segment_gc_summaries_cf_options() -> rocksdb::Options {
     let mut options = default_db_options();
     options.set_merge_operator(
-        "strata-segment-gc-summary-merge",
-        |_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands| {
-            merge_segment_gc_summary(existing, operands)
+        GC_SUMMARY_MERGE,
+        |key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands| {
+            merge_segment_gc_summary(key, existing, operands)
         },
         // Combining signed deltas is an optional optimization. Keeping operands separate makes the
         // initial implementation and its overflow behavior easier to audit.
@@ -54,16 +57,33 @@ pub(crate) fn segment_gc_summaries_cf_options() -> rocksdb::Options {
     options
 }
 
-fn merge_segment_gc_summary(existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+/// Name reported in panic messages, and the operator name RocksDB records.
+const GC_SUMMARY_MERGE: &str = "strata-segment-gc-summary-merge";
+
+/// Folds signed deltas into a segment's GC summary.
+///
+/// Decode failures crash the process rather than returning `None`; see
+/// [`crate::port::codec::decode_in_merge`] for why silence is the worse option there. Arithmetic
+/// failures are different and still return `None`, because an un-appliable delta is a defined
+/// outcome rather than a corrupt input.
+fn merge_segment_gc_summary(
+    key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
     let mut summary = match existing {
-        Some(bytes) => bcs::from_bytes::<SegmentGcSummary>(bytes).ok()?,
+        Some(bytes) => decode_in_merge::<SegmentGcSummary>(GC_SUMMARY_MERGE, key, bytes),
         None => SegmentGcSummary::default(),
     };
     for operand in operands {
-        let delta = bcs::from_bytes::<SegmentGcSummaryDelta>(operand).ok()?;
+        let delta = decode_in_merge::<SegmentGcSummaryDelta>(GC_SUMMARY_MERGE, key, operand);
+        // Unlike a decode failure, an arithmetic overflow here is an expected outcome with defined
+        // behaviour: a delta from an abandoned batch can legitimately fail to apply, and the merge
+        // is meant to fail rather than crash. See the abandoned-batch case in
+        // `tests/segment_gc_summary.rs`.
         apply_segment_gc_summary_delta(&mut summary, &delta)?;
     }
-    bcs::to_bytes(&summary).ok()
+    Some(encode_in_merge(GC_SUMMARY_MERGE, key, &summary))
 }
 
 pub(crate) fn apply_segment_gc_summary_delta(

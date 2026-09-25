@@ -57,6 +57,58 @@ where
     bcs::from_bytes(bytes).map_err(|error| Error::Serialization(error.to_string()))
 }
 
+/// Decodes a value inside a RocksDB merge operator, crashing the process if it cannot.
+///
+/// A merge operator has nowhere to report an error. Returning `None` tells RocksDB the merge
+/// failed, which leaves the key unreadable and shows up later as corruption rather than at the
+/// point of failure, and it runs where no caller can see it. For Strata these values are GC
+/// accounting: silently wrong accounting risks reclaiming live data, so the safe outcome is to stop.
+///
+/// Reaching this means the stored bytes are corrupt or a writer bypassed the publication contract.
+///
+/// Note this **aborts rather than unwinds**. The callback RocksDB calls is `extern "C"`, so the
+/// panic is non-unwinding: the hook prints this message and a backtrace, then the process aborts
+/// without running destructors. That message is the whole forensic record, which is why it carries
+/// the operator, the key and the byte length.
+///
+/// The merge can be driven by a read as well as by compaction, so a poisoned key takes the process
+/// down on the next read of it, repeatedly, until the data is removed. That is intended: a crash
+/// loop on one key is a better failure than quietly serving accounting that deletes live blobs.
+pub fn decode_in_merge<V>(operator: &str, key: &[u8], bytes: &[u8]) -> V
+where
+    V: DeserializeOwned,
+{
+    match decode_value(bytes) {
+        Ok(value) => value,
+        Err(error) => panic!(
+            "{operator}: cannot decode {} bytes for key {}: {error}",
+            bytes.len(),
+            key_hex(key),
+        ),
+    }
+}
+
+/// Encodes a value inside a RocksDB merge operator, crashing the process if it cannot.
+///
+/// See [`decode_in_merge`] for why this cannot return an error.
+pub fn encode_in_merge<V>(operator: &str, key: &[u8], value: &V) -> Vec<u8>
+where
+    V: ?Sized + Serialize,
+{
+    match encode_value(value) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!(
+            "{operator}: cannot encode the merged value for key {}: {error}",
+            key_hex(key)
+        ),
+    }
+}
+
+/// Renders a key for a panic message. Keys are binary, so they are not printable as text.
+pub(crate) fn key_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use core_types::{SegmentId, StrataLsn};

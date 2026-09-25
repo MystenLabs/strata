@@ -1,5 +1,6 @@
 use std::sync::MutexGuard;
 
+use crate::port::codec::{decode_in_merge, encode_in_merge};
 use crate::port::{map::IndexBatch, options::default_db_options};
 use lsm::{GarbageLogPosition, Manifest, ManifestEdit};
 use rocksdb::MergeOperands;
@@ -106,9 +107,9 @@ impl StrataIndex {
 pub(crate) fn lsm_manifests_cf_options() -> rocksdb::Options {
     let mut options = default_db_options();
     options.set_merge_operator(
-        "strata-lsm-manifest-merge",
-        |_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands| {
-            merge_manifest(existing, operands)
+        MANIFEST_MERGE,
+        |key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands| {
+            merge_manifest(key, existing, operands)
         },
         // Applying an edit requires the current live file set. Leaving operands separate keeps
         // partial merge from accidentally accepting a removal it cannot validate.
@@ -117,15 +118,30 @@ pub(crate) fn lsm_manifests_cf_options() -> rocksdb::Options {
     options
 }
 
-fn merge_manifest(existing: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
-    // Public writes validate against the live manifest first. Failure here therefore means stored
-    // bytes are corrupt or a caller bypassed the reservation/publication contract.
-    let mut manifest = bcs::from_bytes::<Manifest>(existing?).ok()?;
+/// Name reported in panic messages, and the operator name RocksDB records.
+const MANIFEST_MERGE: &str = "strata-lsm-manifest-merge";
+
+/// Applies manifest edits to the stored manifest.
+///
+/// No current writer produces manifest operands -- both publication paths write the manifest whole
+/// -- so this runs only for operand chains left by an older writer. Decode failures crash; see
+/// [`crate::port::codec::decode_in_merge`]. Everything else fails the merge as before.
+fn merge_manifest(
+    key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    // An edit cannot be applied without the live file set to validate it against. This is a
+    // deliberate merge failure rather than a decode failure, and it is preserved as-is.
+    let existing = existing?;
+    let mut manifest = decode_in_merge::<Manifest>(MANIFEST_MERGE, key, existing);
     for operand in operands {
-        let edit = bcs::from_bytes::<ManifestEdit>(operand).ok()?;
+        let edit = decode_in_merge::<ManifestEdit>(MANIFEST_MERGE, key, operand);
+        // A rejected edit is a defined outcome, not a corrupt input, so it fails the merge rather
+        // than crashing -- the same distinction as the GC summary operator.
         manifest.apply(&edit).ok()?;
     }
-    bcs::to_bytes(&manifest).ok()
+    Some(encode_in_merge(MANIFEST_MERGE, key, &manifest))
 }
 
 fn validate_name(name: &str) -> Result<()> {
