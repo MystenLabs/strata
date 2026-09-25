@@ -14,11 +14,14 @@
 
 use core_types::{SegmentId, StrataLsn};
 use index::port::{
-    IndexDb, IndexSnapshot, IndexWriteBatch, KeyValue, RocksBackend, TypedMap, codec::encode_key,
+    IndexDb, IndexSnapshot, IndexWriteBatch, RocksBackend, RowCursor, TypedMap, codec::encode_key,
     options::default_db_options,
 };
 use index::{Error, Result, StrataIndex};
-use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, WriteBatch, WriteOptions};
+use rocksdb::{
+    DBAccess, DBRawIteratorWithThreadMode, DBWithThreadMode, MultiThreaded, ReadOptions, WriteBatch,
+    WriteOptions,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -181,13 +184,10 @@ impl IndexDb for TypedStoreBackend {
         db.delete_cf(&cf(db, name)?, key).map_err(err)
     }
 
-    fn iter<'a>(&'a self, name: &str) -> Result<Box<dyn Iterator<Item = Result<KeyValue>> + 'a>> {
+    fn scan<'a>(&'a self, name: &str) -> Result<Box<dyn RowCursor + 'a>> {
         let db = raw(&self.0)?;
-        let iter = db.iterator_cf(&cf(db, name)?, IteratorMode::Start);
-        Ok(Box::new(iter.map(|row| {
-            row.map(|(key, value)| (key.to_vec(), value.to_vec()))
-                .map_err(err)
-        })))
+        let iter = db.raw_iterator_cf_opt(&cf(db, name)?, ReadOptions::default());
+        Ok(Box::new(Cursor::new(iter)))
     }
 
     fn snapshot<'a>(&'a self) -> Result<Box<dyn IndexSnapshot + 'a>> {
@@ -213,10 +213,6 @@ impl IndexDb for TypedStoreBackend {
         raw(&self.0)?.create_cf(name, options).map_err(err)
     }
 
-    fn drop_cf(&self, name: &str) -> Result<()> {
-        raw(&self.0)?.drop_cf(name).map_err(err)
-    }
-
     fn flush_wal(&self, sync: bool) -> Result<()> {
         raw(&self.0)?.flush_wal(sync).map_err(err)
     }
@@ -236,14 +232,49 @@ impl IndexSnapshot for Snapshot<'_> {
             .map(|value| value.to_vec()))
     }
 
-    fn iter<'a>(&'a self, name: &str) -> Result<Box<dyn Iterator<Item = Result<KeyValue>> + 'a>> {
+    fn scan<'a>(&'a self, name: &str) -> Result<Box<dyn RowCursor + 'a>> {
         let iter = self
             .snapshot
-            .iterator_cf(&cf(self.db, name)?, IteratorMode::Start);
-        Ok(Box::new(iter.map(|row| {
-            row.map(|(key, value)| (key.to_vec(), value.to_vec()))
-                .map_err(err)
-        })))
+            .raw_iterator_cf_opt(&cf(self.db, name)?, ReadOptions::default());
+        Ok(Box::new(Cursor::new(iter)))
+    }
+}
+
+/// The adapter's own [`RowCursor`], over a RocksDB raw iterator.
+struct Cursor<'a, D: DBAccess> {
+    iter: DBRawIteratorWithThreadMode<'a, D>,
+    started: bool,
+}
+
+impl<'a, D: DBAccess> Cursor<'a, D> {
+    fn new(iter: DBRawIteratorWithThreadMode<'a, D>) -> Self {
+        Self {
+            iter,
+            started: false,
+        }
+    }
+}
+
+impl<D: DBAccess> RowCursor for Cursor<'_, D> {
+    fn next_row(&mut self) -> Result<bool> {
+        if self.started {
+            self.iter.next();
+        } else {
+            self.iter.seek_to_first();
+            self.started = true;
+        }
+        if self.iter.valid() {
+            return Ok(true);
+        }
+        self.iter.status().map_err(err)?;
+        Ok(false)
+    }
+
+    fn row(&self) -> (&[u8], &[u8]) {
+        (
+            self.iter.key().unwrap_or_default(),
+            self.iter.value().unwrap_or_default(),
+        )
     }
 }
 

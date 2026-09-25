@@ -55,7 +55,7 @@ pub trait IndexDb: Send + Sync + Debug {
     ///
     /// The index only ever performs whole-family forward scans, so the port does not carry the
     /// bounded and reversed iterator variants.
-    fn iter<'a>(&'a self, cf: &str) -> Result<Box<dyn Iterator<Item = Result<KeyValue>> + 'a>>;
+    fn scan<'a>(&'a self, cf: &str) -> Result<Box<dyn RowCursor + 'a>>;
 
     /// Captures a read snapshot for read-your-writes batches.
     fn snapshot<'a>(&'a self) -> Result<Box<dyn IndexSnapshot + 'a>>;
@@ -75,8 +75,26 @@ pub trait IndexDb: Send + Sync + Debug {
     fn flush_wal(&self, sync: bool) -> Result<()>;
 }
 
-/// An owned key/value pair produced by [`IndexDb::iter`].
-pub type KeyValue = (Vec<u8>, Vec<u8>);
+/// A forward cursor over one column family.
+///
+/// This is a lending cursor rather than an [`Iterator`] on purpose. `Iterator` cannot yield items
+/// that borrow from the iterator itself, so an `Iterator`-shaped port would have to hand out owned
+/// `Vec`s — one allocation per key and per value, on every row of every scan. Splitting "advance"
+/// from "look at the current row" lets a backend expose the bytes RocksDB already holds, and keeps
+/// the trait object-safe.
+///
+/// [`TypedMap::safe_iter`] wraps this back up as a normal iterator of decoded rows, so callers
+/// never see the split.
+pub trait RowCursor {
+    /// Advances to the next row, returning `false` once the scan is exhausted.
+    fn next_row(&mut self) -> Result<bool>;
+
+    /// The key and value of the row the cursor is on.
+    ///
+    /// Only meaningful after [`RowCursor::next_row`] returned `true`; the borrow ends at the next
+    /// advance.
+    fn row(&self) -> (&[u8], &[u8]);
+}
 
 /// A point-in-time read view, used to give write batches read-your-writes semantics.
 pub trait IndexSnapshot: Send {
@@ -88,7 +106,7 @@ pub trait IndexSnapshot: Send {
     /// GC planning reads several families plus the epoch history and must see one consistent
     /// view across all of them, so snapshot-consistent scans are part of the port rather than a
     /// convenience layered on top of it.
-    fn iter<'a>(&'a self, cf: &str) -> Result<Box<dyn Iterator<Item = Result<KeyValue>> + 'a>>;
+    fn scan<'a>(&'a self, cf: &str) -> Result<Box<dyn RowCursor + 'a>>;
 }
 
 /// An atomic write batch.
