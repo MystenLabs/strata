@@ -7,7 +7,13 @@
 //! * Keys use bincode with **big-endian, fixed-width integers**. Big-endian matters: RocksDB
 //!   compares keys as byte strings, so only a big-endian fixed-width encoding makes numeric key
 //!   order agree with iteration order. Segment IDs and LSNs are scanned in order and depend on it.
-//! * Values use BCS, which is canonical and already Strata's encoding for records elsewhere.
+//! * Values use MessagePack with **named fields**. Field identity travels with the data, so a value
+//!   type can gain or lose a field without orphaning rows already written: an unknown key is
+//!   ignored on read, and a missing one falls back to `#[serde(default)]`. The previous encoding,
+//!   BCS, is positional, so adding a single field made every stored row undecodable.
+//!
+//! Every new field on a value type therefore needs `#[serde(default)]`, or reads of older rows fail
+//! with `missing field`.
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -46,7 +52,9 @@ pub fn encode_value<V>(value: &V) -> Result<Vec<u8>>
 where
     V: ?Sized + Serialize,
 {
-    bcs::to_bytes(value).map_err(|error| Error::Serialization(error.to_string()))
+    // `to_vec_named` rather than `to_vec`: the latter writes a positional array, which would give
+    // back exactly the brittleness this encoding exists to avoid.
+    rmp_serde::to_vec_named(value).map_err(|error| Error::Serialization(error.to_string()))
 }
 
 /// Decodes a value written by [`encode_value`].
@@ -54,7 +62,7 @@ pub fn decode_value<V>(bytes: &[u8]) -> Result<V>
 where
     V: DeserializeOwned,
 {
-    bcs::from_bytes(bytes).map_err(|error| Error::Serialization(error.to_string()))
+    rmp_serde::from_slice(bytes).map_err(|error| Error::Serialization(error.to_string()))
 }
 
 /// Decodes a value inside a RocksDB merge operator, crashing the process if it cannot.

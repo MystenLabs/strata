@@ -7,14 +7,19 @@
 //!
 //! Two things are verified:
 //!
-//! * the port reads and writes byte-for-byte what the wrapper the index previously used did, so an
-//!   existing database is still readable, and
+//! * index **keys** are byte-for-byte what the wrapper the index previously used wrote. Keys are
+//!   bincode with big-endian fixed-width integers, and that has to stay true for RocksDB's
+//!   byte-wise ordering to match numeric ordering.
 //! * an embedder running its own typed-store RocksDB can host Strata's index, which is the
 //!   integration path that motivated the port.
+//!
+//! **Values** deliberately no longer match. They moved to MessagePack with named fields so a value
+//! type can gain a field without orphaning stored rows, which BCS could not do. Value encoding is
+//! covered by `crates/index/tests/value_wire_format.rs` instead.
 
 use core_types::{SegmentId, StrataLsn};
 use index::port::{
-    IndexDb, IndexSnapshot, IndexWriteBatch, RocksBackend, RowCursor, TypedMap, codec::encode_key,
+    IndexDb, IndexSnapshot, IndexWriteBatch, RocksBackend, RowCursor, codec::encode_key,
     options::default_db_options,
 };
 use index::{Error, Result, StrataIndex};
@@ -55,19 +60,6 @@ fn open_port(path: &std::path::Path) -> Arc<dyn IndexDb> {
     )
 }
 
-fn open_wrapper(path: &std::path::Path) -> DBMap<SegmentId, StrataLsn> {
-    init_typed_store_metrics();
-    let options = typed_store::rocks::default_db_options().options;
-    let db = open_cf_opts(
-        path,
-        Some(options.clone()),
-        MetricConf::new("port_compat"),
-        &[(CF, options)],
-    )
-    .unwrap();
-    DBMap::reopen_with_class(&db, Some(CF), Some(CF), &ReadWriteOptions::default(), true).unwrap()
-}
-
 /// The port's key encoding must be byte-identical to the one that wrote every key on disk. The index
 /// crate pins the same vectors as literals; this checks those literals against the real thing.
 #[test]
@@ -85,52 +77,6 @@ fn key_encoding_matches_the_previous_wrapper_exactly() {
     assert_same(&(7u64, 9u64));
     assert_same(&"lsm-manifest-name".to_owned());
     assert_same(&(42 as SegmentId, 1234 as StrataLsn));
-}
-
-#[tokio::test]
-async fn port_reads_rows_written_by_the_previous_wrapper() {
-    let dir = tempdir().unwrap();
-    let rows: Vec<(SegmentId, StrataLsn)> = vec![(0, 0), (1, 10), (256, 20), (u64::MAX, 30)];
-
-    {
-        let map = open_wrapper(dir.path());
-        for (key, value) in &rows {
-            map.insert(key, value).unwrap();
-        }
-    }
-
-    let map: TypedMap<SegmentId, StrataLsn> = TypedMap::new(open_port(dir.path()), CF);
-    for (key, value) in &rows {
-        assert_eq!(map.get(key).unwrap(), Some(*value), "key {key}");
-    }
-    // Scan order must still be numeric, which is what the segment and LSN sweeps depend on.
-    assert_eq!(
-        map.safe_iter()
-            .unwrap()
-            .collect::<index::Result<Vec<_>>>()
-            .unwrap(),
-        rows
-    );
-}
-
-#[tokio::test]
-async fn the_previous_wrapper_reads_rows_written_by_the_port() {
-    let dir = tempdir().unwrap();
-    let rows: Vec<(SegmentId, StrataLsn)> = vec![(0, 0), (7, 70), (u64::MAX, 99)];
-
-    {
-        let map: TypedMap<SegmentId, StrataLsn> = TypedMap::new(open_port(dir.path()), CF);
-        let mut batch = map.batch();
-        batch
-            .insert_batch(&map, rows.iter().map(|(key, value)| (key, value)))
-            .unwrap();
-        batch.write_with_sync(true).unwrap();
-    }
-
-    let map = open_wrapper(dir.path());
-    for (key, value) in &rows {
-        assert_eq!(map.get(key).unwrap(), Some(*value), "key {key}");
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
