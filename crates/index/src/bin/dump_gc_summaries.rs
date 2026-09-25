@@ -6,7 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use core_types::{PlacementClass, SegmentFileState, SegmentGcSummary, SegmentState};
+use core_types::{PlacementClass, SegmentFileState, SegmentGcSummary, SegmentId, SegmentState};
+use index::port::codec::{decode_key, decode_value};
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded, Options};
 
 fn main() {
@@ -54,15 +55,16 @@ fn main() {
     let mut states = BTreeMap::new();
     for item in db.iterator_cf(&states_cf, IteratorMode::Start) {
         let (key, value) = item.expect("state row");
-        let id = u64::from_be_bytes(key[..8].try_into().expect("u64 key"));
-        let state: SegmentState = bcs::from_bytes(&value).expect("segment state");
+        // Through the codec rather than by hand, so a format change cannot leave this tool behind.
+        let id: SegmentId = decode_key(&key).expect("segment id key");
+        let state: SegmentState = decode_value(&value).expect("segment state");
         states.insert(id, state);
     }
     let mut summaries = BTreeMap::new();
     for item in db.iterator_cf(&summaries_cf, IteratorMode::Start) {
         let (key, value) = item.expect("summary row");
-        let id = u64::from_be_bytes(key[..8].try_into().expect("u64 key"));
-        let summary: SegmentGcSummary = bcs::from_bytes(&value).expect("summary");
+        let id: SegmentId = decode_key(&key).expect("segment id key");
+        let summary: SegmentGcSummary = decode_value(&value).expect("summary");
         summaries.insert(id, summary);
     }
     println!(
