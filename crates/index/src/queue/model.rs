@@ -2,20 +2,6 @@ use crate::port::codec::{decode_value, encode_value};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-/// Logical command identity shared by blob operations and epoch barriers. Zero is the empty
-/// prefix. Never reuse revisions after row cleanup; these are unrelated to Strata's LSNs.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Revision(pub u64);
-
-impl Revision {
-    pub fn next(self) -> Result<Self> {
-        self.0
-            .checked_add(1)
-            .map(Self)
-            .ok_or_else(|| Error::InvalidPendingOperation("revision exhausted".into()))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardGeneration {
     pub shard: u64,
@@ -37,7 +23,8 @@ pub enum BlobOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobCommand {
-    pub revision: Revision,
+    /// Stable application event index. Zero is valid; the blob key scopes the command identity.
+    pub event_index: u64,
     /// Opaque application provenance; never compared for ordering.
     pub source: Vec<u8>,
     pub operation: BlobOperation,
@@ -72,15 +59,16 @@ impl PendingBlobOps {
         let BlobOperand::V1(edit) = operand;
         let register = matches!(edit, BlobEdit::Register(_));
         match edit {
-            BlobEdit::Acknowledge { through } => commands.retain(|c| c.revision > through),
+            BlobEdit::Acknowledge {
+                through_event_index,
+            } => commands.retain(|c| c.event_index > through_event_index),
             BlobEdit::Append(command) | BlobEdit::Register(command) => {
-                if command.revision.0 == 0
-                    || commands
-                        .last()
-                        .is_some_and(|c| c.revision >= command.revision)
+                if commands
+                    .last()
+                    .is_some_and(|c| c.event_index >= command.event_index)
                 {
                     return Err(Error::InvalidPendingOperation(
-                        "revisions must increase and start above zero".into(),
+                        "event indexes must increase within a blob queue".into(),
                     ));
                 }
                 if register {
@@ -116,10 +104,11 @@ pub enum BlobEdit {
     Append(BlobCommand),
     Register(BlobCommand),
     /// Only emit after Strata effects AND their replay identities are durable. This trims the
-    /// applied prefix without dropping concurrent newer appends. Empty rows remain for bounded
-    /// cleanup under the blob lock; do not delete a whole row using an old snapshot.
+    /// applied event prefix without dropping concurrent newer appends. Empty rows remain for
+    /// bounded cleanup under the blob lock; do not delete a whole row using an old snapshot.
+    /// This is not a replay watermark: the application must not enqueue already-handled events.
     Acknowledge {
-        through: Revision,
+        through_event_index: u64,
     },
 }
 

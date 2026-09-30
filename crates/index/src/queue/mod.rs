@@ -2,53 +2,49 @@
 //!
 //! A producer stages metadata and queue changes in one batch. A worker takes a snapshot, syncs
 //! RocksDB, then processes only that snapshot. Registration cancels earlier ordinary deletes;
-//! acknowledgements remove only completed revisions. Epoch barriers order work across blobs.
+//! acknowledgements remove only completed event indexes. Epoch barriers order work across blobs.
 //!
 //! This module does not apply operations to Strata. The worker must recheck cancellation under
 //! the shared blob lock, durably apply effects with replay identities, and drain all preceding
-//! work before an epoch barrier. Revisions are command identities, not LSNs or an applied watermark.
-//! The application owns reference checks, pool fan-out and foreground put coordination.
+//! work through a barrier's event index before advancing the epoch. Event indexes come from the
+//! application; they are not Strata LSNs or a global applied watermark. The application owns
+//! reference checks, event ordering and replay filtering, pool fan-out and foreground put coordination.
 
 mod model;
 pub use model::*;
 
 use crate::{
-    Error, Result,
+    Result,
     port::{
         IndexDb, IndexSnapshot, IndexWriteBatch, TypedMap,
-        codec::{decode_value, encode_key, encode_value},
+        codec::{encode_key, encode_value},
     },
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub const PENDING_BLOBS_CF: &str = "strata_pending_blob_ops";
 pub const EPOCH_BARRIERS_CF: &str = "strata_pending_epoch_barriers";
-pub const LAST_REVISION_CF: &str = "strata_pending_last_revision";
 
 /// Open these families with the application database, registering the merge operator on reopen.
-pub fn cf_options(mut standard: rocksdb::Options) -> [(&'static str, rocksdb::Options); 3] {
+pub fn cf_options(mut standard: rocksdb::Options) -> [(&'static str, rocksdb::Options); 2] {
     let barriers = standard.clone();
-    let revision = standard.clone();
     standard.set_merge_operator(
         "strata_pending_blob_ops_v1",
         |_, existing, operands| merge_pending(existing, operands).ok(),
         // Cancellation and acknowledgement need the base row. Never partially fold them away.
         |_, _, _| None,
     );
-    [
-        (PENDING_BLOBS_CF, standard),
-        (EPOCH_BARRIERS_CF, barriers),
-        (LAST_REVISION_CF, revision),
-    ]
+    [(PENDING_BLOBS_CF, standard), (EPOCH_BARRIERS_CF, barriers)]
 }
 
-/// Open once per application database; clones share the short producer lock.
+/// Pending work keyed by blob, with epoch barriers keyed by the application's event index.
+/// Producers preserve event order for each blob and finish enqueueing all work through a barrier's
+/// index before publishing that barrier. Different blobs may be enqueued concurrently.
 #[derive(Debug, Clone)]
 pub struct PendingQueue {
     db: Arc<dyn IndexDb>,
-    producer_lock: Arc<Mutex<()>>,
     blobs: TypedMap<Vec<u8>, PendingBlobOps>,
-    barriers: TypedMap<Revision, EpochBarrier>,
+    barriers: TypedMap<u64, EpochBarrier>,
 }
 
 impl PendingQueue {
@@ -59,28 +55,16 @@ impl PendingQueue {
             blobs: TypedMap::new(Arc::clone(&db), PENDING_BLOBS_CF),
             barriers: TypedMap::new(Arc::clone(&db), EPOCH_BARRIERS_CF),
             db,
-            producer_lock: Arc::default(),
         }
     }
 
     /// Stage application metadata through `batch.metadata()`. Propagate staging errors and do
-    /// not reenter the queue. Callback failure discards the batch and its revision allocation.
+    /// not enqueue an already-handled event: persist the application's event progress in this
+    /// same batch so recovery can skip it. Callback failure discards the whole batch.
     /// Success means committed, not synced; uncertain commit errors require stopping and recovery.
     pub fn write_batch<T>(&self, update: impl FnOnce(&mut PendingBatch) -> Result<T>) -> Result<T> {
-        let _guard = self
-            .producer_lock
-            .lock()
-            .map_err(|_| Error::InvalidPendingOperation("producer lock poisoned".into()))?;
-        let last_revision = self
-            .db
-            .get(LAST_REVISION_CF, &[])?
-            .as_deref()
-            .map(decode_value)
-            .transpose()?
-            .unwrap_or_default();
         let mut batch = PendingBatch {
             write: self.db.write_batch(),
-            last_revision,
         };
         let result = update(&mut batch)?;
         batch.write.write(false)?;
@@ -109,15 +93,14 @@ impl PendingQueue {
     pub fn barriers<'a>(
         &'a self,
         snapshot: &'a dyn IndexSnapshot,
-    ) -> Result<impl Iterator<Item = Result<(Revision, EpochBarrier)>> + 'a> {
+    ) -> Result<impl Iterator<Item = Result<(u64, EpochBarrier)>> + 'a> {
         self.barriers.safe_iter_with_snapshot(snapshot)
     }
 }
 
-/// The application's atomic batch plus queue revision allocation.
+/// Queue edits and application metadata in one atomic batch.
 pub struct PendingBatch {
     write: Box<dyn IndexWriteBatch>,
-    last_revision: Revision,
 }
 
 impl PendingBatch {
@@ -125,55 +108,53 @@ impl PendingBatch {
         self.write.as_mut()
     }
 
-    fn allocate(&mut self) -> Result<Revision> {
-        let revision = self.last_revision.next()?;
-        self.write
-            .put(LAST_REVISION_CF, &[], &encode_value(&revision)?)?;
-        self.last_revision = revision;
-        Ok(revision)
-    }
-
+    /// Enqueue at most one command per blob per event, in increasing event order. The caller
+    /// coalesces work for the same (blob, event) and filters retries using its metadata. Zero is
+    /// a valid event index; indexes need not be contiguous or unique across different blobs.
     pub fn append(
         &mut self,
         key: &[u8],
+        event_index: u64,
         operation: BlobOperation,
         source: Vec<u8>,
-    ) -> Result<Revision> {
-        let revision = self.allocate()?;
+    ) -> Result<()> {
         let operand = BlobOperand::V1(BlobEdit::Append(BlobCommand {
-            revision,
+            event_index,
             source,
             operation,
         }));
         self.write
-            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)?;
-        Ok(revision)
+            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)
     }
 
     /// Add/validate the live reference in this same batch under the shared blob lock. An old
     /// in-flight put must not call this method; permanent invalidation deletes are never cancelled.
-    pub fn register(&mut self, key: &[u8], end_epoch: u64, source: Vec<u8>) -> Result<Revision> {
-        let revision = self.allocate()?;
+    /// The same event-index contract as [`Self::append`] applies.
+    pub fn register(
+        &mut self,
+        key: &[u8],
+        event_index: u64,
+        end_epoch: u64,
+        source: Vec<u8>,
+    ) -> Result<()> {
         let operand = BlobOperand::V1(BlobEdit::Register(BlobCommand {
-            revision,
+            event_index,
             source,
             operation: BlobOperation::SetLifetime { end_epoch },
         }));
         self.write
-            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)?;
-        Ok(revision)
+            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)
     }
 
-    /// Enqueue in event order, after any preceding pool fan-out. The worker must finish earlier
-    /// revisions before advancing to this absolute epoch, and defer later revisions until after it.
-    pub fn advance_epoch(&mut self, epoch: u64, source: Vec<u8>) -> Result<Revision> {
-        let revision = self.allocate()?;
+    /// Publish only after all blob work through this event index has been enqueued, including any
+    /// pool fan-out. The worker finishes that work before advancing to this absolute epoch and
+    /// defers higher event indexes until afterward. One barrier is allowed per event.
+    pub fn advance_epoch(&mut self, event_index: u64, epoch: u64, source: Vec<u8>) -> Result<()> {
         self.write.put(
             EPOCH_BARRIERS_CF,
-            &encode_key(&revision)?,
+            &encode_key(&event_index)?,
             &encode_value(&EpochBarrier::V1 { epoch, source })?,
-        )?;
-        Ok(revision)
+        )
     }
 }
 
