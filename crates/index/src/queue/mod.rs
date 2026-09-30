@@ -90,34 +90,27 @@ impl PendingQueue {
     /// Capture BEFORE syncing: newer visible writes must wait for the next pass. A sync failure
     /// returns no usable view and requires stopping and recovery. A snapshot can become stale
     /// through registration, so workers still revalidate under the blob lock before deleting.
-    pub fn durable_snapshot(&self) -> Result<DurableSnapshot<'_>> {
+    /// Use this same snapshot for both [`Self::blobs`] and [`Self::barriers`].
+    pub fn durable_snapshot(&self) -> Result<Box<dyn IndexSnapshot + '_>> {
         let snapshot = self.db.snapshot()?;
         self.db.flush_wal(true)?;
-        Ok(DurableSnapshot {
-            queue: self,
-            snapshot,
-        })
-    }
-}
-
-/// A fixed view covered by a successful WAL sync. Iterators stream the tables without collecting
-/// them; the worker can consume bounded batches from each iterator.
-pub struct DurableSnapshot<'a> {
-    queue: &'a PendingQueue,
-    snapshot: Box<dyn IndexSnapshot + 'a>,
-}
-
-impl DurableSnapshot<'_> {
-    pub fn blobs(&self) -> Result<impl Iterator<Item = Result<(Vec<u8>, PendingBlobOps)>> + '_> {
-        self.queue
-            .blobs
-            .safe_iter_with_snapshot(self.snapshot.as_ref())
+        Ok(snapshot)
     }
 
-    pub fn barriers(&self) -> Result<impl Iterator<Item = Result<(Revision, EpochBarrier)>> + '_> {
-        self.queue
-            .barriers
-            .safe_iter_with_snapshot(self.snapshot.as_ref())
+    /// Stream blob operations from the snapshot returned by [`Self::durable_snapshot`].
+    pub fn blobs<'a>(
+        &'a self,
+        snapshot: &'a dyn IndexSnapshot,
+    ) -> Result<impl Iterator<Item = Result<(Vec<u8>, PendingBlobOps)>> + 'a> {
+        self.blobs.safe_iter_with_snapshot(snapshot)
+    }
+
+    /// Stream epoch barriers from the same snapshot used for [`Self::blobs`].
+    pub fn barriers<'a>(
+        &'a self,
+        snapshot: &'a dyn IndexSnapshot,
+    ) -> Result<impl Iterator<Item = Result<(Revision, EpochBarrier)>> + 'a> {
+        self.barriers.safe_iter_with_snapshot(snapshot)
     }
 }
 

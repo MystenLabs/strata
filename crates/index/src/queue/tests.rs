@@ -123,8 +123,9 @@ fn metadata_and_queue_abort_or_commit_together() -> Result<()> {
     });
     assert!(result.is_err());
     assert_eq!(db.get("application", b"progress")?, None);
-    assert!(queue.durable_snapshot()?.blobs()?.next().is_none());
-    assert!(queue.durable_snapshot()?.barriers()?.next().is_none());
+    let snapshot = queue.durable_snapshot()?;
+    assert!(queue.blobs(snapshot.as_ref())?.next().is_none());
+    assert!(queue.barriers(snapshot.as_ref())?.next().is_none());
     assert_eq!(
         queue.write_batch(|batch| {
             batch.metadata().put("application", b"progress", b"42")?;
@@ -147,24 +148,29 @@ fn snapshots_stream_stable_rows_and_numeric_epoch_barriers() -> Result<()> {
         batch.advance_epoch(11, vec![])?;
         batch.register(b"b", 20, vec![])
     })?;
-    let view = queue.durable_snapshot()?;
+    let snapshot = queue.durable_snapshot()?;
+    let mut rows = queue.blobs(snapshot.as_ref())?;
+    // The later barrier scan must share the blob iterator's view despite intervening writes.
     queue.write_batch(|batch| {
         batch.append(b"a", delete(true), vec![])?;
-        batch.register(b"c", 25, vec![])
+        batch.register(b"c", 25, vec![])?;
+        batch.advance_epoch(12, vec![])
     })?;
-    let mut rows = view.blobs()?;
     let a = rows.next().unwrap()?;
     assert_eq!(a.0, b"a");
     assert_eq!(a.1.commands().len(), 1);
     assert_eq!(rows.next().unwrap()?.0, b"b");
     assert!(rows.next().is_none());
     assert_eq!(
-        view.barriers()?
+        queue
+            .barriers(snapshot.as_ref())?
             .map(|r| r.map(|(revision, _)| revision))
             .collect::<Result<Vec<_>>>()?,
         vec![Revision(255), Revision(256)]
     );
-    assert_eq!(queue.durable_snapshot()?.blobs()?.count(), 3);
+    let latest = queue.durable_snapshot()?;
+    assert_eq!(queue.blobs(latest.as_ref())?.count(), 3);
+    assert_eq!(queue.barriers(latest.as_ref())?.count(), 3);
     Ok(())
 }
 
@@ -184,9 +190,9 @@ fn merged_rows_and_allocator_survive_reopen_and_cleanup() -> Result<()> {
         drop(queue.durable_snapshot()?);
     }
     let (_, queue) = open(dir.path());
+    let snapshot = queue.durable_snapshot()?;
     let rows = queue
-        .durable_snapshot()?
-        .blobs()?
+        .blobs(snapshot.as_ref())?
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1.commands()[0].revision, Revision(2));
