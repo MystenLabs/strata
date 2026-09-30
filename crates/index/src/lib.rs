@@ -46,6 +46,7 @@ mod options;
 mod overlay_cache;
 pub mod port;
 mod publication;
+pub mod queue;
 mod segment;
 mod shard;
 mod storage;

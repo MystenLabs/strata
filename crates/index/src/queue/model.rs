@@ -1,4 +1,5 @@
-use crate::Error;
+use crate::port::codec::{decode_value, encode_value};
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 /// Logical command identity shared by blob operations and epoch barriers. Zero is the empty
@@ -7,8 +8,11 @@ use serde::{Deserialize, Serialize};
 pub struct Revision(pub u64);
 
 impl Revision {
-    pub fn next(self) -> Result<Self, Error> {
-        self.0.checked_add(1).map(Self).ok_or(Error::Exhausted)
+    pub fn next(self) -> Result<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or_else(|| Error::InvalidPendingOperation("revision exhausted".into()))
     }
 }
 
@@ -44,7 +48,7 @@ pub enum EpochBarrier {
     V1 { epoch: u64, source: Vec<u8> },
 }
 
-/// Versioned BCS row format. Incompatible schema changes require a new version.
+/// Versioned row format, using the index’s MessagePack codec. Incompatible schema changes require a new version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingBlobOps {
     V1(Vec<BlobCommand>),
@@ -63,7 +67,7 @@ impl PendingBlobOps {
         }
     }
 
-    fn apply(&mut self, operand: BlobOperand) -> Result<(), Error> {
+    fn apply(&mut self, operand: BlobOperand) -> Result<()> {
         let Self::V1(commands) = self;
         let BlobOperand::V1(edit) = operand;
         let register = matches!(edit, BlobEdit::Register(_));
@@ -75,11 +79,15 @@ impl PendingBlobOps {
                         .last()
                         .is_some_and(|c| c.revision >= command.revision)
                 {
-                    return Err(Error::RevisionOrder);
+                    return Err(Error::InvalidPendingOperation(
+                        "revisions must increase and start above zero".into(),
+                    ));
                 }
                 if register {
                     if !matches!(command.operation, BlobOperation::SetLifetime { .. }) {
-                        return Err(Error::RegistrationOperation);
+                        return Err(Error::InvalidPendingOperation(
+                            "registration must initialize a lifetime".into(),
+                        ));
                     }
                     commands.retain(|c| {
                         !matches!(
@@ -116,8 +124,8 @@ pub enum BlobEdit {
 }
 
 impl BlobOperand {
-    pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        Ok(bcs::to_bytes(self)?)
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        encode_value(self)
     }
 }
 
@@ -127,13 +135,10 @@ impl BlobOperand {
 pub fn merge_pending<'a>(
     existing: Option<&[u8]>,
     operands: impl IntoIterator<Item = &'a [u8]>,
-) -> Result<Vec<u8>, Error> {
-    let mut pending: PendingBlobOps = existing
-        .map(bcs::from_bytes)
-        .transpose()?
-        .unwrap_or_default();
+) -> Result<Vec<u8>> {
+    let mut pending: PendingBlobOps = existing.map(decode_value).transpose()?.unwrap_or_default();
     for operand in operands {
-        pending.apply(bcs::from_bytes(operand)?)?;
+        pending.apply(decode_value(operand)?)?;
     }
-    Ok(bcs::to_bytes(&pending)?)
+    encode_value(&pending)
 }
