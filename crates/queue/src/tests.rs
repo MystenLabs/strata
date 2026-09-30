@@ -120,6 +120,10 @@ struct Write {
 
 impl QueueWrite for Write {
     type Error = Error;
+    type Metadata = Self;
+    fn metadata(&mut self) -> &mut Self {
+        self
+    }
     fn merge_blob(&mut self, key: &[u8], operand: &[u8]) -> Result<(), Error> {
         self.edits.push((key.to_vec(), operand.to_vec()));
         Ok(())

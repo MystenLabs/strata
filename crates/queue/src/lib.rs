@@ -29,6 +29,8 @@ pub const MERGE_OPERATOR_NAME: &str = "strata_pending_blob_ops_v1";
 /// Dropping a batch without committing must discard every staged change.
 pub trait QueueWrite {
     type Error: From<Error>;
+    type Metadata;
+    fn metadata(&mut self) -> &mut Self::Metadata;
     fn merge_blob(&mut self, key: &[u8], operand: &[u8]) -> Result<(), Self::Error>;
     fn put_barrier(
         &mut self,
@@ -155,8 +157,8 @@ pub struct PendingBatch<W> {
 
 impl<W: QueueWrite> PendingBatch<W> {
     /// Application metadata must be staged here, never committed independently.
-    pub fn metadata(&mut self) -> &mut W {
-        &mut self.write
+    pub fn metadata(&mut self) -> &mut W::Metadata {
+        self.write.metadata()
     }
 
     fn allocate(&mut self) -> Result<Revision, W::Error> {
