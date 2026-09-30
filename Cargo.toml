@@ -20,6 +20,7 @@ members = [
     "crates/gc",
     "crates/index",
     "crates/lsm",
+    "crates/queue",
     "crates/segment",
     "crates/store",
 ]
