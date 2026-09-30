@@ -13,7 +13,11 @@ use core_types::{
 use index::StrataIndex;
 use lsm::Mutation as LsmMutation;
 
-use crate::{Error, Result, StrataStore, blob_lsm::BlobMutation, partition::partition_for_key};
+use crate::{
+    Error, Result, StrataStore,
+    blob_lsm::{BlobMutation, format::LifecycleMutation},
+    partition::partition_for_key,
+};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -103,6 +107,14 @@ pub(crate) enum BatchOp {
         key: BlobKey,
     },
     IncrementEpoch,
+    ApplyBlobEvent {
+        key: BlobKey,
+        event_index: u64,
+        operation: LifecycleMutation,
+    },
+    AdvanceEpochTo {
+        epoch: Epoch,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -279,6 +291,60 @@ impl<'a> StrataBatch<'a> {
         self
     }
 
+    /// Applies a queued lifetime update at a caller-supplied event index.
+    ///
+    /// Event indexes are stable across restarts and increase per exact key; zero is valid and
+    /// different keys may share an index.
+    /// The caller submits one command per key/event, in order, and retries it with the same payload.
+    /// Events at or below the key's last applied index have no effect, including after recovery.
+    /// The effect and replay marker share one WAL/LSM operand. Wait for durability before retiring
+    /// pending work. Direct puts do not advance or erase the marker.
+    ///
+    /// As with ordinary lifetime updates, initialize a new lifetime before its dependent puts and
+    /// finish preceding events before advancing the epoch. An expired target is accepted because
+    /// retries can arrive after the clock has advanced; it never makes expired data readable.
+    pub fn set_blob_lifetime_at_event(
+        &mut self,
+        key: BlobKey,
+        event_index: u64,
+        logical_end_epoch: Epoch,
+    ) -> &mut Self {
+        self.ops.push(BatchOp::ApplyBlobEvent {
+            key,
+            event_index,
+            operation: LifecycleMutation::SetLifetime { logical_end_epoch },
+        });
+        self
+    }
+
+    /// Deletes all specified shard generations as one event on this exact key.
+    ///
+    /// Uses the same event ordering and durability contract as [`Self::set_blob_lifetime_at_event`].
+    /// Include every targeted generation in this call: separate calls with the same key/event
+    /// would be treated as retries. Generations are explicit and never resolved to a newer shard.
+    /// The caller still coordinates registrations/puts and revalidates pending deletion; deduplication
+    /// protects replay of an applied delete, not the first application of an obsolete intent.
+    pub fn tombstone_at_event(
+        &mut self,
+        key: BlobKey,
+        event_index: u64,
+        shards: Vec<ShardKey>,
+    ) -> &mut Self {
+        self.ops.push(BatchOp::ApplyBlobEvent {
+            key,
+            event_index,
+            operation: LifecycleMutation::Tombstone { shards },
+        });
+        self
+    }
+
+    /// Advances to an absolute epoch. Repeating an equal or older target leaves the clock unchanged.
+    /// The caller must finish all preceding lifecycle work before submitting this barrier.
+    pub fn advance_epoch_to(&mut self, epoch: Epoch) -> &mut Self {
+        self.ops.push(BatchOp::AdvanceEpochTo { epoch });
+        self
+    }
+
     /// Adds an epoch increment to this batch.
     ///
     /// Epoch changes are treated like logical operations. A batch such as
@@ -330,6 +396,11 @@ pub(crate) enum PreparedBatchOp {
         lsn: StrataLsn,
         epoch: Epoch,
     },
+    BlobEvent {
+        key: BlobKey,
+        lsn: StrataLsn,
+        mutation: BlobMutation,
+    },
 }
 
 impl PreparedBatchOp {
@@ -338,6 +409,7 @@ impl PreparedBatchOp {
             Self::Put { lsn, .. }
             | Self::Lifecycle { lsn, .. }
             | Self::Tombstone { lsn, .. }
+            | Self::BlobEvent { lsn, .. }
             | Self::EpochChange { lsn, .. } => *lsn,
         }
     }
@@ -376,6 +448,11 @@ impl PreparedBatchOp {
                 partition: partition_for_key(key.as_bytes(), partition_count),
                 key: key.as_bytes().to_vec(),
                 value: BlobMutation::Tombstone { shard: *shard }.encode_inline()?,
+            })),
+            Self::BlobEvent { key, mutation, .. } => Ok(Some(LsmMutation::Put {
+                partition: partition_for_key(key.as_bytes(), partition_count),
+                key: key.as_bytes().to_vec(),
+                value: mutation.encode_inline()?,
             })),
             Self::EpochChange { .. } => Ok(None),
         }

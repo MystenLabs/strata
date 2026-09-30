@@ -101,6 +101,13 @@
 //! tombstones. GC moves live in the relocation LSM and are folded into main rows by the streaming
 //! compaction join.
 //!
+//! Queued lifecycle work uses [`StrataBatch::set_blob_lifetime_at_event`] and
+//! [`StrataBatch::tombstone_at_event`]. Each records the caller's event index and effect in one
+//! blob-LSM operand; recovery and compaction retain them together. Direct puts leave this replay
+//! marker intact. [`StrataBatch::advance_epoch_to`] provides an absolute, monotonic epoch target.
+//! These APIs return visible LSNs like other writes: sync before acknowledging pending work.
+//! The embedder still owns queue durability, event order, cancellation and put coordination.
+//!
 //! Blob-LSM compaction emits terminal transitions into the global garbage log; the sweeper folds
 //! them into per-segment summaries and local garbage logs. GC plans and copies from that state and
 //! revalidates every copied record against the current blob LSM before publication.

@@ -45,6 +45,7 @@ fn mutation_codecs_round_trip() {
 #[test]
 fn materialized_state_codec_round_trips() {
     let state = BlobState {
+        last_event_index: None,
         versions: BTreeMap::from([(
             shard(1, 2),
             BlobVersion {

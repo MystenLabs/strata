@@ -19,6 +19,7 @@ mod codec;
 mod compaction;
 mod full_merge;
 mod partial_merge;
+mod replay;
 
 fn shard(id: u32, generation: u64) -> ShardKey {
     ShardKey { id, generation }

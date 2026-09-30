@@ -29,8 +29,8 @@ use core_types::{Epoch, ShardId, ShardKey, StrataLsn, encoded_record_len};
 
 use crate::{
     BatchOp, BatchWriteRequest, BatchWriteResult, Error, PendingRollover, PreparedBatch,
-    PreparedBatchOp, Result, StoreWriteProfile, WriteCoordinator, metrics::PutMetric,
-    profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
+    PreparedBatchOp, Result, StoreWriteProfile, WriteCoordinator, blob_lsm::BlobMutation,
+    metrics::PutMetric, profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
 };
 
 impl WriteCoordinator {
@@ -546,6 +546,28 @@ impl WriteCoordinator {
                     });
                     op_epochs.push(Some(next_epoch));
                 }
+                BatchOp::ApplyBlobEvent {
+                    key,
+                    event_index,
+                    operation,
+                } => {
+                    prepared_ops.push(PreparedBatchOp::BlobEvent {
+                        key,
+                        lsn,
+                        mutation: BlobMutation::ApplyEvent {
+                            event_index,
+                            current_epoch: current_epoch.ok_or(Error::EpochNotInitialized)?,
+                            operation,
+                        },
+                    });
+                    op_epochs.push(None);
+                }
+                BatchOp::AdvanceEpochTo { epoch } => {
+                    let epoch = epoch.max(current_epoch.ok_or(Error::EpochNotInitialized)?);
+                    current_epoch = Some(epoch);
+                    prepared_ops.push(PreparedBatchOp::EpochChange { lsn, epoch });
+                    op_epochs.push(Some(epoch));
+                }
             }
         }
 
@@ -608,7 +630,9 @@ impl WriteCoordinator {
                     PreparedBatchOp::Put { .. } => {
                         wrote_payload = true;
                     }
-                    PreparedBatchOp::Lifecycle { .. } | PreparedBatchOp::Tombstone { .. } => {}
+                    PreparedBatchOp::Lifecycle { .. }
+                    | PreparedBatchOp::Tombstone { .. }
+                    | PreparedBatchOp::BlobEvent { .. } => {}
                     PreparedBatchOp::EpochChange { lsn, epoch } => {
                         self.index
                             .put_epoch_change_batch(&mut batch, *lsn, *epoch)?;

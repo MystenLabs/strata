@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod garbage_log;
+mod lifecycle_replay;
 
 const TEST_KEY_LEN: u64 = 6;
 const TEST_PAYLOAD_LEN: u64 = 9;

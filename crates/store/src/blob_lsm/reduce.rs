@@ -146,6 +146,15 @@ pub(crate) fn reduce_patch_mutations(
     relocations: &[RelocationEntry],
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<Vec<BlobMutationWithLSN>> {
+    // An event may already be applied in the unknown base. Treating its delete or lifetime as
+    // unconditional could retire a newer put or emit incorrect GC hints. Preserve this run until
+    // a full merge can resolve the event against the base's replay marker.
+    if mutations
+        .iter()
+        .any(|mutation| matches!(mutation.mutation, BlobMutation::ApplyEvent { .. }))
+    {
+        return Ok(mutations);
+    }
     let mut buckets = BTreeMap::<ShardKey, PatchBucket>::new();
     let mut current_lifetime = None::<PatchLifecycleHint>;
     for event in merge_patch_events(&mutations, snapshot) {
@@ -162,7 +171,7 @@ pub(crate) fn reduce_patch_mutations(
             }
         };
 
-        let BlobMutationWithLSN { lsn, mutation } = mutations[mutation_index];
+        let BlobMutationWithLSN { lsn, mutation } = mutations[mutation_index].clone();
         match mutation {
             BlobMutation::Put {
                 shard,
@@ -230,6 +239,7 @@ pub(crate) fn reduce_patch_mutations(
                     emit,
                 )?;
             }
+            BlobMutation::ApplyEvent { .. } => unreachable!("event patches are retained above"),
         }
     }
 

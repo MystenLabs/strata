@@ -6,9 +6,15 @@
 //! during reads, partial merges, and compactions. Every version that becomes unreachable is
 //! accounted for by exactly one terminal garbage record.
 //!
+//! Queued lifecycle events carry a caller-supplied event index in the same operand as their effect.
+//! The materialized state retains the highest applied index, even after deletion or expiry. Full
+//! merges ignore equal/older events; partial merges preserve event-bearing runs because the base
+//! may already contain their replay marker. Existing v3 records remain readable and are still
+//! emitted for keys without events; event operands and states with replay markers use v4.
+//!
 //! The submodules follow the data path:
 //!
-//! - [`format`]: wire encoding for mutation patches and the materialized state.
+//! - [`mod@format`]: wire encoding for mutation patches and the materialized state.
 //! - `merge`: the two `MergeOperator` entry points. [`BlobMerge`] serves reads and plain
 //!   compactions; `BlobMergeWithRelocations` runs during snapshot compactions, where it also
 //!   heals relocated record references and prunes retired or expired versions.
