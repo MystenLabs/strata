@@ -197,10 +197,22 @@ impl StrataStore {
     /// the owner of the active writer. If callers wrote directly to the index from many threads,
     /// two puts could both publish `next_lsn = 42` while their bytes landed at different offsets.
     pub(crate) fn write_batch(&self, ops: Vec<BatchOp>) -> Result<BatchWriteResult> {
+        self.write_batch_with_lsn(ops, None)
+    }
+
+    pub(crate) fn write_batch_with_lsn(
+        &self,
+        ops: Vec<BatchOp>,
+        lsn_key: Option<Vec<u8>>,
+    ) -> Result<BatchWriteResult> {
+        if lsn_key.is_some() && ops.is_empty() {
+            return Err(Error::EmptyTrackedBatch);
+        }
         let (response_tx, response_rx) = mpsc::channel();
         let (profile, profile_rx) = self.profile_channel();
         let command = WriteCommand::Batch(BatchWriteRequest {
             ops,
+            lsn_key,
             response_tx,
             profile,
         });

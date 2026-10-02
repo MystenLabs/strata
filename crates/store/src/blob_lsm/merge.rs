@@ -238,8 +238,7 @@ impl MergeOperator for BlobMergeWithRelocations {
         }
 
         state.prune_with_snapshot(key, &self.snapshot, emit)?;
-        if state.versions.is_empty() && state.lifetime.is_none() && state.last_event_index.is_none()
-        {
+        if state.versions.is_empty() && state.lifetime.is_none() {
             return Ok(None);
         }
         Ok(Some(encode_inline_value(&state.encode()?)))

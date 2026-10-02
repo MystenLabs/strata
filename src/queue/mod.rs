@@ -4,21 +4,38 @@
 //! RocksDB, then processes only that snapshot. Registration cancels earlier ordinary deletes;
 //! acknowledgements remove only completed event indexes. Epoch barriers order work across blobs.
 //!
-//! This module does not apply operations to Strata. The worker must recheck cancellation under
-//! the shared blob lock, durably apply effects with replay identities, and drain all preceding
-//! work through a barrier's event index before advancing the epoch. Event indexes come from the
-//! application; they are not Strata LSNs or a global applied watermark. The application owns
-//! reference checks, event ordering and replay filtering, pool fan-out and foreground put coordination.
+//! This integration layer sits above the store and index crates. It translates application event
+//! identities into opaque batch keys and records each submission's resulting LSN in a RocksDB
+//! control table. Neither event indexes nor queue commands enter the blob LSM or the store WAL.
+//! Recovery invalidates discarded LSN bindings atomically with the LSN rewind; the queue can
+//! then distinguish a surviving submission from work it must resubmit.
+//!
+//! There is no background worker or lock manager here yet. The caller must select durable work,
+//! recheck cancellation and shard generations under shared locks, and hold those locks through
+//! durable acknowledgement. Drain preceding work before an epoch barrier and block later work
+//! until it completes. The application owns reference checks, event ordering and replay filtering,
+//! pool fan-out, and foreground put coordination. Any uncertain write/sync failure is fail-stop.
 
 mod model;
+mod replay;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("invalid pending lifecycle operation: {0}")]
+    InvalidPendingOperation(String),
+    #[error(transparent)]
+    Index(#[from] index::Error),
+    #[error(transparent)]
+    Store(#[from] store::Error),
+}
+
 pub use model::*;
 
-use crate::{
-    Result,
-    port::{
-        IndexDb, IndexSnapshot, IndexWriteBatch, TypedMap,
-        codec::{encode_key, encode_value},
-    },
+use index::port::{
+    IndexDb, IndexSnapshot, IndexWriteBatch, TypedMap,
+    codec::{encode_key, encode_value},
 };
 use std::sync::Arc;
 
@@ -86,7 +103,10 @@ impl PendingQueue {
         &'a self,
         snapshot: &'a dyn IndexSnapshot,
     ) -> Result<impl Iterator<Item = Result<(Vec<u8>, PendingBlobOps)>> + 'a> {
-        self.blobs.safe_iter_with_snapshot(snapshot)
+        Ok(self
+            .blobs
+            .safe_iter_with_snapshot(snapshot)?
+            .map(|row| row.map_err(Error::from)))
     }
 
     /// Stream epoch barriers from the same snapshot used for [`Self::blobs`].
@@ -94,7 +114,10 @@ impl PendingQueue {
         &'a self,
         snapshot: &'a dyn IndexSnapshot,
     ) -> Result<impl Iterator<Item = Result<(u64, EpochBarrier)>> + 'a> {
-        self.barriers.safe_iter_with_snapshot(snapshot)
+        Ok(self
+            .barriers
+            .safe_iter_with_snapshot(snapshot)?
+            .map(|row| row.map_err(Error::from)))
     }
 }
 
@@ -124,7 +147,8 @@ impl PendingBatch {
             operation,
         }));
         self.write
-            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)
+            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)?;
+        Ok(())
     }
 
     /// Add/validate the live reference in this same batch under the shared blob lock. An old
@@ -143,7 +167,8 @@ impl PendingBatch {
             operation: BlobOperation::SetLifetime { end_epoch },
         }));
         self.write
-            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)
+            .merge(PENDING_BLOBS_CF, &encode_key(key)?, &operand.encode()?)?;
+        Ok(())
     }
 
     /// Publish only after all blob work through this event index has been enqueued, including any
@@ -154,9 +179,12 @@ impl PendingBatch {
             EPOCH_BARRIERS_CF,
             &encode_key(&event_index)?,
             &encode_value(&EpochBarrier::V1 { epoch, source })?,
-        )
+        )?;
+        Ok(())
     }
 }
 
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod tests;

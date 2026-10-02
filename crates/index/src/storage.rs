@@ -56,6 +56,14 @@ impl StrataIndex {
         &self.store_state
     }
 
+    /// Opaque batch keys recorded by the writer, atomically with the submitted LSN frontier.
+    /// A row is durable only once its LSN is published. Recovery removes rows outside the
+    /// recovered prefix before any LSN can be reused. Callers may delete a row only together
+    /// with durable completion of their work, before allowing conflicting writes.
+    pub fn batch_lsns(&self) -> &TypedMap<Vec<u8>, StrataLsn> {
+        &self.batch_lsns
+    }
+
     pub fn epoch_changes(&self) -> &TypedMap<StrataLsn, Epoch> {
         &self.epoch_changes
     }

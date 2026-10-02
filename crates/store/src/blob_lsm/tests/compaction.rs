@@ -17,7 +17,6 @@ fn snapshot_compaction_waits_for_the_materialized_epoch_frontier() {
     let shard = shard(1, 1);
     let record = record(7, 10);
     let state = BlobState {
-        last_event_index: None,
         versions: BTreeMap::from([(
             shard,
             BlobVersion {
@@ -107,7 +106,6 @@ fn snapshot_compaction_expires_versions_at_the_first_reaching_epoch() {
     let shard = shard(1, 1);
     let record = record(7, 10);
     let state = BlobState {
-        last_event_index: None,
         versions: BTreeMap::from([(
             shard,
             BlobVersion {
@@ -145,7 +143,6 @@ fn snapshot_compaction_silently_prunes_legacy_global_expiry() {
     let shard = shard(1, 1);
     let record = record(7, 10);
     let state = BlobState {
-        last_event_index: None,
         versions: BTreeMap::from([(
             shard,
             BlobVersion {
@@ -182,7 +179,6 @@ fn snapshot_compaction_retires_mixed_refs_but_silently_prunes_bulk_reclaimed_ref
     let mixed = record(7, 10);
     let owned = record(8, 20);
     let state = BlobState {
-        last_event_index: None,
         versions: BTreeMap::from([
             (
                 dropped,
@@ -241,7 +237,6 @@ fn snapshot_compaction_silently_prunes_shards_owned_by_the_pre_cutover_path() {
     let pre_cutover_drop = shard(1, 4);
     let legacy_without_job = shard(2, 3);
     let state = BlobState {
-        last_event_index: None,
         versions: BTreeMap::from([
             (
                 pre_cutover_drop,

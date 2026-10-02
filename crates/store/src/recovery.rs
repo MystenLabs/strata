@@ -638,6 +638,14 @@ fn rollback_operations_from(
         .map(|(_, epoch)| epoch)
         .ok_or(Error::EpochNotInitialized)?;
     index.put_current_epoch_batch(&mut batch, current_epoch)?;
+    // Bindings in the discarded suffix must disappear in the SAME durable commit as
+    // the LSN rewind. Otherwise a second crash could mistake reused LSNs for old writes.
+    for row in index.batch_lsns().safe_iter()? {
+        let (key, lsn) = row?;
+        if lsn >= rollback_from {
+            batch.delete_batch(index.batch_lsns(), [&key])?;
+        }
+    }
     index.put_next_lsn_batch(&mut batch, rollback_from)?;
     batch.write_with_sync(true)?;
     metrics.set_next_lsn(rollback_from);

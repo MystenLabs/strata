@@ -7,13 +7,11 @@ use lsm::{
     Error, Result, StoredValue, StrataLsn, decode_record_ref, decode_value, encode_record_ref,
 };
 
-const VERSION: u8 = 4;
-const LEGACY_VERSION: u8 = 3;
+const VERSION: u8 = 3;
 const PUT: u8 = 1;
 const SET_LIFETIME: u8 = 2;
 const TOMBSTONE: u8 = 3;
 const BATCH: u8 = 4;
-const APPLY_EVENT: u8 = 5;
 
 /// Classifies one key's stored blob-LSM operands for the patch's global operand floor.
 ///
@@ -29,50 +27,31 @@ const APPLY_EVENT: u8 = 5;
 /// The store writes every blob's initial lifetime as such a pair, so without this rule every flush
 /// would hold the write-merge frontier back for as long as its patch lives. This assumes a key's
 /// versions live in one shard; a put on one shard does not retire a base version on another.
-/// Event-bearing lifetimes are never discounted: their effect depends on the base replay marker,
-/// and they may protect versions on multiple shards even when this patch puts only one shard.
 pub(crate) fn global_operand_floor(operands: &[(StrataLsn, &[u8])]) -> Result<Option<StrataLsn>> {
     let mut floor = None;
-    let mut has_put = false;
-    let mut has_event_lifetime = false;
     for &(lsn, value) in operands {
         match decode_value(value)? {
-            StoredValue::Blob { .. } => has_put = true,
+            StoredValue::Blob { .. } => return Ok(None),
             StoredValue::Inline(bytes) => {
                 for mutation in BlobMutationWithLSN::decode_inline(lsn, bytes)? {
-                    has_event_lifetime |= matches!(
-                        mutation.mutation,
-                        BlobMutation::ApplyEvent {
-                            operation: LifecycleMutation::SetLifetime { .. },
-                            ..
-                        }
-                    );
                     match mutation.mutation {
-                        BlobMutation::Put { .. } => has_put = true,
-                        BlobMutation::SetLifetime { .. }
-                        | BlobMutation::ApplyEvent {
-                            operation: LifecycleMutation::SetLifetime { .. },
-                            ..
-                        } => {
+                        BlobMutation::Put { .. } => return Ok(None),
+                        BlobMutation::SetLifetime { .. } => {
                             floor = Some(floor.map_or(mutation.lsn, |current: StrataLsn| {
                                 current.min(mutation.lsn)
                             }));
                         }
-                        BlobMutation::Tombstone { .. } | BlobMutation::ApplyEvent { .. } => {}
+                        BlobMutation::Tombstone { .. } => {}
                     }
                 }
             }
         }
     }
-    Ok(if has_put && !has_event_lifetime {
-        None
-    } else {
-        floor
-    })
+    Ok(floor)
 }
 
 /// One self-contained logical mutation to a blob.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlobMutation {
     Put {
         shard: ShardKey,
@@ -86,30 +65,13 @@ pub(crate) enum BlobMutation {
     Tombstone {
         shard: ShardKey,
     },
-    /// The effect and its application identity are one WAL/LSM operand.
-    ApplyEvent {
-        event_index: u64,
-        current_epoch: Epoch,
-        operation: LifecycleMutation,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LifecycleMutation {
-    SetLifetime {
-        logical_end_epoch: Epoch,
-    },
-    /// All targeted generations share one event identity; never mark only part of a delete applied.
-    Tombstone {
-        shards: Vec<ShardKey>,
-    },
 }
 
 impl BlobMutation {
     /// Encodes the Store-owned fields available before the LSM assigns a record reference.
     pub(crate) fn encode_put_metadata(shard: ShardKey, write_epoch: Epoch) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.push(LEGACY_VERSION);
+        bytes.push(VERSION);
         bytes.push(PUT);
         push_shard(&mut bytes, shard);
         push_u64(&mut bytes, write_epoch);
@@ -136,13 +98,9 @@ impl BlobMutation {
     }
 
     /// Encodes a metadata-only mutation stored directly in an LSM patch row.
-    pub(crate) fn encode_inline(&self) -> Result<Vec<u8>> {
+    pub(crate) fn encode_inline(self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        bytes.push(if matches!(self, Self::ApplyEvent { .. }) {
-            VERSION
-        } else {
-            LEGACY_VERSION
-        });
+        bytes.push(VERSION);
         match self {
             Self::Put { .. } => {
                 return Err(invalid("Put must be segment-backed"));
@@ -152,19 +110,12 @@ impl BlobMutation {
                 current_epoch,
             } => {
                 bytes.push(SET_LIFETIME);
-                push_u64(&mut bytes, *logical_end_epoch);
-                push_u64(&mut bytes, *current_epoch);
+                push_u64(&mut bytes, logical_end_epoch);
+                push_u64(&mut bytes, current_epoch);
             }
             Self::Tombstone { shard } => {
                 bytes.push(TOMBSTONE);
-                push_shard(&mut bytes, *shard);
-            }
-            Self::ApplyEvent {
-                event_index,
-                current_epoch,
-                operation,
-            } => {
-                encode_event(&mut bytes, *event_index, *current_epoch, operation)?;
+                push_shard(&mut bytes, shard);
             }
         }
         Ok(bytes)
@@ -175,7 +126,7 @@ impl BlobMutation {
 ///
 /// Partial merges retain this pair because the outer patch row has only one LSN.
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlobMutationWithLSN {
     pub(crate) lsn: StrataLsn,
     pub(crate) mutation: BlobMutation,
@@ -186,49 +137,33 @@ impl BlobMutationWithLSN {
         let count = u32::try_from(mutations.len())
             .map_err(|_| invalid("too many mutations in one blob patch"))?;
         let mut bytes = Vec::new();
-        bytes.push(
-            if mutations
-                .iter()
-                .any(|m| matches!(m.mutation, BlobMutation::ApplyEvent { .. }))
-            {
-                VERSION
-            } else {
-                LEGACY_VERSION
-            },
-        );
+        bytes.push(VERSION);
         bytes.push(BATCH);
         bytes.extend_from_slice(&count.to_le_bytes());
         for mutation in mutations {
             push_lsn(&mut bytes, mutation.lsn);
-            match &mutation.mutation {
+            match mutation.mutation {
                 BlobMutation::Put {
                     shard,
                     write_epoch,
                     record_ref,
                 } => {
                     bytes.push(PUT);
-                    push_shard(&mut bytes, *shard);
-                    push_u64(&mut bytes, *write_epoch);
-                    bytes.extend_from_slice(&encode_record_ref(*record_ref));
+                    push_shard(&mut bytes, shard);
+                    push_u64(&mut bytes, write_epoch);
+                    bytes.extend_from_slice(&encode_record_ref(record_ref));
                 }
                 BlobMutation::SetLifetime {
                     logical_end_epoch,
                     current_epoch,
                 } => {
                     bytes.push(SET_LIFETIME);
-                    push_u64(&mut bytes, *logical_end_epoch);
-                    push_u64(&mut bytes, *current_epoch);
+                    push_u64(&mut bytes, logical_end_epoch);
+                    push_u64(&mut bytes, current_epoch);
                 }
                 BlobMutation::Tombstone { shard } => {
                     bytes.push(TOMBSTONE);
-                    push_shard(&mut bytes, *shard);
-                }
-                BlobMutation::ApplyEvent {
-                    event_index,
-                    current_epoch,
-                    operation,
-                } => {
-                    encode_event(&mut bytes, *event_index, *current_epoch, operation)?;
+                    push_shard(&mut bytes, shard);
                 }
             }
         }
@@ -255,10 +190,6 @@ impl BlobMutationWithLSN {
                     shard: decoder.shard()?,
                 },
             }],
-            APPLY_EVENT => vec![Self {
-                lsn: outer_lsn,
-                mutation: decoder.event()?,
-            }],
             BATCH => {
                 let count = decoder.u32()?;
                 let mut mutations = Vec::with_capacity(count as usize);
@@ -277,7 +208,6 @@ impl BlobMutationWithLSN {
                         TOMBSTONE => BlobMutation::Tombstone {
                             shard: decoder.shard()?,
                         },
-                        APPLY_EVENT => decoder.event()?,
                         tag => {
                             return Err(invalid(format!("unknown batched mutation tag {tag}")));
                         }
@@ -332,9 +262,6 @@ pub struct BlobLifetime {
 pub struct BlobState {
     pub versions: BTreeMap<ShardKey, BlobVersion>,
     pub lifetime: Option<BlobLifetime>,
-    /// Highest applied application event for this exact key, independent of store LSNs.
-    /// Retained even when all versions are gone, so replay cannot delete a later put.
-    pub last_event_index: Option<u64>,
 }
 
 impl BlobState {
@@ -342,11 +269,7 @@ impl BlobState {
         let count = u32::try_from(self.versions.len())
             .map_err(|_| invalid("too many shard versions in one blob state"))?;
         let mut bytes = Vec::with_capacity(6 + self.versions.len() * 60);
-        bytes.push(if self.last_event_index.is_some() {
-            VERSION
-        } else {
-            LEGACY_VERSION
-        });
+        bytes.push(VERSION);
         bytes.extend_from_slice(&count.to_le_bytes());
         for (shard, version) in &self.versions {
             push_shard(&mut bytes, *shard);
@@ -363,16 +286,12 @@ impl BlobState {
             }
             None => bytes.push(0),
         }
-        if let Some(event_index) = self.last_event_index {
-            bytes.push(1);
-            push_u64(&mut bytes, event_index);
-        }
         Ok(bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = Decoder::new(bytes);
-        let version = decoder.version()?;
+        decoder.version()?;
         let count = decoder.u32()?;
         let mut versions = BTreeMap::new();
         for _ in 0..count {
@@ -397,50 +316,10 @@ impl BlobState {
             }),
             tag => return Err(invalid(format!("invalid lifetime marker {tag}"))),
         };
-        let last_event_index = if version == LEGACY_VERSION {
-            None
-        } else {
-            match decoder.u8()? {
-                0 => None,
-                1 => Some(decoder.u64()?),
-                tag => return Err(invalid(format!("invalid event index marker {tag}"))),
-            }
-        };
-        let state = Self {
-            versions,
-            lifetime,
-            last_event_index,
-        };
+        let state = Self { versions, lifetime };
         decoder.finish()?;
         Ok(state)
     }
-}
-
-fn encode_event(
-    bytes: &mut Vec<u8>,
-    event_index: u64,
-    current_epoch: Epoch,
-    operation: &LifecycleMutation,
-) -> Result<()> {
-    bytes.push(APPLY_EVENT);
-    push_u64(bytes, event_index);
-    push_u64(bytes, current_epoch);
-    match operation {
-        LifecycleMutation::SetLifetime { logical_end_epoch } => {
-            bytes.push(SET_LIFETIME);
-            push_u64(bytes, *logical_end_epoch);
-        }
-        LifecycleMutation::Tombstone { shards } => {
-            bytes.push(TOMBSTONE);
-            let count = u32::try_from(shards.len())
-                .map_err(|_| invalid("too many shards in one lifecycle event"))?;
-            bytes.extend_from_slice(&count.to_le_bytes());
-            for shard in shards {
-                push_shard(bytes, *shard);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn push_u64(bytes: &mut Vec<u8>, value: u64) {
@@ -466,35 +345,12 @@ impl<'a> Decoder<'a> {
         Self { bytes, offset: 0 }
     }
 
-    fn version(&mut self) -> Result<u8> {
+    fn version(&mut self) -> Result<()> {
         let version = self.u8()?;
-        if version != VERSION && version != LEGACY_VERSION {
+        if version != VERSION {
             return Err(invalid(format!("unsupported version {version}")));
         }
-        Ok(version)
-    }
-
-    fn event(&mut self) -> Result<BlobMutation> {
-        let event_index = self.u64()?;
-        let current_epoch = self.u64()?;
-        let operation = match self.u8()? {
-            SET_LIFETIME => LifecycleMutation::SetLifetime {
-                logical_end_epoch: self.u64()?,
-            },
-            TOMBSTONE => {
-                let count = self.u32()?;
-                let shards = (0..count)
-                    .map(|_| self.shard())
-                    .collect::<Result<Vec<_>>>()?;
-                LifecycleMutation::Tombstone { shards }
-            }
-            tag => return Err(invalid(format!("invalid lifecycle event tag {tag}"))),
-        };
-        Ok(BlobMutation::ApplyEvent {
-            event_index,
-            current_epoch,
-            operation,
-        })
+        Ok(())
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {

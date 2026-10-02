@@ -98,7 +98,7 @@ fn from_db_creates_only_the_live_column_families() {
         assert!(index.db().cf_exists(name), "missing {name}");
     }
     assert!(index.db().cf_exists("existing"));
-    assert_eq!(index.cf_names().as_strs().len(), 12);
+    assert_eq!(index.cf_names().as_strs().len(), 13);
 }
 
 #[test]

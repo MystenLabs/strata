@@ -1,10 +1,7 @@
 use super::*;
-use crate::{
-    Error,
-    port::{
-        RocksBackend,
-        codec::{decode_value, encode_key},
-    },
+use index::port::{
+    RocksBackend,
+    codec::{decode_value, encode_key},
 };
 use tempfile::tempdir;
 
@@ -146,7 +143,8 @@ fn metadata_and_event_fanout_abort_or_commit_together() -> Result<()> {
         batch.register(b"a", 0, 15, vec![])?;
         batch.register(b"b", 0, 15, vec![])?;
         batch.advance_epoch(0, 10, vec![])?;
-        batch.metadata().put("application", b"event_index", b"0")
+        batch.metadata().put("application", b"event_index", b"0")?;
+        Ok(())
     };
     let result: Result<()> = queue.write_batch(|batch| {
         stage(batch)?;

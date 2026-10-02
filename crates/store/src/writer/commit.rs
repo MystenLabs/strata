@@ -23,14 +23,14 @@
 //! that metadata will never acknowledge — only recovery can reconcile that) and every caller in
 //! the group receives the halt.
 
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 use core_types::{Epoch, ShardId, ShardKey, StrataLsn, encoded_record_len};
 
 use crate::{
     BatchOp, BatchWriteRequest, BatchWriteResult, Error, PendingRollover, PreparedBatch,
-    PreparedBatchOp, Result, StoreWriteProfile, WriteCoordinator, blob_lsm::BlobMutation,
-    metrics::PutMetric, profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
+    PreparedBatchOp, Result, StoreWriteProfile, WriteCoordinator, metrics::PutMetric,
+    profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
 };
 
 impl WriteCoordinator {
@@ -90,6 +90,7 @@ impl WriteCoordinator {
         let mut next_lsn = None;
         let mut current_epoch = None;
         let mut prepared_batches = Vec::with_capacity(requests.len());
+        let mut lsn_keys = HashSet::new();
 
         // Validate everything before writing bytes. A rejected batch does not advance either
         // cursor, so later valid batches still receive a gap-free LSN range.
@@ -123,6 +124,11 @@ impl WriteCoordinator {
                 profile.as_mut(),
                 |profile, elapsed| profile.prepare_batch += elapsed,
                 || {
+                    if let Some(key) = &request.lsn_key
+                        && (lsn_keys.contains(key) || self.index.batch_lsns().contains_key(key)?)
+                    {
+                        return Err(Error::BatchKeyAlreadyExists);
+                    }
                     let batch_next_lsn = match next_lsn {
                         Some(next_lsn) => next_lsn,
                         None => self.index.get_next_lsn()?,
@@ -136,6 +142,9 @@ impl WriteCoordinator {
             );
             match result {
                 Ok((prepared, batch_next_lsn, batch_epoch)) => {
+                    if let Some(key) = &request.lsn_key {
+                        lsn_keys.insert(key.clone());
+                    }
                     next_lsn = Some(batch_next_lsn);
                     current_epoch = batch_epoch;
                     prepared_batches.push((request, prepared, profile));
@@ -284,7 +293,9 @@ impl WriteCoordinator {
         let commit_started = Instant::now();
         let commit_result = self.commit_write_group(
             &pending_rollovers,
-            prepared_batches.iter().map(|(_, prepared, _)| prepared),
+            prepared_batches
+                .iter()
+                .map(|(request, prepared, _)| (prepared, request.lsn_key.as_ref())),
             next_lsn.expect("a non-empty prepared group has a next LSN"),
         );
         let commit_elapsed = commit_started.elapsed();
@@ -546,22 +557,6 @@ impl WriteCoordinator {
                     });
                     op_epochs.push(Some(next_epoch));
                 }
-                BatchOp::ApplyBlobEvent {
-                    key,
-                    event_index,
-                    operation,
-                } => {
-                    prepared_ops.push(PreparedBatchOp::BlobEvent {
-                        key,
-                        lsn,
-                        mutation: BlobMutation::ApplyEvent {
-                            event_index,
-                            current_epoch: current_epoch.ok_or(Error::EpochNotInitialized)?,
-                            operation,
-                        },
-                    });
-                    op_epochs.push(None);
-                }
                 BatchOp::AdvanceEpochTo { epoch } => {
                     let epoch = epoch.max(current_epoch.ok_or(Error::EpochNotInitialized)?);
                     current_epoch = Some(epoch);
@@ -599,6 +594,8 @@ impl WriteCoordinator {
     /// 2. For epoch change, the `epoch_changes[lsn]` history row and the `current_epoch` pointer.
     /// 3. The updated active segment state row but only if op actually wrote payload bytes
     /// 4. `next_lsn = last committed lsn + 1`
+    /// 5. Any opaque caller batch keys mapped to their batch's last LSN. These are submission
+    ///    records, not durability markers; recovery removes them if their writes are discarded.
     ///
     /// A rollover during this write stages its metadata in `self.pending_rollovers`, so the active
     /// segment change commits atomically with the records that reference it.
@@ -615,7 +612,7 @@ impl WriteCoordinator {
     fn commit_write_group<'a>(
         &self,
         pending_rollovers: &[PendingRollover],
-        prepared_batches: impl IntoIterator<Item = &'a PreparedBatch>,
+        prepared_batches: impl IntoIterator<Item = (&'a PreparedBatch, Option<&'a Vec<u8>>)>,
         next_lsn: StrataLsn,
     ) -> Result<()> {
         let mut batch = self.index.batch();
@@ -624,15 +621,17 @@ impl WriteCoordinator {
         }
 
         let mut wrote_payload = false;
-        for prepared in prepared_batches {
+        for (prepared, lsn_key) in prepared_batches {
+            if let Some(key) = lsn_key {
+                let last_lsn = prepared.result.last_lsn().expect("nonempty prepared batch");
+                batch.insert_batch(self.index.batch_lsns(), [(key, last_lsn)])?;
+            }
             for op in &prepared.ops {
                 match op {
                     PreparedBatchOp::Put { .. } => {
                         wrote_payload = true;
                     }
-                    PreparedBatchOp::Lifecycle { .. }
-                    | PreparedBatchOp::Tombstone { .. }
-                    | PreparedBatchOp::BlobEvent { .. } => {}
+                    PreparedBatchOp::Lifecycle { .. } | PreparedBatchOp::Tombstone { .. } => {}
                     PreparedBatchOp::EpochChange { lsn, epoch } => {
                         self.index
                             .put_epoch_change_batch(&mut batch, *lsn, *epoch)?;

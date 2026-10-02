@@ -12,6 +12,14 @@ internal-profiling = ["store/internal-profiling"]
 [dependencies]
 core.workspace = true
 store.workspace = true
+index.workspace = true
+rocksdb.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
 
 [workspace]
 members = [

@@ -3,9 +3,7 @@
 use core_types::{BlobLifecycle, Epoch, GarbageEvent, RecordRef, ShardKey};
 use lsm::{GarbageRecord, Result, StrataLsn};
 
-use super::format::{
-    BlobLifetime, BlobMutation, BlobMutationWithLSN, BlobState, BlobVersion, LifecycleMutation,
-};
+use super::format::{BlobLifetime, BlobMutation, BlobMutationWithLSN, BlobState, BlobVersion};
 use super::garbage::{emit_lifetime_change, emit_record};
 use super::snapshot::BlobCompactionSnapshot;
 
@@ -42,30 +40,6 @@ impl BlobState {
                 current_epoch,
             } => self.set_lifetime(key, lsn, logical_end_epoch, current_epoch, emit),
             BlobMutation::Tombstone { shard } => self.tombstone(key, lsn, shard, emit),
-            BlobMutation::ApplyEvent {
-                event_index,
-                current_epoch,
-                operation,
-            } => {
-                if self
-                    .last_event_index
-                    .is_some_and(|applied| event_index <= applied)
-                {
-                    return Ok(());
-                }
-                match operation {
-                    LifecycleMutation::SetLifetime { logical_end_epoch } => {
-                        self.set_lifetime(key, lsn, logical_end_epoch, current_epoch, emit)?;
-                    }
-                    LifecycleMutation::Tombstone { shards } => {
-                        for shard in shards {
-                            self.tombstone(key, lsn, shard, emit)?;
-                        }
-                    }
-                }
-                self.last_event_index = Some(event_index);
-                Ok(())
-            }
         }
     }
 

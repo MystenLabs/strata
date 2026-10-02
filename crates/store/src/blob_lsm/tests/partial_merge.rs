@@ -710,7 +710,6 @@ fn partial_merge_terminal_event_may_subsume_expiry_from_a_base_lifetime() {
     let base_record = record(1, 10);
     let patch_record = record(2, 20);
     let base_state = BlobState {
-        last_event_index: None,
         versions: BTreeMap::from([(
             shard,
             BlobVersion {
@@ -920,7 +919,6 @@ fn partial_merge_final_put_retires_the_unknown_base_without_a_synthetic_tombston
     let first_patch_record = record(2, 20);
     let final_patch_record = record(3, 30);
     let base_state = BlobState {
-        last_event_index: None,
         versions: BTreeMap::from([(
             shard,
             BlobVersion {

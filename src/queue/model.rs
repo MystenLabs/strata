@@ -1,5 +1,5 @@
-use crate::port::codec::{decode_value, encode_value};
-use crate::{Error, Result};
+use super::{Error, Result};
+use index::port::codec::{decode_value, encode_value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +103,8 @@ pub enum BlobOperand {
 pub enum BlobEdit {
     Append(BlobCommand),
     Register(BlobCommand),
-    /// Only emit after Strata effects AND their replay identities are durable. This trims the
+    /// Only emit after the submitted Strata LSN is durable, in the same synced RocksDB batch as
+    /// deleting its LSN binding (see `PendingQueue::acknowledge_blobs`). This trims the
     /// applied event prefix without dropping concurrent newer appends. Empty rows remain for
     /// bounded cleanup under the blob lock; do not delete a whole row using an old snapshot.
     /// This is not a replay watermark: the application must not enqueue already-handled events.
@@ -114,7 +115,7 @@ pub enum BlobEdit {
 
 impl BlobOperand {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        encode_value(self)
+        Ok(encode_value(self)?)
     }
 }
 
@@ -129,5 +130,5 @@ pub fn merge_pending<'a>(
     for operand in operands {
         pending.apply(decode_value(operand)?)?;
     }
-    encode_value(&pending)
+    Ok(encode_value(&pending)?)
 }
