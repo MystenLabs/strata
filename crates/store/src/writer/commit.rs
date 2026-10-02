@@ -284,7 +284,9 @@ impl WriteCoordinator {
         let commit_started = Instant::now();
         let commit_result = self.commit_write_group(
             &pending_rollovers,
-            prepared_batches.iter().map(|(_, prepared, _)| prepared),
+            prepared_batches
+                .iter()
+                .map(|(request, prepared, _)| (prepared, request.lsn_key.as_ref())),
             next_lsn.expect("a non-empty prepared group has a next LSN"),
         );
         let commit_elapsed = commit_started.elapsed();
@@ -546,6 +548,12 @@ impl WriteCoordinator {
                     });
                     op_epochs.push(Some(next_epoch));
                 }
+                BatchOp::AdvanceEpochTo { epoch } => {
+                    let epoch = epoch.max(current_epoch.ok_or(Error::EpochNotInitialized)?);
+                    current_epoch = Some(epoch);
+                    prepared_ops.push(PreparedBatchOp::EpochChange { lsn, epoch });
+                    op_epochs.push(Some(epoch));
+                }
             }
         }
 
@@ -577,6 +585,8 @@ impl WriteCoordinator {
     /// 2. For epoch change, the `epoch_changes[lsn]` history row and the `current_epoch` pointer.
     /// 3. The updated active segment state row but only if op actually wrote payload bytes
     /// 4. `next_lsn = last committed lsn + 1`
+    /// 5. Any opaque caller batch keys mapped to their batch's last LSN. These are submission
+    ///    records, not durability markers; recovery removes them if their writes are discarded.
     ///
     /// A rollover during this write stages its metadata in `self.pending_rollovers`, so the active
     /// segment change commits atomically with the records that reference it.
@@ -593,7 +603,7 @@ impl WriteCoordinator {
     fn commit_write_group<'a>(
         &self,
         pending_rollovers: &[PendingRollover],
-        prepared_batches: impl IntoIterator<Item = &'a PreparedBatch>,
+        prepared_batches: impl IntoIterator<Item = (&'a PreparedBatch, Option<&'a Vec<u8>>)>,
         next_lsn: StrataLsn,
     ) -> Result<()> {
         let mut batch = self.index.batch();
@@ -602,7 +612,11 @@ impl WriteCoordinator {
         }
 
         let mut wrote_payload = false;
-        for prepared in prepared_batches {
+        for (prepared, lsn_key) in prepared_batches {
+            if let Some(key) = lsn_key {
+                let last_lsn = prepared.result.last_lsn().expect("nonempty prepared batch");
+                batch.insert_batch(self.index.submitted_batch_lsns(), [(key, last_lsn)])?;
+            }
             for op in &prepared.ops {
                 match op {
                     PreparedBatchOp::Put { .. } => {

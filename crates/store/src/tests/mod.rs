@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod garbage_log;
+mod submitted_batch_lsns;
 
 const TEST_KEY_LEN: u64 = 6;
 const TEST_PAYLOAD_LEN: u64 = 9;
@@ -5944,6 +5945,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
     let (epoch_response_tx, epoch_response_rx) = mpsc::channel();
     coordinator.process_batch_group(vec![
         BatchWriteRequest {
+            lsn_key: Some(b"first".to_vec()),
             ops: vec![BatchOp::Put {
                 shard_id: STANDALONE_SHARD.id,
                 key: BlobKey::new(b"durability-pressure".to_vec()).unwrap(),
@@ -5953,6 +5955,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
             profile: ProfileRequest::default(),
         },
         BatchWriteRequest {
+            lsn_key: Some(b"epoch".to_vec()),
             ops: vec![BatchOp::SetBlobLifetime {
                 key: BlobKey::new(b"invalid-lifetime".to_vec()).unwrap(),
                 logical_end_epoch: cfg.starting_epoch,
@@ -5961,6 +5964,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
             profile: ProfileRequest::default(),
         },
         BatchWriteRequest {
+            lsn_key: Some(b"epoch".to_vec()),
             ops: vec![BatchOp::IncrementEpoch],
             response_tx: epoch_response_tx,
             profile: ProfileRequest::default(),
@@ -5977,6 +5981,20 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
     let epoch_result = epoch_response_rx.recv().unwrap().unwrap();
     assert_eq!(epoch_result.last_lsn(), Some(2));
     assert_eq!(epoch_result.last_epoch(), Some(cfg.starting_epoch + 1));
+    assert_eq!(
+        index
+            .submitted_batch_lsns()
+            .get(&b"first".to_vec())
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        index
+            .submitted_batch_lsns()
+            .get(&b"epoch".to_vec())
+            .unwrap(),
+        Some(2)
+    );
     assert_eq!(
         histogram_sample_count(&registry, "strata_store_requests_per_commit_group"),
         1
@@ -5999,6 +6017,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
 
     let (second_response_tx, second_response_rx) = mpsc::channel();
     coordinator.process_batch_group(vec![BatchWriteRequest {
+        lsn_key: None,
         ops: vec![BatchOp::IncrementEpoch],
         response_tx: second_response_tx,
         profile: ProfileRequest::default(),

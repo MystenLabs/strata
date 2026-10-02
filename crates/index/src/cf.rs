@@ -6,6 +6,8 @@ pub(crate) const GC_RECLAIM_STRATEGIES_CF: &str = "gc_reclaim_strategies";
 pub(crate) const SHARDS_CF: &str = "shards";
 pub(crate) const SHARD_CLEANUP_JOBS_CF: &str = "shard_cleanup_jobs";
 pub(crate) const STORE_STATE_CF: &str = "store_state";
+// Keep the persisted name so existing replay records remain discoverable after the API rename.
+pub(crate) const SUBMITTED_BATCH_LSNS_CF: &str = "batch_lsns";
 pub(crate) const EPOCH_CHANGES_CF: &str = "epoch_changes";
 pub(crate) const LSM_MANIFESTS_CF: &str = "lsm_manifests";
 pub(crate) const GARBAGE_LOG_POSITIONS_CF: &str = "garbage_log_positions";
@@ -21,6 +23,7 @@ pub struct StrataIndexCfNames {
     pub shards: String,
     pub shard_cleanup_jobs: String,
     pub store_state: String,
+    pub submitted_batch_lsns: String,
     pub epoch_changes: String,
     pub lsm_manifests: String,
     pub garbage_log_positions: String,
@@ -47,6 +50,7 @@ impl StrataIndexCfNames {
             shards: with_prefix(SHARDS_CF),
             shard_cleanup_jobs: with_prefix(SHARD_CLEANUP_JOBS_CF),
             store_state: with_prefix(STORE_STATE_CF),
+            submitted_batch_lsns: with_prefix(SUBMITTED_BATCH_LSNS_CF),
             epoch_changes: with_prefix(EPOCH_CHANGES_CF),
             lsm_manifests: with_prefix(LSM_MANIFESTS_CF),
             garbage_log_positions: with_prefix(GARBAGE_LOG_POSITIONS_CF),
@@ -58,7 +62,7 @@ impl StrataIndexCfNames {
     ///
     /// Public because an embedder hosting these families in its own database needs to know which
     /// ones belong to Strata.
-    pub fn as_strs(&self) -> [&str; 12] {
+    pub fn as_strs(&self) -> [&str; 13] {
         [
             self.segment_states.as_str(),
             self.segment_publication_lsns.as_str(),
@@ -68,6 +72,7 @@ impl StrataIndexCfNames {
             self.shards.as_str(),
             self.shard_cleanup_jobs.as_str(),
             self.store_state.as_str(),
+            self.submitted_batch_lsns.as_str(),
             self.epoch_changes.as_str(),
             self.lsm_manifests.as_str(),
             self.garbage_log_positions.as_str(),

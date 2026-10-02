@@ -4,9 +4,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Errors emitted by Strata index operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("invalid pending lifecycle operation: {0}")]
-    InvalidPendingOperation(String),
-
     #[error("rocksdb error: {0}")]
     RocksDb(String),
 

@@ -17,6 +17,7 @@
 //! | shard_cleanup_jobs | ShardKey -> ShardCleanupJob                 |
 //! | store_state     | StoreStateKey -> u64                         |
 //! | epoch_changes   | StrataLsn -> current Epoch                   |
+//! | batch_lsns      | opaque caller key -> submitted batch's last LSN |
 //! | lsm_manifests     | String -> lsm::Manifest                 |
 //! | garbage_log_positions | String -> lsm::GarbageLogPosition       |
 //! | segment_garbage_log_positions | SegmentId -> committed local file offset   |
@@ -46,7 +47,6 @@ mod options;
 mod overlay_cache;
 pub mod port;
 mod publication;
-pub mod queue;
 mod segment;
 mod shard;
 mod storage;
@@ -97,6 +97,8 @@ pub struct StrataIndex {
     shard_cleanup_jobs: TypedMap<ShardKey, ShardCleanupJob>,
     /// Store-global cursors.
     store_state: TypedMap<StoreStateKey, StrataLsn>,
+    /// Opaque caller batch key to its last submitted LSN. Recovery removes discarded bindings.
+    submitted_batch_lsns: TypedMap<Vec<u8>, StrataLsn>,
     /// Store-global epoch timeline. LSN 0 is the genesis epoch for the namespace.
     epoch_changes: TypedMap<StrataLsn, Epoch>,
     /// Materialized file set for each LSM, updated through RocksDB merge operands.

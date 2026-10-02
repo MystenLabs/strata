@@ -79,6 +79,9 @@ pub enum Error {
     #[error("write coordinator dropped the response")]
     WriteResponseDropped,
 
+    #[error("cannot record an LSN for an empty batch")]
+    EmptyTrackedBatch,
+
     #[error("durability queue is closed")]
     DurabilityQueueClosed,
 
