@@ -52,9 +52,13 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
         for key in &physical_keys {
             batch.tombstone(7, key.clone());
         }
-        submitted_lsn = queue.submit_blob(b"blob", 100, batch)?;
+        submitted_lsn = queue.submit_blob_strata(b"blob", 100, batch)?;
         assert!(store.published_lsn()? < submitted_lsn);
-        assert!(queue.acknowledge_blobs(&store, &[(b"blob", 100)]).is_err());
+        assert!(
+            queue
+                .acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])
+                .is_err()
+        );
         // A RocksDB checkpoint can be visible before its sync completes. The queue must use
         // the store's successful-durability notification rather than trusting that visible row.
         let published = store.published_lsn()?;
@@ -63,7 +67,11 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
             .index()
             .put_commit_lsn_batch(&mut metadata, submitted_lsn)?;
         metadata.write()?;
-        assert!(queue.acknowledge_blobs(&store, &[(b"blob", 100)]).is_err());
+        assert!(
+            queue
+                .acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])
+                .is_err()
+        );
         let mut metadata = store.index().batch();
         store
             .index()
@@ -79,13 +87,16 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
         for key in &physical_keys {
             batch.tombstone(7, key.clone());
         }
-        assert_eq!(queue.submit_blob(b"blob", 100, batch)?, submitted_lsn);
+        assert_eq!(
+            queue.submit_blob_strata(b"blob", 100, batch)?,
+            submitted_lsn
+        );
         assert_eq!(store.index().get_next_lsn()?, before);
         for key in &physical_keys {
             assert_eq!(store.get_from_shard(7, key)?, None);
         }
-        queue.acknowledge_blobs(&store, &[(b"blob", 100)])?;
-        assert!(store.index().batch_lsns().is_empty()?);
+        queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])?;
+        assert!(store.index().submitted_batch_lsns().is_empty()?);
         // New data is admitted only after the acknowledgement is durably committed.
         for key in &physical_keys {
             store.put(7, key, b"new")?;
@@ -127,7 +138,7 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
             let checkpoint = store.index().get_store_checkpoint()?.unwrap();
             let mut batch = store.batch();
             batch.tombstone(7, blob.clone());
-            let lsn = queue.submit_blob(b"blob", 100, batch)?;
+            let lsn = queue.submit_blob_strata(b"blob", 100, batch)?;
             store.index().flush_wal(true)?;
             assert!(store.published_lsn()? < lsn);
             (checkpoint, lsn, store.config().namespace_dir().join("wal"))
@@ -141,7 +152,7 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
             .unwrap();
         {
             let (store, _) = open_store(dir.path());
-            assert!(store.index().batch_lsns().is_empty()?);
+            assert!(store.index().submitted_batch_lsns().is_empty()?);
             assert_eq!(store.get_from_shard(7, &blob)?, Some(b"old".to_vec()));
             assert_eq!(store.put(7, &key(b"unrelated"), b"value")?, lost_lsn);
             store.sync()?;
@@ -152,10 +163,10 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
     let before = store.index().get_next_lsn()?;
     let mut batch = store.batch();
     batch.tombstone(7, blob.clone());
-    assert_eq!(queue.submit_blob(b"blob", 100, batch)?, before);
+    assert_eq!(queue.submit_blob_strata(b"blob", 100, batch)?, before);
     assert_eq!(store.index().get_next_lsn()?, before + 1);
     store.sync()?;
-    queue.acknowledge_blobs(&store, &[(b"blob", 100)])?;
+    queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])?;
     assert_eq!(store.get_from_shard(7, &blob)?, None);
     Ok(())
 }
@@ -182,14 +193,14 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
         drop(queue.durable_snapshot()?);
         let mut batch = store.batch();
         batch.set_blob_lifetime(blob.clone(), 50);
-        first_lsn = queue.submit_blob(b"blob", 0, batch)?;
+        first_lsn = queue.submit_blob_strata(b"blob", 0, batch)?;
         store.sync()?;
     }
     let (store, queue) = open_store(dir.path());
     let before = store.index().get_next_lsn()?;
     let mut batch = store.batch();
     batch.set_blob_lifetime(blob.clone(), 50);
-    assert_eq!(queue.submit_blob(b"blob", 0, batch)?, first_lsn);
+    assert_eq!(queue.submit_blob_strata(b"blob", 0, batch)?, first_lsn);
     assert_eq!(store.index().get_next_lsn()?, before);
     queue.write_batch(|b| {
         b.append(
@@ -199,16 +210,16 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
             vec![],
         )
     })?;
-    queue.acknowledge_blobs(&store, &[(b"blob", 0)])?;
+    queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", 0)])?;
     let snapshot = queue.durable_snapshot()?;
     let row = queue.blobs(snapshot.as_ref())?.next().unwrap()?.1;
     assert_eq!(row.commands().len(), 1);
     assert_eq!(row.commands()[0].event_index, u64::MAX);
     let mut batch = store.batch();
     batch.set_blob_lifetime(blob.clone(), 60);
-    queue.submit_blob(b"blob", u64::MAX, batch)?;
+    queue.submit_blob_strata(b"blob", u64::MAX, batch)?;
     store.sync()?;
-    queue.acknowledge_blobs(&store, &[(b"blob", u64::MAX)])?;
+    queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", u64::MAX)])?;
     let mut batch = store.batch();
     batch.advance_epoch_to(51);
     batch.write()?;
@@ -231,33 +242,37 @@ async fn cancelled_out_of_order_failed_and_cross_store_submissions_do_not_apply(
         let mut batch = store.batch();
         batch.set_blob_lifetime(key(b"blob"), 50);
         assert!(matches!(
-            queue.submit_blob(b"blob", event, batch),
+            queue.submit_blob_strata(b"blob", event, batch),
             Err(Error::InvalidPendingOperation(_))
         ));
     }
     assert!(matches!(
-        queue.submit_blob(b"blob", 2, store.batch()),
+        queue.submit_blob_strata(b"blob", 2, store.batch()),
         Err(Error::Store(store::Error::EmptyTrackedBatch))
     ));
     let mut batch = store.batch();
     batch.set_blob_lifetime(key(b"blob"), 42);
     assert!(matches!(
-        queue.submit_blob(b"blob", 2, batch),
+        queue.submit_blob_strata(b"blob", 2, batch),
         Err(Error::Store(store::Error::InvalidBlobLifetime { .. }))
     ));
-    assert!(store.index().batch_lsns().is_empty()?);
+    assert!(store.index().submitted_batch_lsns().is_empty()?);
     assert_eq!(store.index().get_next_lsn()?, before);
-    assert!(queue.acknowledge_blobs(&store, &[(b"blob", 2)]).is_err());
+    assert!(
+        queue
+            .acknowledge_blobs_rocksdb(&store, &[(b"blob", 2)])
+            .is_err()
+    );
     let other_dir = tempdir().unwrap();
     let (other, _) = open_store(other_dir.path());
     let other_before = other.index().get_next_lsn()?;
     let mut batch = other.batch();
     batch.set_blob_lifetime(key(b"blob"), 50);
     assert!(matches!(
-        queue.submit_blob(b"blob", 2, batch),
+        queue.submit_blob_strata(b"blob", 2, batch),
         Err(Error::InvalidPendingOperation(_))
     ));
-    assert!(other.index().batch_lsns().is_empty()?);
+    assert!(other.index().submitted_batch_lsns().is_empty()?);
     assert_eq!(other.index().get_next_lsn()?, other_before);
     Ok(())
 }
@@ -278,7 +293,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         for name in [b"a", b"b"] {
             let mut batch = store.batch();
             batch.set_blob_lifetime(key(name), 50);
-            lsns.push(queue.submit_blob(name, 0, batch)?);
+            lsns.push(queue.submit_blob_strata(name, 0, batch)?);
             if name == b"a" {
                 store.sync()?;
             }
@@ -287,7 +302,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         // A is durable, B is not: the whole acknowledgement must abort, retaining A too.
         assert!(
             queue
-                .acknowledge_blobs(&store, &[(b"a", 0), (b"b", 0)])
+                .acknowledge_blobs_rocksdb(&store, &[(b"a", 0), (b"b", 0)])
                 .is_err()
         );
         assert_eq!(
@@ -297,23 +312,23 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         let before = store.index().get_next_lsn()?;
         let mut batch = store.batch();
         batch.set_blob_lifetime(key(b"a"), 50);
-        assert_eq!(queue.submit_blob(b"a", 0, batch)?, lsns[0]);
+        assert_eq!(queue.submit_blob_strata(b"a", 0, batch)?, lsns[0]);
         assert_eq!(store.index().get_next_lsn()?, before);
         store.sync()?;
-        queue.acknowledge_blobs(&store, &[(b"a", 0), (b"b", 0)])?;
-        epoch_lsn = queue.submit_epoch(&store, 0)?;
+        queue.acknowledge_blobs_rocksdb(&store, &[(b"a", 0), (b"b", 0)])?;
+        epoch_lsn = queue.submit_epoch_strata(&store, 0)?;
         assert!(epoch_lsn > lsns[1]);
-        assert!(queue.acknowledge_epoch(&store, 0).is_err());
+        assert!(queue.acknowledge_epoch_rocksdb(&store, 0).is_err());
         store.sync()?;
     }
     let (store, queue) = open_store(dir.path());
     let before = store.index().get_next_lsn()?;
-    assert_eq!(queue.submit_epoch(&store, 0)?, epoch_lsn);
+    assert_eq!(queue.submit_epoch_strata(&store, 0)?, epoch_lsn);
     assert_eq!(store.index().get_next_lsn()?, before);
     assert_eq!(store.current_epoch()?, 45);
-    queue.acknowledge_epoch(&store, 0)?;
+    queue.acknowledge_epoch_rocksdb(&store, 0)?;
     let snapshot = queue.durable_snapshot()?;
     assert!(queue.barriers(snapshot.as_ref())?.next().is_none());
-    assert!(store.index().batch_lsns().is_empty()?);
+    assert!(store.index().submitted_batch_lsns().is_empty()?);
     Ok(())
 }

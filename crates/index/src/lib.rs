@@ -98,7 +98,7 @@ pub struct StrataIndex {
     /// Store-global cursors.
     store_state: TypedMap<StoreStateKey, StrataLsn>,
     /// Opaque caller batch key to its last submitted LSN. Recovery removes discarded bindings.
-    batch_lsns: TypedMap<Vec<u8>, StrataLsn>,
+    submitted_batch_lsns: TypedMap<Vec<u8>, StrataLsn>,
     /// Store-global epoch timeline. LSN 0 is the genesis epoch for the namespace.
     epoch_changes: TypedMap<StrataLsn, Epoch>,
     /// Materialized file set for each LSM, updated through RocksDB merge operands.

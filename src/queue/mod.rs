@@ -12,9 +12,11 @@
 //!
 //! There is no background worker or lock manager here yet. The caller must select durable work,
 //! recheck cancellation and shard generations under shared locks, and hold those locks through
-//! durable acknowledgement. Drain preceding work before an epoch barrier and block later work
-//! until it completes. The application owns reference checks, event ordering and replay filtering,
-//! pool fan-out, and foreground put coordination. Any uncertain write/sync failure is fail-stop.
+//! durable acknowledgement. This serializes each blob's saved-LSN check and submission; different
+//! blobs may run concurrently. Drain preceding work before an epoch barrier, serialize barrier
+//! submissions, and block later work until it completes. The application owns reference checks,
+//! event ordering and replay filtering, pool fan-out, and foreground put coordination. Any
+//! uncertain write/sync failure is fail-stop.
 
 mod model;
 mod replay;

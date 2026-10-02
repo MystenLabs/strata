@@ -309,8 +309,12 @@ impl<'a> StrataBatch<'a> {
     ///
     /// The binding commits atomically with the batch's LSN allocation. The key is not written
     /// into blob records and has no meaning to the engine. Read it through
-    /// `store.index().batch_lsns()`. An existing key is rejected without applying any operations;
-    /// callers own serialization, retry decisions, and eventual cleanup of these records.
+    /// `store.index().submitted_batch_lsns()`.
+    ///
+    /// The caller must use an unused key and serialize submissions for that key. Before retrying,
+    /// check its saved LSN under the same lock and reuse that result if present. This method does
+    /// not deduplicate submissions. Different keys may be submitted concurrently. The caller also
+    /// owns eventual cleanup of these records.
     ///
     /// Success means visible, not durable. Wait for the returned last LSN to be published before
     /// acknowledging application work. Recovery removes bindings for discarded writes in the

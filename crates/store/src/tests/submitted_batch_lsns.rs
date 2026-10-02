@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn tracked_batch_records_last_lsn_and_rejects_duplicate_before_mutating() {
+async fn tracked_batch_records_last_lsn_and_survives_reopen() {
     let dir = tempdir().unwrap();
     let cfg = config(dir.path(), "default");
     let key = BlobKey::new(b"blob".to_vec()).unwrap();
@@ -15,21 +15,21 @@ async fn tracked_batch_records_last_lsn_and_rejects_duplicate_before_mutating() 
         let result = batch.write_with_lsn(tag.clone()).unwrap();
         lsn = result.last_lsn().unwrap();
         assert_eq!(result.op_lsns(), &[lsn - 1, lsn]);
-        assert_eq!(store.index().batch_lsns().get(&tag).unwrap(), Some(lsn));
+        assert_eq!(
+            store.index().submitted_batch_lsns().get(&tag).unwrap(),
+            Some(lsn)
+        );
         assert!(store.published_lsn().unwrap() < lsn);
 
-        let mut duplicate = store.batch();
-        duplicate.tombstone(STANDALONE_SHARD.id, key.clone());
-        assert!(matches!(
-            duplicate.write_with_lsn(tag.clone()),
-            Err(Error::BatchKeyAlreadyExists)
-        ));
         assert_eq!(store.get(&key).unwrap(), Some(b"value".to_vec()));
         assert_eq!(store.index().get_next_lsn().unwrap(), lsn + 1);
         store.sync().unwrap();
     }
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-    assert_eq!(store.index().batch_lsns().get(&tag).unwrap(), Some(lsn));
+    assert_eq!(
+        store.index().submitted_batch_lsns().get(&tag).unwrap(),
+        Some(lsn)
+    );
     assert!(store.published_lsn().unwrap() >= lsn);
 }
 
@@ -51,7 +51,10 @@ async fn rejected_batches_do_not_reserve_a_key_or_an_lsn() {
         batch.write_with_lsn(tag.clone()),
         Err(Error::InvalidBlobLifetime { .. })
     ));
-    assert_eq!(store.index().batch_lsns().get(&tag).unwrap(), None);
+    assert_eq!(
+        store.index().submitted_batch_lsns().get(&tag).unwrap(),
+        None
+    );
     assert_eq!(store.index().get_next_lsn().unwrap(), next_lsn);
 }
 
@@ -93,8 +96,18 @@ async fn rollback_durably_forgets_binding_before_lsn_reuse_and_another_restart()
     {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         assert_eq!(store.get(&key).unwrap(), Some(b"value".to_vec()));
-        assert_eq!(store.index().batch_lsns().get(&tag).unwrap(), None);
-        assert!(store.index().batch_lsns().get(&kept_tag).unwrap().is_some());
+        assert_eq!(
+            store.index().submitted_batch_lsns().get(&tag).unwrap(),
+            None
+        );
+        assert!(
+            store
+                .index()
+                .submitted_batch_lsns()
+                .get(&kept_tag)
+                .unwrap()
+                .is_some()
+        );
         // Unrelated work reuses the old number. It must never make the lost delete look applied.
         let unrelated = BlobKey::new(b"unrelated".to_vec()).unwrap();
         let reused_lsn = store.put(&unrelated, b"other").unwrap();
@@ -104,7 +117,10 @@ async fn rollback_durably_forgets_binding_before_lsn_reuse_and_another_restart()
     {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         assert!(store.published_lsn().unwrap() >= lost_lsn);
-        assert_eq!(store.index().batch_lsns().get(&tag).unwrap(), None);
+        assert_eq!(
+            store.index().submitted_batch_lsns().get(&tag).unwrap(),
+            None
+        );
         let mut batch = store.batch();
         batch.tombstone(STANDALONE_SHARD.id, key.clone());
         let retry_lsn = batch
@@ -117,7 +133,15 @@ async fn rollback_durably_forgets_binding_before_lsn_reuse_and_another_restart()
     }
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     assert_eq!(store.get(&key).unwrap(), None);
-    assert!(store.index().batch_lsns().get(&tag).unwrap().unwrap() > lost_lsn);
+    assert!(
+        store
+            .index()
+            .submitted_batch_lsns()
+            .get(&tag)
+            .unwrap()
+            .unwrap()
+            > lost_lsn
+    );
 }
 
 #[tokio::test]
@@ -141,7 +165,10 @@ async fn recovery_promotes_complete_unsynced_batch_with_its_binding() {
     }
     for _ in 0..2 {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
-        assert_eq!(store.index().batch_lsns().get(&tag).unwrap(), Some(last));
+        assert_eq!(
+            store.index().submitted_batch_lsns().get(&tag).unwrap(),
+            Some(last)
+        );
         assert_eq!(store.current_epoch().unwrap(), 45);
         assert!(store.published_lsn().unwrap() >= last);
         for lsn in 1..=last {

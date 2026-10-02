@@ -23,7 +23,7 @@
 //! that metadata will never acknowledge — only recovery can reconcile that) and every caller in
 //! the group receives the halt.
 
-use std::{collections::HashSet, time::Instant};
+use std::time::Instant;
 
 use core_types::{Epoch, ShardId, ShardKey, StrataLsn, encoded_record_len};
 
@@ -90,7 +90,6 @@ impl WriteCoordinator {
         let mut next_lsn = None;
         let mut current_epoch = None;
         let mut prepared_batches = Vec::with_capacity(requests.len());
-        let mut lsn_keys = HashSet::new();
 
         // Validate everything before writing bytes. A rejected batch does not advance either
         // cursor, so later valid batches still receive a gap-free LSN range.
@@ -124,11 +123,6 @@ impl WriteCoordinator {
                 profile.as_mut(),
                 |profile, elapsed| profile.prepare_batch += elapsed,
                 || {
-                    if let Some(key) = &request.lsn_key
-                        && (lsn_keys.contains(key) || self.index.batch_lsns().contains_key(key)?)
-                    {
-                        return Err(Error::BatchKeyAlreadyExists);
-                    }
                     let batch_next_lsn = match next_lsn {
                         Some(next_lsn) => next_lsn,
                         None => self.index.get_next_lsn()?,
@@ -142,9 +136,6 @@ impl WriteCoordinator {
             );
             match result {
                 Ok((prepared, batch_next_lsn, batch_epoch)) => {
-                    if let Some(key) = &request.lsn_key {
-                        lsn_keys.insert(key.clone());
-                    }
                     next_lsn = Some(batch_next_lsn);
                     current_epoch = batch_epoch;
                     prepared_batches.push((request, prepared, profile));
@@ -624,7 +615,7 @@ impl WriteCoordinator {
         for (prepared, lsn_key) in prepared_batches {
             if let Some(key) = lsn_key {
                 let last_lsn = prepared.result.last_lsn().expect("nonempty prepared batch");
-                batch.insert_batch(self.index.batch_lsns(), [(key, last_lsn)])?;
+                batch.insert_batch(self.index.submitted_batch_lsns(), [(key, last_lsn)])?;
             }
             for op in &prepared.ops {
                 match op {

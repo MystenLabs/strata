@@ -104,7 +104,7 @@ pub enum BlobEdit {
     Append(BlobCommand),
     Register(BlobCommand),
     /// Only emit after the submitted Strata LSN is durable, in the same synced RocksDB batch as
-    /// deleting its LSN binding (see `PendingQueue::acknowledge_blobs`). This trims the
+    /// deleting its LSN binding (see `PendingQueue::acknowledge_blobs_rocksdb`). This trims the
     /// applied event prefix without dropping concurrent newer appends. Empty rows remain for
     /// bounded cleanup under the blob lock; do not delete a whole row using an old snapshot.
     /// This is not a replay watermark: the application must not enqueue already-handled events.

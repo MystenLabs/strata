@@ -82,9 +82,6 @@ pub enum Error {
     #[error("cannot record an LSN for an empty batch")]
     EmptyTrackedBatch,
 
-    #[error("the caller's batch key already has an LSN binding")]
-    BatchKeyAlreadyExists,
-
     #[error("durability queue is closed")]
     DurabilityQueueClosed,
 
