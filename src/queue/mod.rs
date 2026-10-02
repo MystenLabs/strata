@@ -10,14 +10,13 @@
 //! Recovery invalidates discarded LSN bindings atomically with the LSN rewind; the queue can
 //! then distinguish a surviving submission from work it must resubmit.
 //!
-//! There is no background worker or lock manager here yet. The caller must select durable work,
-//! recheck cancellation and shard generations under shared locks, and hold those locks through
-//! durable acknowledgement. This serializes each blob's saved-LSN check and submission; different
-//! blobs may run concurrently. Drain preceding work before an epoch barrier, serialize barrier
-//! submissions, and block later work until it completes. The application owns reference checks,
-//! event ordering and replay filtering, pool fan-out, and foreground put coordination. Any
-//! uncertain write/sync failure is fail-stop.
+//! Create one queue per database and share its clones with producers, foreground puts, and the
+//! worker. Hold its blob guards from fresh reference checks through durable acknowledgement.
+//! Shard changes and epoch barriers take its exclusive lifecycle guard. The worker still owns
+//! durable work selection and event ordering; locks alone do not order events. Any uncertain
+//! write/sync failure is fail-stop. Background processing and Walrus wiring are later milestones.
 
+mod coordination;
 mod model;
 mod replay;
 
@@ -33,6 +32,7 @@ pub enum Error {
     Store(#[from] store::Error),
 }
 
+pub use coordination::{LifecycleGuard, LockedBlobs};
 pub use model::*;
 
 use index::port::{
@@ -64,15 +64,18 @@ pub struct PendingQueue {
     db: Arc<dyn IndexDb>,
     blobs: TypedMap<Vec<u8>, PendingBlobOps>,
     barriers: TypedMap<u64, EpochBarrier>,
+    coordination: Arc<coordination::Coordination>,
 }
 
 impl PendingQueue {
     /// The caller must open the queue families using [`cf_options`]. All queue and application
-    /// metadata writes must keep the WAL enabled.
+    /// metadata writes must keep the WAL enabled. Construct once per database and share clones:
+    /// independently constructed queues do not share their in-memory coordination.
     pub fn new(db: Arc<dyn IndexDb>) -> Self {
         Self {
             blobs: TypedMap::new(Arc::clone(&db), PENDING_BLOBS_CF),
             barriers: TypedMap::new(Arc::clone(&db), EPOCH_BARRIERS_CF),
+            coordination: Arc::default(),
             db,
         }
     }

@@ -12,12 +12,11 @@ impl PendingQueue {
     /// The caller builds `batch` with the command's actual operations, including all of its
     /// physical keys/shards. If an LSN binding already exists, the batch is dropped without writing.
     ///
-    /// The caller must select work from a durable snapshot and hold the shared blob/lifecycle
-    /// locks from revalidation through durable acknowledgement. This method rechecks that the
-    /// command is still first, but it does not make newly enqueued work durable or acquire locks.
-    /// Shard generations must be validated under those locks before building tombstones.
-    /// Submissions for the same blob must be serialized, including the saved-LSN check. Different
-    /// blobs may be submitted concurrently; the writer does not check for duplicate batch keys.
+    /// Select work from a durable snapshot and hold `guard` through durable acknowledgement.
+    /// This rechecks the command and its recorded shard generations under the guard, but does not
+    /// make newly enqueued work durable. A stale/missing shard rejects the entire submission and
+    /// leaves it pending; it must not be silently retargeted to the current generation.
+    /// The caller must build the batch for exactly this command's physical keys and shards.
     ///
     /// Success returns a *submitted* LSN. Batch several submissions before waiting for Strata
     /// durability, then call `acknowledge_blobs_rocksdb`. An uncertain write/sync error requires
@@ -26,30 +25,42 @@ impl PendingQueue {
     /// this exact submission even when earlier attempts' LSNs have been reused.
     pub fn submit_blob_strata(
         &self,
+        guard: &LockedBlobs,
         key: &[u8],
         event_index: u64,
         batch: StrataBatch<'_>,
     ) -> Result<u64> {
+        self.check_blob_lock(guard, key)?;
         self.check_shared_rocksdb(batch.store())?;
         let pending = self.blobs.get(&key.to_vec())?.unwrap_or_default();
-        if pending.commands().first().map(|c| c.event_index) != Some(event_index) {
+        let command = pending
+            .commands()
+            .first()
+            .filter(|c| c.event_index == event_index);
+        let Some(command) = command else {
             return Err(Error::InvalidPendingOperation(
                 "command was cancelled, acknowledged, or is not first in its blob queue".into(),
             ));
-        }
-        self.submit_strata(blob_lsn_key_rocksdb(key, event_index)?, batch)
+        };
+        let shards = match &command.operation {
+            BlobOperation::Delete { shards, .. } => shards.as_slice(),
+            BlobOperation::SetLifetime { .. } => &[],
+        };
+        self.submit_strata(blob_lsn_key_rocksdb(key, event_index)?, batch, shards)
     }
 
     /// Retire completed commands and their LSN bindings atomically, sharing one RocksDB WAL sync.
     /// Release the shared blob locks only after success. Newer queue appends are preserved.
     pub fn acknowledge_blobs_rocksdb(
         &self,
+        guard: &LockedBlobs,
         store: &StrataStore,
         commands: &[(&[u8], u64)],
     ) -> Result<()> {
         self.check_shared_rocksdb(store)?;
         let mut batch = store.index().batch();
         for &(key, event_index) in commands {
+            self.check_blob_lock(guard, key)?;
             let lsn_key = blob_lsn_key_rocksdb(key, event_index)?;
             self.check_durable_strata(store, &lsn_key)?;
             let operand = BlobOperand::V1(BlobEdit::Acknowledge {
@@ -65,7 +76,13 @@ impl PendingQueue {
     /// Submit an absolute epoch target. The caller must first drain all preceding blob commands
     /// and prevent later work from passing this barrier until its acknowledgement is durable.
     /// Serialize barrier submissions, including retries, under the shared lifecycle lock.
-    pub fn submit_epoch_strata(&self, store: &StrataStore, event_index: u64) -> Result<u64> {
+    pub fn submit_epoch_strata(
+        &self,
+        guard: &LifecycleGuard,
+        store: &StrataStore,
+        event_index: u64,
+    ) -> Result<u64> {
+        self.check_lifecycle_lock(guard)?;
         self.check_shared_rocksdb(store)?;
         let Some(EpochBarrier::V1 { epoch, .. }) = self.barriers.get(&event_index)? else {
             return Err(Error::InvalidPendingOperation(
@@ -74,11 +91,17 @@ impl PendingQueue {
         };
         let mut batch = store.batch();
         batch.advance_epoch_to(epoch);
-        self.submit_strata(epoch_lsn_key_rocksdb(event_index)?, batch)
+        self.submit_strata(epoch_lsn_key_rocksdb(event_index)?, batch, &[])
     }
 
     /// Durably retire a completed epoch barrier and its LSN binding in one RocksDB batch.
-    pub fn acknowledge_epoch_rocksdb(&self, store: &StrataStore, event_index: u64) -> Result<()> {
+    pub fn acknowledge_epoch_rocksdb(
+        &self,
+        guard: &LifecycleGuard,
+        store: &StrataStore,
+        event_index: u64,
+    ) -> Result<()> {
+        self.check_lifecycle_lock(guard)?;
         let lsn_key = epoch_lsn_key_rocksdb(event_index)?;
         self.check_durable_strata(store, &lsn_key)?;
         let mut batch = store.index().batch();
@@ -89,12 +112,64 @@ impl PendingQueue {
     }
 
     // The caller holds the blob/lifecycle lock across this lookup and submission.
-    fn submit_strata(&self, lsn_key: Vec<u8>, batch: StrataBatch<'_>) -> Result<u64> {
+    fn submit_strata(
+        &self,
+        lsn_key: Vec<u8>,
+        batch: StrataBatch<'_>,
+        shards: &[ShardGeneration],
+    ) -> Result<u64> {
         if let Some(lsn) = batch.store().index().submitted_batch_lsns().get(&lsn_key)? {
             return Ok(lsn);
         }
+        for expected in shards {
+            let shard_id = expected.shard.try_into().map_err(|_| {
+                Error::InvalidPendingOperation(format!(
+                    "shard id {} exceeds Strata's shard-id range",
+                    expected.shard
+                ))
+            })?;
+            let current = batch
+                .store()
+                .shard_info(shard_id)?
+                .ok_or(store::Error::ShardNotFound { shard_id })?;
+            if !current.is_active() || current.current_generation != expected.generation {
+                return Err(store::Error::ShardUnavailable {
+                    shard_id,
+                    generation: expected.generation,
+                    current_generation: current.current_generation,
+                    state: current.state,
+                }
+                .into());
+            }
+        }
         let result = batch.write_with_lsn(lsn_key)?;
         Ok(result.last_lsn().expect("tracked batches are nonempty"))
+    }
+
+    /// Create/reopen a shard while blob work is excluded. The caller must keep `guard` through
+    /// durability of the Strata change and the corresponding application metadata.
+    pub fn add_shard_strata(
+        &self,
+        guard: &LifecycleGuard,
+        store: &StrataStore,
+        shard: crate::ShardId,
+    ) -> Result<crate::ShardKey> {
+        self.check_lifecycle_lock(guard)?;
+        self.check_shared_rocksdb(store)?;
+        Ok(store.add_shard(shard)?)
+    }
+
+    /// Drop a shard while blob work is excluded. Sync Strata before removing its application
+    /// metadata, and retain `guard` until both are durable. This method returns at visibility.
+    pub fn drop_shard_strata(
+        &self,
+        guard: &LifecycleGuard,
+        store: &StrataStore,
+        shard: crate::ShardId,
+    ) -> Result<()> {
+        self.check_lifecycle_lock(guard)?;
+        self.check_shared_rocksdb(store)?;
+        Ok(store.drop_shard(shard)?)
     }
 
     fn check_shared_rocksdb(&self, store: &StrataStore) -> Result<()> {

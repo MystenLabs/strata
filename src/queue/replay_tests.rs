@@ -4,7 +4,7 @@ use index::{StrataIndex, port::RocksBackend};
 use std::{fs::OpenOptions, path::Path, time::Duration};
 use tempfile::tempdir;
 
-fn open_store(root: &Path) -> (StrataStore, PendingQueue) {
+pub(super) fn open_store(root: &Path) -> (StrataStore, PendingQueue) {
     let mut cfg = StrataStoreConfig::new(root, "test");
     cfg.starting_epoch = 42;
     cfg.gc_workers_enabled = false;
@@ -20,7 +20,7 @@ fn open_store(root: &Path) -> (StrataStore, PendingQueue) {
     (store, PendingQueue::new(db))
 }
 
-fn key(name: &[u8]) -> BlobKey {
+pub(super) fn key(name: &[u8]) -> BlobKey {
     BlobKey::new(name.to_vec()).unwrap()
 }
 
@@ -42,6 +42,7 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
     {
         let (store, queue) = open_store(dir.path());
         store.add_shard(7)?;
+        let guard = queue.lock_blobs(&[b"blob"]).await;
         for key in &physical_keys {
             store.put(7, key, b"old")?;
         }
@@ -52,11 +53,11 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
         for key in &physical_keys {
             batch.tombstone(7, key.clone());
         }
-        submitted_lsn = queue.submit_blob_strata(b"blob", 100, batch)?;
+        submitted_lsn = queue.submit_blob_strata(&guard, b"blob", 100, batch)?;
         assert!(store.published_lsn()? < submitted_lsn);
         assert!(
             queue
-                .acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])
+                .acknowledge_blobs_rocksdb(&guard, &store, &[(b"blob", 100)])
                 .is_err()
         );
         // A RocksDB checkpoint can be visible before its sync completes. The queue must use
@@ -69,7 +70,7 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
         metadata.write()?;
         assert!(
             queue
-                .acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])
+                .acknowledge_blobs_rocksdb(&guard, &store, &[(b"blob", 100)])
                 .is_err()
         );
         let mut metadata = store.index().batch();
@@ -82,20 +83,21 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
     }
     {
         let (store, queue) = open_store(dir.path());
+        let guard = queue.lock_blobs(&[b"blob"]).await;
         let before = store.index().get_next_lsn()?;
         let mut batch = store.batch();
         for key in &physical_keys {
             batch.tombstone(7, key.clone());
         }
         assert_eq!(
-            queue.submit_blob_strata(b"blob", 100, batch)?,
+            queue.submit_blob_strata(&guard, b"blob", 100, batch)?,
             submitted_lsn
         );
         assert_eq!(store.index().get_next_lsn()?, before);
         for key in &physical_keys {
             assert_eq!(store.get_from_shard(7, key)?, None);
         }
-        queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])?;
+        queue.acknowledge_blobs_rocksdb(&guard, &store, &[(b"blob", 100)])?;
         assert!(store.index().submitted_batch_lsns().is_empty()?);
         // New data is admitted only after the acknowledgement is durably committed.
         for key in &physical_keys {
@@ -127,6 +129,7 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
     {
         let (store, queue) = open_store(dir.path());
         store.add_shard(7)?;
+        let _guard = queue.lock_blobs(&[b"blob"]).await;
         store.put(7, &blob, b"old")?;
         store.sync()?;
         queue.write_batch(|b| b.append(b"blob", 100, delete(), vec![]))?;
@@ -135,10 +138,11 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
     for _ in 0..2 {
         let (checkpoint, lost_lsn, wal_dir) = {
             let (store, queue) = open_store(dir.path());
+            let guard = queue.lock_blobs(&[b"blob"]).await;
             let checkpoint = store.index().get_store_checkpoint()?.unwrap();
             let mut batch = store.batch();
             batch.tombstone(7, blob.clone());
-            let lsn = queue.submit_blob_strata(b"blob", 100, batch)?;
+            let lsn = queue.submit_blob_strata(&guard, b"blob", 100, batch)?;
             store.index().flush_wal(true)?;
             assert!(store.published_lsn()? < lsn);
             (checkpoint, lsn, store.config().namespace_dir().join("wal"))
@@ -160,13 +164,17 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
         }
     }
     let (store, queue) = open_store(dir.path());
+    let guard = queue.lock_blobs(&[b"blob"]).await;
     let before = store.index().get_next_lsn()?;
     let mut batch = store.batch();
     batch.tombstone(7, blob.clone());
-    assert_eq!(queue.submit_blob_strata(b"blob", 100, batch)?, before);
+    assert_eq!(
+        queue.submit_blob_strata(&guard, b"blob", 100, batch)?,
+        before
+    );
     assert_eq!(store.index().get_next_lsn()?, before + 1);
     store.sync()?;
-    queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", 100)])?;
+    queue.acknowledge_blobs_rocksdb(&guard, &store, &[(b"blob", 100)])?;
     assert_eq!(store.get_from_shard(7, &blob)?, None);
     Ok(())
 }
@@ -179,6 +187,7 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
     {
         let (store, queue) = open_store(dir.path());
         store.add_shard(7)?;
+        let guard = queue.lock_blobs(&[b"blob"]).await;
         store.set_blob_lifetime(&blob, 45)?;
         store.put(7, &blob, b"value")?;
         store.sync()?;
@@ -193,14 +202,18 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
         drop(queue.durable_snapshot()?);
         let mut batch = store.batch();
         batch.set_blob_lifetime(blob.clone(), 50);
-        first_lsn = queue.submit_blob_strata(b"blob", 0, batch)?;
+        first_lsn = queue.submit_blob_strata(&guard, b"blob", 0, batch)?;
         store.sync()?;
     }
     let (store, queue) = open_store(dir.path());
+    let guard = queue.lock_blobs(&[b"blob"]).await;
     let before = store.index().get_next_lsn()?;
     let mut batch = store.batch();
     batch.set_blob_lifetime(blob.clone(), 50);
-    assert_eq!(queue.submit_blob_strata(b"blob", 0, batch)?, first_lsn);
+    assert_eq!(
+        queue.submit_blob_strata(&guard, b"blob", 0, batch)?,
+        first_lsn
+    );
     assert_eq!(store.index().get_next_lsn()?, before);
     queue.write_batch(|b| {
         b.append(
@@ -210,16 +223,16 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
             vec![],
         )
     })?;
-    queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", 0)])?;
+    queue.acknowledge_blobs_rocksdb(&guard, &store, &[(b"blob", 0)])?;
     let snapshot = queue.durable_snapshot()?;
     let row = queue.blobs(snapshot.as_ref())?.next().unwrap()?.1;
     assert_eq!(row.commands().len(), 1);
     assert_eq!(row.commands()[0].event_index, u64::MAX);
     let mut batch = store.batch();
     batch.set_blob_lifetime(blob.clone(), 60);
-    queue.submit_blob_strata(b"blob", u64::MAX, batch)?;
+    queue.submit_blob_strata(&guard, b"blob", u64::MAX, batch)?;
     store.sync()?;
-    queue.acknowledge_blobs_rocksdb(&store, &[(b"blob", u64::MAX)])?;
+    queue.acknowledge_blobs_rocksdb(&guard, &store, &[(b"blob", u64::MAX)])?;
     let mut batch = store.batch();
     batch.advance_epoch_to(51);
     batch.write()?;
@@ -231,6 +244,7 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
 async fn cancelled_out_of_order_failed_and_cross_store_submissions_do_not_apply() -> Result<()> {
     let dir = tempdir().unwrap();
     let (store, queue) = open_store(dir.path());
+    let guard = queue.lock_blobs(&[b"blob"]).await;
     queue.write_batch(|b| {
         b.append(b"blob", 1, delete(), vec![])?;
         b.register(b"blob", 2, 50, vec![])?;
@@ -242,25 +256,25 @@ async fn cancelled_out_of_order_failed_and_cross_store_submissions_do_not_apply(
         let mut batch = store.batch();
         batch.set_blob_lifetime(key(b"blob"), 50);
         assert!(matches!(
-            queue.submit_blob_strata(b"blob", event, batch),
+            queue.submit_blob_strata(&guard, b"blob", event, batch),
             Err(Error::InvalidPendingOperation(_))
         ));
     }
     assert!(matches!(
-        queue.submit_blob_strata(b"blob", 2, store.batch()),
+        queue.submit_blob_strata(&guard, b"blob", 2, store.batch()),
         Err(Error::Store(store::Error::EmptyTrackedBatch))
     ));
     let mut batch = store.batch();
     batch.set_blob_lifetime(key(b"blob"), 42);
     assert!(matches!(
-        queue.submit_blob_strata(b"blob", 2, batch),
+        queue.submit_blob_strata(&guard, b"blob", 2, batch),
         Err(Error::Store(store::Error::InvalidBlobLifetime { .. }))
     ));
     assert!(store.index().submitted_batch_lsns().is_empty()?);
     assert_eq!(store.index().get_next_lsn()?, before);
     assert!(
         queue
-            .acknowledge_blobs_rocksdb(&store, &[(b"blob", 2)])
+            .acknowledge_blobs_rocksdb(&guard, &store, &[(b"blob", 2)])
             .is_err()
     );
     let other_dir = tempdir().unwrap();
@@ -269,7 +283,7 @@ async fn cancelled_out_of_order_failed_and_cross_store_submissions_do_not_apply(
     let mut batch = other.batch();
     batch.set_blob_lifetime(key(b"blob"), 50);
     assert!(matches!(
-        queue.submit_blob_strata(b"blob", 2, batch),
+        queue.submit_blob_strata(&guard, b"blob", 2, batch),
         Err(Error::InvalidPendingOperation(_))
     ));
     assert!(other.index().submitted_batch_lsns().is_empty()?);
@@ -283,6 +297,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
     let epoch_lsn;
     {
         let (store, queue) = open_store(dir.path());
+        let guard = queue.lock_blobs(&[b"a", b"b"]).await;
         queue.write_batch(|b| {
             b.register(b"a", 0, 50, vec![])?;
             b.register(b"b", 0, 50, vec![])?;
@@ -293,7 +308,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         for name in [b"a", b"b"] {
             let mut batch = store.batch();
             batch.set_blob_lifetime(key(name), 50);
-            lsns.push(queue.submit_blob_strata(name, 0, batch)?);
+            lsns.push(queue.submit_blob_strata(&guard, name, 0, batch)?);
             if name == b"a" {
                 store.sync()?;
             }
@@ -302,7 +317,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         // A is durable, B is not: the whole acknowledgement must abort, retaining A too.
         assert!(
             queue
-                .acknowledge_blobs_rocksdb(&store, &[(b"a", 0), (b"b", 0)])
+                .acknowledge_blobs_rocksdb(&guard, &store, &[(b"a", 0), (b"b", 0)])
                 .is_err()
         );
         assert_eq!(
@@ -312,21 +327,28 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         let before = store.index().get_next_lsn()?;
         let mut batch = store.batch();
         batch.set_blob_lifetime(key(b"a"), 50);
-        assert_eq!(queue.submit_blob_strata(b"a", 0, batch)?, lsns[0]);
+        assert_eq!(queue.submit_blob_strata(&guard, b"a", 0, batch)?, lsns[0]);
         assert_eq!(store.index().get_next_lsn()?, before);
         store.sync()?;
-        queue.acknowledge_blobs_rocksdb(&store, &[(b"a", 0), (b"b", 0)])?;
-        epoch_lsn = queue.submit_epoch_strata(&store, 0)?;
+        queue.acknowledge_blobs_rocksdb(&guard, &store, &[(b"a", 0), (b"b", 0)])?;
+        drop(guard);
+        let lifecycle = queue.lock_lifecycle().await;
+        epoch_lsn = queue.submit_epoch_strata(&lifecycle, &store, 0)?;
         assert!(epoch_lsn > lsns[1]);
-        assert!(queue.acknowledge_epoch_rocksdb(&store, 0).is_err());
+        assert!(
+            queue
+                .acknowledge_epoch_rocksdb(&lifecycle, &store, 0)
+                .is_err()
+        );
         store.sync()?;
     }
     let (store, queue) = open_store(dir.path());
+    let lifecycle = queue.lock_lifecycle().await;
     let before = store.index().get_next_lsn()?;
-    assert_eq!(queue.submit_epoch_strata(&store, 0)?, epoch_lsn);
+    assert_eq!(queue.submit_epoch_strata(&lifecycle, &store, 0)?, epoch_lsn);
     assert_eq!(store.index().get_next_lsn()?, before);
     assert_eq!(store.current_epoch()?, 45);
-    queue.acknowledge_epoch_rocksdb(&store, 0)?;
+    queue.acknowledge_epoch_rocksdb(&lifecycle, &store, 0)?;
     let snapshot = queue.durable_snapshot()?;
     assert!(queue.barriers(snapshot.as_ref())?.next().is_none());
     assert!(store.index().submitted_batch_lsns().is_empty()?);
