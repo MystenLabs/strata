@@ -241,6 +241,11 @@ pub struct StrataBatch<'a> {
 }
 
 impl<'a> StrataBatch<'a> {
+    /// The store this batch will write to.
+    pub fn store(&self) -> &'a StrataStore {
+        self.store
+    }
+
     /// Adds a payload write to this batch.
     ///
     /// Batching submits all operations as one writer command. That keeps

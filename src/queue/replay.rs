@@ -7,8 +7,8 @@ use super::*;
 
 impl PendingQueue {
     /// Submit the first pending command for a blob, or return its previously submitted LSN.
-    /// `prepare` translates that command into ordinary Strata operations (including all of its
-    /// physical keys/shards); it is not called again while the LSN binding exists.
+    /// The caller builds `batch` with the command's actual operations, including all of its
+    /// physical keys/shards. If an LSN binding already exists, the batch is dropped without writing.
     ///
     /// The caller must select work from a durable snapshot and hold the shared blob/lifecycle
     /// locks from revalidation through durable acknowledgement. This method rechecks that the
@@ -20,21 +20,15 @@ impl PendingQueue {
     /// and recovery, without admitting conflicting writes. Recovery has already removed bindings
     /// for discarded writes before the store opens, so a surviving binding identifies this exact
     /// submission even when earlier attempts' LSNs have been reused.
-    pub fn submit_blob(
-        &self,
-        store: &StrataStore,
-        key: &[u8],
-        event_index: u64,
-        prepare: impl FnOnce(&mut StrataBatch<'_>) -> store::Result<()>,
-    ) -> Result<u64> {
-        self.check_store(store)?;
+    pub fn submit_blob(&self, key: &[u8], event_index: u64, batch: StrataBatch<'_>) -> Result<u64> {
+        self.check_store(batch.store())?;
         let pending = self.blobs.get(&key.to_vec())?.unwrap_or_default();
         if pending.commands().first().map(|c| c.event_index) != Some(event_index) {
             return Err(Error::InvalidPendingOperation(
                 "command was cancelled, acknowledged, or is not first in its blob queue".into(),
             ));
         }
-        self.submit(store, blob_lsn_key(key, event_index)?, prepare)
+        self.submit(blob_lsn_key(key, event_index)?, batch)
     }
 
     /// Retire completed commands and their LSN bindings atomically, sharing one RocksDB WAL sync.
@@ -64,10 +58,9 @@ impl PendingQueue {
                 "missing epoch barrier".into(),
             ));
         };
-        self.submit(store, epoch_lsn_key(event_index)?, |batch| {
-            batch.advance_epoch_to(epoch);
-            Ok(())
-        })
+        let mut batch = store.batch();
+        batch.advance_epoch_to(epoch);
+        self.submit(epoch_lsn_key(event_index)?, batch)
     }
 
     /// Durably retire a completed epoch barrier and its LSN binding in one RocksDB batch.
@@ -81,17 +74,10 @@ impl PendingQueue {
         Ok(())
     }
 
-    fn submit(
-        &self,
-        store: &StrataStore,
-        lsn_key: Vec<u8>,
-        prepare: impl FnOnce(&mut StrataBatch<'_>) -> store::Result<()>,
-    ) -> Result<u64> {
-        if let Some(lsn) = store.index().batch_lsns().get(&lsn_key)? {
+    fn submit(&self, lsn_key: Vec<u8>, batch: StrataBatch<'_>) -> Result<u64> {
+        if let Some(lsn) = batch.store().index().batch_lsns().get(&lsn_key)? {
             return Ok(lsn);
         }
-        let mut batch = store.batch();
-        prepare(&mut batch)?;
         let result = batch.write_with_lsn(lsn_key)?;
         Ok(result.last_lsn().expect("tracked batches are nonempty"))
     }
