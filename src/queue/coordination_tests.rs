@@ -60,6 +60,31 @@ async fn concurrent_reacquisition_keeps_one_lock_per_blob_and_cleans_up() {
 }
 
 #[tokio::test]
+async fn foreground_admission_reads_latest_work_and_halts_waiting_puts() -> Result<()> {
+    let dir = tempdir().unwrap();
+    let (_store, queue) = open_store(dir.path());
+    let guard = queue.lock_blobs(&[b"a"]).await?;
+    assert!(queue.pending_blob(&guard, b"a")?.commands().is_empty());
+    assert!(queue.pending_blob(&guard, b"b").is_err());
+    queue.write_batch(|b| b.register(b"a", 1, 50, vec![]))?;
+    assert_eq!(
+        queue.pending_blob(&guard, b"a")?.commands()[0].event_index,
+        1
+    );
+    let mut waiting = Box::pin(queue.lock_blobs(&[b"a"]));
+    assert_pending(waiting.as_mut());
+    queue.halt("foreground durability failure".into());
+    drop(guard);
+    assert!(matches!(waiting.await, Err(Error::WorkerHalted { .. })));
+    assert!(
+        queue
+            .write_batch(|b| b.register(b"b", 2, 50, vec![]))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn clones_serialize_the_same_blob_and_allow_other_blobs() {
     let dir = tempdir().unwrap();
     let (_store, queue) = open_store(dir.path());

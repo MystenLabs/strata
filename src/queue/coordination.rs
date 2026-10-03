@@ -175,7 +175,11 @@ impl PendingQueue {
         Ok(())
     }
 
-    pub(super) fn halt(&self, reason: String) {
+    /// Close admission after an uncertain foreground write, sync, or metadata commit. Call while
+    /// still holding the affected guards, before releasing them. This also stops worker passes;
+    /// the application must stop serving and reopen/recover before resuming. There is no reset
+    /// on a live queue, and raw store calls do not participate in this admission gate.
+    pub fn halt(&self, reason: String) {
         self.coordination
             .halt_reason
             .lock()
