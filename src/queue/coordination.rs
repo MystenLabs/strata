@@ -68,6 +68,14 @@ impl PendingQueue {
     /// this queue, or upgrade blob guards to a lifecycle guard. Do not wait for queued work that
     /// needs these same locks while holding the guard; finish prerequisites first, then recheck.
     pub async fn lock_blobs(&self, keys: &[&[u8]]) -> LockedBlobs {
+        // Blob locks alone cannot exclude shard recreation or epoch changes: those affect many
+        // blobs and take the lifecycle lock exclusively. For example, a delete could validate
+        // shard 7 generation 0, then a drop/recreate could make its tombstone target generation 1.
+        // Take the shared lifecycle guard first and retain it in LockedBlobs through Strata
+        // durability and RocksDB acknowledgement. This also makes epoch advancement wait for
+        // an in-flight lifetime extension to finish. Shared mode allows unrelated blobs to run
+        // concurrently; exclusive mode would serialize all blob work. The worker must still
+        // order queued events so required extensions are processed before an epoch advance.
         let lifecycle = self.coordination.lifecycle.clone().read_owned().await;
         let mut keys: Vec<_> = keys.iter().map(|key| key.to_vec()).collect();
         keys.sort_unstable();
