@@ -57,12 +57,27 @@ impl PendingQueue {
         store: &StrataStore,
         commands: &[(&[u8], u64)],
     ) -> Result<()> {
+        self.acknowledge_blob_group_rocksdb(guard, store, commands, &[])
+    }
+
+    /// Worker-only extension: `retired` deletes need no Strata submission. The worker must verify
+    /// every target generation is retired, then sync Strata while retaining this lifecycle guard
+    /// before calling. Missing shard information is not proof of retirement.
+    pub(super) fn acknowledge_blob_group_rocksdb(
+        &self,
+        guard: &LockedBlobs,
+        store: &StrataStore,
+        submitted: &[(&[u8], u64)],
+        retired: &[(&[u8], u64)],
+    ) -> Result<()> {
         self.check_shared_rocksdb(store)?;
+        for &(key, event_index) in submitted {
+            self.check_durable_strata(store, &blob_lsn_key_rocksdb(key, event_index)?)?;
+        }
         let mut batch = store.index().batch();
-        for &(key, event_index) in commands {
+        for &(key, event_index) in submitted.iter().chain(retired) {
             self.check_blob_lock(guard, key)?;
             let lsn_key = blob_lsn_key_rocksdb(key, event_index)?;
-            self.check_durable_strata(store, &lsn_key)?;
             let operand = BlobOperand::V1(BlobEdit::Acknowledge {
                 through_event_index: event_index,
             });
@@ -172,7 +187,7 @@ impl PendingQueue {
         Ok(store.drop_shard(shard)?)
     }
 
-    fn check_shared_rocksdb(&self, store: &StrataStore) -> Result<()> {
+    pub(super) fn check_shared_rocksdb(&self, store: &StrataStore) -> Result<()> {
         if !Arc::ptr_eq(&self.db, store.index().db()) {
             return Err(Error::InvalidPendingOperation(
                 "queue and store must share the same IndexDb handle".into(),
@@ -208,7 +223,7 @@ impl PendingQueue {
 }
 
 // Versioned, disjoint opaque key spaces. Only this layer knows these contain event indexes.
-fn blob_lsn_key_rocksdb(key: &[u8], event_index: u64) -> Result<Vec<u8>> {
+pub(super) fn blob_lsn_key_rocksdb(key: &[u8], event_index: u64) -> Result<Vec<u8>> {
     Ok(encode_key(&(
         b"queue/blob/v1".as_slice(),
         key,

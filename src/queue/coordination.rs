@@ -14,6 +14,10 @@ use super::{Error, PendingQueue, Result};
 pub(super) struct Coordination {
     lifecycle: Arc<RwLock<()>>,
     blobs: Mutex<HashMap<Vec<u8>, Weak<BlobLock>>>,
+    // The pass mutex also holds the last scanned encoded RocksDB key. Resume after it so a hot
+    // early blob cannot starve later rows. This cursor is an optimization, never recovery state.
+    pub(super) worker: AsyncMutex<Option<Vec<u8>>>,
+    halt_reason: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -67,7 +71,10 @@ impl PendingQueue {
     /// Acquire the entire group in one call: never acquire another guard while holding one from
     /// this queue, or upgrade blob guards to a lifecycle guard. Do not wait for queued work that
     /// needs these same locks while holding the guard; finish prerequisites first, then recheck.
-    pub async fn lock_blobs(&self, keys: &[&[u8]]) -> LockedBlobs {
+    /// A failed worker pass closes admission and returns [`Error::WorkerHalted`], including to
+    /// callers already waiting for locks. Reopen and recover before resuming work.
+    pub async fn lock_blobs(&self, keys: &[&[u8]]) -> Result<LockedBlobs> {
+        self.check_running()?;
         // Blob locks alone cannot exclude shard recreation or epoch changes: those affect many
         // blobs and take the lifecycle lock exclusively. For example, a delete could validate
         // shard 7 generation 0, then a drop/recreate could make its tombstone target generation 1.
@@ -107,24 +114,30 @@ impl PendingQueue {
         for entry in &entries {
             guards.push(entry.mutex.clone().lock_owned().await);
         }
-        LockedBlobs {
+        self.check_running()?;
+        Ok(LockedBlobs {
             _guards: guards,
             entries,
             coordination: self.coordination.clone(),
             _lifecycle: lifecycle,
-        }
+        })
     }
 
     /// Drain admitted blob work and prevent new work during an epoch or shard change.
     /// Do not call while holding any blob or lifecycle guard from this queue.
-    pub async fn lock_lifecycle(&self) -> LifecycleGuard {
-        LifecycleGuard {
+    /// Returns [`Error::WorkerHalted`] if a worker pass failed, including while waiting.
+    pub async fn lock_lifecycle(&self) -> Result<LifecycleGuard> {
+        self.check_running()?;
+        let guard = LifecycleGuard {
             coordination: self.coordination.clone(),
             _guard: self.coordination.lifecycle.clone().write_owned().await,
-        }
+        };
+        self.check_running()?;
+        Ok(guard)
     }
 
     pub(super) fn check_blob_lock(&self, guard: &LockedBlobs, key: &[u8]) -> Result<()> {
+        self.check_running()?;
         if !Arc::ptr_eq(&self.coordination, &guard.coordination)
             || guard
                 .entries
@@ -139,12 +152,35 @@ impl PendingQueue {
     }
 
     pub(super) fn check_lifecycle_lock(&self, guard: &LifecycleGuard) -> Result<()> {
+        self.check_running()?;
         if !Arc::ptr_eq(&self.coordination, &guard.coordination) {
             return Err(Error::InvalidPendingOperation(
                 "lifecycle guard belongs to another queue".into(),
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn check_running(&self) -> Result<()> {
+        if let Some(reason) = &*self
+            .coordination
+            .halt_reason
+            .lock()
+            .expect("halt mutex poisoned")
+        {
+            return Err(Error::WorkerHalted {
+                reason: reason.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn halt(&self, reason: String) {
+        self.coordination
+            .halt_reason
+            .lock()
+            .expect("halt mutex poisoned")
+            .get_or_insert(reason);
     }
 }
 

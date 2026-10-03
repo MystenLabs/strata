@@ -42,7 +42,7 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
     {
         let (store, queue) = open_store(dir.path());
         store.add_shard(7)?;
-        let guard = queue.lock_blobs(&[b"blob"]).await;
+        let guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
         for key in &physical_keys {
             store.put(7, key, b"old")?;
         }
@@ -83,7 +83,7 @@ async fn recovered_delete_is_acknowledged_without_resubmission() -> Result<()> {
     }
     {
         let (store, queue) = open_store(dir.path());
-        let guard = queue.lock_blobs(&[b"blob"]).await;
+        let guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
         let before = store.index().get_next_lsn()?;
         let mut batch = store.batch();
         for key in &physical_keys {
@@ -129,7 +129,7 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
     {
         let (store, queue) = open_store(dir.path());
         store.add_shard(7)?;
-        let _guard = queue.lock_blobs(&[b"blob"]).await;
+        let _guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
         store.put(7, &blob, b"old")?;
         store.sync()?;
         queue.write_batch(|b| b.append(b"blob", 100, delete(), vec![]))?;
@@ -138,7 +138,7 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
     for _ in 0..2 {
         let (checkpoint, lost_lsn, wal_dir) = {
             let (store, queue) = open_store(dir.path());
-            let guard = queue.lock_blobs(&[b"blob"]).await;
+            let guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
             let checkpoint = store.index().get_store_checkpoint()?.unwrap();
             let mut batch = store.batch();
             batch.tombstone(7, blob.clone());
@@ -164,7 +164,7 @@ async fn queue_retries_lost_delete_after_lsn_reuse_and_repeated_crashes() -> Res
         }
     }
     let (store, queue) = open_store(dir.path());
-    let guard = queue.lock_blobs(&[b"blob"]).await;
+    let guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
     let before = store.index().get_next_lsn()?;
     let mut batch = store.batch();
     batch.tombstone(7, blob.clone());
@@ -187,7 +187,7 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
     {
         let (store, queue) = open_store(dir.path());
         store.add_shard(7)?;
-        let guard = queue.lock_blobs(&[b"blob"]).await;
+        let guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
         store.set_blob_lifetime(&blob, 45)?;
         store.put(7, &blob, b"value")?;
         store.sync()?;
@@ -206,7 +206,7 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
         store.sync()?;
     }
     let (store, queue) = open_store(dir.path());
-    let guard = queue.lock_blobs(&[b"blob"]).await;
+    let guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
     let before = store.index().get_next_lsn()?;
     let mut batch = store.batch();
     batch.set_blob_lifetime(blob.clone(), 50);
@@ -244,7 +244,7 @@ async fn lifetime_retry_does_not_reapply_and_acknowledgement_preserves_newer_wor
 async fn cancelled_out_of_order_failed_and_cross_store_submissions_do_not_apply() -> Result<()> {
     let dir = tempdir().unwrap();
     let (store, queue) = open_store(dir.path());
-    let guard = queue.lock_blobs(&[b"blob"]).await;
+    let guard = queue.lock_blobs(&[b"blob"]).await.unwrap();
     queue.write_batch(|b| {
         b.append(b"blob", 1, delete(), vec![])?;
         b.register(b"blob", 2, 50, vec![])?;
@@ -297,7 +297,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
     let epoch_lsn;
     {
         let (store, queue) = open_store(dir.path());
-        let guard = queue.lock_blobs(&[b"a", b"b"]).await;
+        let guard = queue.lock_blobs(&[b"a", b"b"]).await.unwrap();
         queue.write_batch(|b| {
             b.register(b"a", 0, 50, vec![])?;
             b.register(b"b", 0, 50, vec![])?;
@@ -332,7 +332,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         store.sync()?;
         queue.acknowledge_blobs_rocksdb(&guard, &store, &[(b"a", 0), (b"b", 0)])?;
         drop(guard);
-        let lifecycle = queue.lock_lifecycle().await;
+        let lifecycle = queue.lock_lifecycle().await.unwrap();
         epoch_lsn = queue.submit_epoch_strata(&lifecycle, &store, 0)?;
         assert!(epoch_lsn > lsns[1]);
         assert!(
@@ -343,7 +343,7 @@ async fn blob_and_epoch_records_with_the_same_event_index_are_independent() -> R
         store.sync()?;
     }
     let (store, queue) = open_store(dir.path());
-    let lifecycle = queue.lock_lifecycle().await;
+    let lifecycle = queue.lock_lifecycle().await.unwrap();
     let before = store.index().get_next_lsn()?;
     assert_eq!(queue.submit_epoch_strata(&lifecycle, &store, 0)?, epoch_lsn);
     assert_eq!(store.index().get_next_lsn()?, before);
