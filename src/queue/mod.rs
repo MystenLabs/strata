@@ -14,11 +14,14 @@
 //! worker. Hold its blob guards from fresh reference checks through durable acknowledgement.
 //! Shard changes and epoch barriers take its exclusive lifecycle guard. The worker still owns
 //! durable work selection and event ordering; locks alone do not order events. Any uncertain
-//! write/sync failure is fail-stop. Background processing and Walrus wiring are later milestones.
+//! write/sync failure is fail-stop. [`QueueWorker`](crate::queue::QueueWorker) processes bounded
+//! groups with shared durability barriers; Walrus call-site wiring is separate. Drain recovered
+//! work before admitting foreground writes so an unacknowledged deletion cannot run after a new put.
 
 mod coordination;
 mod model;
 mod replay;
+mod worker;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -26,6 +29,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("invalid pending lifecycle operation: {0}")]
     InvalidPendingOperation(String),
+    #[error("lifecycle worker halted; reopen and recover before continuing: {reason}")]
+    WorkerHalted { reason: String },
     #[error(transparent)]
     Index(#[from] index::Error),
     #[error(transparent)]
@@ -34,6 +39,7 @@ pub enum Error {
 
 pub use coordination::{LifecycleGuard, LockedBlobs};
 pub use model::*;
+pub use worker::{QueueWorker, WorkerConfig, WorkerProgress};
 
 use index::port::{
     IndexDb, IndexSnapshot, IndexWriteBatch, TypedMap,
@@ -58,7 +64,9 @@ pub fn cf_options(mut standard: rocksdb::Options) -> [(&'static str, rocksdb::Op
 
 /// Pending work keyed by blob, with epoch barriers keyed by the application's event index.
 /// Producers preserve event order for each blob and finish enqueueing all work through a barrier's
-/// index before publishing that barrier. Different blobs may be enqueued concurrently.
+/// index before publishing that barrier. Publish the barrier before enqueueing higher-index work:
+/// the worker cannot order against a barrier that has not been published yet. Different blobs may
+/// be enqueued concurrently within those boundaries.
 #[derive(Debug, Clone)]
 pub struct PendingQueue {
     db: Arc<dyn IndexDb>,
@@ -85,6 +93,7 @@ impl PendingQueue {
     /// same batch so recovery can skip it. Callback failure discards the whole batch.
     /// Success means committed, not synced; uncertain commit errors require stopping and recovery.
     pub fn write_batch<T>(&self, update: impl FnOnce(&mut PendingBatch) -> Result<T>) -> Result<T> {
+        self.check_running()?;
         let mut batch = PendingBatch {
             write: self.db.write_batch(),
         };
@@ -98,6 +107,7 @@ impl PendingQueue {
     /// through registration, so workers still revalidate under the blob lock before deleting.
     /// Use this same snapshot for both [`Self::blobs`] and [`Self::barriers`].
     pub fn durable_snapshot(&self) -> Result<Box<dyn IndexSnapshot + '_>> {
+        self.check_running()?;
         let snapshot = self.db.snapshot()?;
         self.db.flush_wal(true)?;
         Ok(snapshot)
@@ -177,8 +187,9 @@ impl PendingBatch {
     }
 
     /// Publish only after all blob work through this event index has been enqueued, including any
-    /// pool fan-out. The worker finishes that work before advancing to this absolute epoch and
-    /// defers higher event indexes until afterward. One barrier is allowed per event.
+    /// pool fan-out, and before enqueueing any higher-index work. The worker finishes that work
+    /// before advancing to this absolute epoch and defers higher event indexes until afterward.
+    /// One barrier is allowed per event.
     pub fn advance_epoch(&mut self, event_index: u64, epoch: u64, source: Vec<u8>) -> Result<()> {
         self.write.put(
             EPOCH_BARRIERS_CF,

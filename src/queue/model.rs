@@ -104,9 +104,11 @@ pub enum BlobEdit {
     Append(BlobCommand),
     Register(BlobCommand),
     /// Only emit after the submitted Strata LSN is durable, in the same synced RocksDB batch as
-    /// deleting its LSN binding (see `PendingQueue::acknowledge_blobs_rocksdb`). This trims the
-    /// applied event prefix without dropping concurrent newer appends. Empty rows remain for
-    /// bounded cleanup under the blob lock; do not delete a whole row using an old snapshot.
+    /// deleting its LSN binding (see `PendingQueue::acknowledge_blobs_rocksdb`). The worker may also
+    /// acknowledge a delete without a submission when every target shard generation is durably
+    /// retired, verified under the lifecycle guard. This trims the completed event prefix without
+    /// dropping concurrent newer appends. Empty rows remain for bounded cleanup under the blob
+    /// lock; do not delete a whole row using an old snapshot.
     /// This is not a replay watermark: the application must not enqueue already-handled events.
     Acknowledge {
         through_event_index: u64,
