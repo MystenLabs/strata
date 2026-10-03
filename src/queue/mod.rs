@@ -113,6 +113,15 @@ impl PendingQueue {
         Ok(snapshot)
     }
 
+    /// Read the current pending commands under the same guard used by foreground puts. If work
+    /// remains, release the guard before waiting for the worker, then reacquire and recheck both
+    /// this row and application references. This is an admission check, not a durable work view;
+    /// submissions must still be selected from [`Self::durable_snapshot`].
+    pub fn pending_blob(&self, guard: &LockedBlobs, key: &[u8]) -> Result<PendingBlobOps> {
+        self.check_blob_lock(guard, key)?;
+        Ok(self.blobs.get(&key.to_vec())?.unwrap_or_default())
+    }
+
     /// Stream blob operations from the snapshot returned by [`Self::durable_snapshot`].
     pub fn blobs<'a>(
         &'a self,
