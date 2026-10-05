@@ -2849,6 +2849,38 @@ async fn lifetime_update_after_expiry_applies_only_to_future_put() {
 }
 
 #[tokio::test]
+async fn deferred_lifetime_preserves_put_after_previous_expiry() {
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"re-registered".to_vec()).unwrap();
+    {
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+        store.put(&key, b"old").unwrap();
+        store.set_blob_lifetime(&key, 43).unwrap();
+        store.increment_epoch().unwrap();
+        assert_eq!(store.get(&key).unwrap(), None);
+        store.put(&key, b"new").unwrap();
+        store.set_blob_lifetime(&key, 50).unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
+        store.sync().unwrap();
+    }
+    let store =
+        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+            .unwrap();
+    assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
+    assert_eq!(
+        resolve_blob_version(&store, store.shard(), &key)
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .unwrap()
+            .logical_end_epoch,
+        50
+    );
+}
+
+#[tokio::test]
 async fn reopen_reads_existing_data() {
     let dir = tempdir().unwrap();
     let key = BlobKey::new(b"blob-a".to_vec()).unwrap();

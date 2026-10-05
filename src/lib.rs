@@ -9,6 +9,3 @@ pub use core_types::{
     SegmentId, ShardGeneration, ShardId, ShardInfo, ShardKey, ShardState, StrataLsn,
 };
 pub use store::*;
-
-/// Optional lifecycle queue and replay coordination layered above the storage engine.
-pub mod queue;
