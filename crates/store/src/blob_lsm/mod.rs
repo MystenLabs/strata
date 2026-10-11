@@ -8,7 +8,7 @@
 //!
 //! The submodules follow the data path:
 //!
-//! - [`format`]: wire encoding for mutation patches and the materialized state.
+//! - [`mod@format`]: wire encoding for mutation patches and the materialized state.
 //! - `merge`: the two `MergeOperator` entry points. [`BlobMerge`] serves reads and plain
 //!   compactions; `BlobMergeWithRelocations` runs during snapshot compactions, where it also
 //!   heals relocated record references and prunes retired or expired versions.

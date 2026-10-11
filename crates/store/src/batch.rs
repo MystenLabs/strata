@@ -71,6 +71,7 @@ impl<P> ProfileRequest<P> {
 #[derive(Debug)]
 pub(crate) struct BatchWriteRequest {
     pub(crate) ops: Vec<BatchOp>,
+    pub(crate) lsn_key: Option<Vec<u8>>,
     pub(crate) response_tx: mpsc::Sender<Result<BatchWriteResult>>,
     pub(crate) profile: ProfileRequest<StoreWriteProfile>,
 }
@@ -103,6 +104,9 @@ pub(crate) enum BatchOp {
         key: BlobKey,
     },
     IncrementEpoch,
+    AdvanceEpochTo {
+        epoch: Epoch,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -237,6 +241,11 @@ pub struct StrataBatch<'a> {
 }
 
 impl<'a> StrataBatch<'a> {
+    /// The store this batch will write to.
+    pub fn store(&self) -> &'a StrataStore {
+        self.store
+    }
+
     /// Adds a payload write to this batch.
     ///
     /// Batching submits all operations as one writer command. That keeps
@@ -287,6 +296,32 @@ impl<'a> StrataBatch<'a> {
     pub fn increment_epoch(&mut self) -> &mut Self {
         self.ops.push(BatchOp::IncrementEpoch);
         self
+    }
+
+    /// Advances the clock to at least `epoch`. Repeating a target never increments it again.
+    /// Callers must finish preceding lifetime changes before submitting an epoch advance.
+    pub fn advance_epoch_to(&mut self, epoch: Epoch) -> &mut Self {
+        self.ops.push(BatchOp::AdvanceEpochTo { epoch });
+        self
+    }
+
+    /// Submits a nonempty batch and records its last LSN under an opaque caller key in RocksDB.
+    ///
+    /// The binding commits atomically with the batch's LSN allocation. The key is not written
+    /// into blob records and has no meaning to the engine. Read it through
+    /// `store.index().submitted_batch_lsns()`.
+    ///
+    /// The caller must use an unused key and serialize submissions for that key. Before retrying,
+    /// check its saved LSN under the same lock and reuse that result if present. This method does
+    /// not deduplicate submissions. Different keys may be submitted concurrently. The caller also
+    /// owns eventual cleanup of these records.
+    ///
+    /// Success means visible, not durable. Wait for the returned last LSN to be published before
+    /// acknowledging application work. Recovery removes bindings for discarded writes in the
+    /// same durable batch as the LSN rewind, before LSNs can be reused. Do not write bindings
+    /// yourself or clear them before the associated work is durably acknowledged.
+    pub fn write_with_lsn(self, key: Vec<u8>) -> Result<BatchWriteResult> {
+        self.store.write_batch_with_lsn(self.ops, Some(key))
     }
 
     /// Submits the accumulated operations to the writer.

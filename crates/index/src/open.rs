@@ -49,6 +49,7 @@ impl StrataIndex {
         let shards = TypedMap::new(Arc::clone(&db), &cf_names.shards);
         let shard_cleanup_jobs = TypedMap::new(Arc::clone(&db), &cf_names.shard_cleanup_jobs);
         let store_state = TypedMap::new(Arc::clone(&db), &cf_names.store_state);
+        let submitted_batch_lsns = TypedMap::new(Arc::clone(&db), &cf_names.submitted_batch_lsns);
         let epoch_changes = TypedMap::new(Arc::clone(&db), &cf_names.epoch_changes);
         let lsm_manifests = TypedMap::new(Arc::clone(&db), &cf_names.lsm_manifests);
         let garbage_log_positions = TypedMap::new(Arc::clone(&db), &cf_names.garbage_log_positions);
@@ -65,6 +66,7 @@ impl StrataIndex {
             shards,
             shard_cleanup_jobs,
             store_state,
+            submitted_batch_lsns,
             epoch_changes,
             lsm_manifests,
             manifest_publish_lock: Arc::new(std::sync::Mutex::new(())),

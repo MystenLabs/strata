@@ -151,30 +151,27 @@ impl BlobState {
             },
         };
 
-        if previous_expired {
-            // A lifetime written after the previous one ended does not revive the ended
-            // versions. This is a write, not an epoch transition, and it happens once per key, so
-            // it may say so per record: the partial merge reports the same versions as retired
-            // when a later put replaces them, and the two paths must agree.
-            for version in self.versions.values() {
+        for shard in self.versions.keys().copied().collect::<Vec<_>>() {
+            let version = self.versions[&shard];
+            let before = effective_lifecycle(previous, &version);
+            if previous_expired && before.is_some() {
+                // A new lifetime cannot revive expired data. Puts made after the old expiry
+                // do not inherit that lifetime, however: preserve them and attach the new one.
                 emit_record(
                     key,
                     lsn,
-                    *version,
-                    effective_lifecycle(previous, version),
+                    version,
+                    before,
                     GarbageEvent::Retired {
                         record: version.record_ref,
                     },
                     emit,
                 )?;
-            }
-            self.versions.clear();
-        } else {
-            for version in self.versions.values() {
-                let before = effective_lifecycle(previous, version);
-                let after = effective_lifecycle(Some(next), version);
+                self.versions.remove(&shard);
+            } else {
+                let after = effective_lifecycle(Some(next), &version);
                 if before != after {
-                    emit_lifetime_change(key, lsn, *version, before, after, emit)?;
+                    emit_lifetime_change(key, lsn, version, before, after, emit)?;
                 }
             }
         }

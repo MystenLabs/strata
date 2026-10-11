@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod garbage_log;
+mod submitted_batch_lsns;
 
 const TEST_KEY_LEN: u64 = 6;
 const TEST_PAYLOAD_LEN: u64 = 9;
@@ -2845,6 +2846,38 @@ async fn lifetime_update_after_expiry_applies_only_to_future_put() {
         .unwrap()
         .unwrap();
     assert_eq!(resolved.lifecycle.unwrap().logical_end_epoch, 50);
+}
+
+#[tokio::test]
+async fn deferred_lifetime_preserves_put_after_previous_expiry() {
+    let dir = tempdir().unwrap();
+    let key = BlobKey::new(b"re-registered".to_vec()).unwrap();
+    {
+        let store =
+            try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+                .unwrap();
+        store.put(&key, b"old").unwrap();
+        store.set_blob_lifetime(&key, 43).unwrap();
+        store.increment_epoch().unwrap();
+        assert_eq!(store.get(&key).unwrap(), None);
+        store.put(&key, b"new").unwrap();
+        store.set_blob_lifetime(&key, 50).unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
+        store.sync().unwrap();
+    }
+    let store =
+        try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
+            .unwrap();
+    assert_eq!(store.get(&key).unwrap(), Some(b"new".to_vec()));
+    assert_eq!(
+        resolve_blob_version(&store, store.shard(), &key)
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .unwrap()
+            .logical_end_epoch,
+        50
+    );
 }
 
 #[tokio::test]
@@ -5944,6 +5977,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
     let (epoch_response_tx, epoch_response_rx) = mpsc::channel();
     coordinator.process_batch_group(vec![
         BatchWriteRequest {
+            lsn_key: Some(b"first".to_vec()),
             ops: vec![BatchOp::Put {
                 shard_id: STANDALONE_SHARD.id,
                 key: BlobKey::new(b"durability-pressure".to_vec()).unwrap(),
@@ -5953,6 +5987,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
             profile: ProfileRequest::default(),
         },
         BatchWriteRequest {
+            lsn_key: Some(b"epoch".to_vec()),
             ops: vec![BatchOp::SetBlobLifetime {
                 key: BlobKey::new(b"invalid-lifetime".to_vec()).unwrap(),
                 logical_end_epoch: cfg.starting_epoch,
@@ -5961,6 +5996,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
             profile: ProfileRequest::default(),
         },
         BatchWriteRequest {
+            lsn_key: Some(b"epoch".to_vec()),
             ops: vec![BatchOp::IncrementEpoch],
             response_tx: epoch_response_tx,
             profile: ProfileRequest::default(),
@@ -5977,6 +6013,20 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
     let epoch_result = epoch_response_rx.recv().unwrap().unwrap();
     assert_eq!(epoch_result.last_lsn(), Some(2));
     assert_eq!(epoch_result.last_epoch(), Some(cfg.starting_epoch + 1));
+    assert_eq!(
+        index
+            .submitted_batch_lsns()
+            .get(&b"first".to_vec())
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        index
+            .submitted_batch_lsns()
+            .get(&b"epoch".to_vec())
+            .unwrap(),
+        Some(2)
+    );
     assert_eq!(
         histogram_sample_count(&registry, "strata_store_requests_per_commit_group"),
         1
@@ -5999,6 +6049,7 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
 
     let (second_response_tx, second_response_rx) = mpsc::channel();
     coordinator.process_batch_group(vec![BatchWriteRequest {
+        lsn_key: None,
         ops: vec![BatchOp::IncrementEpoch],
         response_tx: second_response_tx,
         profile: ProfileRequest::default(),

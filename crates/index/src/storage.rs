@@ -56,6 +56,16 @@ impl StrataIndex {
         &self.store_state
     }
 
+    /// Maps a caller's batch key to that submitted batch's last LSN, until acknowledgement.
+    ///
+    /// The writer records this mapping atomically with the submitted LSN frontier. Presence means
+    /// submitted, not necessarily durable in Strata; wait for its LSN to be published. Recovery
+    /// removes rows outside the recovered prefix before any LSN can be reused. Callers may delete
+    /// a row only together with durable completion of their work, before allowing conflicting writes.
+    pub fn submitted_batch_lsns(&self) -> &TypedMap<Vec<u8>, StrataLsn> {
+        &self.submitted_batch_lsns
+    }
+
     pub fn epoch_changes(&self) -> &TypedMap<StrataLsn, Epoch> {
         &self.epoch_changes
     }

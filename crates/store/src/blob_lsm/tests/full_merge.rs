@@ -105,3 +105,33 @@ fn lifetime_expiry_and_tombstone_match_store_visibility() {
             record: after_expiry
         }));
 }
+
+#[test]
+fn deferred_lifetime_keeps_only_versions_written_after_old_expiry() {
+    let old_shard = shard(1, 1);
+    let new_shard = shard(2, 1);
+    let old = record(1, 10);
+    let new = record(2, 20);
+    let (state, _) = merge(&[
+        (
+            1,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 10,
+                current_epoch: 5,
+            }),
+        ),
+        (2, put_patch(old_shard, 5, old)),
+        (4, put_patch(new_shard, 10, new)),
+        (
+            5,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 20,
+                current_epoch: 10,
+            }),
+        ),
+    ]);
+    assert!(state.resolve(old_shard, 10).is_none());
+    let (version, lifetime) = state.resolve(new_shard, 10).unwrap();
+    assert_eq!(version.record_ref, new);
+    assert_eq!(lifetime.unwrap().logical_end_epoch, 20);
+}
