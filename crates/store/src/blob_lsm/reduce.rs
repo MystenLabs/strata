@@ -193,18 +193,14 @@ pub(crate) fn reduce_patch_mutations(
                 )?;
             }
             BlobMutation::SetLifetime {
-                logical_end_epoch,
-                current_epoch,
+                logical_end_epoch, ..
             } => {
-                let extension_count = current_lifetime
-                    .filter(|hint| hint.lifecycle.logical_end_epoch > current_epoch)
-                    .map_or(0, |hint| hint.lifecycle.extension_count.saturating_add(1));
+                // A partial merge cannot count extensions: a later merge may include older
+                // lifetimes or a base that this merge cannot see. Use a stable routing hint;
+                // full compaction publishes the real count at the Put's later LSN.
                 current_lifetime = Some(PatchLifecycleHint {
                     lsn,
-                    lifecycle: BlobLifecycle {
-                        logical_end_epoch,
-                        extension_count,
-                    },
+                    lifecycle: BlobLifecycle::new(logical_end_epoch),
                 });
                 for bucket in buckets.values_mut() {
                     bucket.logical_end_epoch = Some(logical_end_epoch);

@@ -153,6 +153,66 @@ fn rejects_conflicting_event_at_one_position() {
     );
 }
 
+#[test]
+fn reopens_legacy_lifetime_count_corrections_in_publication_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7.glog");
+    let record = record(1, 6);
+    let hint = |extension_count| {
+        event(
+            b"a",
+            500,
+            GarbageEvent::SetLifecycle {
+                record,
+                lifecycle: Some(BlobLifecycle {
+                    logical_end_epoch: 54,
+                    extension_count,
+                }),
+            },
+        )
+    };
+    let mut file = SegmentGarbageLog::open(&path, 0).unwrap();
+    file.append(&[hint(1)]).unwrap();
+    let committed = file.append(&[hint(16), hint(16)]).unwrap();
+    drop(file);
+    let summary = SegmentGcSummary {
+        total_bytes: 6,
+        live_bytes: 6,
+        ..Default::default()
+    };
+    let overlay = fold_segment_garbage(
+        read_segment_garbage(&path, committed).unwrap(),
+        summary.clone(),
+    )
+    .unwrap();
+    assert_eq!(overlay.summary, summary);
+    assert_eq!(overlay.lifetimes[0].lifecycle.extension_count, 16);
+    assert_eq!(overlay.lifetimes[0].lifecycle.logical_end_epoch, 54);
+
+    // Publication order, rather than the numeric maximum, must agree with the live sweeper.
+    let overlay = fold_segment_garbage(vec![hint(16), hint(1)], summary).unwrap();
+    assert_eq!(overlay.lifetimes[0].lifecycle.extension_count, 1);
+}
+
+#[test]
+fn rejects_different_expiry_at_one_position() {
+    let record = record(1, 6);
+    let records = [10, 20].map(|end| {
+        event(
+            b"a",
+            1,
+            GarbageEvent::SetLifecycle {
+                record,
+                lifecycle: Some(BlobLifecycle::new(end)),
+            },
+        )
+    });
+    assert!(matches!(
+        fold_segment_garbage(records.to_vec(), Default::default()),
+        Err(lsm::Error::InvalidGarbageLog(_))
+    ));
+}
+
 fn event(key: &[u8], sequence: u64, event: GarbageEvent) -> GarbageRecord {
     GarbageRecord {
         key: SegmentKey {
