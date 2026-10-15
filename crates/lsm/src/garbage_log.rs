@@ -527,8 +527,10 @@ pub fn read_segment_garbage(path: impl AsRef<Path>, committed: u64) -> Result<Ve
 /// restatements are collapsed (the inline comment below explains the one legitimate source of
 /// those), and three things are then rejected: an event whose key and record ref disagree about
 /// the segment, records from more than one segment in one file, and two *different* events at
-/// the same (key, lsn, range) position — the same contradictions the global log rejects at
-/// append time, caught here instead.
+/// the same (key, lsn, range) position. Old partial compactions could restate a lifetime hint
+/// with a different extension count as they picked up more history. Accept only that correction,
+/// keeping publication order for equal positions so replay agrees with the live sweeper. The
+/// expiry epoch must still agree; extension counts affect GC placement, not whether bytes expire.
 ///
 /// The fold itself is a straight replay: each Retired event masks its range as retired, each
 /// Expired as expired, each SetLifecycle installs a lifetime hint over its range. In the running
@@ -541,7 +543,7 @@ pub fn fold_segment_garbage(
     mut records: Vec<GarbageRecord>,
     summary: SegmentGcSummary,
 ) -> Result<SegmentGcOverlay> {
-    records.sort_unstable_by(GarbageRecord::cmp_position);
+    records.sort_by(GarbageRecord::cmp_position);
     // Relocation-aware compaction may restate the same destination lifecycle at the relocation
     // LSN that initialized an output written by an older Store version. The segment summary is
     // authoritative and overlay transitions are idempotent, so collapse semantically identical
@@ -565,10 +567,16 @@ pub fn fold_segment_garbage(
             "segment garbage log contains records for multiple segments".to_owned(),
         ));
     }
-    if records
-        .windows(2)
-        .any(|pair| pair[0].cmp_position(&pair[1]).is_eq())
-    {
+    if records.windows(2).any(|pair| {
+        pair[0].cmp_position(&pair[1]).is_eq()
+            && !matches!(
+                (&pair[0].event, &pair[1].event),
+                (
+                    GarbageEvent::SetLifecycle { lifecycle: Some(left), .. },
+                    GarbageEvent::SetLifecycle { lifecycle: Some(right), .. },
+                ) if left.logical_end_epoch == right.logical_end_epoch
+            )
+    }) {
         return Err(Error::InvalidGarbageLog(
             "segment garbage log contains conflicting events for one key, lsn, and record"
                 .to_owned(),

@@ -222,6 +222,39 @@ fn partial_merge_expiry_targets_relocated_destination() {
 }
 
 #[test]
+fn repeated_partial_merges_keep_lifetime_hints_stable() {
+    // A later compaction can include older lifetimes that the first partial merge did not see.
+    // The same hint LSN must not acquire a different extension count as that happens.
+    let lifetime = || {
+        inline_patch(BlobMutation::SetLifetime {
+            logical_end_epoch: 10,
+            current_epoch: 5,
+        })
+    };
+    let payload = record(2, 20);
+    let (first, mut garbage) = partial_merge_with_snapshot(
+        &[(3, lifetime()), (4, put_patch(shard(1, 1), 5, payload))],
+        BlobCompactionSnapshot::default(),
+    );
+    let first_hint = garbage[0].clone();
+    let (second, more_garbage) = partial_merge_with_snapshot(
+        &[(1, lifetime()), (2, lifetime()), (4, first)],
+        BlobCompactionSnapshot::default(),
+    );
+    assert_eq!(first_hint.event, more_garbage[0].event);
+    assert_eq!(first_hint.lsn, more_garbage[0].lsn);
+    garbage.extend(more_garbage);
+
+    let (state, final_garbage) = merge(&[(4, second)]);
+    assert_eq!(state.lifetime.unwrap().lifecycle.extension_count, 2);
+    garbage.extend(final_garbage);
+    let overlay = lsm::fold_segment_garbage(garbage, Default::default()).unwrap();
+    assert_eq!(overlay.lifetimes.len(), 1);
+    assert_eq!(overlay.lifetimes[0].lifecycle.extension_count, 2);
+    assert_eq!(overlay.lifetimes[0].lifecycle.logical_end_epoch, 10);
+}
+
+#[test]
 fn partial_merge_expires_patch_puts_before_and_after_a_lifetime() {
     let shard_a = shard(1, 1);
     let shard_b = shard(2, 1);

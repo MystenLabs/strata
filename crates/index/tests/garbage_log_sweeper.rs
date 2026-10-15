@@ -233,6 +233,75 @@ async fn repeated_lifecycle_restatement_is_idempotent_for_summary_merges() {
 }
 
 #[tokio::test]
+async fn legacy_lifetime_count_correction_survives_reopen_and_retirement() {
+    let directory = TempDir::new().unwrap();
+    let open = || {
+        StrataIndex::open_path(
+            directory.path().join("index"),
+            "strata",
+            directory.path().display().to_string(),
+        )
+        .unwrap()
+    };
+    let index = open();
+    put_ready_segment(&index, 1, 100, 1);
+    let global_dir = directory.path().join("global-garbage");
+    let namespace_dir = directory.path().join("namespace");
+    let mut log = GarbageLog::open(&global_dir, 1024 * 1024, Default::default()).unwrap();
+    for extension_count in [1, 16] {
+        let lifecycle = BlobLifecycle {
+            logical_end_epoch: 54,
+            extension_count,
+        };
+        let head = log
+            .append(&[event(
+                b"a",
+                500,
+                GarbageEvent::SetLifecycle {
+                    record: record(1, 0, 100),
+                    lifecycle: Some(lifecycle),
+                },
+                set_lifecycle_delta(100, lifecycle),
+            )])
+            .unwrap();
+        publish_head(&index, head);
+        assert!(sweep(&index, &global_dir, &namespace_dir));
+    }
+    let expected = index.get_segment_gc_summary(1).unwrap().unwrap();
+    assert_eq!(
+        expected.extension_count_histogram,
+        BTreeMap::from([(16, 1)])
+    );
+    drop(index);
+
+    // Reopening removes the overlay cache. GC and the next sweep must fold the persisted log.
+    let index = open();
+    let overlay = index
+        .read_segment_garbage_overlay(&namespace_dir, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(overlay.summary, expected);
+    assert_eq!(overlay.lifetimes[0].lifecycle.extension_count, 16);
+    let head = log
+        .append(&[event(
+            b"a",
+            501,
+            GarbageEvent::Retired {
+                record: record(1, 0, 100),
+            },
+            Default::default(),
+        )])
+        .unwrap();
+    publish_head(&index, head);
+    assert!(sweep(&index, &global_dir, &namespace_dir));
+    let summary = index.get_segment_gc_summary(1).unwrap().unwrap();
+    assert_eq!(summary.live_bytes, 0);
+    assert_eq!(summary.retired_bytes, 100);
+    assert!(summary.extension_count_histogram.is_empty());
+    assert!(summary.future_epoch_histogram.is_empty());
+}
+
+#[tokio::test]
 async fn sweep_discards_events_for_wholesale_deleted_segments() {
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
