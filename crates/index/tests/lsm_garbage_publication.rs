@@ -1,4 +1,9 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::{
+    num::NonZeroU32,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use core_types::{BlobKey, RecordRef, SegmentGcSummaryDelta};
 use index::StrataIndex;
@@ -34,7 +39,7 @@ impl MergeOperator for Replace {
 }
 
 #[tokio::test]
-async fn compaction_garbage_records_are_synced_before_the_manifest_is_published() {
+async fn compaction_appends_garbage_before_locking_and_merges_the_latest_manifest() {
     let directory = TempDir::new().unwrap();
     let db_path = directory.path().join("index");
     let lsm_path = directory.path().join("lsm");
@@ -75,9 +80,64 @@ async fn compaction_garbage_records_are_synced_before_the_manifest_is_published(
 
     // A tiny soft limit makes the next frame roll, which lets recovery prove it was unpublished.
     let mut log = GarbageLog::open(&log_path, 1, GarbageLogPosition::default()).unwrap();
-    let committed = index
-        .publish_lsm_compaction(LSM_NAME, &edit, LOG_NAME, &mut log, &records)
-        .unwrap();
+    let initial_position = log.position();
+    let (appended_while_locked, committed) = thread::scope(|scope| {
+        let guard = index.lock_lsm_manifests();
+        let publisher = scope
+            .spawn(|| index.publish_lsm_compaction(LSM_NAME, &edit, LOG_NAME, &mut log, &records));
+
+        // Another publisher holds the manifest lock. Compaction must still be able to write
+        // its garbage frame, but cannot expose that frame's position until its edit commits.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let appended = loop {
+            let position = GarbageLogPosition {
+                log_id: initial_position.log_id,
+                offset: std::fs::metadata(GarbageLog::path(&log_path, initial_position.log_id))
+                    .unwrap()
+                    .len(),
+            };
+            if let Ok(Some((written, _))) =
+                GarbageLog::read_next(&log_path, GarbageLogPosition::default(), position)
+                && written == records
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(index.get_garbage_log_position(LOG_NAME).unwrap(), None);
+        assert_eq!(
+            index.get_lsm_manifest(LSM_NAME).unwrap(),
+            Some(manifest.clone())
+        );
+
+        // Advance the frontier while compaction waits. Its previously prepared edit must merge
+        // into this newer manifest rather than replacing it with the original snapshot.
+        let mut batch = index.batch();
+        index
+            .merge_lsm_manifest_batch(
+                &mut batch,
+                LSM_NAME,
+                &ManifestEdit {
+                    remove: Vec::new(),
+                    add_base: Vec::new(),
+                    add_patches: Vec::new(),
+                    materialized_through: Some(10),
+                    wal_retained_from: None,
+                },
+                &guard,
+            )
+            .unwrap();
+        batch.write_with_sync(true).unwrap();
+        drop(guard);
+        (appended, publisher.join().unwrap().unwrap())
+    });
+    assert!(
+        appended_while_locked,
+        "garbage append waited for the manifest lock"
+    );
     assert_eq!(
         index.get_garbage_log_position(LOG_NAME).unwrap(),
         Some(committed)
@@ -92,7 +152,8 @@ async fn compaction_garbage_records_are_synced_before_the_manifest_is_published(
 
     let reopened = StrataIndex::open_path(&db_path, "strata", &metric_suffix).unwrap();
     let reopened_manifest = reopened.get_lsm_manifest(LSM_NAME).unwrap().unwrap();
-    assert_eq!(reopened_manifest.generation, 2);
+    assert_eq!(reopened_manifest.generation, 3);
+    assert_eq!(reopened_manifest.materialized_through, Some(10));
     assert_eq!(
         reopened_manifest.partitions[&0].base[0].relative_path,
         "base-00000000000000000003.sst"
@@ -102,6 +163,85 @@ async fn compaction_garbage_records_are_synced_before_the_manifest_is_published(
     GarbageLog::open(&log_path, 1, committed).unwrap();
     assert!(GarbageLog::path(&log_path, 1).exists());
     assert!(!GarbageLog::path(&log_path, 2).exists());
+}
+
+#[tokio::test]
+async fn failed_manifest_publication_discards_uncommitted_garbage_on_reopen() {
+    let directory = TempDir::new().unwrap();
+    let log_path = directory.path().join("garbage");
+    let index = StrataIndex::open_path(
+        directory.path().join("index"),
+        "strata",
+        directory.path().display().to_string(),
+    )
+    .unwrap();
+    let manifest = Manifest::empty(SCHEMA, PATCH_FORMAT, NonZeroU32::new(1).unwrap());
+    let mut batch = index.batch();
+    index
+        .put_lsm_manifest_batch(&mut batch, LSM_NAME, &manifest)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+
+    let mut log = GarbageLog::open(&log_path, 1024, GarbageLogPosition::default()).unwrap();
+    let initial_position = log.position();
+    let records = [garbage_record(b"key", 10, b"old")];
+    let invalid_edit = ManifestEdit {
+        remove: vec!["missing.sst".to_owned()],
+        add_base: Vec::new(),
+        add_patches: Vec::new(),
+        materialized_through: None,
+        wal_retained_from: None,
+    };
+    let error = index
+        .publish_lsm_compaction(LSM_NAME, &invalid_edit, LOG_NAME, &mut log, &records)
+        .unwrap_err();
+    assert!(matches!(error, index::Error::InvalidLsmManifest(_)));
+    assert!(log.position().offset > initial_position.offset);
+    assert_eq!(index.get_garbage_log_position(LOG_NAME).unwrap(), None);
+    assert_eq!(index.get_lsm_manifest(LSM_NAME).unwrap(), Some(manifest));
+
+    let edit = ManifestEdit {
+        remove: Vec::new(),
+        add_base: Vec::new(),
+        add_patches: Vec::new(),
+        materialized_through: Some(10),
+        wal_retained_from: None,
+    };
+    let error = index
+        .publish_lsm_compaction(LSM_NAME, &edit, LOG_NAME, &mut log, &records)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        index::Error::Lsm(lsm::Error::InvalidGarbageLog(_))
+    ));
+    drop(log);
+
+    // Recovery trusts the committed head, so the frame from the failed edit is discarded.
+    let committed = index
+        .get_garbage_log_position(LOG_NAME)
+        .unwrap()
+        .unwrap_or_default();
+    let mut log = GarbageLog::open(&log_path, 1024, committed).unwrap();
+    assert_eq!(log.position(), initial_position);
+    let position = index
+        .publish_lsm_compaction(LSM_NAME, &edit, LOG_NAME, &mut log, &records)
+        .unwrap();
+    assert_eq!(
+        index.get_garbage_log_position(LOG_NAME).unwrap(),
+        Some(position)
+    );
+    assert_eq!(
+        GarbageLog::read_next(&log_path, committed, position).unwrap(),
+        Some((records.to_vec(), position))
+    );
+    assert_eq!(
+        index
+            .get_lsm_manifest(LSM_NAME)
+            .unwrap()
+            .unwrap()
+            .materialized_through,
+        Some(10)
+    );
 }
 
 fn garbage_record(key: &[u8], lsn: StrataLsn, value: &[u8]) -> GarbageRecord {

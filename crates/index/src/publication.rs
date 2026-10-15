@@ -7,7 +7,8 @@ impl StrataIndex {
     ///
     /// New SSTs must already be synced, and the caller must keep the input tables reserved until
     /// this returns. This method syncs all garbage records as one frame before committing the frame's
-    /// end position with the manifest edit. Its mutable log borrow serializes append and publish.
+    /// end position with the manifest edit. The caller must serialize garbage-log append and
+    /// publication, including across separately opened handles to the same log.
     /// After any error, the caller must reopen the log from its stored position before reusing it.
     ///
     /// Segment summaries are updated later by the sweeper, after the corresponding segment-local
@@ -29,14 +30,19 @@ impl StrataIndex {
             )));
         }
 
-        let guard = self.lock_lsm_manifests();
-        let mut batch = self.batch();
-        self.merge_lsm_manifest_batch(&mut batch, lsm_name, edit, &guard)?;
+        // A large garbage frame can take time to write and sync. Let flush/frontier publishers
+        // keep using the manifest while that happens; this frame remains unpublished until the
+        // batch below commits its position together with the edit.
         let position = if records.is_empty() {
             committed
         } else {
             garbage_log.append(records)?
         };
+
+        let guard = self.lock_lsm_manifests();
+        let mut batch = self.batch();
+        // Merge into the latest manifest, preserving any publications during the log append.
+        self.merge_lsm_manifest_batch(&mut batch, lsm_name, edit, &guard)?;
         self.put_garbage_log_position_batch(&mut batch, garbage_log_name, position)?;
         batch.write_with_sync(true)?;
         drop(guard);
