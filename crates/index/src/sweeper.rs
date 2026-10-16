@@ -17,6 +17,8 @@ use lsm::{
 use crate::{Error, Result, StrataIndex, segment::gc_summary::apply_segment_gc_summary_delta};
 
 const MAX_SWEEP_FRAMES: usize = 256;
+// Frames from a large compaction must not all be decoded into memory in one sweep.
+const MAX_SWEEP_RECORDS: usize = 32_768;
 /// Heap budget for folded overlays kept between sweeps (see `overlay_cache`). A mature
 /// one-gigabyte segment of 16 KiB records folds to about two megabytes, so this holds the
 /// overlays of several hundred such segments.
@@ -125,17 +127,22 @@ impl StrataIndex {
 
         let mut by_segment = BTreeMap::<SegmentId, Vec<GarbageRecord>>::new();
         let mut next_cursor = cursor;
+        let mut record_count = 0;
         for _ in 0..MAX_SWEEP_FRAMES {
             let Some((records, position)) =
                 GarbageLog::read_next(global_log_dir, next_cursor, head)?
             else {
                 break;
             };
+            record_count += records.len();
             for record in records {
                 let segment_id = record.key.segment_id;
                 by_segment.entry(segment_id).or_default().push(record);
             }
             next_cursor = position;
+            if record_count >= MAX_SWEEP_RECORDS {
+                break;
+            }
         }
         if next_cursor == cursor {
             return Ok(false);
