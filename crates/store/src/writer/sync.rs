@@ -143,6 +143,8 @@ impl WriteCoordinator {
             return Ok(Some(target));
         }
 
+        self.metrics
+            .set_main_block_cache(self.lsm.block_cache_stats());
         let current_lsn = self.index.get_next_lsn()?.saturating_sub(1);
         let committed_lsn = self.index.get_committed_lsn()?;
         if committed_lsn > current_lsn {

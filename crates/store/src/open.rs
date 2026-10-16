@@ -478,6 +478,7 @@ pub(crate) fn open_lsm(
         next_lsn,
         recovered,
         LsmOptions {
+            block_cache_capacity_bytes: config.lsm_block_cache_capacity_bytes,
             rollover_policy: Some(MemtableRolloverPolicy::new(
                 LSM_MEMTABLE_MAX_KEYS,
                 config.lsm_memtable_max_age,
