@@ -1,7 +1,7 @@
 pub(crate) mod gc_summary;
 
 use crate::port::map::IndexBatch;
-use core_types::{SegmentId, SegmentOwner, SegmentState, ShardKey};
+use core_types::{SegmentFileState, SegmentId, SegmentOwner, SegmentState, ShardKey};
 
 use crate::Result;
 
@@ -35,6 +35,14 @@ impl StrataIndex {
         state: &SegmentState,
     ) -> Result<()> {
         batch.insert_batch(self.segment_states(), [(&state.segment_id, state)])?;
+        if state.state == SegmentFileState::Deleted {
+            // Close cached log handles before unlinking so they do not retain disk space.
+            // Eviction is safe even if the metadata batch later fails.
+            self.overlay_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(state.segment_id);
+        }
         Ok(())
     }
 
