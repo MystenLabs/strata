@@ -263,6 +263,91 @@ impl GarbageLog {
         }
     }
 
+    /// Reads a bounded prefix using parallel checksum/decoding workers. Frame discovery is
+    /// ordered; results are returned in that same order regardless of completion order. No
+    /// caller may advance its durable cursor until every returned frame has been applied.
+    /// Limits are soft for one legacy oversized frame, which cannot be split during replay.
+    pub fn read_batch(
+        dir: impl AsRef<Path>,
+        cursor: GarbageLogPosition,
+        through: GarbageLogPosition,
+        max_frames: usize,
+        max_records: usize,
+        workers: usize,
+    ) -> Result<Vec<(Vec<GarbageRecord>, GarbageLogPosition)>> {
+        const MAX_BATCH_BYTES: u64 = 64 << 20;
+        if through != GarbageLogPosition::default() {
+            validate_position(cursor)?;
+            validate_position(through)?;
+        }
+        let mut frames = Vec::new();
+        let mut next = cursor;
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        while frames.len() < max_frames && next != through {
+            let Some(frame) = locate_frame(dir.as_ref(), next, through)? else {
+                break;
+            };
+            count = count.saturating_add(frame.count as usize);
+            bytes = bytes.saturating_add(frame.end.offset - frame.offset);
+            next = frame.end;
+            frames.push(frame);
+            if count >= max_records || bytes >= MAX_BATCH_BYTES {
+                break;
+            }
+        }
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = workers.clamp(1, 32).min(frames.len());
+        let queue = std::sync::Mutex::new(frames.into_iter().enumerate());
+        let mut results = std::thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|_| {
+                    let queue = &queue;
+                    scope.spawn(move || -> Result<Vec<_>> {
+                        let mut results = Vec::new();
+                        loop {
+                            let Some((index, frame)) =
+                                queue.lock().expect("garbage frame queue poisoned").next()
+                            else {
+                                break;
+                            };
+                            let (records, end) = read_records_at(&frame.path, frame.offset)?;
+                            if end != frame.end.offset || records.len() != frame.count as usize {
+                                return Err(Error::CorruptGarbageLog {
+                                    path: frame.path,
+                                    reason: "frame changed while reading".into(),
+                                });
+                            }
+                            results.push((index, records, frame.end));
+                        }
+                        Ok(results)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut all = Vec::new();
+            let mut error = None;
+            for handle in handles {
+                match handle.join().expect("garbage frame reader panicked") {
+                    Ok(results) => all.extend(results),
+                    Err(err) => {
+                        error.get_or_insert(err);
+                    }
+                }
+            }
+            match error {
+                Some(err) => Err(err),
+                None => Ok(all),
+            }
+        })?;
+        results.sort_unstable_by_key(|(index, _, _)| *index);
+        Ok(results
+            .into_iter()
+            .map(|(_, records, end)| (records, end))
+            .collect())
+    }
+
     /// Appends and syncs one sorted compaction batch as a single frame.
     ///
     /// Two validations run before any byte is written. Every record's key and its event must name
@@ -974,10 +1059,83 @@ pub(super) fn write_frame(file: &mut File, records: &[Vec<u8>], path: &Path) -> 
         .map_err(|source| io_error(path, source))
 }
 
+/// A frame boundary discovered before parallel payload validation.
+struct GarbageFrame {
+    path: PathBuf,
+    offset: u64,
+    end: GarbageLogPosition,
+    count: u32,
+}
+
+/// Locate a frame using only its header. The parallel reader still verifies its checksum and
+/// contents before anything is returned to the sweeper; an untrusted count never advances a cursor.
+fn locate_frame(
+    dir: &Path,
+    cursor: GarbageLogPosition,
+    through: GarbageLogPosition,
+) -> Result<Option<GarbageFrame>> {
+    if through == GarbageLogPosition::default() || cursor == through {
+        return Ok(None);
+    }
+    validate_position(cursor)?;
+    validate_position(through)?;
+    let (mut log_id, mut offset) = if cursor == GarbageLogPosition::default() {
+        (1, HEADER_LEN)
+    } else {
+        (cursor.log_id, cursor.offset)
+    };
+    loop {
+        if log_id > through.log_id || (log_id == through.log_id && offset >= through.offset) {
+            return Err(Error::InvalidGarbageLog(
+                "sweep cursor is beyond committed head".into(),
+            ));
+        }
+        let path = GarbageLog::path(dir, log_id);
+        let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+        let len = file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?
+            .len();
+        if offset == len && log_id < through.log_id {
+            log_id += 1;
+            offset = HEADER_LEN;
+            continue;
+        }
+        read_header(&mut file, &path)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|source| io_error(&path, source))?;
+        let mut prefix = [0u8; 12];
+        file.read_exact(&mut prefix)
+            .map_err(|source| io_error(&path, source))?;
+        let payload_len = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+        let count = u32::from_le_bytes(prefix[8..].try_into().unwrap());
+        let end = offset
+            .checked_add(44)
+            .and_then(|v| v.checked_add(payload_len))
+            .ok_or_else(|| Error::InvalidGarbageLog("garbage frame offset overflow".into()))?;
+        if end > len
+            || (log_id == through.log_id && end > through.offset)
+            || u64::from(count) * 4 > payload_len
+        {
+            return Err(Error::CorruptGarbageLog {
+                path,
+                reason: "invalid committed frame length".into(),
+            });
+        }
+        return Ok(Some(GarbageFrame {
+            path,
+            offset,
+            end: GarbageLogPosition {
+                log_id,
+                offset: end,
+            },
+            count,
+        }));
+    }
+}
+
 /// Reads and fully validates the single frame starting at `offset`, returning its records and
-/// exclusive end.
-///
-/// Everything is checked before anything is believed: the file header, the frame's claimed
+/// exclusive end. Everything is checked before anything is believed: the file header, the frame's claimed
 /// length against the file, the SHA-256 over prefix and payload, each record's length field, and
 /// finally that the payload holds exactly the claimed record count with no bytes left over.
 /// Callers use this only at offsets a committed position vouches for; recovery uses its own

@@ -40,6 +40,7 @@ impl StrataIndex {
     }
 
     fn from_db_with_cf_names(db: Arc<dyn IndexDb>, cf_names: StrataIndexCfNames) -> Result<Self> {
+        let garbage_forwarding = TypedMap::new(Arc::clone(&db), &cf_names.garbage_forwarding);
         let segment_states = TypedMap::new(Arc::clone(&db), &cf_names.segment_states);
         let segment_publication_lsns =
             TypedMap::new(Arc::clone(&db), &cf_names.segment_publication_lsns);
@@ -59,6 +60,7 @@ impl StrataIndex {
             db,
             cf_names,
             segment_states,
+            garbage_forwarding,
             segment_publication_lsns,
             segment_gc_summaries,
             gc_reclaim_pending,

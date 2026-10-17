@@ -178,14 +178,9 @@ impl MergeOperator for BlobMergeWithRelocations {
                 .expiry(lifetime.lifecycle.logical_end_epoch)
                 .is_some()
         });
-        // GC publication stamps each copy's segment summary with the lifecycle the key had at
-        // publish time, so a destination only needs to hear about a lifetime written after that.
-        // Forwarding on every heal would touch every destination segment once per full pass.
-        let lifetime_changed_after = |publish_lsn: StrataLsn| {
-            state
-                .lifetime
-                .is_some_and(|lifetime| lifetime.lsn > publish_lsn)
-        };
+        // GC may activate before sweeping has learned a lifetime. Seed the current lifecycle
+        // on the first healing of each moved reference, even when it predates activation.
+        // Once healed, subsequent compactions do not repeat the hint.
         for relocation in relocations {
             let lifecycle = state
                 .versions
@@ -203,9 +198,7 @@ impl MergeOperator for BlobMergeWithRelocations {
                 if version.record_ref != relocation.to {
                     version.record_ref = relocation.to;
                     self.healed_references.fetch_add(1, Ordering::Relaxed);
-                    if let Some(lifecycle) = lifecycle
-                        && lifetime_changed_after(relocation.publish_lsn)
-                    {
+                    if let Some(lifecycle) = lifecycle {
                         emit_lifetime_change(
                             key,
                             relocation.publish_lsn,

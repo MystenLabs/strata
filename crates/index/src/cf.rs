@@ -1,3 +1,5 @@
+pub(crate) const GARBAGE_FORWARDING_CF: &str = "garbage_forwarding";
+
 pub(crate) const SEGMENT_STATES_CF: &str = "segment_states";
 pub(crate) const SEGMENT_PUBLICATION_LSNS_CF: &str = "segment_publication_lsns";
 pub(crate) const SEGMENT_GC_SUMMARIES_CF: &str = "segment_gc_summaries";
@@ -15,6 +17,7 @@ pub(crate) const SEGMENT_GARBAGE_LOG_POSITIONS_CF: &str = "segment_garbage_log_p
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StrataIndexCfNames {
+    pub garbage_forwarding: String,
     pub segment_states: String,
     pub segment_publication_lsns: String,
     pub segment_gc_summaries: String,
@@ -42,6 +45,7 @@ impl StrataIndexCfNames {
         };
 
         Self {
+            garbage_forwarding: with_prefix(GARBAGE_FORWARDING_CF),
             segment_states: with_prefix(SEGMENT_STATES_CF),
             segment_publication_lsns: with_prefix(SEGMENT_PUBLICATION_LSNS_CF),
             segment_gc_summaries: with_prefix(SEGMENT_GC_SUMMARIES_CF),
@@ -62,8 +66,9 @@ impl StrataIndexCfNames {
     ///
     /// Public because an embedder hosting these families in its own database needs to know which
     /// ones belong to Strata.
-    pub fn as_strs(&self) -> [&str; 13] {
+    pub fn as_strs(&self) -> [&str; 14] {
         [
+            self.garbage_forwarding.as_str(),
             self.segment_states.as_str(),
             self.segment_publication_lsns.as_str(),
             self.segment_gc_summaries.as_str(),
