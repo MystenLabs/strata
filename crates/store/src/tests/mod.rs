@@ -249,6 +249,7 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         write_queue_capacity: 128,
         max_unsealed_segments: 8,
         segment_reader_cache_capacity: 16,
+        lsm_block_cache_capacity_bytes: lsm::DEFAULT_BLOCK_CACHE_BYTES,
         lsm_partition_count: DEFAULT_LSM_PARTITION_COUNT,
         lsm_compaction_patch_bytes: DEFAULT_LSM_COMPACTION_PATCH_BYTES,
         lsm_memtable_max_age: DEFAULT_LSM_MEMTABLE_MAX_AGE,
@@ -265,6 +266,45 @@ fn config(root_dir: &Path, namespace: &str) -> StrataStoreConfig {
         gc_planner_config: GcPlannerConfig::default(),
         shard_drop_gc_drain_timeout: DEFAULT_SHARD_DROP_GC_DRAIN_TIMEOUT,
         starting_epoch: 42,
+    }
+}
+
+#[tokio::test]
+async fn configured_blob_lsm_cache_reuses_verified_blocks() {
+    for capacity in [0, 1024 * 1024] {
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path(), "cache-budget");
+        cfg.lsm_block_cache_capacity_bytes = capacity;
+        cfg.gc_workers_enabled = false;
+        cfg.lsm_memtable_max_age = Duration::from_millis(10);
+        let key = BlobKey::new(b"cached-blob".to_vec()).unwrap();
+        let registry = Registry::default();
+        let metrics = StrataStoreMetrics::new(&registry, "cache-budget").unwrap();
+        let store = try_open_standalone_store(cfg, metrics).unwrap();
+        let lsn = store.put(&key, b"payload").unwrap();
+        store.sync().unwrap();
+        wait_for_lsm_gc(&store, lsn);
+        assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+        let before = store.main_lsm_block_cache_stats().unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
+        let after = store.main_lsm_block_cache_stats().unwrap();
+        assert!(after.bytes <= capacity);
+        store.sync().unwrap();
+        assert_eq!(
+            counter_value(&registry, "strata_store_main_block_cache_hits_total"),
+            after.hits as f64
+        );
+        assert_eq!(
+            counter_value(&registry, "strata_store_main_block_cache_misses_total"),
+            after.misses as f64
+        );
+        if capacity == 0 {
+            assert_eq!(after.hits, 0);
+            assert!(after.misses > before.misses);
+        } else {
+            assert!(after.hits > before.hits);
+            assert_eq!(after.misses, before.misses);
+        }
     }
 }
 

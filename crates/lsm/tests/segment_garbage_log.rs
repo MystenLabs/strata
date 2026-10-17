@@ -5,6 +5,60 @@ use core_types::{
 use lsm::{GarbageRecord, SegmentGarbageLog, fold_segment_garbage, read_segment_garbage};
 
 #[test]
+#[cfg(unix)]
+fn validated_writer_resumes_only_the_same_committed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7.glog");
+    let first = event(b"a", 1, retire(1, 6));
+    let mut file = SegmentGarbageLog::open(&path, 0).unwrap();
+    let committed = file.append(std::slice::from_ref(&first)).unwrap();
+    assert!(file.is_at_committed_position(&path, committed).unwrap());
+    assert!(!file.is_at_committed_position(&path, 0).unwrap());
+    assert!(!file.is_at_committed_position(&path, committed - 1).unwrap());
+    assert!(
+        !file
+            .is_at_committed_position(&dir.path().join("8.glog"), committed)
+            .unwrap()
+    );
+
+    let second = event(b"b", 2, retire(20, 5));
+    let next = file.append(std::slice::from_ref(&second)).unwrap();
+    assert!(!file.is_at_committed_position(&path, committed).unwrap());
+    assert!(file.is_at_committed_position(&path, next).unwrap());
+    assert_eq!(
+        read_segment_garbage(&path, next).unwrap(),
+        vec![first, second]
+    );
+
+    // An external append invalidates a cached writer even if its own offset is unchanged.
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unpublished tail")
+        .unwrap();
+    assert!(!file.is_at_committed_position(&path, next).unwrap());
+    file = SegmentGarbageLog::open(&path, next).unwrap();
+    assert!(file.is_at_committed_position(&path, next).unwrap());
+
+    // A same-length replacement must not reuse the old open file or its validated history.
+    let replacement = dir.path().join("replacement.glog");
+    std::fs::copy(&path, &replacement).unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert!(!file.is_at_committed_position(&path, next).unwrap());
+    file = SegmentGarbageLog::open(&path, next).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(next - 1)
+        .unwrap();
+    assert!(!file.is_at_committed_position(&path, next).unwrap());
+    assert!(SegmentGarbageLog::open(&path, next).is_err());
+}
+
+#[test]
 fn reopen_discards_an_unpublished_tail_before_replay() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("7.glog");

@@ -16,6 +16,95 @@ const HEAD: &str = "segment-ref";
 const CURSOR: &str = "segment-ref-sweep";
 
 #[tokio::test]
+async fn failed_sweep_drops_cached_writers_and_retries_from_committed_positions() {
+    let directory = TempDir::new().unwrap();
+    let index = StrataIndex::open_path(directory.path().join("index"), "strata", "test").unwrap();
+    let global_dir = directory.path().join("global-garbage");
+    let namespace_dir = directory.path().join("namespace");
+    let mut log = GarbageLog::open(&global_dir, 1024 * 1024, Default::default()).unwrap();
+    let initial: Vec<_> = (1..=2)
+        .map(|id| {
+            put_ready_segment(&index, id, 100, 1);
+            event(
+                b"a",
+                1,
+                GarbageEvent::SetLifecycle {
+                    record: record(id, 0, 100),
+                    lifecycle: None,
+                },
+                Default::default(),
+            )
+        })
+        .collect();
+    publish_head(&index, log.append(&initial).unwrap());
+    assert!(sweep(&index, &global_dir, &namespace_dir));
+    let committed_cursor = index.get_garbage_log_position(CURSOR).unwrap();
+    let committed_position = index.get_segment_garbage_log_position(1).unwrap().unwrap();
+
+    let retirements: Vec<_> = (1..=2)
+        .map(|id| {
+            event(
+                b"a",
+                2,
+                GarbageEvent::Retired {
+                    record: record(id, 0, 100),
+                },
+                retire_delta(100),
+            )
+        })
+        .collect();
+    let head = log.append(&retirements).unwrap();
+    publish_head(&index, head);
+    // Segment 1 appends successfully, then segment 2 fails before the metadata commit.
+    let second_path = namespace_dir.join("segments/2.glog");
+    let saved = std::fs::read(&second_path).unwrap();
+    std::fs::write(&second_path, []).unwrap();
+    assert!(
+        index
+            .sweep_garbage_log(&global_dir, &namespace_dir, HEAD, CURSOR)
+            .is_err()
+    );
+    assert_eq!(
+        index.get_garbage_log_position(CURSOR).unwrap(),
+        committed_cursor
+    );
+    assert_eq!(
+        index.get_segment_garbage_log_position(1).unwrap(),
+        Some(committed_position)
+    );
+    assert_eq!(
+        index.get_segment_gc_summary(1).unwrap().unwrap().live_bytes,
+        100
+    );
+    assert!(
+        std::fs::metadata(namespace_dir.join("segments/1.glog"))
+            .unwrap()
+            .len()
+            > committed_position
+    );
+
+    std::fs::write(&second_path, saved).unwrap();
+    assert!(sweep(&index, &global_dir, &namespace_dir));
+    assert_eq!(index.get_garbage_log_position(CURSOR).unwrap(), Some(head));
+    for id in 1..=2 {
+        let position = index.get_segment_garbage_log_position(id).unwrap().unwrap();
+        let events =
+            read_segment_garbage(namespace_dir.join(format!("segments/{id}.glog")), position)
+                .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                initial[id as usize - 1].clone(),
+                retirements[id as usize - 1].clone()
+            ]
+        );
+        let summary = index.get_segment_gc_summary(id).unwrap().unwrap();
+        assert_eq!(summary.live_bytes, 0);
+        assert_eq!(summary.retired_bytes, 100);
+    }
+}
+
+#[tokio::test]
 async fn sweep_copies_details_before_publishing_summaries_and_cursor() {
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(

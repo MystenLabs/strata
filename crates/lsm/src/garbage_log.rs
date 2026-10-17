@@ -354,6 +354,7 @@ impl GarbageLog {
 /// born-dead ranges (in the running example, B's and C's bytes inside S42). The committed offset
 /// is a per-segment row in RocksDB, published by whoever appended — same trust model as the
 /// global log: the file's own length proves nothing.
+#[derive(Debug)]
 pub struct SegmentGarbageLog {
     path: PathBuf,
     file: File,
@@ -361,6 +362,39 @@ pub struct SegmentGarbageLog {
 }
 
 impl SegmentGarbageLog {
+    /// Whether this writer can resume at the caller's committed position without recovery.
+    ///
+    /// The caller must serialize appends and cache the writer only after its log sync and
+    /// metadata commit succeed. Reusing the same open file preserves its validated prefix;
+    /// a changed position, unpublished tail, or replaced file requires a fresh [`Self::open`].
+    pub fn is_at_committed_position(&self, path: &Path, committed: u64) -> Result<bool> {
+        if committed == 0 || self.path != path || self.offset != committed {
+            return Ok(false);
+        }
+        // An open handle alone is insufficient: its path may now name a different file.
+        // Keep the conservative recovery path on platforms without Unix file identity.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let current = match fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(source) => return Err(io_error(path, source)),
+            };
+            let opened = self
+                .file
+                .metadata()
+                .map_err(|source| io_error(path, source))?;
+            Ok(current.dev() == opened.dev()
+                && current.ino() == opened.ino()
+                && current.len() == committed
+                && opened.len() == committed)
+        }
+        #[cfg(not(unix))]
+        Ok(false)
+    }
+
     /// Opens the committed prefix and removes any later unpublished frames.
     ///
     /// `committed == 0` does not mean "open whatever is there" — it means nothing was ever

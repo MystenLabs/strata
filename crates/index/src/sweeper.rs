@@ -195,6 +195,8 @@ impl StrataIndex {
         }
 
         let mut appended = Vec::new();
+        let mut updated_overlays = Vec::new();
+        let mut pending_overlay_bytes: usize = 0;
         for (segment_id, records) in by_segment {
             let state = states
                 .remove(&segment_id)
@@ -210,9 +212,9 @@ impl StrataIndex {
                 .overlay_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take(segment_id, committed);
-            let mut overlay = match cached {
-                Some((expected_row, mut overlay)) => {
+                .take(segment_id, committed, &path)?;
+            let (mut overlay, mut file) = match cached {
+                Some((expected_row, mut overlay, file)) => {
                     // Other publishers may have moved the row since this overlay was folded;
                     // carry that movement into the cached summary so it matches a fresh fold.
                     let drift = summary_delta_between(&expected_row, &row);
@@ -223,7 +225,7 @@ impl StrataIndex {
                             ))
                         },
                     )?;
-                    overlay
+                    (overlay, file)
                 }
                 None => {
                     let existing = if committed == 0 {
@@ -231,7 +233,10 @@ impl StrataIndex {
                     } else {
                         read_segment_garbage(&path, committed)?
                     };
-                    fold_segment_garbage(existing, row.clone())?
+                    (
+                        fold_segment_garbage(existing, row.clone())?,
+                        SegmentGarbageLog::open(&path, committed)?,
+                    )
                 }
             };
             let before_summary = overlay.summary.clone();
@@ -243,24 +248,41 @@ impl StrataIndex {
             // Derive the merge operand from the overlay transition instead, preserving both
             // idempotency and commutativity with allocation-baseline merge operands.
             let summary_delta = summary_delta_between(&before_summary, &overlay.summary);
-            let mut file = SegmentGarbageLog::open(path, committed)?;
             let position = file.append_unsynced(&records)?;
             appended.push(file);
             batch.put(self.segment_garbage_log_positions(), &segment_id, &position)?;
             self.merge_segment_gc_summary_batch(batch.raw_batch_mut(), segment_id, &summary_delta)?;
             let mut expected_row = row;
-            if apply_segment_gc_summary_delta(&mut expected_row, &summary_delta).is_some() {
-                self.overlay_cache
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(segment_id, position, expected_row, overlay);
-            }
+            // Waiting for the commit must not retain an unbounded batch of large overlays.
+            let bytes = crate::overlay_cache::overlay_bytes(&overlay);
+            let entry = if pending_overlay_bytes.saturating_add(bytes) <= OVERLAY_CACHE_BYTES
+                && apply_segment_gc_summary_delta(&mut expected_row, &summary_delta).is_some()
+            {
+                pending_overlay_bytes += bytes;
+                Some((segment_id, position, expected_row, overlay))
+            } else {
+                None
+            };
+            updated_overlays.push(entry);
         }
         // One filesystem sync covers every appended log; it must land before the positions
         // that make those appends visible are committed below.
         sync_segment_garbage_logs(namespace_dir.as_ref(), &appended)?;
         batch.put(self.garbage_log_positions(), &cursor_name, &next_cursor)?;
         batch.write_with_sync(true)?;
+        // Keep validated writers only after publication succeeds. Any earlier error drops
+        // the touched writers and overlays, so a retry recovers from the committed positions.
+        {
+            let mut cache = self
+                .overlay_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (file, entry) in appended.into_iter().zip(updated_overlays) {
+                if let Some((segment_id, position, expected_row, overlay)) = entry {
+                    cache.insert(segment_id, position, expected_row, overlay, file);
+                }
+            }
+        }
         GarbageLog::reclaim_before(global_log_dir, next_cursor)?;
         Ok(true)
     }

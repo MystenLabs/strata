@@ -64,6 +64,10 @@ struct PrometheusMetrics {
     get_errors_total: IntCounter,
     get_duration_seconds: Histogram,
     get_payload_bytes_total: IntCounter,
+    main_block_cache_hits_total: IntCounter,
+    main_block_cache_misses_total: IntCounter,
+    main_block_cache_evictions_total: IntCounter,
+    main_block_cache_bytes: IntGauge,
     relocation_cache_requests_total: IntCounterVec,
     relocation_lookups_total: IntCounterVec,
     relocation_lookup_duration_seconds: Histogram,
@@ -354,6 +358,30 @@ impl StrataStoreMetrics {
                     &labels,
                     "get_payload_bytes_total",
                     "Total payload bytes returned by Strata get calls.",
+                )?,
+                main_block_cache_hits_total: register_counter(
+                    registry,
+                    &labels,
+                    "main_block_cache_hits_total",
+                    "Total blob-LSM block-cache hits.",
+                )?,
+                main_block_cache_misses_total: register_counter(
+                    registry,
+                    &labels,
+                    "main_block_cache_misses_total",
+                    "Total blob-LSM block-cache misses requiring a read and checksum.",
+                )?,
+                main_block_cache_evictions_total: register_counter(
+                    registry,
+                    &labels,
+                    "main_block_cache_evictions_total",
+                    "Total blob-LSM block-cache evictions.",
+                )?,
+                main_block_cache_bytes: register_gauge(
+                    registry,
+                    &labels,
+                    "main_block_cache_bytes",
+                    "Bytes retained by the blob-LSM block cache.",
                 )?,
                 relocation_cache_requests_total: register_counter_vec(
                     registry,
@@ -1142,6 +1170,24 @@ impl StrataStoreMetrics {
         metrics
             .relocation_lookup_duration_seconds
             .observe(duration_seconds(elapsed));
+    }
+
+    // Called only by the write coordinator at sync boundaries. Publish cumulative
+    // cache statistics without adding metric updates to every point read.
+    pub(crate) fn set_main_block_cache(&self, stats: lsm::BlockCacheStats) {
+        let Some(metrics) = &self.inner else {
+            return;
+        };
+        for (counter, value) in [
+            (&metrics.main_block_cache_hits_total, stats.hits),
+            (&metrics.main_block_cache_misses_total, stats.misses),
+            (&metrics.main_block_cache_evictions_total, stats.evictions),
+        ] {
+            counter.inc_by(value.saturating_sub(counter.get()));
+        }
+        metrics
+            .main_block_cache_bytes
+            .set(to_i64(stats.bytes as u64));
     }
 
     pub(crate) fn record_relocation_cache_lookup(&self, hit: bool) {

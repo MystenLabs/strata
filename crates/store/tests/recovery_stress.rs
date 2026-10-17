@@ -433,6 +433,7 @@ fn store_config(root_dir: &Path) -> StrataStoreConfig {
         max_unsealed_segments: 3,
         segment_reader_cache_capacity: 8,
         lsm_partition_count: store::DEFAULT_LSM_PARTITION_COUNT,
+        lsm_block_cache_capacity_bytes: lsm::DEFAULT_BLOCK_CACHE_BYTES,
         lsm_compaction_patch_bytes: store::DEFAULT_LSM_COMPACTION_PATCH_BYTES,
         lsm_memtable_max_age: store::DEFAULT_LSM_MEMTABLE_MAX_AGE,
         recovery_policy: StrataRecoveryPolicy::PointInTime,

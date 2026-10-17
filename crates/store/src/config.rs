@@ -30,6 +30,10 @@ pub struct StrataStoreConfig {
     pub write_queue_capacity: usize,
     pub max_unsealed_segments: usize,
     pub segment_reader_cache_capacity: usize,
+    /// Bytes retained for immutable blob-LSM data blocks. Cached blocks have already passed
+    /// checksum validation, so repeated reads avoid disk I/O and hashing. Zero disables caching.
+    /// The relocation LSM keeps its separate default budget.
+    pub lsm_block_cache_capacity_bytes: usize,
     /// Number of hash partitions shared by the main and relocation LSMs.
     ///
     /// This is an on-disk compatibility setting. Reopening an existing namespace with a
@@ -112,6 +116,7 @@ impl StrataStoreConfig {
             write_queue_capacity: 1024,
             max_unsealed_segments: 8,
             segment_reader_cache_capacity: DEFAULT_SEGMENT_READER_CACHE_CAPACITY,
+            lsm_block_cache_capacity_bytes: lsm::DEFAULT_BLOCK_CACHE_BYTES,
             lsm_partition_count: DEFAULT_LSM_PARTITION_COUNT,
             lsm_compaction_patch_bytes: DEFAULT_LSM_COMPACTION_PATCH_BYTES,
             lsm_memtable_max_age: DEFAULT_LSM_MEMTABLE_MAX_AGE,
