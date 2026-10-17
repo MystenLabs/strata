@@ -325,7 +325,6 @@ impl StrataStore {
                 executor: GcExecutor {
                     config: config.clone(),
                     index: index.clone(),
-                    lsm: Arc::downgrade(&lsm),
                     publish_cleanup_lock: Arc::clone(&gc_publish_cleanup_lock),
                     garbage_publish_lock: Arc::clone(&garbage_publish_lock),
                     relocation_activations: Arc::clone(&relocation_activations),

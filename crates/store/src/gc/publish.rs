@@ -17,9 +17,9 @@ use super::output::{
     gc_output_bytes_by_source, initial_gc_output_metadata, skipped_gc_output_ranges,
 };
 use crate::{
-    Error, GARBAGE_LOG_HEAD, GARBAGE_LOG_SWEEP_CURSOR, GcPublishResult, GcStagedCopiedRecord,
-    LSM_GARBAGE_LOG_MAX_BYTES, RELOCATION_LSM_MANIFEST, Result,
-    blob_lsm::{BlobMerge, BlobState, effective_lifecycle, terminal_garbage_record},
+    Error, GARBAGE_LOG_HEAD, GcPublishResult, GcStagedCopiedRecord, LSM_GARBAGE_LOG_MAX_BYTES,
+    RELOCATION_LSM_MANIFEST, Result,
+    blob_lsm::terminal_garbage_record,
     fs_util::{segment_garbage_log_path, unlink_gc_segment_files},
     gc::{
         GcExecutor, GcPrepublishedCopy, GcPrepublishedOutputSegment, OverlayRecordClassifier,
@@ -28,16 +28,14 @@ use crate::{
     layout::segment_state_path,
     maintenance::{garbage_log_dir, read_relocation_lsm_manifest},
     metrics::GcKnownDelta,
-    partition::partition_for_key,
     relocation::RelocationEntry,
     shard_gc::shard_generation_is_obsolete,
 };
 use core_types::{
-    BlobKey, BlobLifecycle, GarbageEvent, PlacementClass, SegmentFileState, SegmentGcRecordRange,
-    SegmentId, SegmentState, ShardKey, StrataLsn,
+    GarbageEvent, PlacementClass, SegmentFileState, SegmentGcRecordRange, SegmentId, SegmentState,
 };
 use gc_planner::{GcAction, GcScenario};
-use lsm::{GarbageLog, SegmentGarbageLog, StoredValue, decode_value};
+use lsm::{GarbageLog, SegmentGarbageLog};
 
 #[derive(Debug)]
 struct GcPreparedPublish {
@@ -47,14 +45,10 @@ struct GcPreparedPublish {
 }
 
 impl GcExecutor {
-    /// Reconciles and publishes one prepared copy under the garbage-publication lock, held from
-    /// the drain through the activation batch. Compaction passes run beside this freely; only
-    /// their frame publication waits, and it waits for at most this one publish. Holding the lock
-    /// across all three steps is what makes the drained overlays exactly the state the batch is
-    /// judged against: no compaction frame can land between revalidation and activation, and a
-    /// frame that lands after finds this activation in the relocation activation table and is
-    /// redirected to the new copies. Foreground writes do not take this lock and do not enter
-    /// this call path.
+    /// Publishes against the garbage state already folded for these sources. Unswept events
+    /// are forwarded to destinations using durable routes installed in the activation batch.
+    /// The publication lock coordinates that boundary and concurrent compaction publication;
+    /// GC never drains the global backlog while holding it.
     pub(crate) fn submit_gc_publish(&self, copy: GcPrepublishedCopy) -> Result<GcPublishResult> {
         let scenario = Some(copy.plan.scenario);
         let started = Instant::now();
@@ -65,10 +59,6 @@ impl GcExecutor {
         self.metrics
             .record_gc_attempt_phase(scenario, "publish_lock_wait", started.elapsed());
         let started = Instant::now();
-        self.drain_gc_reconciliation_log()?;
-        self.metrics
-            .record_gc_attempt_phase(scenario, "drain", started.elapsed());
-        let started = Instant::now();
         let publish = self.prepare_gc_publish(copy)?;
         self.metrics
             .record_gc_attempt_phase(scenario, "revalidate", started.elapsed());
@@ -77,77 +67,6 @@ impl GcExecutor {
         self.metrics
             .record_gc_attempt_phase(scenario, "commit", started.elapsed());
         Ok(result)
-    }
-
-    /// Folds all committed garbage into the per-segment overlays used for revalidation. The
-    /// caller holds the garbage-publication lock; each bounded sweep's synced metadata batch also
-    /// makes any earlier relocation activation durable.
-    fn drain_gc_reconciliation_log(&self) -> Result<()> {
-        loop {
-            let relocation_lsn = self.relocations.lsm().last_lsn()?.unwrap_or_default();
-            let started = Instant::now();
-            let swept = self.index.sweep_garbage_log(
-                garbage_log_dir(&self.config),
-                self.config.namespace_dir(),
-                GARBAGE_LOG_HEAD,
-                GARBAGE_LOG_SWEEP_CURSOR,
-            )?;
-            self.metrics
-                .record_garbage_sweep("gc_publish", swept, started.elapsed());
-            if !swept {
-                break;
-            }
-            self.durable_relocation_lsn
-                .fetch_max(relocation_lsn, std::sync::atomic::Ordering::Release);
-        }
-        Ok(())
-    }
-
-    /// Revalidates copied ranges against committed segment-local garbage state.
-    ///
-    /// Decides, for each copied record: is it still worth publishing?
-    /// `reconciled_lsn` is the latest visible foreground sequence observed for this pass.
-    /// Metadata actions skip the line:
-    /// DeleteSegment(s) / ReclassifySegment copied nothing, so there's nothing to revalidate - return immediately.
-    /// Load an overlay + classifier per distinct source segment. A missing overlay means the source vanished → GcMissingSourceSegment.
-    /// Sort all records by (segment_id, offset, len, payload_lsn, shard, key). This is not cosmetic — it's correctness critical.
-    /// The OverlayRecordClassifier is a forward-only cursor merging against the overlay's sorted range lists; it never rewinds.
-    /// The sort also makes survivor order and table construction deterministic.
-    /// Classify each record, in priority order:
-    /// Shard generation fenced? (shard_generation_is_obsolete) — the whole shard was dropped/recreated, so everything from the old generation is dead → skip as Retired.
-    /// Overlay says Retired (a newer write replaced it) → skip.
-    /// Overlay says Expired (explicit terminal expiry event) → skip.
-    /// CopyEligible { lifecycle } → survivor.
-    /// Bonus: the record's lifecycle is refreshed from the overlay, since it may know a newer routing hint than the planner did.
-    /// An overlay range must either fully contain a record or not touch it at all — partial overlap is an error,
-    /// because GC moves whole encoded records and can't split a payload's liveness.
-    /// Example: A and D come out as survivors; B is skipped(Retired), C is skipped(Expired).
-    /// The lifecycle the main LSM currently holds for one payload, or `None` when the key has
-    /// no lifetime or the payload is no longer its live version.
-    fn lsm_lifecycle(
-        &self,
-        key: &BlobKey,
-        shard: ShardKey,
-        payload_lsn: StrataLsn,
-    ) -> Result<Option<BlobLifecycle>> {
-        let Some(lsm) = self.lsm.upgrade() else {
-            return Ok(None);
-        };
-        let partition = partition_for_key(key.as_bytes(), self.config.lsm_partition_count);
-        let Some(encoded) = lsm.get(partition, key.as_bytes(), &BlobMerge)? else {
-            return Ok(None);
-        };
-        let StoredValue::Inline(bytes) = decode_value(&encoded)? else {
-            return Err(Error::InvariantViolation {
-                reason: format!("materialized blob state for {key:?} is segment-backed"),
-            });
-        };
-        let state = BlobState::decode(bytes)?;
-        Ok(state
-            .versions
-            .get(&shard)
-            .filter(|version| version.lsn == payload_lsn)
-            .and_then(|version| effective_lifecycle(state.lifetime, version)))
     }
 
     fn prepare_gc_publish(&self, mut copy: GcPrepublishedCopy) -> Result<GcPreparedPublish> {
@@ -215,19 +134,11 @@ impl GcExecutor {
                     OverlayRecordState::Retired => Some(GcSkippedCopiedRecordKind::Retired),
                     OverlayRecordState::Expired => Some(GcSkippedCopiedRecordKind::Expired),
                     OverlayRecordState::CopyEligible { lifecycle } => {
-                        // The overlay learns a lifetime only once the sweeper folds its hint.
-                        // The output summary written below is what lets the clock end this
-                        // copy later, and compaction forwards only lifetimes written after this
-                        // publish, so a copy whose lifetime the overlay does not know yet must
-                        // take it from the LSM now or never be judged at all.
-                        record.source.lifecycle = match lifecycle {
-                            Some(lifecycle) => Some(lifecycle),
-                            None => self.lsm_lifecycle(
-                                &record.source.key,
-                                record.source.shard,
-                                record.source.payload_lsn,
-                            )?,
-                        };
+                        // Use only swept knowledge. Pending lifecycle events will arrive via
+                        // the durable forwarding routes, in their original log order. Reading
+                        // a newer lifecycle from the blob LSM here would let an older pending
+                        // hint overwrite it. A later healing compaction seeds unknown lifetimes.
+                        record.source.lifecycle = lifecycle;
                         None
                     }
                 }
@@ -250,7 +161,7 @@ impl GcExecutor {
     ///
     /// 1. Write, fsync, and rename one relocation patch SST. It has an independent relocation-LSM
     ///    sequence; GC does not reserve foreground LSNs or touch the main WAL.
-    /// 2. Under the garbage-publication lock (held by the caller since the drain), atomically add
+    /// 2. Under the garbage-publication lock (held by the caller since revalidation), atomically add
     ///    that table to the relocation manifest and publish output/source/garbage metadata with a
     ///    synced batch.
     ///
@@ -459,7 +370,11 @@ impl GcExecutor {
             .map(|record| {
                 terminal_garbage_record(
                     record.source.key.as_bytes(),
-                    record.publish_lsn,
+                    // This retires a physical source copy, not a logical blob version.
+                    // Put it after all logical events when replay sorts the local history;
+                    // sharing the durable foreground LSN could collide with a pending lifetime
+                    // or expiry at that same LSN. No foreground sequence is allocated here.
+                    u64::MAX,
                     record.source.from,
                     record.source.lifecycle,
                     GarbageEvent::Retired {
@@ -544,6 +459,13 @@ impl GcExecutor {
                     publish_lsn,
                 )?;
             }
+            self.index.put_garbage_forwarding_batch(
+                &mut batch,
+                committed_garbage,
+                published_records
+                    .iter()
+                    .map(|record| (record.source.from, record.to)),
+            )?;
             for state in &relocating_source_states {
                 self.index.put_segment_state_batch(&mut batch, state)?;
             }
@@ -732,9 +654,9 @@ impl GcExecutor {
     /// 3. It must be Sealed or GcRelocating — deleting an active or half-sealed segment is a
     ///    planner bug (GcSourceSegmentNotSealed).
     /// 4. Its GC summary must show live_ref_count == 0 (GcSourceSegmentNotEmpty otherwise). The
-    ///    summary only advances when the garbage log is swept, which is why publication drains the
-    ///    log first: for S7 this gate cannot pass until the relocation retirement events have
-    ///    been folded in.
+    ///    summary only advances when the garbage log is swept. This source stays ineligible
+    ///    until its own retirement events are folded; publication never drains unrelated work.
+    ///
     /// Plus one silent gate: if a live snapshot is pinned at an LSN >= the segment's
     /// published_at_lsn, the snapshot could still read these bytes, so the segment is quietly
     /// skipped this round — no error, the planner simply proposes it again after the snapshot

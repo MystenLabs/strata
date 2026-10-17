@@ -5059,17 +5059,8 @@ async fn gc_publish_forwards_lagging_lifetime_then_retires_destination() {
             .is_some_and(|relocation| relocation.to == destination)
     );
 
-    // The overlay had no lifetime for B when the copy was taken, so publication took the
-    // extension to 50 from the LSM and seeded the copy with it.
-    let initial_destination_overlay = segment_overlay(&store, destination.segment_id);
-    assert!(initial_destination_overlay.lifetimes.iter().any(|entry| {
-        entry.range == SegmentGcRecordRange::from(destination)
-            && entry.lifecycle.logical_end_epoch == 50
-    }));
-    assert_eq!(
-        initial_destination_overlay.summary.unknown_lifetime_bytes,
-        0
-    );
+    // Activation no longer forces sweeping or reads a newer LSM lifetime. The pending
+    // lifetime is delivered by forwarding or the first healing compaction below.
     store.sync().unwrap();
     wait_for_lsm_gc(&store, publish_lsn.max(lifetime_b_lsn));
     let destination_overlay = segment_overlay(&store, destination.segment_id);
@@ -6147,4 +6138,167 @@ async fn reopen_after_rollover_appends_to_highest_open_segment() {
     assert_eq!(store.get(&key_1).unwrap(), Some(b"payload-a".to_vec()));
     assert_eq!(store.get(&key_2).unwrap(), Some(b"payload-b".to_vec()));
     assert_eq!(store.get(&key_3).unwrap(), Some(b"x".to_vec()));
+}
+
+#[tokio::test]
+async fn gc_activates_with_unswept_garbage_and_forwards_it_afterward() {
+    gc_activates_with_unswept_garbage_case(false).await;
+}
+
+#[tokio::test]
+async fn pending_expiry_at_the_durable_lsn_does_not_conflict_with_gc_retirement() {
+    gc_activates_with_unswept_garbage_case(true).await;
+}
+
+async fn gc_activates_with_unswept_garbage_case(expired: bool) {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path(), "default");
+    cfg.segment_max_bytes = TEST_RECORD_LEN * 3 - 1;
+    cfg.gc_workers_enabled = false;
+    let key_a = BlobKey::new(b"blob-a".to_vec()).unwrap();
+    let key_b = BlobKey::new(b"blob-b".to_vec()).unwrap();
+    let key_c = BlobKey::new(b"blob-c".to_vec()).unwrap();
+    let mut store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
+
+    store.put(&key_a, b"payload-a").unwrap();
+    store.put(&key_b, b"payload-b").unwrap();
+    let lsn_c = store.put(&key_c, b"payload-c").unwrap();
+    store.sync().unwrap();
+    wait_for_segment_state(store.index(), FIRST_SEGMENT_ID, SegmentFileState::Sealed);
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, lsn_c);
+    let mut source_state = store
+        .index()
+        .get_segment_state(FIRST_SEGMENT_ID)
+        .unwrap()
+        .unwrap();
+    source_state.placement_class = PlacementClass::Spillover;
+    store.index().put_segment_state(&source_state).unwrap();
+
+    let ref_b = lsm_blob_ref(&store, &key_b);
+
+    let tombstone_a_lsn = store.tombstone(&key_a).unwrap();
+    store.sync().unwrap();
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
+    wait_for_lsm_gc(&store, tombstone_a_lsn);
+
+    let planner = GcPlanner::new(GcPlannerConfig {
+        max_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        max_l0_copy_bytes_per_plan: TEST_RECORD_LEN * 4,
+        min_l0_rewrite_epoch_distance: 1,
+        min_l0_rewrite_useful_ratio_bps: 1,
+        min_reclaim_bytes: 1,
+        min_garbage_ratio_bps: 1,
+        min_exact_epoch_bucket_bytes: 1,
+        min_exact_epoch_distance: 1,
+        max_exact_epoch_extension_count: 1,
+        min_join_output_bytes: 1,
+        max_join_sources: 4,
+    });
+    let prepared = store.prepare_gc_plan(&planner).unwrap().unwrap();
+    let copied = store.copy_prepared_gc_plan(prepared).unwrap();
+
+    // Keep both maintenance consumers still while publishing the pending deletion.
+    store
+        .store
+        .garbage_sweep_tx
+        .take()
+        .unwrap()
+        .send(())
+        .unwrap();
+    store
+        .store
+        .garbage_sweep_handle
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    let pause = Arc::clone(&store.compaction_pause_lock);
+    let pause_guard = pause.write();
+    let tombstone_b_lsn = store.tombstone(&key_b).unwrap();
+    store.sync().unwrap();
+    let global_dir = crate::maintenance::garbage_log_dir(&store.config);
+    let head = store
+        .index()
+        .get_garbage_log_position(GARBAGE_LOG_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    let pending = crate::blob_lsm::terminal_garbage_record(
+        key_b.as_bytes(),
+        tombstone_b_lsn,
+        ref_b,
+        None,
+        if expired {
+            core_types::GarbageEvent::Expired { record: ref_b }
+        } else {
+            core_types::GarbageEvent::Retired { record: ref_b }
+        },
+    )
+    .unwrap();
+    let mut log = lsm::GarbageLog::open(&global_dir, LSM_GARBAGE_LOG_MAX_BYTES, head).unwrap();
+    let unswept_head = log.append(&[pending]).unwrap();
+    let mut batch = store.index().batch();
+    store
+        .index()
+        .put_garbage_log_position_batch(&mut batch, GARBAGE_LOG_HEAD, unswept_head)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+    drop(log);
+    let cursor = store
+        .index()
+        .get_garbage_log_position(GARBAGE_LOG_SWEEP_CURSOR)
+        .unwrap();
+    assert_ne!(cursor, Some(unswept_head));
+
+    let published = store.publish_prepared_gc_copy(copied).unwrap();
+    assert_eq!(
+        published.published_records.len(),
+        1,
+        "activation uses known garbage, without draining"
+    );
+    assert_eq!(
+        store
+            .index()
+            .get_garbage_log_position(GARBAGE_LOG_SWEEP_CURSOR)
+            .unwrap(),
+        cursor
+    );
+    let destination = published.published_records[0].to;
+    assert_eq!(
+        segment_overlay(&store, destination.segment_id)
+            .summary
+            .live_bytes,
+        destination.len
+    );
+    assert_eq!(
+        store.get(&key_b).unwrap(),
+        None,
+        "physical activation must not resurrect a tombstone"
+    );
+
+    // The prefix event follows the durable route; GC's subsequent source retirement does not.
+    while store
+        .index()
+        .sweep_garbage_log(
+            &global_dir,
+            store.config.namespace_dir(),
+            GARBAGE_LOG_HEAD,
+            GARBAGE_LOG_SWEEP_CURSOR,
+        )
+        .unwrap()
+    {}
+    let overlay = segment_overlay(&store, destination.segment_id);
+    assert_eq!(overlay.summary.live_bytes, 0);
+    assert_eq!(overlay.summary.garbage_bytes(), destination.len);
+    assert_eq!(
+        overlay.summary.expired_bytes,
+        if expired { destination.len } else { 0 }
+    );
+    // Reconstructing the source log also verifies there is no collision between an old
+    // logical event and the physical-retirement marker emitted at activation.
+    assert_eq!(
+        segment_overlay(&store, ref_b.segment_id).summary.live_bytes,
+        0
+    );
+    drop(pause_guard);
 }

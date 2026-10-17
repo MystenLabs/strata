@@ -38,6 +38,7 @@
 mod cf;
 mod cleanup;
 mod error;
+mod garbage_forwarding;
 mod gc;
 mod global;
 mod indexed_batch;
@@ -81,6 +82,8 @@ pub struct StrataIndex {
     cf_names: StrataIndexCfNames,
     /// Durable manifest for each segment: path, state, offsets, placement, LSN bounds, and digest.
     segment_states: TypedMap<SegmentId, SegmentState>,
+    /// Routes retained until pre-activation garbage has been applied to relocated copies.
+    garbage_forwarding: TypedMap<SegmentId, garbage_forwarding::GarbageForwarding>,
     /// First Store LSN at which each physical segment became visible.
     ///
     /// Missing rows are legacy segments and conservatively mean LSN 0.

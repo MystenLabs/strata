@@ -318,3 +318,60 @@ fn record_ref(segment_id: u64, offset: u64, len: u64) -> RecordRef {
         len,
     }
 }
+
+#[test]
+fn parallel_batch_reader_matches_serial_order_across_rollovers_and_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = GarbageLog::open(dir.path(), 1000, Default::default()).unwrap();
+    let mut expected = Vec::new();
+    for i in 1..=20 {
+        let records = vec![event(i, b"a"), event(i, b"b")];
+        let end = log.append(&records).unwrap();
+        expected.push((records, end));
+    }
+    let head = log.position();
+    for workers in [1, 4] {
+        let mut cursor = Default::default();
+        let mut actual = Vec::new();
+        loop {
+            let batch = GarbageLog::read_batch(dir.path(), cursor, head, 8, 5, workers).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(
+                batch.len() <= 3,
+                "record limit permits only the final whole frame to exceed it"
+            );
+            cursor = batch.last().unwrap().1;
+            actual.extend(batch);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(cursor, head);
+    }
+}
+
+#[test]
+fn parallel_batch_reader_rejects_corrupt_frame_and_uncommitted_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = GarbageLog::open(dir.path(), 1 << 20, Default::default()).unwrap();
+    let first = log.append(&[event(1, b"a")]).unwrap();
+    let head = log.append(&[event(2, b"b")]).unwrap();
+    let partial = GarbageLogPosition {
+        offset: head.offset - 1,
+        ..head
+    };
+    assert!(GarbageLog::read_batch(dir.path(), Default::default(), partial, 8, 100, 4).is_err());
+    let path = GarbageLog::path(dir.path(), head.log_id);
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    // Corrupt the second frame checksum. The valid first frame must not be returned alone.
+    file.seek(SeekFrom::Start(head.offset - 32)).unwrap();
+    file.write_all(&[0; 32]).unwrap();
+    file.sync_all().unwrap();
+    assert!(GarbageLog::read_batch(dir.path(), Default::default(), head, 8, 100, 4).is_err());
+    assert_eq!(
+        GarbageLog::read_batch(dir.path(), Default::default(), first, 8, 100, 4)
+            .unwrap()
+            .len(),
+        1
+    );
+}

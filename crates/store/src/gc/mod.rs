@@ -17,9 +17,9 @@
 //! 3. Prepublish (prepublish_gc_outputs): give T900 a durable id (S42), rename it into its
 //!    retention directory, and write a PendingGcOutput row so a crash from here on has a durable
 //!    pointer to clean up by.
-//! 4. Publish (`submit_gc_publish`, in `publish.rs`): revalidate every copy against the freshly
-//!    drained overlays — this is where B and C are discovered dead — and activate the relocation
-//!    table. S7 is deleted much later, by a separate delete plan, once its overlay proves empty
+//! 4. Publish (`submit_gc_publish`, in `publish.rs`): revalidate against already swept overlays,
+//!    then activate the relocation table with durable routes for pending garbage. The sweeper
+//!    forwards older events to these copies later, without making activation wait for catch-up. S7 is deleted much later, by a separate delete plan, once its overlay proves empty
 //!    and the activation is durable.
 //!
 //! Around the pipeline sit the GcConcurrencyController (an additive-increase/backoff tuner that
@@ -36,7 +36,7 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak, atomic::AtomicU64, mpsc},
+    sync::{Arc, Mutex, atomic::AtomicU64, mpsc},
 };
 
 use core_types::{
@@ -45,7 +45,7 @@ use core_types::{
 };
 use gc_planner::{DestinationClass, GcCopyRecord, GcPlan, GcPlanner};
 use index::StrataIndex;
-use lsm::{LiveSnapshots, Lsm};
+use lsm::LiveSnapshots;
 
 use crate::{
     Error, GcIoLimiter, Result, SegmentIdAllocator, StoreHalt, StrataStore,
@@ -263,8 +263,6 @@ pub(crate) struct GcExecutor {
     pub(crate) config: crate::StrataStoreConfig,
     /// Metadata/index handle used for snapshots and validation.
     pub(crate) index: StrataIndex,
-    /// The blob LSM, consulted at publish for lifetimes the source overlay does not know yet.
-    pub(crate) lsm: Weak<Lsm>,
     /// Serializes GC output publication with shard-generation directory cleanup.
     pub(crate) publish_cleanup_lock: Arc<Mutex<()>>,
     /// Serializes whole-shard metadata removal with garbage-log publication and sweeping.
@@ -304,7 +302,6 @@ impl StrataStore {
         Ok(GcExecutor {
             config: self.config.clone(),
             index: self.index.clone(),
-            lsm: Arc::downgrade(&self.lsm()?),
             publish_cleanup_lock: Arc::clone(&self.gc_publish_cleanup_lock),
             garbage_publish_lock: Arc::clone(&self.garbage_publish_lock),
             relocation_activations: Arc::clone(&self.relocation_activations),
