@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
 use crate::{
     CompactionReservation, Error, GarbageRecord, Manifest, ManifestEdit, MergeOperator,
     OperandFloor, Result, TableMeta, TableReader, TableStore, TableTarget, TableWriter,
-    table::TableCursor,
+    table::{TableCursor, TableRow},
 };
 
 /// Files reserved for one compaction and their complete key bounds.
@@ -281,66 +281,40 @@ pub fn merge_compaction(
     mut emit: impl FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<()> {
     let root = inputs.reservation.root();
-    let mut base = inputs
+    let base = inputs
         .base
         .iter()
         .map(|table| TableReader::open_base(root, table, &inputs.schema_id)?.into_cursor())
         .collect::<Result<Vec<_>>>()?;
-    let mut patches = inputs
+    let patches = inputs
         .patches
         .iter()
         .map(|table| TableReader::open_patch(root, table, &inputs.patch_format_id)?.into_cursor())
         .collect::<Result<Vec<_>>>()?;
 
-    while let Some(key) = next_key(&base, &patches) {
+    let mut rows = CompactionRows::new(base.into_iter().chain(patches).collect());
+    while let Some(key) = rows.next_key().map(<[u8]>::to_vec) {
         let mut base_value = None;
         let mut key_prefix_len = 0;
-        for cursor in &mut base {
-            while cursor
-                .current()
-                .is_some_and(|row| row.key.as_slice() == key)
-            {
-                if base_value.is_some() {
+        let mut key_patches = Vec::new();
+        rows.consume_key(&key, |row| {
+            if row.key_prefix_len != 0 {
+                if key_prefix_len != 0 && key_prefix_len != row.key_prefix_len {
                     return Err(Error::InvalidManifest {
-                        reason: "compaction found multiple base values for one key".to_owned(),
+                        reason: "compaction found conflicting prefixes for one key".to_owned(),
                     });
                 }
-                let row = cursor.current().expect("checked current row");
-                if row.key_prefix_len != 0 {
-                    if key_prefix_len != 0 && key_prefix_len != row.key_prefix_len {
-                        return Err(Error::InvalidManifest {
-                            reason: "compaction found conflicting prefixes for one key".to_owned(),
-                        });
-                    }
-                    key_prefix_len = row.key_prefix_len;
-                }
-                base_value = Some(row.value.clone());
-                cursor.advance()?;
+                key_prefix_len = row.key_prefix_len;
             }
-        }
-
-        let mut key_patches = Vec::new();
-        for cursor in &mut patches {
-            while cursor
-                .current()
-                .is_some_and(|row| row.key.as_slice() == key)
-            {
-                let row = cursor.current().expect("checked current row");
-                if row.key_prefix_len != 0 {
-                    if key_prefix_len != 0 && key_prefix_len != row.key_prefix_len {
-                        return Err(Error::InvalidManifest {
-                            reason: "compaction found conflicting prefixes for one key".to_owned(),
-                        });
-                    }
-                    key_prefix_len = row.key_prefix_len;
-                }
-                key_patches.push((
-                    row.lsn.expect("patch cursor has lsned rows"),
-                    row.value.clone(),
-                ));
-                cursor.advance()?;
+            if let Some(lsn) = row.lsn {
+                key_patches.push((lsn, row.value.clone()));
+            } else if base_value.replace(row.value.clone()).is_some() {
+                return Err(Error::InvalidManifest {
+                    reason: "compaction found multiple base values for one key".to_owned(),
+                });
             }
-        }
+            Ok(())
+        })?;
 
         if key_patches.is_empty() {
             if merge.merge_base() {
@@ -506,7 +480,7 @@ pub fn write_patch_compaction_streaming(
         .first()
         .expect("compaction inputs always contain a patch")
         .partition;
-    let mut patches = inputs
+    let patches = inputs
         .patches
         .iter()
         .map(|table| TableReader::open_patch(root, table, &inputs.patch_format_id)?.into_cursor())
@@ -523,30 +497,25 @@ pub fn write_patch_compaction_streaming(
     let mut writer = None;
     let mut outputs = Vec::new();
 
-    while let Some(key) = next_key(&[], &patches) {
+    let mut rows = CompactionRows::new(patches);
+    while let Some(key) = rows.next_key().map(<[u8]>::to_vec) {
         let mut key_patches = Vec::new();
         let mut key_prefix_len = 0;
-        for cursor in &mut patches {
-            while cursor
-                .current()
-                .is_some_and(|row| row.key.as_slice() == key)
-            {
-                let row = cursor.current().expect("checked current row");
-                if row.key_prefix_len != 0 {
-                    if key_prefix_len != 0 && key_prefix_len != row.key_prefix_len {
-                        return Err(Error::InvalidManifest {
-                            reason: "compaction found conflicting prefixes for one key".to_owned(),
-                        });
-                    }
-                    key_prefix_len = row.key_prefix_len;
+        rows.consume_key(&key, |row| {
+            if row.key_prefix_len != 0 {
+                if key_prefix_len != 0 && key_prefix_len != row.key_prefix_len {
+                    return Err(Error::InvalidManifest {
+                        reason: "compaction found conflicting prefixes for one key".to_owned(),
+                    });
                 }
-                key_patches.push((
-                    row.lsn.expect("patch cursor has lsned rows"),
-                    row.value.clone(),
-                ));
-                cursor.advance()?;
+                key_prefix_len = row.key_prefix_len;
             }
-        }
+            key_patches.push((
+                row.lsn.expect("patch cursor has lsned rows"),
+                row.value.clone(),
+            ));
+            Ok(())
+        })?;
         key_patches.sort_unstable_by_key(|(lsn, _)| *lsn);
         if let Some(lsn) = key_patches
             .windows(2)
@@ -630,13 +599,51 @@ pub fn write_patch_compaction_streaming(
     Ok(edit)
 }
 
-fn next_key(base: &[TableCursor], patches: &[TableCursor]) -> Option<Vec<u8>> {
-    base.iter()
-        .chain(patches)
-        .filter_map(TableCursor::current)
-        .map(|row| row.key.as_slice())
-        .min()
-        .map(<[u8]>::to_vec)
+/// One heap entry per nonempty SST. Selecting a key and finding its matching inputs both
+/// use the heap, rather than scanning every cursor for every key.
+struct CompactionRows {
+    cursors: Vec<TableCursor>,
+    heads: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
+}
+
+impl CompactionRows {
+    fn new(cursors: Vec<TableCursor>) -> Self {
+        let heads = cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cursor)| {
+                cursor
+                    .current()
+                    .map(|row| Reverse((row.key.clone(), index)))
+            })
+            .collect();
+        Self { cursors, heads }
+    }
+
+    fn next_key(&self) -> Option<&[u8]> {
+        self.heads.peek().map(|Reverse((key, _))| key.as_slice())
+    }
+
+    fn consume_key(
+        &mut self,
+        key: &[u8],
+        mut visit: impl FnMut(&TableRow) -> Result<()>,
+    ) -> Result<()> {
+        while self.next_key() == Some(key) {
+            let Reverse((_, index)) = self.heads.pop().expect("heap has this key");
+            let cursor = &mut self.cursors[index];
+            // Consume all versions of this key before reinserting the cursor. Ties are broken
+            // by input index; the caller still orders the collected patch operands by LSN.
+            while let Some(row) = cursor.current().filter(|row| row.key == key) {
+                visit(row)?;
+                cursor.advance()?;
+            }
+            if let Some(row) = cursor.current() {
+                self.heads.push(Reverse((row.key.clone(), index)));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn overlaps(left: &TableMeta, right: &TableMeta) -> bool {
