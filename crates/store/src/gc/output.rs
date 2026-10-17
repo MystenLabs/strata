@@ -2,7 +2,7 @@
 //! segments, skipped-record classification, and initial output metadata rows.
 //! By the time anything here runs, GC has already picked a fragmented source segment,
 //! copied its eligible records into temporary staging files, and because compaction could run
-//! during that copy, reconciled every copy against the drained segment garbage overlays.
+//! during that copy, reconciled every copy against the already swept segment garbage overlays.
 //! Some copies survived that reconciliation; some were explicitly retired or expired mid-flight.
 //! One running example for everything below, matching the diagram: source segment 12 holds 100 MB, badly fragmented.
 //! GC copied four records into a staging file with temporary id 9001 — a (4 KB) and b (8 KB) still live at publish time,
@@ -198,9 +198,9 @@ pub(crate) fn skipped_gc_output_ranges(
 
 /// Builds the initial segment-local GC metadata for newly promoted output files.
 ///
-/// Pass 1: Published destinations start live with unknown lifetime and produce no local garbage
-/// event. GC does not infer expiry from `current_epoch`. A later relocation-aware full compaction
-/// installs the destination's authoritative lifecycle or terminal state.
+/// Pass 1: Published destinations start live with the source's swept lifecycle, if known.
+/// GC does not infer expiry from `current_epoch`. Forwarded events and relocation-aware
+/// compaction supply any lifecycle or terminal state not yet known at activation.
 ///
 /// Pass 2: Copied records explicitly retired or expired by the reconciled source overlay are
 /// included only when their staging file was promoted. Their destination bytes are born terminal
@@ -208,8 +208,8 @@ pub(crate) fn skipped_gc_output_ranges(
 /// skipped record was never assigned a relocation publish LSN.
 ///
 /// Pass 3: Verify that every sealed output byte is accounted for as live, retired, or expired.
-/// Lifecycle bounds remain empty at birth and are populated when compaction installs destination
-/// lifecycles. A record targeting a segment outside this output plan is an invariant violation.
+/// Lifecycle bounds reflect the known lifecycles at birth. A record targeting a segment outside
+/// this output plan is an invariant violation.
 #[allow(clippy::type_complexity)]
 pub(crate) fn initial_gc_output_metadata(
     states: &[SegmentState],
@@ -237,8 +237,8 @@ pub(crate) fn initial_gc_output_metadata(
                     ),
                 })?;
         // Seed the copy with the lifecycle it was published with. The clock ends the copy by
-        // this bucket, and compaction forwards a lifetime to it only when one is written after
-        // this publish; a copy seeded as unknown would never be judged. The same lifecycle goes
+        // this bucket. An unknown copy stays conservative until sweeping or the first healing
+        // compaction supplies its lifecycle. The same lifecycle goes
         // into the output's own garbage log so its overlay agrees with the summary: a later
         // forwarded hint for the same lifecycle then changes nothing instead of counting twice.
         // It is stamped at the payload's own LSN, like a skipped copy's event, so it sorts before
