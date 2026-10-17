@@ -261,3 +261,67 @@ fn garbage_record(key: &[u8], lsn: StrataLsn, value: &[u8]) -> GarbageRecord {
         summary_delta: SegmentGcSummaryDelta::default(),
     }
 }
+
+#[tokio::test]
+async fn streamed_frames_are_all_unpublished_when_appending_fails() {
+    let directory = TempDir::new().unwrap();
+    let index = StrataIndex::open_path(
+        directory.path().join("index"),
+        "strata",
+        directory.path().display().to_string(),
+    )
+    .unwrap();
+    let manifest = Manifest::empty(SCHEMA, PATCH_FORMAT, NonZeroU32::new(1).unwrap());
+    let mut batch = index.batch();
+    index
+        .put_lsm_manifest_batch(&mut batch, LSM_NAME, &manifest)
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+    let edit = ManifestEdit {
+        remove: Vec::new(),
+        add_base: Vec::new(),
+        add_patches: Vec::new(),
+        materialized_through: Some(20),
+        wal_retained_from: None,
+    };
+    let path = directory.path().join("garbage");
+    let mut log = GarbageLog::open(&path, 1, GarbageLogPosition::default()).unwrap();
+    let result =
+        index.publish_lsm_compaction_streaming(LSM_NAME, &edit, LOG_NAME, &mut log, |log| {
+            log.append_unsynced(&[garbage_record(b"a", 10, b"old")])?;
+            log.append_unsynced(&[garbage_record(b"b", 20, b"old")])?;
+            Err(lsm::Error::InvalidGarbageLog(
+                "injected staging read failure".into(),
+            ))
+        });
+    assert!(result.is_err());
+    assert_eq!(index.get_garbage_log_position(LOG_NAME).unwrap(), None);
+    assert_eq!(index.get_lsm_manifest(LSM_NAME).unwrap(), Some(manifest));
+    drop(log);
+    let mut log = GarbageLog::open(&path, 1, GarbageLogPosition::default()).unwrap();
+    assert!(!GarbageLog::path(&path, 2).exists());
+    let position = index
+        .publish_lsm_compaction_streaming(LSM_NAME, &edit, LOG_NAME, &mut log, |log| {
+            log.append_unsynced(&[garbage_record(b"a", 10, b"old")])?;
+            log.append_unsynced(&[garbage_record(b"b", 20, b"old")])?;
+            Ok(())
+        })
+        .unwrap();
+    drop(log);
+    let _recovered = GarbageLog::open(&path, 1, position).unwrap();
+    let (_, first) = GarbageLog::read_next(&path, GarbageLogPosition::default(), position)
+        .unwrap()
+        .unwrap();
+    let (_, last) = GarbageLog::read_next(&path, first, position)
+        .unwrap()
+        .unwrap();
+    assert_eq!(last, position);
+    assert_eq!(
+        index
+            .get_lsm_manifest(LSM_NAME)
+            .unwrap()
+            .unwrap()
+            .materialized_through,
+        Some(20)
+    );
+}

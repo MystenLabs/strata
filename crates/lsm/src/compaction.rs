@@ -356,8 +356,27 @@ pub fn write_compaction(
     inputs: &CompactionInputs,
     merge: &dyn MergeOperator,
     target_file_size: u64,
-    mut next_output: impl FnMut() -> Result<TableTarget>,
+    next_output: impl FnMut() -> Result<TableTarget>,
 ) -> Result<(ManifestEdit, Vec<GarbageRecord>)> {
+    let mut records = Vec::new();
+    let edit =
+        write_compaction_streaming(inputs, merge, target_file_size, next_output, |record| {
+            records.push(record);
+            Ok(())
+        })?;
+    records.sort_unstable_by(GarbageRecord::cmp_position);
+    Ok((edit, records))
+}
+
+/// Writes compaction outputs while handing garbage records to a bounded, caller-owned sink.
+/// Records arrive in blob-key order; records for a key must be sorted before publication.
+pub fn write_compaction_streaming(
+    inputs: &CompactionInputs,
+    merge: &dyn MergeOperator,
+    target_file_size: u64,
+    mut next_output: impl FnMut() -> Result<TableTarget>,
+    mut emit: impl FnMut(GarbageRecord) -> Result<()>,
+) -> Result<ManifestEdit> {
     if target_file_size == 0 {
         return Err(Error::InvalidTable(
             "compaction target file size must be non-zero".to_owned(),
@@ -373,7 +392,6 @@ pub fn write_compaction(
         .partition;
     let mut writer = None;
     let mut outputs = Vec::new();
-    let mut records = Vec::new();
     merge_compaction(
         inputs,
         merge,
@@ -399,10 +417,7 @@ pub fn write_compaction(
             }
             Ok(())
         },
-        |record| {
-            records.push(record);
-            Ok(())
-        },
+        &mut emit,
     )?;
     if let Some(writer) = writer {
         outputs.push(writer.finish()?);
@@ -421,8 +436,7 @@ pub fn write_compaction(
         wal_retained_from: None,
     };
     edit.validate()?;
-    records.sort_unstable_by(GarbageRecord::cmp_position);
-    Ok((edit, records))
+    Ok(edit)
 }
 
 /// Rewrites patch SSTs without materializing them into a base table.
@@ -433,8 +447,27 @@ pub fn write_patch_compaction(
     inputs: &CompactionInputs,
     merge: &dyn MergeOperator,
     target_file_size: u64,
-    mut next_output: impl FnMut() -> Result<TableTarget>,
+    next_output: impl FnMut() -> Result<TableTarget>,
 ) -> Result<(ManifestEdit, Vec<GarbageRecord>)> {
+    let mut records = Vec::new();
+    let edit =
+        write_patch_compaction_streaming(inputs, merge, target_file_size, next_output, |record| {
+            records.push(record);
+            Ok(())
+        })?;
+    records.sort_unstable_by(GarbageRecord::cmp_position);
+    Ok((edit, records))
+}
+
+/// Writes compaction outputs while handing garbage records to a bounded, caller-owned sink.
+/// Records arrive in blob-key order; records for a key must be sorted before publication.
+pub fn write_patch_compaction_streaming(
+    inputs: &CompactionInputs,
+    merge: &dyn MergeOperator,
+    target_file_size: u64,
+    mut next_output: impl FnMut() -> Result<TableTarget>,
+    mut emit: impl FnMut(GarbageRecord) -> Result<()>,
+) -> Result<ManifestEdit> {
     if target_file_size == 0 {
         return Err(Error::InvalidTable(
             "compaction target file size must be non-zero".to_owned(),
@@ -463,7 +496,6 @@ pub fn write_patch_compaction(
         .unwrap_or_default();
     let mut writer = None;
     let mut outputs = Vec::new();
-    let mut records = Vec::new();
 
     let mut rows = CompactionRows::new(patches);
     while let Some(key) = rows.next_key().map(<[u8]>::to_vec) {
@@ -525,7 +557,9 @@ pub fn write_patch_compaction(
                         &value,
                     )?;
                 }
-                records.extend(merged_records);
+                for record in merged_records {
+                    emit(record)?;
+                }
             }
             None => {
                 for (lsn, value) in key_patches {
@@ -562,8 +596,7 @@ pub fn write_patch_compaction(
         wal_retained_from: None,
     };
     edit.validate()?;
-    records.sort_unstable_by(GarbageRecord::cmp_position);
-    Ok((edit, records))
+    Ok(edit)
 }
 
 /// One heap entry per nonempty SST. Selecting a key and finding its matching inputs both
