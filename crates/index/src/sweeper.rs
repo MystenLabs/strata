@@ -351,15 +351,8 @@ impl StrataIndex {
                 (overlay, file)
             }
             None => {
-                let existing = if committed == 0 {
-                    Vec::new()
-                } else {
-                    read_segment_garbage(&path, committed)?
-                };
-                (
-                    fold_segment_garbage(existing, row.clone())?,
-                    SegmentGarbageLog::open(&path, committed)?,
-                )
+                let (file, existing) = SegmentGarbageLog::open_and_read(&path, committed)?;
+                (fold_segment_garbage(existing, row.clone())?, file)
             }
         };
         let before_summary = overlay.summary.clone();
