@@ -21,8 +21,10 @@ use lsm::SegmentGarbageLog;
 
 use crate::Result;
 
-/// Bound open log handles as well as overlay memory.
-const MAX_CACHED_LOGS: usize = 1024;
+/// Bound open log handles as well as overlay memory. A sweeping working set can span
+/// thousands of small overlays; a 1,024-handle cap evicted them well before the byte budget
+/// was exhausted. Keep enough handles for that working set while retaining both limits.
+const MAX_CACHED_LOGS: usize = 8_192;
 
 /// Overlays retained across sweeps, bounded by their estimated heap footprint.
 #[derive(Debug)]
@@ -203,6 +205,28 @@ mod tests {
             log,
         );
         assert!(!cache.entries.contains_key(&5));
+    }
+
+    #[test]
+    fn retains_a_working_set_larger_than_one_thousand_segments() {
+        let _ = fdlimit::raise_fd_limit();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.glog");
+        let (_, committed) = cached_log(&path);
+        let mut cache = OverlayCache::new(1 << 30);
+        for segment in 0..2_300 {
+            let log = SegmentGarbageLog::open(&path, committed).unwrap();
+            cache.insert(
+                segment,
+                committed,
+                SegmentGcSummary::default(),
+                overlay(3),
+                log,
+            );
+        }
+        for segment in 0..2_300 {
+            assert!(cache.take(segment, committed, &path).unwrap().is_some());
+        }
     }
 
     #[test]

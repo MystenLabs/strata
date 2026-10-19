@@ -5,6 +5,76 @@ use core_types::{
 use lsm::{GarbageRecord, SegmentGarbageLog, fold_segment_garbage, read_segment_garbage};
 
 #[test]
+fn recover_and_read_returns_only_committed_history_and_can_append() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7.glog");
+    let first = event(b"a", 1, retire(1, 6));
+    let second = event(b"b", 2, retire(20, 5));
+    let mut file = SegmentGarbageLog::open(&path, 0).unwrap();
+    file.append(std::slice::from_ref(&first)).unwrap();
+    let committed = file.append(std::slice::from_ref(&second)).unwrap();
+    file.append(&[event(b"c", 3, retire(40, 10))]).unwrap();
+    drop(file);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"torn tail")
+        .unwrap();
+
+    let (mut file, records) = SegmentGarbageLog::open_and_read(&path, committed).unwrap();
+    assert_eq!(records, vec![first, second]);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), committed);
+    let replacement = event(b"d", 4, retire(60, 7));
+    let next = file.append(std::slice::from_ref(&replacement)).unwrap();
+    let mut expected = records;
+    expected.push(replacement);
+    assert_eq!(read_segment_garbage(&path, next).unwrap(), expected);
+}
+
+#[test]
+fn recover_and_read_rejects_bad_boundary_and_corrupt_history_without_truncating() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7.glog");
+    let mut file = SegmentGarbageLog::open(&path, 0).unwrap();
+    let committed = file.append(&[event(b"a", 1, retire(1, 6))]).unwrap();
+    let physical_end = file.append(&[event(b"b", 2, retire(20, 5))]).unwrap();
+    drop(file);
+    for invalid in [1, 11, committed - 1, committed + 1, physical_end + 1] {
+        assert!(SegmentGarbageLog::open_and_read(&path, invalid).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), physical_end);
+    }
+    let mut raw = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    raw.seek(SeekFrom::Start(12 + 12 + 4)).unwrap();
+    raw.write_all(&[0xff]).unwrap();
+    assert!(matches!(
+        SegmentGarbageLog::open_and_read(&path, committed),
+        Err(lsm::Error::CorruptGarbageLog { .. })
+    ));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), physical_end);
+}
+
+#[test]
+fn recover_and_read_zero_position_discards_existing_unpublished_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7.glog");
+    let mut file = SegmentGarbageLog::open(&path, 0).unwrap();
+    file.append(&[event(b"a", 1, retire(1, 6))]).unwrap();
+    drop(file);
+    let (mut file, records) = SegmentGarbageLog::open_and_read(&path, 0).unwrap();
+    assert!(records.is_empty());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 12);
+    let replacement = event(b"b", 2, retire(20, 5));
+    let committed = file.append(std::slice::from_ref(&replacement)).unwrap();
+    assert_eq!(
+        read_segment_garbage(&path, committed).unwrap(),
+        vec![replacement]
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn validated_writer_resumes_only_the_same_committed_file() {
     let dir = tempfile::tempdir().unwrap();

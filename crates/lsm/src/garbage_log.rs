@@ -493,7 +493,29 @@ impl SegmentGarbageLog {
     /// anything beyond it is truncated. Landing past or between frame boundaries is corruption.
     /// The file is then positioned at the committed offset, ready to append.
     pub fn open(path: impl AsRef<Path>, committed: u64) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_replaying(path.as_ref(), committed, |_| {})
+    }
+
+    /// Recovers a writer and returns its committed records in one validation pass.
+    ///
+    /// This has the same boundary, checksum, and unpublished-tail checks as [`Self::open`].
+    /// Callers rebuilding an overlay can consume these records instead of reading and
+    /// validating the same history again before opening the writer.
+    pub fn open_and_read(
+        path: impl AsRef<Path>,
+        committed: u64,
+    ) -> Result<(Self, Vec<GarbageRecord>)> {
+        let mut records = Vec::new();
+        let writer = Self::open_replaying(path.as_ref(), committed, |frame| records.extend(frame))?;
+        Ok((writer, records))
+    }
+
+    fn open_replaying(
+        path: &Path,
+        committed: u64,
+        mut replay: impl FnMut(Vec<GarbageRecord>),
+    ) -> Result<Self> {
+        let path = path.to_path_buf();
         let parent = path.parent().ok_or_else(|| {
             Error::InvalidGarbageLog("segment garbage log has no parent directory".to_owned())
         })?;
@@ -525,9 +547,14 @@ impl SegmentGarbageLog {
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         read_header(&mut file, &path)?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?
+            .len();
         let mut offset = HEADER_LEN;
         while offset < committed {
-            let (_, end) = read_records_at(&path, offset)?;
+            let (records, end) = read_records_from(&mut file, &path, offset, file_len)?;
+            replay(records);
             offset = end;
         }
         if offset != committed {
@@ -1161,6 +1188,15 @@ pub(super) fn read_records_at(path: &Path, offset: u64) -> Result<(Vec<GarbageRe
         .map_err(|source| io_error(path, source))?
         .len();
     read_header(&mut file, path)?;
+    read_records_from(&mut file, path, offset, file_len)
+}
+
+fn read_records_from(
+    file: &mut File,
+    path: &Path,
+    offset: u64,
+    file_len: u64,
+) -> Result<(Vec<GarbageRecord>, u64)> {
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| io_error(path, source))?;
 
