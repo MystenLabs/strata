@@ -2461,6 +2461,22 @@ async fn metrics_track_core_store_operations() {
     let metrics = StrataStoreMetrics::new(&registry, "default").unwrap();
     let store = try_open_standalone_store(config(dir.path(), "default"), metrics).unwrap();
 
+    for name in [
+        "strata_store_lsm_sst_files",
+        "strata_store_lsm_sst_bytes",
+        "strata_store_lsm_sst_records",
+    ] {
+        let families = registry.gather();
+        let family = families.iter().find(|f| f.name() == name).unwrap();
+        assert_eq!(family.get_metric().len(), 4, "main/relocation × base/patch");
+        assert!(
+            family
+                .get_metric()
+                .iter()
+                .all(|m| m.get_gauge().value() == 0.0)
+        );
+    }
+
     let put_lsn = store.put(&key, b"payload").unwrap();
     assert_eq!(store.get(&key).unwrap(), Some(b"payload".to_vec()));
     assert_eq!(store.get(&missing).unwrap(), None);

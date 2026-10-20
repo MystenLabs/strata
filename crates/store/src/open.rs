@@ -164,6 +164,7 @@ impl StrataStore {
         let lsm = open_lsm(&config, &index, next_lsn, blob_recovery)?;
         publish_recovered_store_checkpoint(&index, &metrics, &store_wal, &active_segment_state)?;
         let relocations = open_relocation_lsm(&config, &index, next_lsn, relocation_recovery)?;
+        metrics.bind_lsm_inventory(&lsm, relocations.lsm());
         let durable_relocation_lsn = Arc::new(AtomicU64::new(relocations.manifest_sequence()));
         let relocation_cache = Arc::new(RelocationCache::new(DEFAULT_RELOCATION_CACHE_ENTRIES));
         let live_snapshots = lsm.live_snapshots();

@@ -1,3 +1,7 @@
+mod lsm_inventory;
+
+use lsm_inventory::LsmInventory;
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use core_types::{Epoch, SegmentGcSummary, SegmentId, StrataLsn};
@@ -34,6 +38,7 @@ pub struct StrataStoreMetrics {
 
 #[derive(Debug)]
 struct PrometheusMetrics {
+    lsm_inventory: LsmInventory,
     queued_write_commands: IntGauge,
     write_queue_send_duration_seconds: Histogram,
     write_queue_send_errors_total: IntCounter,
@@ -160,6 +165,12 @@ struct PrometheusMetrics {
 }
 
 impl StrataStoreMetrics {
+    pub(crate) fn bind_lsm_inventory(&self, main: &Arc<lsm::Lsm>, relocation: &Arc<lsm::Lsm>) {
+        if let Some(metrics) = &self.inner {
+            metrics.lsm_inventory.bind(main, relocation);
+        }
+    }
+
     /// Creates Prometheus-backed metrics for one Strata store.
     ///
     /// `store_label` should be a low-cardinality store identifier, such as a namespace or shard
@@ -173,6 +184,7 @@ impl StrataStoreMetrics {
 
         Ok(Self {
             inner: Some(Arc::new(PrometheusMetrics {
+                lsm_inventory: LsmInventory::register(registry, &labels)?,
                 queued_write_commands: register_gauge(
                     registry,
                     &labels,

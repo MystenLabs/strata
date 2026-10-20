@@ -53,7 +53,10 @@ pub use memtable::{
 };
 pub use merge::{MergeOperator, Replace};
 pub use segment;
-pub use snapshot::{CompactionReservation, LiveSnapshots, Snapshot, SnapshotPin, TableStore};
+pub use snapshot::{
+    CompactionReservation, LiveSnapshots, LsmTableStats, Snapshot, SnapshotPin, TableStats,
+    TableStore,
+};
 pub use table::{
     BlockCacheStats, DEFAULT_BLOCK_CACHE_BYTES, OperandFloorFn, TableReader, TableWriter,
 };
