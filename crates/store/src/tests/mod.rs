@@ -1320,6 +1320,41 @@ async fn tombstone_only_hides_the_target_shard_generation() {
 }
 
 #[tokio::test]
+async fn delete_key_hides_every_shard_and_clears_lifetime_for_a_later_put() {
+    let dir = tempdir().unwrap();
+    let store =
+        StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
+    store.add_shard(10).unwrap();
+    store.add_shard(20).unwrap();
+    let key = BlobKey::new(b"blob-a".to_vec()).unwrap();
+
+    store.set_blob_lifetime(&key, 50).unwrap();
+    store.put(10, &key, b"primary").unwrap();
+    store.put(20, &key, b"secondary").unwrap();
+    store.delete_key(&key).unwrap();
+
+    assert_eq!(store.get_from_shard(10, &key).unwrap(), None);
+    assert_eq!(store.get_from_shard(20, &key).unwrap(), None);
+    store.sync().unwrap();
+    drop(store);
+    let store =
+        StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap();
+    assert_eq!(store.get_from_shard(10, &key).unwrap(), None);
+    assert_eq!(store.get_from_shard(20, &key).unwrap(), None);
+
+    store.put(10, &key, b"recreated").unwrap();
+    let recreated = lsm_blob(
+        &store,
+        ShardKey {
+            id: 10,
+            generation: 0,
+        },
+        &key,
+    );
+    assert!(recreated.lifecycle.is_none());
+}
+
+#[tokio::test]
 async fn contains_in_shards_resolves_one_blob_across_active_shards() {
     let dir = tempdir().unwrap();
     let store =
@@ -6261,4 +6296,60 @@ async fn gc_activates_with_unswept_garbage_case(expired: bool) {
         0
     );
     drop(pause_guard);
+}
+
+#[tokio::test]
+async fn tracked_delete_key_batch_preserves_order_and_replays_after_reopen() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path(), "default");
+    let key = BlobKey::new(b"ordered-delete".to_vec()).unwrap();
+    let binding = b"delete-key-batch".to_vec();
+    let last_lsn;
+    {
+        let store = StrataStore::open(cfg.clone(), StrataStoreMetrics::default()).unwrap();
+        store.add_shard(10).unwrap();
+        let mut batch = store.batch();
+        batch
+            .set_blob_lifetime(key.clone(), 50)
+            .put(10, key.clone(), b"before".to_vec())
+            .delete_key(key.clone())
+            .put(10, key.clone(), b"after".to_vec());
+        last_lsn = *batch
+            .write_with_lsn(binding.clone())
+            .unwrap()
+            .op_lsns()
+            .last()
+            .unwrap();
+        assert_eq!(
+            store.get_from_shard(10, &key).unwrap(),
+            Some(b"after".to_vec())
+        );
+        store.sync().unwrap();
+    }
+    let store = StrataStore::open(cfg, StrataStoreMetrics::default()).unwrap();
+    assert_eq!(
+        store.index().submitted_batch_lsns().get(&binding).unwrap(),
+        Some(last_lsn)
+    );
+    assert_eq!(
+        store.get_from_shard(10, &key).unwrap(),
+        Some(b"after".to_vec())
+    );
+    assert!(
+        lsm_blob(
+            &store,
+            ShardKey {
+                id: 10,
+                generation: 0
+            },
+            &key
+        )
+        .lifecycle
+        .is_none()
+    );
+    let mut batch = store.batch();
+    batch.delete_key(key.clone());
+    batch.write().unwrap();
+    assert_eq!(store.get_from_shard(10, &key).unwrap(), None);
+    store.sync().unwrap();
 }

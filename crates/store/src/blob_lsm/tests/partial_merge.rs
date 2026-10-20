@@ -70,6 +70,58 @@ fn partial_merge_batches_operations_without_changing_full_merge() {
 }
 
 #[test]
+fn partial_merge_keeps_delete_key_as_the_unknown_base_barrier() {
+    let shard_a = shard(1, 1);
+    let shard_b = shard(2, 1);
+    let deleted = record(1, 10);
+    let surviving = record(2, 20);
+    let patches = [
+        (
+            1,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 10,
+                current_epoch: 5,
+            }),
+        ),
+        (2, put_patch(shard_a, 5, deleted)),
+        (3, inline_patch(BlobMutation::DeleteKey)),
+        (4, put_patch(shard_b, 6, surviving)),
+    ];
+    let borrowed = patches
+        .iter()
+        .map(|(lsn, value)| (*lsn, value.as_slice()))
+        .collect::<Vec<_>>();
+    let mut partial_garbage = Vec::new();
+    let batched = BlobMerge
+        .partial_merge(b"blob", &borrowed, &mut |record| {
+            partial_garbage.push(record);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    let decoded = decode_patches(&[(4, batched.as_slice())]).unwrap();
+
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(decoded[0].mutation, BlobMutation::DeleteKey);
+    assert!(matches!(
+        decoded[1].mutation,
+        BlobMutation::Put { record_ref, .. } if record_ref == surviving
+    ));
+    assert_eq!(partial_garbage.len(), 1);
+    assert_eq!(partial_garbage[0].lsn, 3);
+    assert_eq!(
+        partial_garbage[0].event,
+        GarbageEvent::Retired { record: deleted }
+    );
+
+    let direct = merge(&patches);
+    let (from_batch_state, mut from_batch_garbage) = merge(&[(4, batched)]);
+    from_batch_garbage.extend(partial_garbage);
+    assert_eq!(from_batch_state, direct.0);
+    assert_functionally_equivalent_garbage(&from_batch_garbage, &direct.1);
+}
+
+#[test]
 fn partial_merge_preserves_lifetimes_without_expiring_puts() {
     let shard = shard(1, 1);
     let record = record(2, 20);
@@ -1019,4 +1071,63 @@ fn partial_merge_final_put_retires_the_unknown_base_without_a_synthetic_tombston
                     record: base_record,
                 }
     }));
+}
+
+#[test]
+fn delete_key_is_equivalent_across_partial_merge_boundaries() {
+    let patches = [
+        (
+            1,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 20,
+                current_epoch: 5,
+            }),
+        ),
+        (2, put_patch(shard(1, 1), 5, record(1, 10))),
+        (3, put_patch(shard(1, 2), 5, record(2, 20))),
+        (4, inline_patch(BlobMutation::DeleteKey)),
+        (5, put_patch(shard(2, 1), 6, record(3, 30))),
+        (
+            6,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 30,
+                current_epoch: 6,
+            }),
+        ),
+        (7, inline_patch(BlobMutation::DeleteKey)),
+        (
+            8,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 40,
+                current_epoch: 6,
+            }),
+        ),
+        (9, put_patch(shard(1, 2), 6, record(4, 40))),
+    ];
+    let direct = merge(&patches);
+    // Every contiguous partial merge must preserve deletion of older, unseen inputs, including
+    // another generation of the same shard. Later puts must inherit only the new lifetime.
+    for start in 0..patches.len() - 1 {
+        for end in start + 2..=patches.len() {
+            let borrowed = patches[start..end]
+                .iter()
+                .map(|(lsn, value)| (*lsn, value.as_slice()))
+                .collect::<Vec<_>>();
+            let mut garbage = Vec::new();
+            let compacted = BlobMerge
+                .partial_merge(b"blob", &borrowed, &mut |record| {
+                    garbage.push(record);
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            let mut combined = patches[..start].to_vec();
+            combined.push((patches[end - 1].0, compacted));
+            combined.extend_from_slice(&patches[end..]);
+            let (state, remaining_garbage) = merge(&combined);
+            garbage.extend(remaining_garbage);
+            assert_eq!(state, direct.0, "range {start}..{end}");
+            assert_functionally_equivalent_garbage(&garbage, &direct.1);
+        }
+    }
 }
