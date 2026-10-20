@@ -40,6 +40,7 @@ impl BlobState {
                 current_epoch,
             } => self.set_lifetime(key, lsn, logical_end_epoch, current_epoch, emit),
             BlobMutation::Tombstone { shard } => self.tombstone(key, lsn, shard, emit),
+            BlobMutation::DeleteKey => self.delete_key(key, lsn, emit),
         }
     }
 
@@ -198,6 +199,29 @@ impl BlobState {
                 emit,
             )?;
         }
+        Ok(())
+    }
+
+    fn delete_key(
+        &mut self,
+        key: &[u8],
+        lsn: StrataLsn,
+        emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
+    ) -> Result<()> {
+        let lifetime = self.lifetime;
+        for (_, version) in std::mem::take(&mut self.versions) {
+            emit_record(
+                key,
+                lsn,
+                version,
+                effective_lifecycle(lifetime, &version),
+                GarbageEvent::Retired {
+                    record: version.record_ref,
+                },
+                emit,
+            )?;
+        }
+        self.lifetime = None;
         Ok(())
     }
 }

@@ -2,9 +2,9 @@
 //!
 //! Every blob key materializes to one [`BlobState`]: the latest [`BlobVersion`] per shard plus an
 //! optional blob-wide [`BlobLifetime`]. Writers never read-modify-write that state — they append
-//! encoded [`BlobMutation`] patches (Put / SetLifetime / Tombstone) and the LSM folds them in
-//! during reads, partial merges, and compactions. Every version that becomes unreachable is
-//! accounted for by exactly one terminal garbage record.
+//! encoded [`BlobMutation`] patches (Put / SetLifetime / Tombstone / DeleteKey) and the LSM folds
+//! them in during reads, partial merges, and compactions. Every version that becomes unreachable
+//! is accounted for by exactly one terminal garbage record.
 //!
 //! The submodules follow the data path:
 //!

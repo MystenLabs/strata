@@ -103,6 +103,9 @@ pub(crate) enum BatchOp {
         shard_id: ShardId,
         key: BlobKey,
     },
+    DeleteKey {
+        key: BlobKey,
+    },
     IncrementEpoch,
     AdvanceEpochTo {
         epoch: Epoch,
@@ -288,6 +291,15 @@ impl<'a> StrataBatch<'a> {
         self
     }
 
+    /// Adds a whole-key logical delete to this batch.
+    ///
+    /// Unlike [`Self::tombstone`], this removes every shard generation and the blob-wide lifetime
+    /// associated with the exact key. A later higher-LSN put recreates the key from empty state.
+    pub fn delete_key(&mut self, key: BlobKey) -> &mut Self {
+        self.ops.push(BatchOp::DeleteKey { key });
+        self
+    }
+
     /// Adds an epoch increment to this batch.
     ///
     /// Epoch changes are treated like logical operations. A batch such as
@@ -361,6 +373,10 @@ pub(crate) enum PreparedBatchOp {
         key: BlobKey,
         lsn: StrataLsn,
     },
+    DeleteKey {
+        key: BlobKey,
+        lsn: StrataLsn,
+    },
     EpochChange {
         lsn: StrataLsn,
         epoch: Epoch,
@@ -373,6 +389,7 @@ impl PreparedBatchOp {
             Self::Put { lsn, .. }
             | Self::Lifecycle { lsn, .. }
             | Self::Tombstone { lsn, .. }
+            | Self::DeleteKey { lsn, .. }
             | Self::EpochChange { lsn, .. } => *lsn,
         }
     }
@@ -411,6 +428,11 @@ impl PreparedBatchOp {
                 partition: partition_for_key(key.as_bytes(), partition_count),
                 key: key.as_bytes().to_vec(),
                 value: BlobMutation::Tombstone { shard: *shard }.encode_inline()?,
+            })),
+            Self::DeleteKey { key, .. } => Ok(Some(LsmMutation::Put {
+                partition: partition_for_key(key.as_bytes(), partition_count),
+                key: key.as_bytes().to_vec(),
+                value: BlobMutation::DeleteKey.encode_inline()?,
             })),
             Self::EpochChange { .. } => Ok(None),
         }

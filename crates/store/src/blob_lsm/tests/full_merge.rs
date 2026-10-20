@@ -50,6 +50,41 @@ fn tombstone_only_retires_its_shard() {
 }
 
 #[test]
+fn delete_key_retires_every_shard_and_clears_lifetime() {
+    let shard_a = shard(1, 1);
+    let shard_b = shard(2, 3);
+    let record_a = record(1, 10);
+    let record_b = record(2, 20);
+    let after_delete = record(3, 30);
+    let patches = [
+        (
+            1,
+            inline_patch(BlobMutation::SetLifetime {
+                logical_end_epoch: 10,
+                current_epoch: 5,
+            }),
+        ),
+        (2, put_patch(shard_a, 5, record_a)),
+        (3, put_patch(shard_b, 5, record_b)),
+        (4, inline_patch(BlobMutation::DeleteKey)),
+        (5, put_patch(shard_a, 6, after_delete)),
+    ];
+
+    let (state, garbage) = merge(&patches);
+
+    assert_eq!(state.versions.len(), 1);
+    assert_eq!(state.versions[&shard_a].record_ref, after_delete);
+    assert!(state.lifetime.is_none());
+    assert!(state.resolve(shard_a, 6).unwrap().1.is_none());
+    assert!(garbage.iter().any(|record| {
+        record.lsn == 4 && record.event == GarbageEvent::Retired { record: record_a }
+    }));
+    assert!(garbage.iter().any(|record| {
+        record.lsn == 4 && record.event == GarbageEvent::Retired { record: record_b }
+    }));
+}
+
+#[test]
 fn lifetime_expiry_and_tombstone_match_store_visibility() {
     let shard = shard(1, 1);
     let first = record(1, 10);

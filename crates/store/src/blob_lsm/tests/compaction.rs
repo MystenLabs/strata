@@ -139,6 +139,77 @@ fn snapshot_compaction_expires_versions_at_the_first_reaching_epoch() {
 }
 
 #[test]
+fn snapshot_compaction_materializes_delete_key_as_physical_key_removal() {
+    let shard_a = shard(1, 1);
+    let shard_b = shard(2, 3);
+    let record_a = record(7, 10);
+    let record_b = record(8, 20);
+    let state = BlobState {
+        versions: BTreeMap::from([
+            (
+                shard_a,
+                BlobVersion {
+                    lsn: 2,
+                    write_epoch: 5,
+                    record_ref: record_a,
+                },
+            ),
+            (
+                shard_b,
+                BlobVersion {
+                    lsn: 3,
+                    write_epoch: 5,
+                    record_ref: record_b,
+                },
+            ),
+        ]),
+        lifetime: Some(BlobLifetime {
+            lsn: 1,
+            lifecycle: BlobLifecycle {
+                logical_end_epoch: 10,
+                extension_count: 0,
+            },
+        }),
+    };
+    let encoded_base = encode_inline_value(&state.encode().unwrap());
+    let delete = inline_patch(BlobMutation::DeleteKey);
+    let merge = BlobMergeWithRelocations::new(
+        None,
+        BlobCompactionSnapshot {
+            materialized_through_lsn: 4,
+            ..BlobCompactionSnapshot::default()
+        },
+    );
+    let mut garbage = Vec::new();
+
+    let merged = merge
+        .merge(
+            b"blob",
+            Some(&encoded_base),
+            &[(4, delete.as_slice())],
+            &mut |record| {
+                garbage.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert!(merged.is_none());
+    assert_eq!(garbage.len(), 2);
+    assert!(garbage.iter().all(|record| record.lsn == 4));
+    assert!(
+        garbage
+            .iter()
+            .any(|record| { record.event == GarbageEvent::Retired { record: record_a } })
+    );
+    assert!(
+        garbage
+            .iter()
+            .any(|record| { record.event == GarbageEvent::Retired { record: record_b } })
+    );
+}
+
+#[test]
 fn snapshot_compaction_silently_prunes_legacy_global_expiry() {
     let shard = shard(1, 1);
     let record = record(7, 10);

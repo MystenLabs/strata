@@ -33,6 +33,7 @@ fn mutation_codecs_round_trip() {
             current_epoch: 4,
         },
         BlobMutation::Tombstone { shard: shard(5, 6) },
+        BlobMutation::DeleteKey,
     ];
     for mutation in inline_mutations {
         assert_eq!(

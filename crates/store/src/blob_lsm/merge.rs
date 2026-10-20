@@ -154,11 +154,15 @@ impl MergeOperator for BlobMergeWithRelocations {
                 }
             }
             for mutation in decode_patches(patches)? {
-                if let BlobMutation::Put {
-                    shard, record_ref, ..
-                } = mutation.mutation
-                {
-                    input_record_refs.insert((shard, mutation.lsn), record_ref);
+                match mutation.mutation {
+                    BlobMutation::Put {
+                        shard, record_ref, ..
+                    } => {
+                        input_record_refs.insert((shard, mutation.lsn), record_ref);
+                    }
+                    BlobMutation::SetLifetime { .. }
+                    | BlobMutation::Tombstone { .. }
+                    | BlobMutation::DeleteKey => {}
                 }
             }
         }

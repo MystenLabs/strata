@@ -12,6 +12,7 @@ const PUT: u8 = 1;
 const SET_LIFETIME: u8 = 2;
 const TOMBSTONE: u8 = 3;
 const BATCH: u8 = 4;
+const DELETE_KEY: u8 = 5;
 
 /// Classifies one key's stored blob-LSM operands for the patch's global operand floor.
 ///
@@ -41,7 +42,7 @@ pub(crate) fn global_operand_floor(operands: &[(StrataLsn, &[u8])]) -> Result<Op
                                 current.min(mutation.lsn)
                             }));
                         }
-                        BlobMutation::Tombstone { .. } => {}
+                        BlobMutation::Tombstone { .. } | BlobMutation::DeleteKey => {}
                     }
                 }
             }
@@ -65,6 +66,8 @@ pub(crate) enum BlobMutation {
     Tombstone {
         shard: ShardKey,
     },
+    /// Logically deletes every shard version and the blob-wide lifetime for this exact key.
+    DeleteKey,
 }
 
 impl BlobMutation {
@@ -117,6 +120,7 @@ impl BlobMutation {
                 bytes.push(TOMBSTONE);
                 push_shard(&mut bytes, shard);
             }
+            Self::DeleteKey => bytes.push(DELETE_KEY),
         }
         Ok(bytes)
     }
@@ -165,6 +169,7 @@ impl BlobMutationWithLSN {
                     bytes.push(TOMBSTONE);
                     push_shard(&mut bytes, shard);
                 }
+                BlobMutation::DeleteKey => bytes.push(DELETE_KEY),
             }
         }
         Ok(bytes)
@@ -190,6 +195,10 @@ impl BlobMutationWithLSN {
                     shard: decoder.shard()?,
                 },
             }],
+            DELETE_KEY => vec![Self {
+                lsn: outer_lsn,
+                mutation: BlobMutation::DeleteKey,
+            }],
             BATCH => {
                 let count = decoder.u32()?;
                 let mut mutations = Vec::with_capacity(count as usize);
@@ -208,6 +217,7 @@ impl BlobMutationWithLSN {
                         TOMBSTONE => BlobMutation::Tombstone {
                             shard: decoder.shard()?,
                         },
+                        DELETE_KEY => BlobMutation::DeleteKey,
                         tag => {
                             return Err(invalid(format!("unknown batched mutation tag {tag}")));
                         }
