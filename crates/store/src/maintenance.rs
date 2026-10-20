@@ -75,8 +75,8 @@ pub(crate) struct GarbageLogSweeper {
 }
 
 impl GarbageLogSweeper {
-    /// The loop: drain everything, wake GC if anything moved, nap GARBAGE_SWEEP_INTERVAL (one
-    /// second), repeat until shutdown.
+    /// Process bounded groups, wake GC if anything moved, and check shutdown between groups.
+    /// When caught up or after an error, wait GARBAGE_SWEEP_INTERVAL before trying again.
     ///
     /// A drain that advanced anything broadcasts GcCommand::Run to every GC worker — freshly
     /// folded garbage is exactly what unlocks new plans (a segment's live counter hitting zero
@@ -92,6 +92,12 @@ impl GarbageLogSweeper {
                     for gc_tx in gc_txs.iter() {
                         let _ = gc_tx.send(GcCommand::Run);
                     }
+                    // Keep catching up, but observe shutdown and wake GC between bounded
+                    // groups even when new garbage prevents the log from becoming empty.
+                    match self.shutdown_rx.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => continue,
+                        _ => break,
+                    }
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -105,7 +111,7 @@ impl GarbageLogSweeper {
         }
     }
 
-    /// Sweeps bounded batches until the global log is drained, and doubles as the durability
+    /// Sweeps up to eight bounded batches, and doubles as the durability
     /// heartbeat for GC relocation activations.
     ///
     /// Each iteration, under the garbage-publication lock: first sample the relocation LSM's
@@ -121,12 +127,11 @@ impl GarbageLogSweeper {
     /// *before* the synced sweep, so every sequence it promotes was activated by a batch that the
     /// sweep's sync provably covered. Sampling after the sweep could catch an activation that
     /// slipped in behind the sync and promote a sequence that is not durable yet — declaring safe
-    /// a source deletion that a crash could still orphan. Because sweeps run every second, an
-    /// activation becomes deletion-safe within about a second without GC ever issuing its own
-    /// RocksDB fsync.
+    /// a source deletion that a crash could still orphan. Activation already syncs its own
+    /// RocksDB batch; sweep progress separately makes its source-retirement events visible.
     fn drain(&self) -> Result<bool> {
         let mut advanced = false;
-        loop {
+        for _ in 0..8 {
             let (swept, relocation_lsn, expiry_frontier_advanced) = {
                 let _publish_guard = self
                     .garbage_publish_lock
@@ -169,6 +174,7 @@ impl GarbageLogSweeper {
             self.durable_relocation_lsn
                 .fetch_max(relocation_lsn, std::sync::atomic::Ordering::Release);
             advanced = true;
+            std::thread::yield_now();
         }
         Ok(advanced)
     }

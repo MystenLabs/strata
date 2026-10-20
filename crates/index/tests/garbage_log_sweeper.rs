@@ -16,6 +16,110 @@ const HEAD: &str = "segment-ref";
 const CURSOR: &str = "segment-ref-sweep";
 
 #[tokio::test]
+async fn failed_sweep_drops_cached_writers_and_retries_from_committed_positions() {
+    let directory = TempDir::new().unwrap();
+    let index = StrataIndex::open_path(directory.path().join("index"), "strata", "test").unwrap();
+    let global_dir = directory.path().join("global-garbage");
+    let namespace_dir = directory.path().join("namespace");
+    let mut log = GarbageLog::open(&global_dir, 1024 * 1024, Default::default()).unwrap();
+    let initial: Vec<_> = (1..=2)
+        .map(|id| {
+            put_ready_segment(&index, id, 100, 1);
+            event(
+                b"a",
+                1,
+                GarbageEvent::SetLifecycle {
+                    record: record(id, 0, 100),
+                    lifecycle: None,
+                },
+                Default::default(),
+            )
+        })
+        .collect();
+    publish_head(&index, log.append(&initial).unwrap());
+    assert!(sweep(&index, &global_dir, &namespace_dir));
+    let committed_cursor = index.get_garbage_log_position(CURSOR).unwrap();
+    let committed_position = index.get_segment_garbage_log_position(1).unwrap().unwrap();
+
+    let retirements: Vec<_> = (1..=2)
+        .map(|id| {
+            event(
+                b"a",
+                2,
+                GarbageEvent::Retired {
+                    record: record(id, 0, 100),
+                },
+                retire_delta(100),
+            )
+        })
+        .collect();
+    let head = log.append(&retirements).unwrap();
+    publish_head(&index, head);
+    // A forwarding route must survive the failed batch, including after writers appended.
+    put_ready_segment(&index, 3, 100, 1);
+    let mut activation = index.batch();
+    index
+        .put_garbage_forwarding_batch(
+            &mut activation,
+            head,
+            [(record(1, 0, 100), record(3, 0, 100))],
+        )
+        .unwrap();
+    activation.write_with_sync(true).unwrap();
+    // Segment 1 appends successfully, then segment 2 fails before the metadata commit.
+    let second_path = namespace_dir.join("segments/2.glog");
+    let saved = std::fs::read(&second_path).unwrap();
+    std::fs::write(&second_path, []).unwrap();
+    assert!(
+        index
+            .sweep_garbage_log(&global_dir, &namespace_dir, HEAD, CURSOR)
+            .is_err()
+    );
+    assert_eq!(
+        index.get_garbage_log_position(CURSOR).unwrap(),
+        committed_cursor
+    );
+    assert_eq!(
+        index.get_segment_garbage_log_position(1).unwrap(),
+        Some(committed_position)
+    );
+    assert_eq!(
+        index.get_segment_gc_summary(1).unwrap().unwrap().live_bytes,
+        100
+    );
+    assert!(
+        std::fs::metadata(namespace_dir.join("segments/1.glog"))
+            .unwrap()
+            .len()
+            > committed_position
+    );
+
+    std::fs::write(&second_path, saved).unwrap();
+    assert!(sweep(&index, &global_dir, &namespace_dir));
+    assert_eq!(index.get_garbage_log_position(CURSOR).unwrap(), Some(head));
+    assert_eq!(
+        index.get_segment_gc_summary(3).unwrap().unwrap().live_bytes,
+        0
+    );
+    for id in 1..=2 {
+        let position = index.get_segment_garbage_log_position(id).unwrap().unwrap();
+        let events =
+            read_segment_garbage(namespace_dir.join(format!("segments/{id}.glog")), position)
+                .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                initial[id as usize - 1].clone(),
+                retirements[id as usize - 1].clone()
+            ]
+        );
+        let summary = index.get_segment_gc_summary(id).unwrap().unwrap();
+        assert_eq!(summary.live_bytes, 0);
+        assert_eq!(summary.retired_bytes, 100);
+    }
+}
+
+#[tokio::test]
 async fn sweep_copies_details_before_publishing_summaries_and_cursor() {
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
@@ -701,4 +805,178 @@ async fn sweep_bounds_records_even_when_few_frames_are_pending() {
             .retired_bytes,
         count
     );
+}
+
+/// A pending lifetime and deletion must follow both relocations across a restart. The GC
+/// retirement frames after each route's boundary must affect only their source copies.
+#[test]
+fn pending_garbage_follows_moves_after_restart_without_retiring_live_copies() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("index");
+    let global = dir.path().join("global");
+    let namespace = dir.path().join("namespace");
+    let index = StrataIndex::open_path(&db, "strata", "test").unwrap();
+    for id in 1..=3 {
+        put_ready_segment(&index, id, 200, 2);
+    }
+    let mut log = GarbageLog::open(&global, 1, Default::default()).unwrap();
+    let pending = vec![
+        event(
+            b"a",
+            2,
+            GarbageEvent::SetLifecycle {
+                record: record(1, 0, 100),
+                lifecycle: Some(BlobLifecycle {
+                    logical_end_epoch: 50,
+                    extension_count: 0,
+                }),
+            },
+            Default::default(),
+        ),
+        event(
+            b"b",
+            3,
+            GarbageEvent::Retired {
+                record: record(1, 100, 100),
+            },
+            Default::default(),
+        ),
+    ];
+    let before_first_move = log.append(&pending).unwrap();
+    publish_head(&index, before_first_move);
+    let mut batch = index.batch();
+    index
+        .put_garbage_forwarding_batch(
+            &mut batch,
+            before_first_move,
+            [
+                (record(1, 0, 100), record(2, 0, 100)),
+                (record(1, 100, 100), record(2, 100, 100)),
+            ],
+        )
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+    let old_retirements = |id| {
+        vec![
+            event(
+                b"a",
+                u64::MAX,
+                GarbageEvent::Retired {
+                    record: record(id, 0, 100),
+                },
+                Default::default(),
+            ),
+            event(
+                b"b",
+                u64::MAX,
+                GarbageEvent::Retired {
+                    record: record(id, 100, 100),
+                },
+                Default::default(),
+            ),
+        ]
+    };
+    let before_second_move = log.append(&old_retirements(1)).unwrap();
+    publish_head(&index, before_second_move);
+    let mut batch = index.batch();
+    index
+        .put_garbage_forwarding_batch(
+            &mut batch,
+            before_second_move,
+            [
+                (record(2, 0, 100), record(3, 0, 100)),
+                (record(2, 100, 100), record(3, 100, 100)),
+            ],
+        )
+        .unwrap();
+    batch.write_with_sync(true).unwrap();
+    let head = log.append(&old_retirements(2)).unwrap();
+    publish_head(&index, head);
+    // Nothing has been swept, and neither activation waited for it.
+    assert!(index.get_garbage_log_position(CURSOR).unwrap().is_none());
+    drop(index);
+    let index = StrataIndex::open_path(&db, "strata", "test").unwrap();
+    assert!(sweep(&index, &global, &namespace));
+    assert_eq!(index.get_garbage_log_position(CURSOR).unwrap(), Some(head));
+    for id in 1..=2 {
+        assert_eq!(
+            index
+                .get_segment_gc_summary(id)
+                .unwrap()
+                .unwrap()
+                .live_bytes,
+            0
+        );
+    }
+    let overlay = index
+        .read_segment_garbage_overlay(&namespace, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(overlay.summary.live_bytes, 100);
+    assert_eq!(overlay.summary.retired_bytes, 100);
+    assert_eq!(overlay.summary.future_epoch_histogram[&50].bytes, 100);
+    assert_eq!(
+        overlay.retired,
+        vec![SegmentGcRecordRange {
+            offset: 100,
+            len: 100
+        }]
+    );
+    assert_eq!(overlay.lifetimes[0].lifecycle.logical_end_epoch, 50);
+    // A retry after a completed cursor neither duplicates deltas nor re-forwards retirement.
+    drop(index);
+    let index = StrataIndex::open_path(&db, "strata", "test").unwrap();
+    assert!(!sweep(&index, &global, &namespace));
+    assert_eq!(
+        index
+            .read_segment_garbage_overlay(&namespace, 3)
+            .unwrap()
+            .unwrap(),
+        overlay
+    );
+}
+
+#[test]
+fn reducers_preserve_each_segments_event_order_across_frames() {
+    let dir = TempDir::new().unwrap();
+    let index = StrataIndex::open_path(dir.path().join("index"), "strata", "test").unwrap();
+    let global = dir.path().join("global");
+    let namespace = dir.path().join("namespace");
+    let mut log = GarbageLog::open(&global, 1 << 20, Default::default()).unwrap();
+    for id in 1..=32 {
+        put_ready_segment(&index, id, 100, 1);
+    }
+    let mut head = Default::default();
+    for lsn in 1..=5 {
+        let records = (1..=32)
+            .map(|id| {
+                event(
+                    b"a",
+                    lsn,
+                    GarbageEvent::SetLifecycle {
+                        record: record(id, 0, 100),
+                        lifecycle: Some(BlobLifecycle {
+                            logical_end_epoch: 10 + lsn,
+                            extension_count: lsn as u32,
+                        }),
+                    },
+                    Default::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        head = log.append(&records).unwrap();
+    }
+    publish_head(&index, head);
+    assert!(sweep(&index, &global, &namespace));
+    for id in 1..=32 {
+        let overlay = index
+            .read_segment_garbage_overlay(&namespace, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlay.summary.live_bytes, 100);
+        assert_eq!(overlay.summary.future_epoch_histogram.len(), 1);
+        assert_eq!(overlay.summary.future_epoch_histogram[&15].bytes, 100);
+        assert_eq!(overlay.lifetimes[0].lifecycle.logical_end_epoch, 15);
+        assert_eq!(overlay.lifetimes[0].lifecycle.extension_count, 5);
+    }
 }

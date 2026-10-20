@@ -5,6 +5,8 @@
 //! rebuilding overlays it rebuilt a minute ago. The sweeper keeps the overlays it produced,
 //! keyed by the segment and the log position they correspond to, and reuses one whenever the
 //! segment's log is still at that position.
+//! The matching validated log writer is retained too, so a cache hit skips recovery's full
+//! history scan. Entries are published only after a successful durable sweep commit.
 //!
 //! The overlay's summary starts from the segment's summary row, which other publishers also
 //! move (allocation baselines, GC output accounting). Each entry therefore remembers the row
@@ -12,9 +14,17 @@
 //! current value is applied to the cached summary, which yields exactly the summary a fresh fold
 //! from the current row would.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use core_types::{SegmentGcOverlay, SegmentGcSummary, SegmentId};
+use lsm::SegmentGarbageLog;
+
+use crate::Result;
+
+/// Bound open log handles as well as overlay memory. A sweeping working set can span
+/// thousands of small overlays; a 1,024-handle cap evicted them well before the byte budget
+/// was exhausted. Keep enough handles for that working set while retaining both limits.
+const MAX_CACHED_LOGS: usize = 8_192;
 
 /// Overlays retained across sweeps, bounded by their estimated heap footprint.
 #[derive(Debug)]
@@ -32,9 +42,16 @@ struct CachedOverlay {
     overlay: SegmentGcOverlay,
     bytes: usize,
     last_used: u64,
+    log: SegmentGarbageLog,
 }
 
 impl OverlayCache {
+    pub(crate) fn remove(&mut self, segment_id: SegmentId) {
+        if let Some(entry) = self.entries.remove(&segment_id) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        }
+    }
+
     pub(crate) fn new(capacity_bytes: usize) -> Self {
         Self {
             capacity_bytes,
@@ -50,20 +67,28 @@ impl OverlayCache {
         &mut self,
         segment_id: SegmentId,
         committed: u64,
-    ) -> Option<(SegmentGcSummary, SegmentGcOverlay)> {
-        let entry = self.entries.remove(&segment_id)?;
+        path: &Path,
+    ) -> Result<Option<(SegmentGcSummary, SegmentGcOverlay, SegmentGarbageLog)>> {
+        let Some(entry) = self.entries.remove(&segment_id) else {
+            return Ok(None);
+        };
         self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
-        (entry.committed == committed).then_some((entry.expected_row, entry.overlay))
+        if entry.committed != committed || !entry.log.is_at_committed_position(path, committed)? {
+            return Ok(None);
+        }
+        Ok(Some((entry.expected_row, entry.overlay, entry.log)))
     }
 
     /// Caches the overlay that corresponds to the segment's log prefix ending at `committed`,
     /// together with the summary row the sweep expects to have left behind.
+    /// Only insert after both the log and the metadata batch have been synced successfully.
     pub(crate) fn insert(
         &mut self,
         segment_id: SegmentId,
         committed: u64,
         expected_row: SegmentGcSummary,
         overlay: SegmentGcOverlay,
+        log: SegmentGarbageLog,
     ) {
         let bytes = overlay_bytes(&overlay);
         if bytes > self.capacity_bytes {
@@ -72,7 +97,9 @@ impl OverlayCache {
         if let Some(previous) = self.entries.remove(&segment_id) {
             self.used_bytes = self.used_bytes.saturating_sub(previous.bytes);
         }
-        while self.used_bytes.saturating_add(bytes) > self.capacity_bytes {
+        while self.used_bytes.saturating_add(bytes) > self.capacity_bytes
+            || self.entries.len() >= MAX_CACHED_LOGS
+        {
             let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used)
             else {
                 break;
@@ -90,6 +117,7 @@ impl OverlayCache {
                 overlay,
                 bytes,
                 last_used: self.tick,
+                log,
             },
         );
     }
@@ -100,7 +128,7 @@ impl OverlayCache {
     }
 }
 
-fn overlay_bytes(overlay: &SegmentGcOverlay) -> usize {
+pub(crate) fn overlay_bytes(overlay: &SegmentGcOverlay) -> usize {
     const RANGE_BYTES: usize = 16;
     const LIFETIME_BYTES: usize = 40;
     const BUCKET_BYTES: usize = 48;
@@ -126,35 +154,113 @@ mod tests {
         }
     }
 
+    fn cached_log(path: &Path) -> (SegmentGarbageLog, u64) {
+        let log = SegmentGarbageLog::open(path, 0).unwrap();
+        let committed = std::fs::metadata(path).unwrap().len();
+        (log, committed)
+    }
+
     #[test]
     fn entries_are_reused_only_at_their_committed_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("7.glog");
         let mut cache = OverlayCache::new(1 << 20);
-        cache.insert(7, 100, SegmentGcSummary::default(), overlay(3));
-        assert!(cache.take(7, 99).is_none());
-        assert!(
-            cache.take(7, 100).is_none(),
-            "the stale take dropped the entry"
-        );
-        cache.insert(7, 100, SegmentGcSummary::default(), overlay(3));
-        let (_, taken) = cache.take(7, 100).unwrap();
+        let (log, committed) = cached_log(&path);
+        cache.insert(7, committed, SegmentGcSummary::default(), overlay(3), log);
+        assert!(cache.take(7, committed - 1, &path).unwrap().is_none());
+        assert!(cache.take(7, committed, &path).unwrap().is_none());
+        let (log, committed) = cached_log(&path);
+        cache.insert(7, committed, SegmentGcSummary::default(), overlay(3), log);
+        let (_, taken, _) = cache.take(7, committed, &path).unwrap().unwrap();
         assert_eq!(taken.expired.len(), 3);
-        assert!(cache.take(7, 100).is_none(), "take removes the entry");
+        assert!(cache.take(7, committed, &path).unwrap().is_none());
     }
 
     #[test]
     fn least_recently_used_entries_are_evicted_to_fit() {
+        let dir = tempfile::tempdir().unwrap();
         // Each entry with 100 ranges costs 256 + 1600 bytes; three fit, four do not.
         let mut cache = OverlayCache::new(6_000);
-        for segment in 1..=3 {
-            cache.insert(segment, 1, SegmentGcSummary::default(), overlay(100));
+        for segment in 1..=4 {
+            let path = dir.path().join(format!("{segment}.glog"));
+            let (log, committed) = cached_log(&path);
+            cache.insert(
+                segment,
+                committed,
+                SegmentGcSummary::default(),
+                overlay(100),
+                log,
+            );
         }
         assert_eq!(cache.len(), 3);
-        cache.insert(4, 1, SegmentGcSummary::default(), overlay(100));
-        assert_eq!(cache.len(), 3);
-        assert!(cache.take(1, 1).is_none(), "segment 1 was the oldest");
-        assert!(cache.take(4, 1).is_some());
+        assert!(!cache.entries.contains_key(&1), "segment 1 was the oldest");
+        assert!(cache.entries.contains_key(&4));
         // An overlay larger than the whole cache is never kept.
-        cache.insert(5, 1, SegmentGcSummary::default(), overlay(10_000));
-        assert!(cache.take(5, 1).is_none());
+        let (log, committed) = cached_log(&dir.path().join("5.glog"));
+        cache.insert(
+            5,
+            committed,
+            SegmentGcSummary::default(),
+            overlay(10_000),
+            log,
+        );
+        assert!(!cache.entries.contains_key(&5));
+    }
+
+    #[test]
+    fn retains_a_working_set_larger_than_one_thousand_segments() {
+        let _ = fdlimit::raise_fd_limit();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.glog");
+        let (_, committed) = cached_log(&path);
+        let mut cache = OverlayCache::new(1 << 30);
+        for segment in 0..2_300 {
+            let log = SegmentGarbageLog::open(&path, committed).unwrap();
+            cache.insert(
+                segment,
+                committed,
+                SegmentGcSummary::default(),
+                overlay(3),
+                log,
+            );
+        }
+        for segment in 0..2_300 {
+            assert!(cache.take(segment, committed, &path).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn log_handles_are_bounded_even_for_tiny_overlays() {
+        let _ = fdlimit::raise_fd_limit();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.glog");
+        let (_, committed) = cached_log(&path);
+        let mut cache = OverlayCache::new(1 << 30);
+        for segment in 0..=MAX_CACHED_LOGS as u64 {
+            let log = SegmentGarbageLog::open(&path, committed).unwrap();
+            cache.insert(
+                segment,
+                committed,
+                SegmentGcSummary::default(),
+                overlay(0),
+                log,
+            );
+        }
+        assert_eq!(cache.len(), MAX_CACHED_LOGS);
+        assert!(!cache.entries.contains_key(&0));
+    }
+
+    #[test]
+    fn replacing_a_log_invalidates_its_overlay_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("7.glog");
+        let (log, committed) = cached_log(&path);
+        let mut cache = OverlayCache::new(1 << 20);
+        cache.insert(7, committed, SegmentGcSummary::default(), overlay(3), log);
+        let replacement = dir.path().join("replacement.glog");
+        let (_, replacement_position) = cached_log(&replacement);
+        assert_eq!(committed, replacement_position);
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(cache.take(7, committed, &path).unwrap().is_none());
     }
 }

@@ -263,6 +263,91 @@ impl GarbageLog {
         }
     }
 
+    /// Reads a bounded prefix using parallel checksum/decoding workers. Frame discovery is
+    /// ordered; results are returned in that same order regardless of completion order. No
+    /// caller may advance its durable cursor until every returned frame has been applied.
+    /// Limits are soft for one legacy oversized frame, which cannot be split during replay.
+    pub fn read_batch(
+        dir: impl AsRef<Path>,
+        cursor: GarbageLogPosition,
+        through: GarbageLogPosition,
+        max_frames: usize,
+        max_records: usize,
+        workers: usize,
+    ) -> Result<Vec<(Vec<GarbageRecord>, GarbageLogPosition)>> {
+        const MAX_BATCH_BYTES: u64 = 64 << 20;
+        if through != GarbageLogPosition::default() {
+            validate_position(cursor)?;
+            validate_position(through)?;
+        }
+        let mut frames = Vec::new();
+        let mut next = cursor;
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        while frames.len() < max_frames && next != through {
+            let Some(frame) = locate_frame(dir.as_ref(), next, through)? else {
+                break;
+            };
+            count = count.saturating_add(frame.count as usize);
+            bytes = bytes.saturating_add(frame.end.offset - frame.offset);
+            next = frame.end;
+            frames.push(frame);
+            if count >= max_records || bytes >= MAX_BATCH_BYTES {
+                break;
+            }
+        }
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = workers.clamp(1, 32).min(frames.len());
+        let queue = std::sync::Mutex::new(frames.into_iter().enumerate());
+        let mut results = std::thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|_| {
+                    let queue = &queue;
+                    scope.spawn(move || -> Result<Vec<_>> {
+                        let mut results = Vec::new();
+                        loop {
+                            let Some((index, frame)) =
+                                queue.lock().expect("garbage frame queue poisoned").next()
+                            else {
+                                break;
+                            };
+                            let (records, end) = read_records_at(&frame.path, frame.offset)?;
+                            if end != frame.end.offset || records.len() != frame.count as usize {
+                                return Err(Error::CorruptGarbageLog {
+                                    path: frame.path,
+                                    reason: "frame changed while reading".into(),
+                                });
+                            }
+                            results.push((index, records, frame.end));
+                        }
+                        Ok(results)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut all = Vec::new();
+            let mut error = None;
+            for handle in handles {
+                match handle.join().expect("garbage frame reader panicked") {
+                    Ok(results) => all.extend(results),
+                    Err(err) => {
+                        error.get_or_insert(err);
+                    }
+                }
+            }
+            match error {
+                Some(err) => Err(err),
+                None => Ok(all),
+            }
+        })?;
+        results.sort_unstable_by_key(|(index, _, _)| *index);
+        Ok(results
+            .into_iter()
+            .map(|(_, records, end)| (records, end))
+            .collect())
+    }
+
     /// Appends and syncs one sorted compaction batch as a single frame.
     ///
     /// Two validations run before any byte is written. Every record's key and its event must name
@@ -354,6 +439,7 @@ impl GarbageLog {
 /// born-dead ranges (in the running example, B's and C's bytes inside S42). The committed offset
 /// is a per-segment row in RocksDB, published by whoever appended — same trust model as the
 /// global log: the file's own length proves nothing.
+#[derive(Debug)]
 pub struct SegmentGarbageLog {
     path: PathBuf,
     file: File,
@@ -361,6 +447,39 @@ pub struct SegmentGarbageLog {
 }
 
 impl SegmentGarbageLog {
+    /// Whether this writer can resume at the caller's committed position without recovery.
+    ///
+    /// The caller must serialize appends and cache the writer only after its log sync and
+    /// metadata commit succeed. Reusing the same open file preserves its validated prefix;
+    /// a changed position, unpublished tail, or replaced file requires a fresh [`Self::open`].
+    pub fn is_at_committed_position(&self, path: &Path, committed: u64) -> Result<bool> {
+        if committed == 0 || self.path != path || self.offset != committed {
+            return Ok(false);
+        }
+        // An open handle alone is insufficient: its path may now name a different file.
+        // Keep the conservative recovery path on platforms without Unix file identity.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let current = match fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(source) => return Err(io_error(path, source)),
+            };
+            let opened = self
+                .file
+                .metadata()
+                .map_err(|source| io_error(path, source))?;
+            Ok(current.dev() == opened.dev()
+                && current.ino() == opened.ino()
+                && current.len() == committed
+                && opened.len() == committed)
+        }
+        #[cfg(not(unix))]
+        Ok(false)
+    }
+
     /// Opens the committed prefix and removes any later unpublished frames.
     ///
     /// `committed == 0` does not mean "open whatever is there" — it means nothing was ever
@@ -374,7 +493,29 @@ impl SegmentGarbageLog {
     /// anything beyond it is truncated. Landing past or between frame boundaries is corruption.
     /// The file is then positioned at the committed offset, ready to append.
     pub fn open(path: impl AsRef<Path>, committed: u64) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_replaying(path.as_ref(), committed, |_| {})
+    }
+
+    /// Recovers a writer and returns its committed records in one validation pass.
+    ///
+    /// This has the same boundary, checksum, and unpublished-tail checks as [`Self::open`].
+    /// Callers rebuilding an overlay can consume these records instead of reading and
+    /// validating the same history again before opening the writer.
+    pub fn open_and_read(
+        path: impl AsRef<Path>,
+        committed: u64,
+    ) -> Result<(Self, Vec<GarbageRecord>)> {
+        let mut records = Vec::new();
+        let writer = Self::open_replaying(path.as_ref(), committed, |frame| records.extend(frame))?;
+        Ok((writer, records))
+    }
+
+    fn open_replaying(
+        path: &Path,
+        committed: u64,
+        mut replay: impl FnMut(Vec<GarbageRecord>),
+    ) -> Result<Self> {
+        let path = path.to_path_buf();
         let parent = path.parent().ok_or_else(|| {
             Error::InvalidGarbageLog("segment garbage log has no parent directory".to_owned())
         })?;
@@ -406,9 +547,14 @@ impl SegmentGarbageLog {
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         read_header(&mut file, &path)?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?
+            .len();
         let mut offset = HEADER_LEN;
         while offset < committed {
-            let (_, end) = read_records_at(&path, offset)?;
+            let (records, end) = read_records_from(&mut file, &path, offset, file_len)?;
+            replay(records);
             offset = end;
         }
         if offset != committed {
@@ -953,10 +1099,83 @@ pub(super) fn write_frame(file: &mut File, records: &[Vec<u8>], path: &Path) -> 
         .map_err(|source| io_error(path, source))
 }
 
+/// A frame boundary discovered before parallel payload validation.
+struct GarbageFrame {
+    path: PathBuf,
+    offset: u64,
+    end: GarbageLogPosition,
+    count: u32,
+}
+
+/// Locate a frame using only its header. The parallel reader still verifies its checksum and
+/// contents before anything is returned to the sweeper; an untrusted count never advances a cursor.
+fn locate_frame(
+    dir: &Path,
+    cursor: GarbageLogPosition,
+    through: GarbageLogPosition,
+) -> Result<Option<GarbageFrame>> {
+    if through == GarbageLogPosition::default() || cursor == through {
+        return Ok(None);
+    }
+    validate_position(cursor)?;
+    validate_position(through)?;
+    let (mut log_id, mut offset) = if cursor == GarbageLogPosition::default() {
+        (1, HEADER_LEN)
+    } else {
+        (cursor.log_id, cursor.offset)
+    };
+    loop {
+        if log_id > through.log_id || (log_id == through.log_id && offset >= through.offset) {
+            return Err(Error::InvalidGarbageLog(
+                "sweep cursor is beyond committed head".into(),
+            ));
+        }
+        let path = GarbageLog::path(dir, log_id);
+        let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+        let len = file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?
+            .len();
+        if offset == len && log_id < through.log_id {
+            log_id += 1;
+            offset = HEADER_LEN;
+            continue;
+        }
+        read_header(&mut file, &path)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|source| io_error(&path, source))?;
+        let mut prefix = [0u8; 12];
+        file.read_exact(&mut prefix)
+            .map_err(|source| io_error(&path, source))?;
+        let payload_len = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+        let count = u32::from_le_bytes(prefix[8..].try_into().unwrap());
+        let end = offset
+            .checked_add(44)
+            .and_then(|v| v.checked_add(payload_len))
+            .ok_or_else(|| Error::InvalidGarbageLog("garbage frame offset overflow".into()))?;
+        if end > len
+            || (log_id == through.log_id && end > through.offset)
+            || u64::from(count) * 4 > payload_len
+        {
+            return Err(Error::CorruptGarbageLog {
+                path,
+                reason: "invalid committed frame length".into(),
+            });
+        }
+        return Ok(Some(GarbageFrame {
+            path,
+            offset,
+            end: GarbageLogPosition {
+                log_id,
+                offset: end,
+            },
+            count,
+        }));
+    }
+}
+
 /// Reads and fully validates the single frame starting at `offset`, returning its records and
-/// exclusive end.
-///
-/// Everything is checked before anything is believed: the file header, the frame's claimed
+/// exclusive end. Everything is checked before anything is believed: the file header, the frame's claimed
 /// length against the file, the SHA-256 over prefix and payload, each record's length field, and
 /// finally that the payload holds exactly the claimed record count with no bytes left over.
 /// Callers use this only at offsets a committed position vouches for; recovery uses its own
@@ -969,6 +1188,15 @@ pub(super) fn read_records_at(path: &Path, offset: u64) -> Result<(Vec<GarbageRe
         .map_err(|source| io_error(path, source))?
         .len();
     read_header(&mut file, path)?;
+    read_records_from(&mut file, path, offset, file_len)
+}
+
+fn read_records_from(
+    file: &mut File,
+    path: &Path,
+    offset: u64,
+    file_len: u64,
+) -> Result<(Vec<GarbageRecord>, u64)> {
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| io_error(path, source))?;
 
