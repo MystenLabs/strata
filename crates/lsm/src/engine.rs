@@ -535,6 +535,13 @@ impl Lsm {
         Arc::clone(&self.tables)
     }
 
+    /// Current installed SST inventory, including flushed patches pending durable publication.
+    ///
+    /// Copies cached totals under the read-view lock: no directory scan, SST reads, or key walk.
+    pub fn table_stats(&self) -> crate::LsmTableStats {
+        lock(&self.memory).snapshot.table_stats()
+    }
+
     pub fn block_cache_stats(&self) -> BlockCacheStats {
         self.tables.block_cache_stats()
     }
@@ -1956,6 +1963,7 @@ mod tests {
         let lsm = open_with_rollover(&directory);
         lsm.write(1, put(b"a", b"one")).unwrap();
         lsm.write(2, put(b"b", b"two")).unwrap();
+        assert_eq!(lsm.table_stats(), crate::LsmTableStats::default());
 
         let table = lsm
             .flush_one(0, lsm.allocate_patch_target().unwrap(), 0, |_| {
@@ -1964,6 +1972,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        let inventory = lsm.table_stats();
+        assert_eq!(inventory.patch.files, 1);
+        assert_eq!(inventory.patch.bytes, table.file_len);
+        assert_eq!(inventory.patch.records, table.record_count);
         assert!(lsm.frozen_generations(0).unwrap().is_empty());
         assert!(lsm.manifest().partitions[&0].patches.is_empty());
         assert_eq!(
@@ -1992,6 +2004,8 @@ mod tests {
             .unwrap()
         );
         assert_eq!(lsm.manifest().partitions[&0].patches, [table]);
+        // Publishing a pending patch must not count it twice.
+        assert_eq!(lsm.table_stats(), inventory);
         let materialized = lsm
             .materialize_through(1, |edit| {
                 let mut manifest = (*lsm.manifest()).clone();
