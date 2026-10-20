@@ -253,7 +253,7 @@ impl RelocationStore {
         )
     }
 
-    pub fn lsm(&self) -> &Lsm {
+    pub fn lsm(&self) -> &Arc<Lsm> {
         &self.lsm
     }
 }

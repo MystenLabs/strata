@@ -358,6 +358,32 @@ pub(crate) struct PartitionReaders {
 // obsolete inputs remain on disk until its snapshots finish. We trade temporary disk space for
 // unversioned base values, predictable reads, and a much simpler merge contract.
 
+/// Inventory of one kind of SST in the current read view.
+///
+/// Records are physical SST entries, not unique live keys: patches can repeat keys and contain
+/// obsolete operands. Bytes exclude memtables, payload segments, and obsolete or staged SSTs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TableStats {
+    pub files: u64,
+    pub bytes: u64,
+    pub records: u64,
+}
+
+impl TableStats {
+    fn add(&mut self, table: &TableMeta) {
+        self.files = self.files.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(table.file_len);
+        self.records = self.records.saturating_add(table.record_count);
+    }
+}
+
+/// Cached inventory of SSTs installed in one read view, including pending flushed patches.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LsmTableStats {
+    pub base: TableStats,
+    pub patch: TableStats,
+}
+
 /// A coherent, immutable read view over one manifest generation.
 ///
 /// The caller must capture `manifest` and `max_lsn` atomically. Base values belong to that
@@ -366,6 +392,7 @@ pub(crate) struct PartitionReaders {
 pub struct Snapshot {
     pub(crate) full_manifest: Arc<Manifest>,
     max_lsn: u64,
+    table_stats: LsmTableStats,
     pub(crate) readers: BTreeMap<u32, PartitionReaders>,
     _table_pin: TablePinGuard,
     _lsn_pin: Option<SnapshotPin>,
@@ -404,16 +431,23 @@ impl Snapshot {
         );
 
         let mut readers = BTreeMap::new();
+        let mut table_stats = LsmTableStats::default();
         for (&partition, partition_tables) in &manifest.partitions {
             let base = partition_tables
                 .base
                 .iter()
-                .map(|table| tables.cached_base_reader(table, &manifest.schema_id))
+                .map(|table| {
+                    table_stats.base.add(table);
+                    tables.cached_base_reader(table, &manifest.schema_id)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let patches = partition_tables
                 .patches
                 .iter()
-                .map(|table| tables.cached_patch_reader(table, &manifest.patch_format_id))
+                .map(|table| {
+                    table_stats.patch.add(table);
+                    tables.cached_patch_reader(table, &manifest.patch_format_id)
+                })
                 .collect::<Result<Vec<_>>>()?;
             readers.insert(partition, PartitionReaders { base, patches });
         }
@@ -421,6 +455,7 @@ impl Snapshot {
         Ok(Self {
             full_manifest: manifest,
             max_lsn,
+            table_stats,
             readers,
             _table_pin: table_pin,
             _lsn_pin: lsn_pin,
@@ -429,6 +464,11 @@ impl Snapshot {
 
     pub fn manifest(&self) -> &Manifest {
         &self.full_manifest
+    }
+
+    /// Constant-time access to metadata totals cached while constructing the read view.
+    pub fn table_stats(&self) -> LsmTableStats {
+        self.table_stats
     }
 
     pub fn max_lsn(&self) -> u64 {
@@ -585,6 +625,63 @@ mod tests {
             TableWriter::create_patch(directory.path(), path, id, 0, "patch-v1").unwrap();
         writer.add_patch(b"a", lsn, value).unwrap();
         writer.finish().unwrap()
+    }
+
+    #[test]
+    fn inventory_counts_physical_records_and_excludes_obsolete_files() {
+        let directory = TempDir::new().unwrap();
+        let base = write_base(&directory);
+        let patch = write_patch(&directory, "patch.sst", 2, 10, b"patch");
+        let second = write_patch(&directory, "second.sst", 3, 11, b"another");
+        let files = Arc::new(TableStore::new(directory.path()));
+        let old = Snapshot::new(
+            Arc::clone(&files),
+            manifest(vec![base.clone()], vec![patch.clone(), second.clone()]),
+            11,
+        )
+        .unwrap();
+        let stats = old.table_stats();
+        assert_eq!(
+            stats.base,
+            TableStats {
+                files: 1,
+                bytes: base.file_len,
+                records: 2
+            }
+        );
+        // Both patches name the same key, already present in the base.
+        assert_eq!(
+            stats.patch,
+            TableStats {
+                files: 2,
+                bytes: patch.file_len + second.file_len,
+                records: 2
+            }
+        );
+        assert_eq!(
+            std::fs::metadata(directory.path().join("base.sst"))
+                .unwrap()
+                .len(),
+            stats.base.bytes
+        );
+        assert_eq!(
+            std::fs::metadata(directory.path().join("patch.sst"))
+                .unwrap()
+                .len()
+                + std::fs::metadata(directory.path().join("second.sst"))
+                    .unwrap()
+                    .len(),
+            stats.patch.bytes
+        );
+
+        let current =
+            Snapshot::new(Arc::clone(&files), manifest(vec![base], Vec::new()), 11).unwrap();
+        // Old files still exist and are pinned by an older reader, but aren't in the new view.
+        assert!(files.is_pinned(&patch));
+        assert_eq!(current.table_stats().patch, TableStats::default());
+        assert_eq!(old.table_stats(), stats);
+        let empty = Snapshot::new(files, manifest(Vec::new(), Vec::new()), 11).unwrap();
+        assert_eq!(empty.table_stats(), LsmTableStats::default());
     }
 
     #[test]
