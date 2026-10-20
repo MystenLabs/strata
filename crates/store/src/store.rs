@@ -191,6 +191,16 @@ impl StrataStore {
         Ok(result.first_lsn().unwrap_or(0))
     }
 
+    /// Appends an ordered logical delete for an exact blob key.
+    ///
+    /// The delete retires every shard version and clears the key's lifetime. It becomes a physical
+    /// key removal when full compaction folds the mutation into the base; a later put recreates the
+    /// key normally.
+    pub fn delete_key(&self, key: &BlobKey) -> Result<StrataLsn> {
+        let result = self.write_batch(vec![BatchOp::DeleteKey { key: key.clone() }])?;
+        result.first_lsn().ok_or(Error::WriteResponseDropped)
+    }
+
     /// Sends a prepared list of operations to the single writer and waits for the committed result.
     ///
     /// LSNs, segment offsets, and epoch rows must be allocated together by

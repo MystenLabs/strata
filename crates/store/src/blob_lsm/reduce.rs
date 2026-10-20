@@ -76,8 +76,9 @@ fn merge_patch_events<'a>(
 ///
 /// Epoch changes are virtual mutations. The reducer merges them with the real mutations by LSN and
 /// keeps one bucket per shard. A Put or Tombstone replaces its shard's bucket; a SetLifetime changes
-/// the lifetime of every bucket; and an epoch change drops the buckets whose lifetime has ended.
-/// After the scan, every SetLifetime and the mutation left in each bucket survive in their original
+/// the lifetime of every bucket; DeleteKey resets the entire unknown-base state; and an epoch change
+/// drops the buckets whose lifetime has ended. After the scan, every SetLifetime after the latest
+/// DeleteKey, that DeleteKey barrier, and the mutation left in each bucket survive in their original
 /// LSN order.
 ///
 /// Every `SetLifetime` is retained: an older lifetime may expire an unknown-base version before a
@@ -148,6 +149,7 @@ pub(crate) fn reduce_patch_mutations(
 ) -> Result<Vec<BlobMutationWithLSN>> {
     let mut buckets = BTreeMap::<ShardKey, PatchBucket>::new();
     let mut current_lifetime = None::<PatchLifecycleHint>;
+    let mut delete_key_index = None;
     for event in merge_patch_events(&mutations, snapshot) {
         let mutation_index = match event {
             PatchEvent::Mutation(mutation_index) => mutation_index,
@@ -226,14 +228,28 @@ pub(crate) fn reduce_patch_mutations(
                     emit,
                 )?;
             }
+            BlobMutation::DeleteKey => {
+                for (shard, bucket) in std::mem::take(&mut buckets) {
+                    retire_patch_bucket(key, shard, bucket, lsn, relocations, emit)?;
+                }
+                current_lifetime = None;
+                // Only the latest whole-key delete is needed to clear the unknown base. Any
+                // earlier delete and every lifetime before it are subsumed by this barrier.
+                delete_key_index = Some(mutation_index);
+            }
         }
     }
 
     let mut keep = vec![false; mutations.len()];
     for (index, mutation) in mutations.iter().enumerate() {
-        if matches!(mutation.mutation, BlobMutation::SetLifetime { .. }) {
+        if matches!(mutation.mutation, BlobMutation::SetLifetime { .. })
+            && delete_key_index.is_none_or(|delete| index > delete)
+        {
             keep[index] = true;
         }
+    }
+    if let Some(index) = delete_key_index {
+        keep[index] = true;
     }
     for (&shard, bucket) in &buckets {
         keep[bucket.mutation_index] = true;
@@ -263,21 +279,33 @@ fn replace_patch_bucket(
     relocations: &[RelocationEntry],
     emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
 ) -> Result<()> {
-    if let Some(previous) = buckets.insert(shard, next)
-        && let Some(version) = previous.put
-    {
-        let (version, event_lsn) = resolve_event_version(key, shard, version, lsn, relocations);
-        emit(terminal_garbage_record(
-            key,
-            event_lsn,
-            version.record_ref,
-            None,
-            GarbageEvent::Retired {
-                record: version.record_ref,
-            },
-        )?)?;
+    if let Some(previous) = buckets.insert(shard, next) {
+        retire_patch_bucket(key, shard, previous, lsn, relocations, emit)?;
     }
     Ok(())
+}
+
+fn retire_patch_bucket(
+    key: &[u8],
+    shard: ShardKey,
+    bucket: PatchBucket,
+    lsn: StrataLsn,
+    relocations: &[RelocationEntry],
+    emit: &mut dyn FnMut(GarbageRecord) -> Result<()>,
+) -> Result<()> {
+    let Some(version) = bucket.put else {
+        return Ok(());
+    };
+    let (version, event_lsn) = resolve_event_version(key, shard, version, lsn, relocations);
+    emit(terminal_garbage_record(
+        key,
+        event_lsn,
+        version.record_ref,
+        None,
+        GarbageEvent::Retired {
+            record: version.record_ref,
+        },
+    )?)
 }
 
 /// Drops every bucket whose proven lifetime ended at or before `epoch`.

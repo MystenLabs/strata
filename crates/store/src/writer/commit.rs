@@ -102,7 +102,7 @@ impl WriteCoordinator {
             let delete_count = request
                 .ops
                 .iter()
-                .filter(|op| matches!(op, BatchOp::Tombstone { .. }))
+                .filter(|op| matches!(op, BatchOp::Tombstone { .. } | BatchOp::DeleteKey { .. }))
                 .count();
             let mut profile = request.profile.begin(started);
             if request.ops.is_empty() {
@@ -331,11 +331,12 @@ impl WriteCoordinator {
                 segment_bytes = segment_bytes.saturating_add(metric.record_bytes);
                 self.metrics.record_put(Ok(metric), started.elapsed());
             }
-            for _ in prepared
-                .ops
-                .iter()
-                .filter(|op| matches!(op, PreparedBatchOp::Tombstone { .. }))
-            {
+            for _ in prepared.ops.iter().filter(|op| {
+                matches!(
+                    op,
+                    PreparedBatchOp::Tombstone { .. } | PreparedBatchOp::DeleteKey { .. }
+                )
+            }) {
                 self.metrics.record_delete(true, started.elapsed());
             }
             let _ = profile_phase(
@@ -387,11 +388,12 @@ impl WriteCoordinator {
             {
                 self.metrics.record_put(Err(()), started.elapsed());
             }
-            for _ in prepared
-                .ops
-                .iter()
-                .filter(|op| matches!(op, PreparedBatchOp::Tombstone { .. }))
-            {
+            for _ in prepared.ops.iter().filter(|op| {
+                matches!(
+                    op,
+                    PreparedBatchOp::Tombstone { .. } | PreparedBatchOp::DeleteKey { .. }
+                )
+            }) {
                 self.metrics.record_delete(false, started.elapsed());
             }
             if let Some(mut profile) = profile {
@@ -436,7 +438,8 @@ impl WriteCoordinator {
     /// It also stamps the op with the current epoch of the system.
     /// `SetBlobLifetime`: requires the target epoch to be strictly in future. `logical_end_epoch <= current` is
     /// rejected as `InvalidBlobLifetime` error.
-    /// `Tombstone`: just needs a shard resolved.
+    /// `Tombstone`: just needs a shard resolved. `DeleteKey` needs no shard lookup because it
+    /// clears every materialized version for its exact key.
     /// `IncrementEpoch`: bumps the epoch in the current batch which means later ops in the same batch
     /// will see the new epoch.
     ///
@@ -536,6 +539,10 @@ impl WriteCoordinator {
                     prepared_ops.push(PreparedBatchOp::Tombstone { shard, key, lsn });
                     op_epochs.push(None);
                 }
+                BatchOp::DeleteKey { key } => {
+                    prepared_ops.push(PreparedBatchOp::DeleteKey { key, lsn });
+                    op_epochs.push(None);
+                }
                 BatchOp::IncrementEpoch => {
                     let next_epoch = current_epoch
                         .ok_or(Error::EpochNotInitialized)?
@@ -622,7 +629,9 @@ impl WriteCoordinator {
                     PreparedBatchOp::Put { .. } => {
                         wrote_payload = true;
                     }
-                    PreparedBatchOp::Lifecycle { .. } | PreparedBatchOp::Tombstone { .. } => {}
+                    PreparedBatchOp::Lifecycle { .. }
+                    | PreparedBatchOp::Tombstone { .. }
+                    | PreparedBatchOp::DeleteKey { .. } => {}
                     PreparedBatchOp::EpochChange { lsn, epoch } => {
                         self.index
                             .put_epoch_change_batch(&mut batch, *lsn, *epoch)?;
