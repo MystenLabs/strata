@@ -21,6 +21,33 @@ impl StrataIndex {
         garbage_log: &mut GarbageLog,
         records: &[GarbageRecord],
     ) -> Result<GarbageLogPosition> {
+        self.publish_lsm_compaction_streaming(
+            lsm_name,
+            edit,
+            garbage_log_name,
+            garbage_log,
+            |log| {
+                if !records.is_empty() {
+                    log.append_unsynced(records)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Publishes a compaction whose garbage is supplied in bounded frames.
+    ///
+    /// `append` must append only this compaction's records. All appended frames are synced before
+    /// their final position and the manifest edit commit together. Until then, none is visible to
+    /// the sweeper. The caller holds the same garbage-publication lock as the slice-based method.
+    pub fn publish_lsm_compaction_streaming(
+        &self,
+        lsm_name: &str,
+        edit: &ManifestEdit,
+        garbage_log_name: &str,
+        garbage_log: &mut GarbageLog,
+        append: impl FnOnce(&mut GarbageLog) -> lsm::Result<()>,
+    ) -> Result<GarbageLogPosition> {
         let committed = self
             .get_garbage_log_position(garbage_log_name)?
             .unwrap_or_default();
@@ -33,10 +60,12 @@ impl StrataIndex {
         // A large garbage frame can take time to write and sync. Let flush/frontier publishers
         // keep using the manifest while that happens; this frame remains unpublished until the
         // batch below commits its position together with the edit.
-        let position = if records.is_empty() {
+        append(garbage_log)?;
+        garbage_log.sync()?;
+        let position = if garbage_log.is_at_committed_position(committed) {
             committed
         } else {
-            garbage_log.append(records)?
+            garbage_log.position()
         };
 
         let guard = self.lock_lsm_manifests();

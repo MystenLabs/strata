@@ -47,8 +47,13 @@ use index::StrataIndex;
 use lsm::{
     GarbageLog, GarbageRecord, Lsm, Manifest as LsmManifest, ManifestEdit, StrataLsn, TableMeta,
     select_base_sweep_inputs, select_compaction_inputs, select_patch_group_inputs,
-    write_compaction, write_patch_compaction,
+    write_compaction, write_compaction_streaming, write_patch_compaction,
+    write_patch_compaction_streaming,
 };
+
+mod garbage;
+
+use garbage::GarbageSpool;
 
 /// Folds the global garbage log into per-segment overlays on a one-second cadence.
 ///
@@ -787,13 +792,23 @@ impl LsmCompactor {
                 .transpose()?,
             _ => None,
         };
-        let (edit, mut garbage, healed_references) = if tier {
+        let mut garbage = GarbageSpool::new(
+            self.garbage_log_dir
+                .parent()
+                .expect("garbage log has a namespace directory"),
+        )?;
+        let (edit, healed_references) = if tier {
             let merge = BlobMergeWithRelocations::new(relocation_scan, epoch_snapshot);
             // One output per tier merge whatever its size, so tiers keep growing geometrically
             // instead of splitting into equal files that would be merged again and again.
-            let (edit, garbage) =
-                write_patch_compaction(&inputs, &merge, u64::MAX, || lsm.allocate_patch_target())?;
-            (edit, garbage, 0)
+            let edit = write_patch_compaction_streaming(
+                &inputs,
+                &merge,
+                u64::MAX,
+                || lsm.allocate_patch_target(),
+                |record| garbage.push(record),
+            )?;
+            (edit, 0)
         } else {
             let snapshot = BlobCompactionSnapshot {
                 shard_infos: self.index.iter_shards()?.into_iter().collect(),
@@ -816,10 +831,13 @@ impl LsmCompactor {
                 ..epoch_snapshot
             };
             let merge = BlobMergeWithRelocations::new(relocation_scan, snapshot);
-            let (mut edit, garbage) =
-                write_compaction(&inputs, &merge, LSM_COMPACTION_TARGET_BYTES, || {
-                    lsm.allocate_base_target()
-                })?;
+            let mut edit = write_compaction_streaming(
+                &inputs,
+                &merge,
+                LSM_COMPACTION_TARGET_BYTES,
+                || lsm.allocate_base_target(),
+                |record| garbage.push(record),
+            )?;
             // All rows in every output passed through `merge` with the epoch snapshot bounded by
             // exactly this LSN. If the bound is 120, a later global coverage calculation may count
             // these bases as having considered the epoch transition at 120; it must not stamp the
@@ -827,7 +845,7 @@ impl LsmCompactor {
             for table in &mut edit.add_base {
                 table.merge_applied_through_lsn = Some(bound);
             }
-            (edit, garbage, merge.healed_references())
+            (edit, merge.healed_references())
         };
         let output_bytes = table_bytes(&edit.add_base) + table_bytes(&edit.add_patches);
 
@@ -835,24 +853,28 @@ impl LsmCompactor {
             .garbage_publish_lock
             .lock()
             .expect("garbage publication lock poisoned");
-        let redirected = redirect_garbage_to_current_copies(&mut garbage, |key, from| {
-            activations.resolve(key, from, relocation_watermark)
-        });
-        self.metrics
-            .record_main_compaction_redirected_garbage(redirected);
+        let mut redirected = 0;
         let committed = self
             .index
             .get_garbage_log_position(GARBAGE_LOG_HEAD)?
             .unwrap_or_default();
         let mut garbage_log =
             GarbageLog::open(&self.garbage_log_dir, LSM_GARBAGE_LOG_MAX_BYTES, committed)?;
-        self.index.publish_lsm_compaction(
+        self.index.publish_lsm_compaction_streaming(
             BLOB_LSM_MANIFEST,
             &edit,
             GARBAGE_LOG_HEAD,
             &mut garbage_log,
-            &garbage,
+            |log| {
+                garbage.append_to(log, |records| {
+                    redirected += redirect_garbage_to_current_copies(records, |key, from| {
+                        activations.resolve(key, from, relocation_watermark)
+                    });
+                })
+            },
         )?;
+        self.metrics
+            .record_main_compaction_redirected_garbage(redirected);
         lsm.reload_manifest(|| read_blob_lsm_manifest(&self.index))?;
         self.metrics.record_main_compaction(
             kind,

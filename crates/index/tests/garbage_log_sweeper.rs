@@ -752,6 +752,61 @@ fn segment_state(segment_id: SegmentId) -> SegmentState {
     }
 }
 
+#[tokio::test]
+async fn sweep_bounds_records_even_when_few_frames_are_pending() {
+    let directory = TempDir::new().unwrap();
+    let index = StrataIndex::open_path(
+        directory.path().join("index"),
+        "strata",
+        directory.path().display().to_string(),
+    )
+    .unwrap();
+    let records_per_frame = 16_384u64;
+    let count = 3 * records_per_frame;
+    put_ready_segment(&index, 1, count, count);
+    let global = directory.path().join("global");
+    let namespace = directory.path().join("namespace");
+    let mut log =
+        GarbageLog::open(&global, 64 * 1024 * 1024, GarbageLogPosition::default()).unwrap();
+    for frame in 0..3 {
+        let records: Vec<_> = (frame * records_per_frame..(frame + 1) * records_per_frame)
+            .map(|i| {
+                event(
+                    &i.to_be_bytes(),
+                    i + 1,
+                    GarbageEvent::Retired {
+                        record: record(1, i, 1),
+                    },
+                    retire_delta(1),
+                )
+            })
+            .collect();
+        log.append(&records).unwrap();
+    }
+    let head = log.position();
+    publish_head(&index, head);
+    assert!(sweep(&index, &global, &namespace));
+    assert_ne!(index.get_garbage_log_position(CURSOR).unwrap(), Some(head));
+    assert_eq!(
+        index
+            .get_segment_gc_summary(1)
+            .unwrap()
+            .unwrap()
+            .retired_bytes,
+        2 * records_per_frame
+    );
+    assert!(sweep(&index, &global, &namespace));
+    assert_eq!(index.get_garbage_log_position(CURSOR).unwrap(), Some(head));
+    assert_eq!(
+        index
+            .get_segment_gc_summary(1)
+            .unwrap()
+            .unwrap()
+            .retired_bytes,
+        count
+    );
+}
+
 /// A pending lifetime and deletion must follow both relocations across a restart. The GC
 /// retirement frames after each route's boundary must affect only their source copies.
 #[test]

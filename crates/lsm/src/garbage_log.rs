@@ -363,6 +363,14 @@ impl GarbageLog {
     /// new position is returned; making that position *mean* something is the caller's RocksDB
     /// commit, per the contract on the type.
     pub fn append(&mut self, records: &[GarbageRecord]) -> Result<GarbageLogPosition> {
+        let position = self.append_unsynced(records)?;
+        self.sync()?;
+        Ok(position)
+    }
+
+    /// Appends one frame without syncing the active file. Call `sync` before publishing its
+    /// position. Rolling syncs the previous file before closing it.
+    pub fn append_unsynced(&mut self, records: &[GarbageRecord]) -> Result<GarbageLogPosition> {
         if records
             .iter()
             .any(|record| record.key.segment_id != record.event.record().segment_id)
@@ -395,9 +403,6 @@ impl GarbageLog {
             &records,
             &Self::path(&self.dir, self.log_id),
         )?;
-        self.file
-            .sync_data()
-            .map_err(|source| io_error(&Self::path(&self.dir, self.log_id), source))?;
         self.offset = self
             .offset
             .checked_add(frame_len)
@@ -405,7 +410,15 @@ impl GarbageLog {
         Ok(self.position())
     }
 
+    /// Makes all appended frames durable, including any files synced during rolling.
+    pub fn sync(&self) -> Result<()> {
+        self.file
+            .sync_data()
+            .map_err(|source| io_error(&Self::path(&self.dir, self.log_id), source))
+    }
+
     fn roll(&mut self) -> Result<()> {
+        self.sync()?;
         let next_id = self
             .log_id
             .checked_add(1)

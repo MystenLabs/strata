@@ -18,6 +18,7 @@ use lsm::{
 use crate::{Error, Result, StrataIndex, segment::gc_summary::apply_segment_gc_summary_delta};
 
 const MAX_SWEEP_FRAMES: usize = 256;
+// Frames from a large compaction must not all be decoded into memory in one sweep.
 const MAX_SWEEP_RECORDS: usize = 32_768;
 const SWEEP_WORKERS: usize = 4;
 /// Heap budget for folded overlays kept between sweeps (see `overlay_cache`). A mature
