@@ -22,7 +22,7 @@ async fn tracked_batch_records_last_lsn_and_survives_reopen() {
         assert!(store.published_lsn().unwrap() < lsn);
 
         assert_eq!(store.get(&key).unwrap(), Some(b"value".to_vec()));
-        assert_eq!(store.index().get_next_lsn().unwrap(), lsn + 1);
+        assert_eq!(store.next_lsn(), lsn + 1);
         store.sync().unwrap();
     }
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
@@ -40,7 +40,7 @@ async fn rejected_batches_do_not_reserve_a_key_or_an_lsn() {
         try_open_standalone_store(config(dir.path(), "default"), StrataStoreMetrics::default())
             .unwrap();
     let tag = b"rejected".to_vec();
-    let next_lsn = store.index().get_next_lsn().unwrap();
+    let next_lsn = store.next_lsn();
     assert!(matches!(
         store.batch().write_with_lsn(tag.clone()),
         Err(Error::EmptyTrackedBatch)
@@ -55,7 +55,7 @@ async fn rejected_batches_do_not_reserve_a_key_or_an_lsn() {
         store.index().submitted_batch_lsns().get(&tag).unwrap(),
         None
     );
-    assert_eq!(store.index().get_next_lsn().unwrap(), next_lsn);
+    assert_eq!(store.next_lsn(), next_lsn);
 }
 
 #[tokio::test]

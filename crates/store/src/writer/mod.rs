@@ -185,7 +185,7 @@ impl WriteCoordinator {
     }
 
     fn process_scheduled_sync_and_commit(&mut self) -> Result<()> {
-        let current_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        let current_lsn = self.next_lsn.saturating_sub(1);
         let committed_lsn = self.index.get_committed_lsn()?;
         if committed_lsn > current_lsn {
             return Err(Error::InvariantViolation {
@@ -299,7 +299,7 @@ impl WriteCoordinator {
             current_generation: shard.generation,
             state: ShardState::Dropped,
         };
-        let drop_lsn = self.index.get_next_lsn()?;
+        let drop_lsn = self.next_lsn;
         let next_lsn = drop_lsn
             .checked_add(1)
             .ok_or(segment::Error::RangeOverflow)?;
@@ -323,11 +323,15 @@ impl WriteCoordinator {
                     state: ShardCleanupState::ReadyForGc,
                 },
             )?;
-            self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
+            self.put_writer_frontier_batch(&mut batch, next_lsn)?;
             batch.write()?;
             Ok::<(), Error>(())
         })();
 
+        let commit_result = commit_result.and_then(|()| {
+            self.index_next_lsn = next_lsn;
+            self.advance_next_lsn(next_lsn)
+        });
         if let Err(error) = commit_result {
             self.halt_writer_error("shard drop after store-WAL append", &error);
             return Err(error);

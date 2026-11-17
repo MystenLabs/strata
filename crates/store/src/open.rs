@@ -47,6 +47,7 @@ use crate::{
     },
     wal::Wal,
     wal_format::StoreWalMutation,
+    writer_cursor::{WriterCursor, WriterCursorRecord, apply_writer_cursor, writer_cursor_path},
 };
 
 /// Aggregates authoritative per-segment GC summaries for metric initialization.
@@ -125,6 +126,9 @@ impl StrataStore {
         ensure_default_shard_registered(&index)?;
         ensure_epoch_initialized(&index, config.starting_epoch)?;
         reconcile_orphan_ingest_segment_files(&config, &index)?;
+        // Bring the index rows recovery reads up to the writer's last commit, if the cursor
+        // file is ahead of them.
+        apply_writer_cursor(&config, &index)?;
         recover_unsealed_segments(&config, &index, &metrics)?;
         recover_store_wal_prefix(&config, &index, &metrics)?;
         ensure_blob_compaction_garbage_cutover(&index)?;
@@ -268,6 +272,16 @@ impl StrataStore {
             Arc::clone(&segment_io_observer),
         ));
         let segment_sync_tx = store_wal.file_sync_sender();
+        // Recovery is complete and nothing has written yet: the index rows are exact. Start the
+        // cursor from them, which also retires whatever record a previous run left behind.
+        let writer_next_lsn = index.get_next_lsn()?;
+        let visible_next_lsn = Arc::new(AtomicU64::new(writer_next_lsn));
+        let cursor = WriterCursor::open(writer_cursor_path(&config))?;
+        cursor.write(&WriterCursorRecord::new(
+            writer_next_lsn,
+            writer_next_lsn,
+            &active_segment_state,
+        ))?;
         let coordinator = WriteCoordinator {
             config: config.clone(),
             index: index.clone(),
@@ -289,6 +303,10 @@ impl StrataStore {
             sync_and_commit_in_flight: None,
             pending_sync_requests: Vec::new(),
             active_segment_state,
+            next_lsn: writer_next_lsn,
+            index_next_lsn: writer_next_lsn,
+            visible_next_lsn: Arc::clone(&visible_next_lsn),
+            cursor,
             durable_offset,
             active_allocation_records: 0,
             active_allocation_tracker: Arc::new(SegmentAllocationTracker::with_published_bytes(
@@ -331,6 +349,7 @@ impl StrataStore {
                     relocations: Arc::clone(&relocations),
                     relocation_cache: Arc::clone(&relocation_cache),
                     durable_relocation_lsn: Arc::clone(&durable_relocation_lsn),
+                    visible_next_lsn: Arc::clone(&visible_next_lsn),
                     live_snapshots: live_snapshots.clone(),
                     lsm_compact_tx: lsm_compact_tx.clone(),
                     claims: Arc::clone(&gc_claims),
@@ -406,6 +425,7 @@ impl StrataStore {
             compaction_pause_lock,
             relocation_activations,
             durable_relocation_lsn,
+            visible_next_lsn,
             gc_claims,
             gc_concurrency,
             gc_io_limiter,

@@ -143,7 +143,7 @@ impl WriteCoordinator {
             return Ok(Some(target));
         }
 
-        let current_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        let current_lsn = self.next_lsn.saturating_sub(1);
         let committed_lsn = self.index.get_committed_lsn()?;
         if committed_lsn > current_lsn {
             return Err(Error::InvariantViolation {
@@ -340,7 +340,7 @@ impl WriteCoordinator {
                 ),
             });
         }
-        let current_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        let current_lsn = self.next_lsn.saturating_sub(1);
         if commit.target_lsn > current_lsn {
             return Err(Error::InvariantViolation {
                 reason: format!(
@@ -357,16 +357,23 @@ impl WriteCoordinator {
                 let mut batch = self.index.batch();
                 let mut states = Vec::with_capacity(commit.segments.len());
                 let mut allocation_marks = Vec::with_capacity(commit.segments.len());
+                let mut wrote_active_segment = false;
                 for segment in &commit.segments {
-                    let mut state = self
-                        .index
-                        .get_segment_state(segment.segment_id)?
-                        .ok_or_else(|| Error::InvariantViolation {
-                            reason: format!(
-                                "durability target references missing segment {}",
-                                segment.segment_id
-                            ),
-                        })?;
+                    let mut state = if segment.segment_id == self.active_segment_state.segment_id {
+                        // The index row of the active segment is only as new as the writer's
+                        // last index batch. The writer's own copy is the current one.
+                        wrote_active_segment = true;
+                        self.active_segment_state.clone()
+                    } else {
+                        self.index
+                            .get_segment_state(segment.segment_id)?
+                            .ok_or_else(|| Error::InvariantViolation {
+                                reason: format!(
+                                    "durability target references missing segment {}",
+                                    segment.segment_id
+                                ),
+                            })?
+                    };
                     if state.write_offset < segment.durable_offset {
                         return Err(Error::InvariantViolation {
                             reason: format!(
@@ -414,6 +421,14 @@ impl WriteCoordinator {
                     ));
                     states.push(state);
                 }
+                // Publication is the one place the index is guaranteed to catch up with the
+                // writer: `NextLsn` must never be durable behind `CommittedLsn`, and it is only
+                // ever written with the active segment's row (see `writer_cursor`).
+                if !wrote_active_segment {
+                    self.index
+                        .put_segment_state_batch(&mut batch, &self.active_segment_state)?;
+                }
+                self.index.put_next_lsn_batch(&mut batch, self.next_lsn)?;
                 self.index
                     .put_commit_lsn_batch(&mut batch, commit.target_lsn)?;
                 self.index.put_store_checkpoint_batch(
@@ -433,6 +448,9 @@ impl WriteCoordinator {
             |profile, elapsed| profile.index_batch_commit += elapsed,
             || batch.write_with_sync(true),
         )?;
+        // The index now holds the writer's frontier; rebase the cursor on it.
+        self.index_next_lsn = self.next_lsn;
+        self.advance_next_lsn(self.next_lsn)?;
         // Segment and store-WAL fsyncs, followed by the synced index checkpoint, have all
         // completed. Notify subscribers at this exact durability boundary, not at put visibility.
         self.store_halt.publish_lsn(commit.target_lsn);
@@ -508,13 +526,7 @@ impl WriteCoordinator {
         } = request;
         let started = Instant::now();
         let profile = profile_request.begin(started);
-        let target_lsn = match self.index.get_next_lsn() {
-            Ok(next_lsn) => next_lsn.saturating_sub(1),
-            Err(error) => {
-                let _ = response_tx.send(Err(error.into()));
-                return;
-            }
-        };
+        let target_lsn = self.next_lsn.saturating_sub(1);
         match self.index.get_committed_lsn() {
             Ok(published) if published > target_lsn => {
                 let _ = response_tx.send(Err(Error::InvariantViolation {

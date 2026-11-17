@@ -6,6 +6,12 @@ use crate::{Error, Result};
 use super::StrataIndex;
 
 impl StrataIndex {
+    /// Returns the persisted `NextLsn` row.
+    ///
+    /// While a store is open this is only as new as its writer's last index batch: ordinary
+    /// commits advance the writer's own frontier, which `StrataStore::next_lsn` returns, and
+    /// reach this row with the next durability publication. It is exact once a store has
+    /// finished opening, before its first write.
     pub fn get_next_lsn(&self) -> Result<StrataLsn> {
         Ok(self.store_state.get(&StoreStateKey::NextLsn)?.unwrap_or(1))
     }

@@ -68,7 +68,10 @@ impl GcExecutor {
     }
 
     fn prepare_gc_publish(&self, mut copy: GcPrepublishedCopy) -> Result<GcPreparedPublish> {
-        let reconciled_lsn = self.index.get_next_lsn()?.saturating_sub(1);
+        let reconciled_lsn = self
+            .visible_next_lsn
+            .load(std::sync::atomic::Ordering::Acquire)
+            .saturating_sub(1);
         if matches!(
             &copy.plan.action,
             GcAction::DeleteSegment { .. }
