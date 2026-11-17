@@ -1595,7 +1595,7 @@ async fn foreground_sync_does_not_wait_for_garbage_publication() {
         StrataStore::open(config(dir.path(), "default"), StrataStoreMetrics::default()).unwrap(),
     );
     let garbage_lock = Arc::clone(&store.garbage_publish_lock);
-    let garbage_guard = garbage_lock.lock().unwrap();
+    let garbage_guard = garbage_lock.lock();
 
     store
         .put(
@@ -4330,11 +4330,7 @@ async fn join_multiple_fully_evacuates_and_deletes_every_source() {
 
     loop {
         let swept = {
-            let _publish_guard = store
-                .store
-                .garbage_publish_lock
-                .lock()
-                .expect("garbage publication lock poisoned");
+            let _publish_guard = store.store.garbage_publish_lock.lock();
             store
                 .index()
                 .sweep_garbage_log(
@@ -4556,11 +4552,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
 
     loop {
         let swept = {
-            let _publish_guard = store
-                .store
-                .garbage_publish_lock
-                .lock()
-                .expect("garbage publication lock poisoned");
+            let _publish_guard = store.store.garbage_publish_lock.lock();
             store
                 .index()
                 .sweep_garbage_log(

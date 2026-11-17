@@ -266,7 +266,7 @@ pub(crate) struct GcExecutor {
     /// Serializes GC output publication with shard-generation directory cleanup.
     pub(crate) publish_cleanup_lock: Arc<Mutex<()>>,
     /// Serializes whole-shard metadata removal with garbage-log publication and sweeping.
-    pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
+    pub(crate) garbage_publish_lock: Arc<parking_lot::Mutex<()>>,
     /// Where a publish records its activations so an in-flight compaction pass can redirect the
     /// garbage events it aimed at the old copies.
     pub(crate) relocation_activations: Arc<RelocationActivations>,

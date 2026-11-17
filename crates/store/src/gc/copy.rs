@@ -130,10 +130,7 @@ impl GcExecutor {
                 .publish_cleanup_lock
                 .lock()
                 .expect("gc publish/cleanup lock poisoned");
-            let _garbage_publish_guard = self
-                .garbage_publish_lock
-                .lock()
-                .expect("garbage publication lock poisoned");
+            let _garbage_publish_guard = self.garbage_publish_lock.lock();
             let Some(current_job) = self.index.get_shard_cleanup_job(job.shard)? else {
                 continue;
             };

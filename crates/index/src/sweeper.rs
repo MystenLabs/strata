@@ -18,8 +18,16 @@ use lsm::{
 use crate::{Error, Result, StrataIndex, segment::gc_summary::apply_segment_gc_summary_delta};
 
 const MAX_SWEEP_FRAMES: usize = 256;
-// Frames from a large compaction must not all be decoded into memory in one sweep.
-const MAX_SWEEP_RECORDS: usize = 32_768;
+// Frames from a large compaction must not all be decoded into memory in one sweep; the byte
+// bound in `GarbageLog::read_batch` caps that as well. This bound has to stay large, because
+// a batch pays a fixed price whatever its size: one sync of the whole file system holding
+// the segment logs (`sync_segment_garbage_logs`), which flushes everything else dirty on the
+// volume too, and one synced index batch. The parallel map and reduce only speed up the
+// per-record work in between. At 32,768 records a store under 12,800 puts/s spent 0.5 to 1 s
+// per batch, nearly all of it that fixed price, swept fewer than 50,000 records a second, and
+// held the publication lock for minutes after each compaction, starving collector
+// publication.
+const MAX_SWEEP_RECORDS: usize = 1 << 20;
 const SWEEP_WORKERS: usize = 4;
 /// Heap budget for folded overlays kept between sweeps (see `overlay_cache`). A mature
 /// one-gigabyte segment of 16 KiB records folds to about two megabytes, so this holds the
