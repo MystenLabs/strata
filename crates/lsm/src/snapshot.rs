@@ -237,25 +237,44 @@ impl TableStore {
     ///
     /// Returns `false` when the file is pinned. Returns `true` when the file was removed or was
     /// already absent. The caller must ensure the table is no longer in the current manifest.
+    ///
+    /// Only the pin check and the unlink run under the use lock, so that a pin cannot slip in
+    /// between them. The directory sync, the block-cache purge and the close of the cached reader
+    /// (which is where the file system frees the file's blocks) run after the lock is released.
+    /// Every snapshot build and every snapshot drop takes the use lock, and a compaction removes
+    /// tens of tables in a row, so holding it across a sync per table stalled publications, and
+    /// through them reads, for seconds.
     pub fn remove_if_unpinned(&self, table: &TableMeta) -> Result<bool> {
         validate_relative_path(&table.relative_path)?;
-        let uses = self.uses();
-        if uses
-            .get(&table.relative_path)
-            .is_some_and(|table_use| !table_use.is_unused())
-        {
-            return Ok(false);
-        }
-
         let path = self.root.join(&table.relative_path);
-        match fs::remove_file(&path) {
-            Ok(()) => sync_parent(&path)?,
-            Err(source) if source.kind() == ErrorKind::NotFound => {}
-            Err(source) => return Err(Error::Io { path, source }),
+        let unlinked = {
+            let uses = self.uses();
+            if uses
+                .get(&table.relative_path)
+                .is_some_and(|table_use| !table_use.is_unused())
+            {
+                return Ok(false);
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(source) if source.kind() == ErrorKind::NotFound => false,
+                Err(source) => return Err(Error::Io { path, source }),
+            }
+        };
+        if unlinked {
+            sync_parent(&path)?;
         }
         self.block_cache.remove_table(table.id);
-        self.readers().remove(&table.relative_path);
+        // Take the reader out under the cache lock and close it after the lock is released.
+        let reader = self.readers().remove(&table.relative_path);
+        drop(reader);
         Ok(true)
+    }
+
+    /// Holds the table-use lock, as obsolete-table removal does around an unlink.
+    #[cfg(test)]
+    pub(crate) fn lock_uses_for_test(&self) -> impl Drop + '_ {
+        self.uses()
     }
 
     fn pin(self: &Arc<Self>, tables: impl Iterator<Item = String>) -> TablePinGuard {
