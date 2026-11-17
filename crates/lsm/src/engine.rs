@@ -639,23 +639,26 @@ impl Lsm {
             max_lsn,
         )?;
 
-        let mut state = lock(&self.memory);
-        self.check_running()?;
-        let partition_state = state.partition_mut(partition)?;
-        let current = partition_state
-            .frozen
-            .front()
-            .expect("serialized flush retains its frozen generation");
-        if current.generation() != frozen.generation() {
-            return Err(Error::InvalidManifest {
-                reason: "frozen memtable changed during serialized flush".to_owned(),
-            });
-        }
-        partition_state.frozen.pop_front();
-        state.manifest = manifest;
-        state.pending_patches = pending_patches;
-        state.snapshot = snapshot;
-        self.memory_changed.notify_all();
+        let displaced = {
+            let mut state = lock(&self.memory);
+            self.check_running()?;
+            let partition_state = state.partition_mut(partition)?;
+            let current = partition_state
+                .frozen
+                .front()
+                .expect("serialized flush retains its frozen generation");
+            if current.generation() != frozen.generation() {
+                return Err(Error::InvalidManifest {
+                    reason: "frozen memtable changed during serialized flush".to_owned(),
+                });
+            }
+            partition_state.frozen.pop_front();
+            state.pending_patches = pending_patches;
+            let displaced = state.replace_view(manifest, snapshot);
+            self.memory_changed.notify_all();
+            displaced
+        };
+        drop(displaced);
         Ok(Some(meta))
     }
 
@@ -693,22 +696,24 @@ impl Lsm {
             max_lsn,
         )?;
 
-        let mut state = lock(&self.memory);
-        self.check_running()?;
-        for table in &ready {
-            if !state
-                .pending_patches
-                .iter()
-                .any(|pending| pending.relative_path == table.relative_path)
-            {
-                return Err(Error::InvalidManifest {
-                    reason: format!("pending SST {} disappeared", table.relative_path),
-                });
+        let displaced = {
+            let mut state = lock(&self.memory);
+            self.check_running()?;
+            for table in &ready {
+                if !state
+                    .pending_patches
+                    .iter()
+                    .any(|pending| pending.relative_path == table.relative_path)
+                {
+                    return Err(Error::InvalidManifest {
+                        reason: format!("pending SST {} disappeared", table.relative_path),
+                    });
+                }
             }
-        }
-        state.manifest = published;
-        state.pending_patches = remaining;
-        state.snapshot = snapshot;
+            state.pending_patches = remaining;
+            state.replace_view(published, snapshot)
+        };
+        drop(displaced);
         Ok(true)
     }
 
@@ -785,10 +790,12 @@ impl Lsm {
             &pending_patches,
             max_lsn,
         )?;
-        let mut state = lock(&self.memory);
-        self.check_running()?;
-        state.manifest = published;
-        state.snapshot = snapshot;
+        let displaced = {
+            let mut state = lock(&self.memory);
+            self.check_running()?;
+            state.replace_view(published, snapshot)
+        };
+        drop(displaced);
         Ok(Some(materialized_through))
     }
 
@@ -812,6 +819,15 @@ impl Lsm {
         self.install_manifest_locked(manifest)
     }
 
+    /// Installs `manifest` as the current view. The caller holds the flush lock.
+    ///
+    /// The snapshot over the new manifest is built before the memory lock is taken. Building it
+    /// pins every table and opens a reader for each table this engine has not read yet, and
+    /// concurrent reads must not wait for that file-system work. The flush lock makes the early
+    /// build safe: pending patches change only under it, so the set captured here is still
+    /// current at the swap. The visible frontier may advance in between, which is harmless
+    /// because reads pass the live frontier to the snapshot themselves, as they already do after
+    /// a flush.
     fn install_manifest_locked(&self, manifest: Manifest) -> Result<()> {
         manifest.validate()?;
         let manifest_lsn = manifest
@@ -831,22 +847,33 @@ impl Lsm {
                     .map_or(manifest_lsn, |current| current.max(manifest_lsn)),
             );
         }
-        let mut state = lock(&self.memory);
-        if let Some(manifest_lsn) = manifest_lsn {
-            state.last_visible_lsn = Some(
-                state
-                    .last_visible_lsn
-                    .map_or(manifest_lsn, |current| current.max(manifest_lsn)),
-            );
-        }
+        let (pending_patches, visible_lsn) = {
+            let state = lock(&self.memory);
+            (state.pending_patches.clone(), state.last_visible_lsn)
+        };
+        let snapshot_lsn = visible_lsn
+            .into_iter()
+            .chain(manifest_lsn)
+            .max()
+            .unwrap_or_default();
         let snapshot = snapshot_with_pending_patches(
             Arc::clone(&self.tables),
             Arc::clone(&manifest),
-            &state.pending_patches,
-            state.last_visible_lsn.unwrap_or_default(),
+            &pending_patches,
+            snapshot_lsn,
         )?;
-        state.manifest = manifest;
-        state.snapshot = snapshot;
+        let displaced = {
+            let mut state = lock(&self.memory);
+            if let Some(manifest_lsn) = manifest_lsn {
+                state.last_visible_lsn = Some(
+                    state
+                        .last_visible_lsn
+                        .map_or(manifest_lsn, |current| current.max(manifest_lsn)),
+                );
+            }
+            state.replace_view(manifest, snapshot)
+        };
+        drop(displaced);
         Ok(())
     }
 
@@ -1118,7 +1145,27 @@ fn snapshot_with_pending_patches(
     )?))
 }
 
+/// The manifest and snapshot that a publication displaced.
+///
+/// Dropping the last reference to a snapshot releases its table pins, which takes the table
+/// store's use lock, and can close table files. Obsolete-table cleanup takes the same lock around
+/// an unlink. A drop under the memory lock would therefore make every concurrent read wait for
+/// file-system work, so publishers carry the displaced view out of the critical section and drop
+/// it there.
+#[must_use = "drop the displaced view only after releasing the memory lock"]
+struct DisplacedView {
+    _manifest: Arc<Manifest>,
+    _snapshot: Arc<Snapshot>,
+}
+
 impl MemoryState {
+    fn replace_view(&mut self, manifest: Arc<Manifest>, snapshot: Arc<Snapshot>) -> DisplacedView {
+        DisplacedView {
+            _manifest: mem::replace(&mut self.manifest, manifest),
+            _snapshot: mem::replace(&mut self.snapshot, snapshot),
+        }
+    }
+
     fn partition(&self, partition: u32) -> Result<&PartitionState> {
         self.partitions
             .get(&partition)
@@ -1688,6 +1735,49 @@ mod tests {
             target.relative_path() == format!("patch-{:020}.sst", target.id())
                 || target.relative_path() == format!("base-{:020}.sst", target.id())
         }));
+    }
+
+    #[test]
+    fn manifest_install_blocked_on_table_pins_does_not_block_reads() {
+        let directory = TempDir::new().unwrap();
+        let lsm = open(&directory, Vec::new());
+        lsm.write(1, put(b"a", b"one")).unwrap();
+
+        // Obsolete-table cleanup holds the table-use lock around an unlink. Hold it here the way
+        // a slow unlink would, then start an install, which needs that lock to pin its tables.
+        let tables = lsm.table_store();
+        let use_lock = tables.lock_uses_for_test();
+        let install_lsm = Arc::clone(&lsm);
+        let (install_started_tx, install_started_rx) = mpsc::channel();
+        let install = thread::spawn(move || {
+            let manifest = (*install_lsm.manifest()).clone();
+            install_started_tx.send(()).unwrap();
+            install_lsm.install_manifest(manifest)
+        });
+        install_started_rx.recv().unwrap();
+        // Give the install time to reach the pin. Without the fix it waits there while holding
+        // the memory lock; with it, it waits before taking that lock.
+        thread::sleep(Duration::from_millis(100));
+
+        let read_lsm = Arc::clone(&lsm);
+        let (read_done_tx, read_done_rx) = mpsc::channel();
+        let read = thread::spawn(move || {
+            read_done_tx
+                .send(read_lsm.get(0, b"a", &Replace).unwrap())
+                .unwrap();
+        });
+        let value = read_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a read waited for an install that was blocked on the table-use lock");
+        assert_eq!(value, Some(encode_inline_value(b"one")));
+
+        drop(use_lock);
+        install.join().unwrap().unwrap();
+        read.join().unwrap();
+        assert_eq!(
+            lsm.get(0, b"a", &Replace).unwrap(),
+            Some(encode_inline_value(b"one"))
+        );
     }
 
     #[test]
