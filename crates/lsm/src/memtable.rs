@@ -198,6 +198,8 @@ impl Memtable {
         self.generation.entry_count == 0
     }
 
+    /// LSN of the first mutation inserted, which is also the smallest in the generation:
+    /// every insert must carry an LSN above the previous one.
     pub fn first_lsn(&self) -> Option<StrataLsn> {
         self.generation.first_lsn
     }
@@ -401,6 +403,8 @@ impl FrozenMemtable {
         self.generation.entry_count == 0
     }
 
+    /// LSN of the first mutation inserted, which is also the smallest in the generation:
+    /// every insert must carry an LSN above the previous one.
     pub fn first_lsn(&self) -> Option<StrataLsn> {
         self.generation.first_lsn
     }
@@ -808,6 +812,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn first_lsn_is_the_smallest_lsn_of_each_generation() {
+        let smallest = |entries: super::MemtableEntries<'_>| entries.map(|entry| entry.lsn).min();
+
+        let mut memtable = Memtable::new(1, 1024);
+        assert_eq!(memtable.first_lsn(), None);
+        // Later versions of an earlier key, and keys that hash anywhere, never lower it.
+        insert(&mut memtable, b"m", 5, b"one");
+        insert(&mut memtable, b"a", 9, b"two");
+        insert(&mut memtable, b"m", 12, b"three");
+        insert(&mut memtable, b"z", 30, b"four");
+        assert_eq!(memtable.first_lsn(), Some(lsn(5)));
+        assert_eq!(memtable.first_lsn(), smallest(memtable.entries()));
+        // An out-of-order LSN is rejected, so nothing below the first can arrive later.
+        assert!(memtable.insert(b"b", lsn(4), b"late").is_err());
+        assert_eq!(memtable.first_lsn(), Some(lsn(5)));
+
+        let frozen = memtable.rollover(2).unwrap();
+        assert_eq!(frozen.first_lsn(), Some(lsn(5)));
+        assert_eq!(frozen.first_lsn(), smallest(frozen.entries()));
+        assert_eq!(memtable.first_lsn(), None);
+        insert(&mut memtable, b"a", 31, b"five");
+        insert(&mut memtable, b"c", 40, b"six");
+        assert_eq!(memtable.first_lsn(), Some(lsn(31)));
+        assert_eq!(memtable.first_lsn(), smallest(memtable.entries()));
+
+        // A recycled generation starts over.
+        let mut recycled = frozen.recycle(3).unwrap();
+        assert_eq!(recycled.first_lsn(), None);
+        insert(&mut recycled, b"q", 50, b"seven");
+        assert_eq!(recycled.first_lsn(), Some(lsn(50)));
     }
 
     #[test]
