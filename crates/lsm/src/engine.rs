@@ -736,6 +736,9 @@ impl Lsm {
                 Arc::clone(&state.manifest),
                 state.pending_patches.clone(),
                 state.last_visible_lsn.unwrap_or_default(),
+                // A generation's first LSN is its smallest, so this reads one field per
+                // generation. Walking every entry here held the memory lock for a millisecond
+                // or more on each call, and the foreground writer's next batch waited it out.
                 state
                     .partitions
                     .values()
@@ -743,10 +746,9 @@ impl Lsm {
                         partition
                             .frozen
                             .iter()
-                            .flat_map(|memtable| memtable.entries())
-                            .chain(partition.active.entries())
+                            .filter_map(|memtable| memtable.first_lsn())
+                            .chain(partition.active.first_lsn())
                     })
-                    .map(|entry| entry.lsn)
                     .chain(
                         state
                             .pending_patches
@@ -2038,6 +2040,52 @@ mod tests {
         // LSNs 1..=16 may be RocksDB-only. LSN 17 cannot be crossed until its row is in an SST.
         assert_eq!(advanced, Some(16));
         assert_eq!(lsm.manifest().materialized_through, Some(16));
+    }
+
+    #[test]
+    fn materialization_stops_before_the_smallest_lsn_of_any_unflushed_generation() {
+        let directory = TempDir::new().unwrap();
+        let lsm = Arc::new(
+            Lsm::from_parts(
+                directory.path(),
+                Arc::new(Manifest::empty("test-base", "test-patch", NonZeroU32::MIN)),
+                Vec::new(),
+                None,
+                LsmOptions {
+                    rollover_policy: Some(MemtableRolloverPolicy::new(
+                        NonZeroUsize::new(3).unwrap(),
+                        Duration::from_secs(60),
+                    )),
+                    ..LsmOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        let publish = |edit: &ManifestEdit| {
+            let mut manifest = (*lsm.manifest()).clone();
+            manifest.apply(edit)?;
+            Ok(manifest)
+        };
+        // Three keys fill the first generation; the fourth write rolls it. Each generation
+        // holds several rows, and neither's smallest LSN is the row a map walk yields first.
+        for (lsn, key) in [(3, b"m"), (7, b"a"), (8, b"z")] {
+            lsm.write(lsn, put(key, b"frozen")).unwrap();
+        }
+        for (lsn, key) in [(11, b"q"), (12, b"b")] {
+            lsm.write(lsn, put(key, b"active")).unwrap();
+        }
+        assert_eq!(lsm.frozen_generations(0).unwrap().len(), 1);
+
+        // The frozen generation starts at 3.
+        assert_eq!(lsm.materialize_through(20, publish).unwrap(), Some(2));
+
+        // Once it is flushed and published through its last row, the active one at 11 is next.
+        lsm.flush_one(0, lsm.allocate_patch_target().unwrap(), 8, publish)
+            .unwrap()
+            .unwrap();
+        assert!(lsm.frozen_generations(0).unwrap().is_empty());
+        assert_eq!(lsm.materialize_through(20, publish).unwrap(), Some(10));
+        assert_eq!(lsm.manifest().materialized_through, Some(10));
     }
 
     #[test]
