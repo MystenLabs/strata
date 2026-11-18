@@ -53,9 +53,7 @@ impl GcExecutor {
         let scenario = Some(copy.plan.scenario);
         let started = Instant::now();
         let garbage_publish_lock = Arc::clone(&self.garbage_publish_lock);
-        let _publish_guard = garbage_publish_lock
-            .lock()
-            .expect("garbage publication lock poisoned");
+        let _publish_guard = garbage_publish_lock.lock();
         self.metrics
             .record_gc_attempt_phase(scenario, "publish_lock_wait", started.elapsed());
         let started = Instant::now();

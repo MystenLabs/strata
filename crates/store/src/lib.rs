@@ -305,7 +305,7 @@ pub struct StrataStore {
     pub(crate) gc_txs: Vec<mpsc::Sender<GcCommand>>,
     gc_handles: Vec<JoinHandle<()>>,
     pub(crate) gc_publish_cleanup_lock: Arc<Mutex<()>>,
-    pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
+    pub(crate) garbage_publish_lock: Arc<parking_lot::Mutex<()>>,
     /// Held shared by every blob-LSM compaction pass. Nothing in the store takes it exclusively;
     /// tests do, to hold the compactor still while they stage a scenario. parking_lot's lock so a
     /// waiting writer is admitted after the pass in progress rather than losing the wake-up race

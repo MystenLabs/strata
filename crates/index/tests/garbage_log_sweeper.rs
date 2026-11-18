@@ -752,8 +752,11 @@ fn segment_state(segment_id: SegmentId) -> SegmentState {
     }
 }
 
+/// A sweep pays a fixed cost per batch (an append and a sync for every segment it touches, and
+/// one synced index batch), so a backlog of tens of thousands of records has to go in one batch,
+/// not several. The record bound itself is exercised by `lsm`'s `read_batch` tests.
 #[tokio::test]
-async fn sweep_bounds_records_even_when_few_frames_are_pending() {
+async fn sweep_takes_a_backlog_of_several_frames_in_one_batch() {
     let directory = TempDir::new().unwrap();
     let index = StrataIndex::open_path(
         directory.path().join("index"),
@@ -786,16 +789,6 @@ async fn sweep_bounds_records_even_when_few_frames_are_pending() {
     let head = log.position();
     publish_head(&index, head);
     assert!(sweep(&index, &global, &namespace));
-    assert_ne!(index.get_garbage_log_position(CURSOR).unwrap(), Some(head));
-    assert_eq!(
-        index
-            .get_segment_gc_summary(1)
-            .unwrap()
-            .unwrap()
-            .retired_bytes,
-        2 * records_per_frame
-    );
-    assert!(sweep(&index, &global, &namespace));
     assert_eq!(index.get_garbage_log_position(CURSOR).unwrap(), Some(head));
     assert_eq!(
         index
@@ -805,6 +798,7 @@ async fn sweep_bounds_records_even_when_few_frames_are_pending() {
             .retired_bytes,
         count
     );
+    assert!(!sweep(&index, &global, &namespace));
 }
 
 /// A pending lifetime and deletion must follow both relocations across a restart. The GC

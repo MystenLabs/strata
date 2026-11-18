@@ -66,7 +66,7 @@ pub(crate) struct GarbageLogSweeper {
     pub(crate) index: StrataIndex,
     pub(crate) global_log_dir: PathBuf,
     pub(crate) namespace_dir: PathBuf,
-    pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
+    pub(crate) garbage_publish_lock: Arc<parking_lot::Mutex<()>>,
     pub(crate) relocations: Weak<RelocationStore>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
     pub(crate) gc_txs: Arc<Mutex<Vec<mpsc::Sender<GcCommand>>>>,
@@ -114,6 +114,8 @@ impl GarbageLogSweeper {
     /// Sweeps up to eight bounded batches, and doubles as the durability
     /// heartbeat for GC relocation activations.
     ///
+    /// Between iterations the lock goes to whichever publisher is waiting for it.
+    ///
     /// Each iteration, under the garbage-publication lock: first sample the relocation LSM's
     /// last activation sequence, then run one bounded sweep. The sweep itself syncs each touched
     /// segment-local file and commits its cursor, positions, and summaries in one *synced* RocksDB
@@ -132,41 +134,39 @@ impl GarbageLogSweeper {
     fn drain(&self) -> Result<bool> {
         let mut advanced = false;
         for _ in 0..8 {
-            let (swept, relocation_lsn, expiry_frontier_advanced) = {
-                let _publish_guard = self
-                    .garbage_publish_lock
-                    .lock()
-                    .expect("garbage publish lock poisoned");
-                let relocation_lsn = self
-                    .relocations
-                    .upgrade()
-                    .map(|relocations| relocations.lsm().last_lsn())
-                    .transpose()?
-                    .flatten()
-                    .unwrap_or_default();
-                let started = Instant::now();
-                let swept = self.index.sweep_garbage_log(
-                    &self.global_log_dir,
-                    &self.namespace_dir,
-                    GARBAGE_LOG_HEAD,
-                    GARBAGE_LOG_SWEEP_CURSOR,
-                )?;
-                self.metrics
-                    .record_garbage_sweep("sweeper", swept, started.elapsed());
-                self.publish_garbage_log_backlog()?;
-                // A compaction publishes its new base frontiers and its garbage-log head in one
-                // batch. Only the iteration that observes no remaining frame may expose that
-                // coverage to GC: at this point every Expired event produced by those bases is in
-                // the segment summaries. The shared publication lock prevents a new compaction or
-                // GC publish from appending between the empty-log observation and the frontier
-                // write below.
-                let expiry_frontier_advanced = if swept {
-                    false
-                } else {
-                    self.refresh_expiry_accounting_frontier()?
-                };
-                (swept, relocation_lsn, expiry_frontier_advanced)
+            let publish_guard = self.garbage_publish_lock.lock();
+            let relocation_lsn = self
+                .relocations
+                .upgrade()
+                .map(|relocations| relocations.lsm().last_lsn())
+                .transpose()?
+                .flatten()
+                .unwrap_or_default();
+            let started = Instant::now();
+            let swept = self.index.sweep_garbage_log(
+                &self.global_log_dir,
+                &self.namespace_dir,
+                GARBAGE_LOG_HEAD,
+                GARBAGE_LOG_SWEEP_CURSOR,
+            )?;
+            self.metrics
+                .record_garbage_sweep("sweeper", swept, started.elapsed());
+            self.publish_garbage_log_backlog()?;
+            // A compaction publishes its new base frontiers and its garbage-log head in one
+            // batch. Only the iteration that observes no remaining frame may expose that
+            // coverage to GC: at this point every Expired event produced by those bases is in
+            // the segment summaries. The shared publication lock prevents a new compaction or
+            // GC publish from appending between the empty-log observation and the frontier
+            // write below.
+            let expiry_frontier_advanced = if swept {
+                false
+            } else {
+                self.refresh_expiry_accounting_frontier()?
             };
+            // Hand the lock to a publisher that waited through this batch. After a plain unlock
+            // this loop takes the lock straight back for its next batch, and a collector or
+            // compaction publication then waits out the whole backlog.
+            parking_lot::MutexGuard::unlock_fair(publish_guard);
             advanced |= expiry_frontier_advanced;
             if !swept {
                 break;
@@ -174,7 +174,6 @@ impl GarbageLogSweeper {
             self.durable_relocation_lsn
                 .fetch_max(relocation_lsn, std::sync::atomic::Ordering::Release);
             advanced = true;
-            std::thread::yield_now();
         }
         Ok(advanced)
     }
@@ -458,7 +457,7 @@ pub(crate) struct LsmCompactor {
     pub(crate) garbage_log_dir: PathBuf,
     pub(crate) compaction_pause_lock: Arc<parking_lot::RwLock<()>>,
     pub(crate) relocation_activations: Arc<RelocationActivations>,
-    pub(crate) garbage_publish_lock: Arc<Mutex<()>>,
+    pub(crate) garbage_publish_lock: Arc<parking_lot::Mutex<()>>,
     pub(crate) wake_rx: mpsc::Receiver<()>,
     pub(crate) store_halt: StoreHalt,
     pub(crate) metrics: StrataStoreMetrics,
@@ -849,10 +848,7 @@ impl LsmCompactor {
         };
         let output_bytes = table_bytes(&edit.add_base) + table_bytes(&edit.add_patches);
 
-        let _publish_guard = self
-            .garbage_publish_lock
-            .lock()
-            .expect("garbage publication lock poisoned");
+        let _publish_guard = self.garbage_publish_lock.lock();
         let mut redirected = 0;
         let committed = self
             .index

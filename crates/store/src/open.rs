@@ -181,7 +181,7 @@ impl StrataStore {
         let store_halt = StoreHalt::new(index.get_committed_lsn()?);
         let compaction_pause_lock = Arc::new(parking_lot::RwLock::new(()));
         let relocation_activations = Arc::new(RelocationActivations::default());
-        let garbage_publish_lock = Arc::new(Mutex::new(()));
+        let garbage_publish_lock = Arc::new(parking_lot::Mutex::new(()));
         let gc_concurrency = Arc::new(GcConcurrencyController::new(
             GcConcurrencyConfig::from_store_config(&config),
             metrics.clone(),
