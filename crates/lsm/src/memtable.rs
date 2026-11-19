@@ -351,8 +351,23 @@ impl Memtable {
     }
 
     /// Freezes the active key/version map and installs an empty generation.
+    ///
+    /// The new generation's key map is sized for as many keys as the outgoing one holds. A map
+    /// that starts empty grows by doubling, and every doubling rehashes all of its keys inside
+    /// the insert that triggers it: with a few thousand keys per generation that is a pause of
+    /// several hundred microseconds on the writer, a few times per generation. Consecutive
+    /// generations of a partition hold about the same number of keys, so sizing the next one
+    /// from the last removes those pauses.
     pub fn rollover(&mut self, next_generation: u64) -> Result<FrozenMemtable> {
-        self.rollover_into(Self::new(next_generation, self.capacity()))
+        let replacement = Self {
+            generation: Generation::with_key_capacity(
+                next_generation,
+                self.capacity(),
+                self.key_count(),
+            ),
+            rollover_policy: None,
+        };
+        self.rollover_into(replacement)
     }
 
     /// Freezes the active generation and installs an empty, possibly recycled replacement.
@@ -522,10 +537,16 @@ impl FrozenMemtable {
 
 impl Generation {
     fn new(id: u64, capacity: usize) -> Self {
+        Self::with_key_capacity(id, capacity, 0)
+    }
+
+    /// A generation whose key map can take `keys` keys before it has to grow. Zero allocates
+    /// nothing, like `HashMap::new`.
+    fn with_key_capacity(id: u64, capacity: usize, keys: usize) -> Self {
         Self {
             id,
             capacity,
-            rows: HashMap::new(),
+            rows: HashMap::with_capacity(keys),
             used_bytes: 0,
             entry_count: 0,
             first_lsn: None,
@@ -1211,6 +1232,45 @@ mod tests {
         insert(&mut memtable, b"deleted", 1, b"");
 
         assert_eq!(memtable.get(b"deleted").unwrap().value, b"");
+    }
+
+    #[test]
+    fn rollover_sizes_the_next_key_map_for_the_outgoing_key_count() {
+        let mut active = Memtable::new(1, 1 << 20);
+        assert_eq!(active.generation.rows.capacity(), 0);
+        for index in 0..1000_u64 {
+            insert(
+                &mut active,
+                format!("key-{index:04}").as_bytes(),
+                index + 1,
+                b"value",
+            );
+        }
+
+        let frozen = active.rollover(2).unwrap();
+        assert_eq!(frozen.key_count(), 1000);
+        let sized = active.generation.rows.capacity();
+        assert!(
+            sized >= 1000,
+            "the next generation was sized for {sized} keys"
+        );
+
+        // Filling the next generation to the same key count never grows the map, so no insert
+        // pays for a rehash.
+        for index in 0..1000_u64 {
+            insert(
+                &mut active,
+                format!("next-{index:04}").as_bytes(),
+                2000 + index,
+                b"value",
+            );
+            assert_eq!(active.generation.rows.capacity(), sized);
+        }
+
+        // An empty outgoing generation asks for nothing.
+        let mut empty = Memtable::new(1, 1024);
+        empty.rollover(2).unwrap();
+        assert_eq!(empty.generation.rows.capacity(), 0);
     }
 
     #[test]
