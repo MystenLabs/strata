@@ -1,11 +1,21 @@
-//! Bounded memtable storing each key's versions directly in a hash map.
+//! Bounded memtable keeping each generation's key and value bytes in a few large blocks.
 //!
-//! The first version is embedded in the map value. A key allocates a history vector only after its
-//! second mutation, and values already owned by the write pipeline move into the generation without
-//! another byte allocation or copy. Rollover freezes the complete map and installs a fresh one.
+//! A generation holds one row per key, in insertion order, and finds a key through a table from
+//! the key's hash to its row. Key and value bytes are copied into the generation's byte blocks.
+//! The first version of a key is embedded in its row; a key allocates a history vector only after
+//! its second mutation. Rollover freezes the complete generation and installs a fresh one.
+//!
+//! The bytes are not kept as one heap allocation per key and per value because of who frees them.
+//! A generation is filled by the serialized writer and dropped by the flush thread once its table
+//! is published. With one allocation each, that drop returns tens of thousands of small chunks to
+//! the writer's allocator arena from another thread every few seconds. glibc parks such chunks
+//! unmerged on the arena's fastbins, and the writer's next allocation of 1 KiB or more merges all
+//! of them at once (`malloc_consolidate`), a pause of up to several milliseconds inside a put.
+//! Dropping a generation now frees a handful of blocks and its row vector.
 
 use std::{
     collections::{HashMap, hash_map},
+    hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState},
     mem,
     num::NonZeroUsize,
     path::Path,
@@ -17,10 +27,18 @@ use crate::{Error, OperandFloor, OperandFloorFn, Result, StrataLsn, TableMeta, T
 /// Default logical byte capacity of one memtable generation.
 pub const DEFAULT_MEMTABLE_BUFFER_BYTES: usize = 1 << 30;
 
-// Logical accounting includes the directly stored version descriptor and its owned bytes. A key's
-// bytes are charged only for its first version. Hash-table buckets and allocator rounding remain
-// implementation overhead, just as the old buffer-backed representation did not charge its index.
+// Logical accounting includes the directly stored version descriptor and the version's value
+// bytes. A key's bytes are charged only for its first version. The key table, the row vector and
+// the unused tail of a byte block remain implementation overhead, just as the old buffer-backed
+// representation did not charge its index.
 pub(crate) const VERSION_BYTES: usize = mem::size_of::<Version>();
+
+/// Capacity of one byte block. Keys and values of the index are a few dozen bytes each, so a
+/// block takes a few thousand of them; a key or value larger than this gets a block of its own.
+const BLOCK_BYTES: usize = 256 * 1024;
+
+/// Marks the end of a chain of rows whose keys share one hash.
+const NO_ROW: usize = usize::MAX;
 
 /// Rolls a non-empty active generation when either limit is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +97,7 @@ pub struct Memtable {
     rollover_policy: Option<MemtableRolloverPolicy>,
 }
 
-/// Immutable key/version map produced by one rollover.
+/// Immutable generation produced by one rollover.
 #[derive(Debug)]
 pub struct FrozenMemtable {
     generation: Generation,
@@ -89,36 +107,130 @@ pub struct FrozenMemtable {
 struct Generation {
     id: u64,
     capacity: usize,
-    rows: HashMap<Vec<u8>, KeyHistory>,
+    // From a key's hash to the first row with that hash. The hash is computed once per lookup
+    // with `hasher`, which is keyed at random like a `HashMap`'s, and the table uses it as is.
+    index: HashMap<u64, usize, BuildHasherDefault<PrecomputedHash>>,
+    hasher: RandomState,
+    // One row per key, in the order the keys first arrived.
+    rows: Vec<Row>,
+    bytes: ByteBlocks,
     used_bytes: usize,
     entry_count: usize,
     first_lsn: Option<StrataLsn>,
     last_lsn: Option<StrataLsn>,
     started_at: Instant,
+    // Gives every key the same hash, so that tests can exercise the chains of colliding rows.
+    #[cfg(test)]
+    collide_all_keys: bool,
 }
 
 #[derive(Debug)]
-struct KeyHistory {
+struct Row {
+    key: Span,
+    // The next row whose key has the same 64-bit hash, or `NO_ROW`. Two different keys with one
+    // hash are not expected in practice; the chain keeps them correct if it happens.
+    next_with_hash: usize,
     // Keeping the common single-version case inline avoids one Vec allocation per unique key.
     first: Version,
     rest: Vec<Version>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Version {
     lsn: StrataLsn,
-    value: Vec<u8>,
+    value: Span,
     key_prefix_len: usize,
 }
 
-impl KeyHistory {
-    fn new(first: Version) -> Self {
-        Self {
-            first,
-            rest: Vec::new(),
+/// Where a run of bytes lives in a generation's byte blocks.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    block: usize,
+    start: usize,
+    len: usize,
+}
+
+/// Append-only storage for a generation's key and value bytes.
+#[derive(Debug, Default)]
+struct ByteBlocks {
+    blocks: Vec<Vec<u8>>,
+    // The block that takes the next bytes. Blocks before it are closed; blocks after it are empty
+    // and were kept from a recycled generation.
+    current: usize,
+}
+
+impl ByteBlocks {
+    /// Copies `bytes` into a block and returns where they are.
+    ///
+    /// A block never reallocates: bytes go into the current block only if they fit in its spare
+    /// capacity, and otherwise into the next one. No insert therefore pays for copying earlier
+    /// bytes, and the cost of a new block is one allocation.
+    fn push(&mut self, bytes: &[u8]) -> Span {
+        if bytes.is_empty() {
+            return Span {
+                block: 0,
+                start: 0,
+                len: 0,
+            };
+        }
+        loop {
+            match self.blocks.get_mut(self.current) {
+                Some(block) if block.capacity() - block.len() >= bytes.len() => {
+                    let start = block.len();
+                    block.extend_from_slice(bytes);
+                    return Span {
+                        block: self.current,
+                        start,
+                        len: bytes.len(),
+                    };
+                }
+                Some(_) => self.current += 1,
+                None => self
+                    .blocks
+                    .push(Vec::with_capacity(bytes.len().max(BLOCK_BYTES))),
+            }
         }
     }
 
+    fn get(&self, span: Span) -> &[u8] {
+        if span.len == 0 {
+            return &[];
+        }
+        &self.blocks[span.block][span.start..span.start + span.len]
+    }
+
+    /// Empties every block and keeps their allocations.
+    fn clear(&mut self) {
+        for block in &mut self.blocks {
+            block.clear();
+        }
+        self.current = 0;
+    }
+}
+
+/// Hasher for a table whose keys already are hashes.
+#[derive(Debug, Default, Clone, Copy)]
+struct PrecomputedHash(u64);
+
+impl Hasher for PrecomputedHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // The table is keyed by `u64`, which arrives through `write_u64`. Anything else is folded
+        // in rather than rejected, so the type stays a valid hasher.
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+impl Row {
     fn get(&self, index: usize) -> Option<&Version> {
         if index == 0 {
             Some(&self.first)
@@ -129,10 +241,6 @@ impl KeyHistory {
 
     fn latest(&self) -> &Version {
         self.rest.last().unwrap_or(&self.first)
-    }
-
-    fn push(&mut self, version: Version) {
-        self.rest.push(version);
     }
 
     fn versions(&self) -> impl Iterator<Item = &Version> {
@@ -211,7 +319,7 @@ impl Memtable {
     /// Stores one mutation and makes it the latest value for `key`.
     ///
     /// The configured rollover policy is evaluated before validation or mutation. When it fires,
-    /// the old map is returned and the entry is inserted into the new active
+    /// the old generation is returned and the entry is inserted into the new active
     /// generation. LSNs must increase across the rollover boundary.
     ///
     /// Without a configured policy, a full generation is left unchanged and reports
@@ -224,11 +332,9 @@ impl Memtable {
     ) -> Result<Option<FrozenMemtable>> {
         let should_rollover = self.rollover_due();
 
-        let mut key = key.to_vec();
-        let mut value = value.to_vec();
-        let mut required = self.generation.validate_insert(&key, lsn, &value)?;
+        let mut required = self.generation.validate_insert(key, lsn, value)?;
         if should_rollover {
-            required = self.generation.required_bytes_for_new_key(&key, &value)?;
+            required = self.generation.required_bytes_for_new_key(key, value)?;
         }
         let frozen = if should_rollover {
             let next_generation =
@@ -243,18 +349,19 @@ impl Memtable {
             self.generation.ensure_available(required)?;
             None
         };
-        self.generation
-            .insert_owned(&mut key, lsn, &mut value, 0, required);
+        self.generation.insert_bytes(key, lsn, value, 0, required);
         Ok(frozen)
     }
 
     pub(crate) fn insert_active(&mut self, key: &[u8], lsn: StrataLsn, value: &[u8]) -> Result<()> {
-        let mut key = key.to_vec();
-        let mut value = value.to_vec();
-        self.insert_active_owned(&mut key, lsn, &mut value)
+        let required = self.generation.validate_insert(key, lsn, value)?;
+        self.generation.ensure_available(required)?;
+        self.generation.insert_bytes(key, lsn, value, 0, required);
+        Ok(())
     }
 
-    /// Inserts engine-owned bytes without allocating or copying their key or value again.
+    /// Inserts engine-owned bytes. They are copied into the generation's byte blocks and the two
+    /// vectors are left empty, with their allocations, for the caller to reuse or drop.
     ///
     /// On `MemtableFull`, both vectors remain untouched so the engine can roll and retry.
     pub(crate) fn insert_active_owned(
@@ -278,14 +385,13 @@ impl Memtable {
         value: &[u8],
     ) -> Result<Option<FrozenMemtable>> {
         let should_rollover = self.rollover_due();
-        let (mut required, mut full_key) = self
+        let (mut required, full_key) = self
             .generation
             .validate_prefix_insert(key_prefix, key_suffix, lsn, value)?;
-        let mut value = value.to_vec();
         if should_rollover {
             required = self
                 .generation
-                .required_bytes_for_new_key(&full_key, &value)?;
+                .required_bytes_for_new_key(&full_key, value)?;
         }
         let frozen = if should_rollover {
             let next_generation =
@@ -301,7 +407,7 @@ impl Memtable {
             None
         };
         self.generation
-            .insert_owned(&mut full_key, lsn, &mut value, key_prefix.len(), required);
+            .insert_bytes(&full_key, lsn, value, key_prefix.len(), required);
         Ok(frozen)
     }
 
@@ -312,14 +418,17 @@ impl Memtable {
         lsn: StrataLsn,
         value: &[u8],
     ) -> Result<()> {
-        let mut full_key = Vec::with_capacity(key_prefix.len().saturating_add(key_suffix.len()));
-        full_key.extend_from_slice(key_prefix);
-        full_key.extend_from_slice(key_suffix);
-        let mut value = value.to_vec();
-        self.insert_prefix_active_owned(&mut full_key, key_prefix.len(), lsn, &mut value)
+        let (required, full_key) = self
+            .generation
+            .validate_prefix_insert(key_prefix, key_suffix, lsn, value)?;
+        self.generation.ensure_available(required)?;
+        self.generation
+            .insert_bytes(&full_key, lsn, value, key_prefix.len(), required);
+        Ok(())
     }
 
     /// Inserts an engine-owned full key and value while retaining the key's explicit prefix split.
+    /// The bytes are copied and the vectors left empty, as in [`Self::insert_active_owned`].
     /// On `MemtableFull`, both vectors remain untouched for a rollover retry.
     pub(crate) fn insert_prefix_active_owned(
         &mut self,
@@ -345,19 +454,19 @@ impl Memtable {
         self.generation.get_all(key)
     }
 
-    /// Iterates every mutation, grouped by hash-map key and then by increasing LSN.
+    /// Iterates every mutation, grouped by key and then by increasing LSN.
     pub fn entries(&self) -> MemtableEntries<'_> {
         self.generation.entries()
     }
 
-    /// Freezes the active key/version map and installs an empty generation.
+    /// Freezes the active generation and installs an empty one.
     ///
-    /// The new generation's key map is sized for as many keys as the outgoing one holds. A map
-    /// that starts empty grows by doubling, and every doubling rehashes all of its keys inside
-    /// the insert that triggers it: with a few thousand keys per generation that is a pause of
-    /// several hundred microseconds on the writer, a few times per generation. Consecutive
-    /// generations of a partition hold about the same number of keys, so sizing the next one
-    /// from the last removes those pauses.
+    /// The new generation's key table and row vector are sized for as many keys as the outgoing
+    /// one holds. A table that starts empty grows by doubling, and every doubling moves all of its
+    /// entries inside the insert that triggers it: with a few thousand keys per generation that
+    /// is a pause of several hundred microseconds on the writer, a few times per generation.
+    /// Consecutive generations of a partition hold about the same number of keys, so sizing the
+    /// next one from the last removes those pauses.
     pub fn rollover(&mut self, next_generation: u64) -> Result<FrozenMemtable> {
         let replacement = Self {
             generation: Generation::with_key_capacity(
@@ -373,7 +482,8 @@ impl Memtable {
     /// Freezes the active generation and installs an empty, possibly recycled replacement.
     ///
     /// A small caller-owned pool can recycle published generations and pass them here, retaining
-    /// the hash-table allocation instead of allocating it on every rollover.
+    /// the key table, the row vector and the byte blocks instead of allocating them on every
+    /// rollover.
     pub fn rollover_into(&mut self, mut replacement: Memtable) -> Result<FrozenMemtable> {
         if replacement.generation.id <= self.generation.id {
             return Err(Error::MemtableGenerationOutOfOrder {
@@ -436,7 +546,7 @@ impl FrozenMemtable {
         self.generation.get_all(key)
     }
 
-    /// Iterates every mutation, grouped by hash-map key and then by increasing LSN.
+    /// Iterates every mutation, grouped by key and then by increasing LSN.
     pub fn entries(&self) -> MemtableEntries<'_> {
         self.generation.entries()
     }
@@ -450,11 +560,12 @@ impl FrozenMemtable {
     }
 
     pub(crate) fn indexed_entries(&self) -> impl Iterator<Item = (&[u8], usize, StrataLsn)> {
-        self.generation.rows.iter().flat_map(|(key, history)| {
-            history
-                .versions()
+        let generation = &self.generation;
+        generation.rows.iter().flat_map(move |row| {
+            let key = generation.bytes.get(row.key);
+            row.versions()
                 .enumerate()
-                .map(move |(version, value)| (key.as_slice(), version, value.lsn))
+                .map(move |(version, value)| (key, version, value.lsn))
         })
     }
 
@@ -484,28 +595,34 @@ impl FrozenMemtable {
         }
         let mut writer =
             TableWriter::create_patch(root, relative_path, id, partition, patch_format_id)?;
-        let mut rows = self.generation.rows.iter().collect::<Vec<_>>();
+        let generation = &self.generation;
+        let mut rows = generation
+            .rows
+            .iter()
+            .map(|row| (generation.bytes.get(row.key), row))
+            .collect::<Vec<_>>();
         rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let mut floor = OperandFloor::None;
-        for (key, history) in rows {
+        for (key, row) in rows {
             if let Some(classify) = classify_operands {
-                let operands = history
+                let operands = row
                     .versions()
-                    .map(|version| (version.lsn, version.value.as_slice()))
+                    .map(|version| (version.lsn, generation.bytes.get(version.value)))
                     .collect::<Vec<_>>();
                 if let Some(lsn) = classify(&operands)? {
                     floor = floor.merge(OperandFloor::At(lsn));
                 }
             }
-            for version in history.versions() {
+            for version in row.versions() {
+                let value = generation.bytes.get(version.value);
                 if version.key_prefix_len == 0 {
-                    writer.add_patch(key, version.lsn, &version.value)?;
+                    writer.add_patch(key, version.lsn, value)?;
                 } else {
                     writer.add_prefix_patch(
                         &key[..version.key_prefix_len],
                         &key[version.key_prefix_len..],
                         version.lsn,
-                        &version.value,
+                        value,
                     )?;
                 }
             }
@@ -540,31 +657,61 @@ impl Generation {
         Self::with_key_capacity(id, capacity, 0)
     }
 
-    /// A generation whose key map can take `keys` keys before it has to grow. Zero allocates
-    /// nothing, like `HashMap::new`.
+    /// A generation whose key table and row vector can take `keys` keys before they have to
+    /// grow. Zero allocates nothing.
     fn with_key_capacity(id: u64, capacity: usize, keys: usize) -> Self {
         Self {
             id,
             capacity,
-            rows: HashMap::with_capacity(keys),
+            index: HashMap::with_capacity_and_hasher(keys, BuildHasherDefault::default()),
+            hasher: RandomState::new(),
+            rows: Vec::with_capacity(keys),
+            bytes: ByteBlocks::default(),
             used_bytes: 0,
             entry_count: 0,
             first_lsn: None,
             last_lsn: None,
             started_at: Instant::now(),
+            #[cfg(test)]
+            collide_all_keys: false,
         }
     }
 
     fn reset(&mut self, id: u64) {
         self.id = id;
-        // `clear` drops key/value allocations but retains the hash-table buckets for the next
-        // generation. Values on the engine path were already allocated before insertion.
+        // Keeps the key table's buckets, the row vector and the byte blocks for the next
+        // generation. Only the history vectors of keys with several versions are freed.
+        self.index.clear();
         self.rows.clear();
+        self.bytes.clear();
         self.used_bytes = 0;
         self.entry_count = 0;
         self.first_lsn = None;
         self.last_lsn = None;
         self.started_at = Instant::now();
+    }
+
+    fn key_hash(&self, key: &[u8]) -> u64 {
+        #[cfg(test)]
+        if self.collide_all_keys {
+            return 0;
+        }
+        self.hasher.hash_one(key)
+    }
+
+    /// The row of `key`, if the generation has one.
+    fn find(&self, key: &[u8]) -> Option<usize> {
+        let mut row = *self.index.get(&self.key_hash(key))?;
+        loop {
+            let candidate = &self.rows[row];
+            if self.bytes.get(candidate.key) == key {
+                return Some(row);
+            }
+            if candidate.next_with_hash == NO_ROW {
+                return None;
+            }
+            row = candidate.next_with_hash;
+        }
     }
 
     fn validate_insert(&self, key: &[u8], lsn: StrataLsn, value: &[u8]) -> Result<usize> {
@@ -578,7 +725,7 @@ impl Generation {
             capacity: self.capacity,
             required: usize::MAX,
         })?;
-        let key_bytes = if self.rows.contains_key(key) {
+        let key_bytes = if self.find(key).is_some() {
             0
         } else {
             key.len()
@@ -656,7 +803,7 @@ impl Generation {
     }
 
     fn required_bytes(&self, key: &[u8], value: &[u8]) -> Result<usize> {
-        let key_bytes = if self.rows.contains_key(key) {
+        let key_bytes = if self.find(key).is_some() {
             0
         } else {
             key.len()
@@ -709,6 +856,7 @@ impl Generation {
         Ok(())
     }
 
+    /// Stores caller-owned bytes and leaves the caller's vectors empty.
     fn insert_owned(
         &mut self,
         key: &mut Vec<u8>,
@@ -717,15 +865,56 @@ impl Generation {
         key_prefix_len: usize,
         required: usize,
     ) {
+        self.insert_bytes(key, lsn, value, key_prefix_len, required);
+        key.clear();
+        value.clear();
+    }
+
+    fn insert_bytes(
+        &mut self,
+        key: &[u8],
+        lsn: StrataLsn,
+        value: &[u8],
+        key_prefix_len: usize,
+        required: usize,
+    ) {
+        let hash = self.key_hash(key);
         let version = Version {
             lsn,
-            value: mem::take(value),
+            value: self.bytes.push(value),
             key_prefix_len,
         };
-        if let Some(history) = self.rows.get_mut(key.as_slice()) {
-            history.push(version);
-        } else {
-            self.rows.insert(mem::take(key), KeyHistory::new(version));
+        match self.index.entry(hash) {
+            hash_map::Entry::Vacant(slot) => {
+                slot.insert(self.rows.len());
+                self.rows.push(Row {
+                    key: self.bytes.push(key),
+                    next_with_hash: NO_ROW,
+                    first: version,
+                    rest: Vec::new(),
+                });
+            }
+            hash_map::Entry::Occupied(slot) => {
+                let mut row = *slot.get();
+                loop {
+                    if self.bytes.get(self.rows[row].key) == key {
+                        self.rows[row].rest.push(version);
+                        break;
+                    }
+                    let next = self.rows[row].next_with_hash;
+                    if next == NO_ROW {
+                        self.rows[row].next_with_hash = self.rows.len();
+                        self.rows.push(Row {
+                            key: self.bytes.push(key),
+                            next_with_hash: NO_ROW,
+                            first: version,
+                            rest: Vec::new(),
+                        });
+                        break;
+                    }
+                    row = next;
+                }
+            }
         }
         self.used_bytes += required;
         self.entry_count += 1;
@@ -734,25 +923,24 @@ impl Generation {
     }
 
     fn get(&self, key: &[u8]) -> Option<MemtableEntry<'_>> {
-        let (stored_key, history) = self.rows.get_key_value(key)?;
-        Some(Self::entry(stored_key, history.latest()))
+        let row = &self.rows[self.find(key)?];
+        Some(self.entry(row, row.latest()))
     }
 
     fn get_all(&self, key: &[u8]) -> Vec<MemtableEntry<'_>> {
-        self.rows
-            .get_key_value(key)
-            .map_or_else(Vec::new, |(stored_key, history)| {
-                history
-                    .versions()
-                    .map(|version| Self::entry(stored_key, version))
-                    .collect()
-            })
+        self.find(key).map_or_else(Vec::new, |row| {
+            let row = &self.rows[row];
+            row.versions()
+                .map(|version| self.entry(row, version))
+                .collect()
+        })
     }
 
     fn entries(&self) -> MemtableEntries<'_> {
         MemtableEntries {
-            rows: self.rows.iter(),
-            current: None,
+            generation: self,
+            row: 0,
+            version: 0,
         }
     }
 
@@ -760,37 +948,32 @@ impl Generation {
         let mut entries = self
             .rows
             .iter()
-            .map(|(key, history)| Self::entry(key, history.latest()))
+            .map(|row| self.entry(row, row.latest()))
             .collect::<Vec<_>>();
         entries.sort_unstable_by(|left, right| left.key.cmp(right.key));
         entries
     }
 
     fn entry_at(&self, key: &[u8], version: usize) -> Option<MemtableEntry<'_>> {
-        let (stored_key, history) = self.rows.get_key_value(key)?;
-        Some(Self::entry(stored_key, history.get(version)?))
+        let row = &self.rows[self.find(key)?];
+        Some(self.entry(row, row.get(version)?))
     }
 
-    fn entry<'a>(key: &'a [u8], version: &'a Version) -> MemtableEntry<'a> {
+    fn entry(&self, row: &Row, version: &Version) -> MemtableEntry<'_> {
         MemtableEntry {
             lsn: version.lsn,
-            key,
-            value: &version.value,
+            key: self.bytes.get(row.key),
+            value: self.bytes.get(version.value),
             key_prefix_len: version.key_prefix_len,
         }
     }
 }
 
-struct KeyVersions<'a> {
-    key: &'a [u8],
-    history: &'a KeyHistory,
-    next: usize,
-}
-
 /// Borrowed iterator over one stable memtable generation.
 pub struct MemtableEntries<'a> {
-    rows: hash_map::Iter<'a, Vec<u8>, KeyHistory>,
-    current: Option<KeyVersions<'a>>,
+    generation: &'a Generation,
+    row: usize,
+    version: usize,
 }
 
 impl<'a> Iterator for MemtableEntries<'a> {
@@ -798,18 +981,13 @@ impl<'a> Iterator for MemtableEntries<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(current) = &mut self.current
-                && let Some(version) = current.history.get(current.next)
-            {
-                current.next += 1;
-                return Some(Generation::entry(current.key, version));
+            let row = self.generation.rows.get(self.row)?;
+            if let Some(version) = row.get(self.version) {
+                self.version += 1;
+                return Some(self.generation.entry(row, version));
             }
-            let (key, history) = self.rows.next()?;
-            self.current = Some(KeyVersions {
-                key,
-                history,
-                next: 0,
-            });
+            self.row += 1;
+            self.version = 0;
         }
     }
 }
@@ -820,7 +998,7 @@ mod tests {
 
     use crate::{Error, OperandFloor, OperandFloorFn, StrataLsn, TableReader};
 
-    use super::{Memtable, MemtableRolloverPolicy, VERSION_BYTES};
+    use super::{BLOCK_BYTES, Memtable, MemtableRolloverPolicy, VERSION_BYTES};
 
     fn lsn(sequence: u64) -> StrataLsn {
         sequence
@@ -902,12 +1080,12 @@ mod tests {
     }
 
     #[test]
-    fn first_version_is_inline_and_owned_bytes_move_without_a_copy() {
+    fn first_version_is_inline_and_owned_bytes_are_copied_into_one_block() {
         let mut memtable = Memtable::new(1, 1024);
         let mut key = b"key".to_vec();
         let mut value = b"value".to_vec();
-        let key_pointer = key.as_ptr();
-        let value_pointer = value.as_ptr();
+        let key_capacity = key.capacity();
+        let value_capacity = value.capacity();
         memtable
             .insert_active_owned(&mut key, lsn(7), &mut value)
             .unwrap();
@@ -916,37 +1094,43 @@ mod tests {
             memtable.used_bytes(),
             VERSION_BYTES + b"key".len() + b"value".len()
         );
-        let (stored_key, history) = memtable
-            .generation
-            .rows
-            .get_key_value(b"key".as_slice())
-            .unwrap();
-        assert_eq!(stored_key.as_ptr(), key_pointer);
-        assert_eq!(history.first.value.as_ptr(), value_pointer);
-        assert_eq!(history.rest.capacity(), 0);
+        // The caller's vectors come back empty and keep their allocations.
+        assert!(key.is_empty() && value.is_empty());
+        assert_eq!(key.capacity(), key_capacity);
+        assert_eq!(value.capacity(), value_capacity);
+        let entry = memtable.get(b"key").unwrap();
+        assert_eq!(
+            (entry.key, entry.value),
+            (b"key".as_slice(), b"value".as_slice())
+        );
+        // Key and value share one block, and a single version allocates no history vector.
+        let generation = &memtable.generation;
+        assert_eq!(generation.bytes.blocks.len(), 1);
+        assert_eq!(generation.bytes.blocks[0], b"valuekey");
+        assert_eq!(generation.rows.len(), 1);
+        assert_eq!(generation.rows[0].rest.capacity(), 0);
+    }
+
+    #[test]
+    fn version_descriptor_charge_matches_the_stored_record() {
+        // Byte accounting charges every version this much on top of its bytes. The record holds
+        // an LSN, the place of the value and the prefix length.
+        assert_eq!(VERSION_BYTES, 40);
     }
 
     #[test]
     fn repeated_versions_reuse_the_key_and_allocate_history_lazily() {
         let mut memtable = Memtable::new(1, 1024);
         insert(&mut memtable, b"key", 1, b"first");
-        let key_pointer = memtable
-            .generation
-            .rows
-            .get_key_value(b"key".as_slice())
-            .unwrap()
-            .0
-            .as_ptr();
+        let key_pointer = memtable.get(b"key").unwrap().key.as_ptr();
 
         insert(&mut memtable, b"key", 2, b"second");
 
-        let (stored_key, history) = memtable
-            .generation
-            .rows
-            .get_key_value(b"key".as_slice())
-            .unwrap();
-        assert_eq!(stored_key.as_ptr(), key_pointer);
-        assert_eq!(1 + history.rest.len(), 2);
+        assert_eq!(memtable.get(b"key").unwrap().key.as_ptr(), key_pointer);
+        assert_eq!(memtable.generation.rows.len(), 1);
+        assert_eq!(1 + memtable.generation.rows[0].rest.len(), 2);
+        // The key's bytes were stored once.
+        assert_eq!(memtable.generation.bytes.blocks[0], b"firstkeysecond");
         assert_eq!(memtable.key_count(), 1);
         assert_eq!(
             memtable.used_bytes(),
@@ -1237,6 +1421,7 @@ mod tests {
     #[test]
     fn rollover_sizes_the_next_key_map_for_the_outgoing_key_count() {
         let mut active = Memtable::new(1, 1 << 20);
+        assert_eq!(active.generation.index.capacity(), 0);
         assert_eq!(active.generation.rows.capacity(), 0);
         for index in 0..1000_u64 {
             insert(
@@ -1249,14 +1434,15 @@ mod tests {
 
         let frozen = active.rollover(2).unwrap();
         assert_eq!(frozen.key_count(), 1000);
-        let sized = active.generation.rows.capacity();
+        let sized = active.generation.index.capacity();
+        let rows_sized = active.generation.rows.capacity();
         assert!(
-            sized >= 1000,
-            "the next generation was sized for {sized} keys"
+            sized >= 1000 && rows_sized >= 1000,
+            "the next generation was sized for {sized} keys and {rows_sized} rows"
         );
 
-        // Filling the next generation to the same key count never grows the map, so no insert
-        // pays for a rehash.
+        // Filling the next generation to the same key count grows neither the key table nor the
+        // row vector, so no insert pays for moving the earlier entries.
         for index in 0..1000_u64 {
             insert(
                 &mut active,
@@ -1264,13 +1450,164 @@ mod tests {
                 2000 + index,
                 b"value",
             );
-            assert_eq!(active.generation.rows.capacity(), sized);
+            assert_eq!(active.generation.index.capacity(), sized);
+            assert_eq!(active.generation.rows.capacity(), rows_sized);
         }
 
         // An empty outgoing generation asks for nothing.
         let mut empty = Memtable::new(1, 1024);
         empty.rollover(2).unwrap();
+        assert_eq!(empty.generation.index.capacity(), 0);
         assert_eq!(empty.generation.rows.capacity(), 0);
+    }
+
+    #[test]
+    fn a_generation_keeps_its_bytes_in_a_few_blocks() {
+        // 20,000 keys with a value each: 40,000 byte strings, about 0.5 MiB.
+        let mut memtable = Memtable::new(1, 1 << 30);
+        for index in 0..20_000_u64 {
+            insert(
+                &mut memtable,
+                format!("key-{index:08}").as_bytes(),
+                index + 1,
+                format!("value-{index:08}").as_bytes(),
+            );
+        }
+        let blocks = &memtable.generation.bytes.blocks;
+        assert!(blocks.len() <= 3, "{} blocks", blocks.len());
+        // No block grew past the capacity it was created with, so nothing was ever moved.
+        assert!(blocks.iter().all(|block| block.capacity() == BLOCK_BYTES));
+        for index in (0..20_000_u64).step_by(997) {
+            let entry = memtable.get(format!("key-{index:08}").as_bytes()).unwrap();
+            assert_eq!(entry.value, format!("value-{index:08}").as_bytes());
+            assert_eq!(entry.lsn, index + 1);
+        }
+        assert_eq!(memtable.entries().count(), 20_000);
+    }
+
+    #[test]
+    fn bytes_larger_than_a_block_get_their_own_block() {
+        let mut memtable = Memtable::new(1, 1 << 30);
+        let large = vec![7_u8; BLOCK_BYTES + 1];
+        insert(&mut memtable, b"before", 1, b"small");
+        insert(&mut memtable, b"large", 2, &large);
+        insert(&mut memtable, b"after", 3, b"small again");
+
+        assert_eq!(memtable.get(b"before").unwrap().value, b"small");
+        assert_eq!(memtable.get(b"large").unwrap().value, large.as_slice());
+        assert_eq!(memtable.get(b"after").unwrap().value, b"small again");
+        let blocks = &memtable.generation.bytes.blocks;
+        assert!(blocks.iter().any(|block| block.len() == BLOCK_BYTES + 1));
+        // Earlier blocks are not reallocated to make room.
+        assert!(blocks.iter().all(|block| block.len() <= block.capacity()));
+        assert_eq!(blocks[0].capacity(), BLOCK_BYTES);
+    }
+
+    #[test]
+    fn keys_with_the_same_hash_stay_separate() {
+        let mut memtable = Memtable::new(1, 1 << 20);
+        memtable.generation.collide_all_keys = true;
+        insert(&mut memtable, b"alpha", 1, b"a1");
+        insert(&mut memtable, b"beta", 2, b"b1");
+        insert(&mut memtable, b"gamma", 3, b"g1");
+        insert(&mut memtable, b"beta", 4, b"b2");
+        insert(&mut memtable, b"alpha", 5, b"a2");
+        insert(&mut memtable, b"gamma", 6, b"g2");
+        insert(&mut memtable, b"", 7, b"empty key");
+
+        // One hash, one table entry, four rows chained behind it.
+        assert_eq!(memtable.generation.index.len(), 1);
+        assert_eq!(memtable.key_count(), 4);
+        assert_eq!(memtable.entry_count(), 7);
+        assert_eq!(memtable.get(b"alpha").unwrap().value, b"a2");
+        assert_eq!(memtable.get(b"beta").unwrap().value, b"b2");
+        assert_eq!(memtable.get(b"gamma").unwrap().value, b"g2");
+        assert_eq!(memtable.get(b"").unwrap().value, b"empty key");
+        assert!(memtable.get(b"delta").is_none());
+        assert!(memtable.get_all(b"delta").is_empty());
+        assert_eq!(
+            memtable
+                .get_all(b"beta")
+                .into_iter()
+                .map(|entry| (entry.lsn, entry.value))
+                .collect::<Vec<_>>(),
+            vec![(2, b"b1".as_slice()), (4, b"b2".as_slice())]
+        );
+        // A key that is new to the generation is charged for its bytes, a known one is not.
+        assert_eq!(
+            memtable.used_bytes(),
+            7 * VERSION_BYTES + b"alphabetagamma".len() + 6 * 2 + b"empty key".len()
+        );
+
+        let frozen = memtable.rollover(2).unwrap();
+        assert_eq!(frozen.entry_at(b"gamma", 0).value, b"g1");
+        assert_eq!(frozen.entry_at(b"gamma", 1).value, b"g2");
+        assert_eq!(
+            frozen
+                .latest_entries_sorted()
+                .into_iter()
+                .map(|entry| (entry.key, entry.value))
+                .collect::<Vec<_>>(),
+            vec![
+                (b"".as_slice(), b"empty key".as_slice()),
+                (b"alpha".as_slice(), b"a2".as_slice()),
+                (b"beta".as_slice(), b"b2".as_slice()),
+                (b"gamma".as_slice(), b"g2".as_slice()),
+            ]
+        );
+        let mut indexed = frozen
+            .indexed_entries()
+            .map(|(key, version, lsn)| (lsn, key.to_vec(), version))
+            .collect::<Vec<_>>();
+        indexed.sort_unstable();
+        assert_eq!(
+            indexed,
+            vec![
+                (1, b"alpha".to_vec(), 0),
+                (2, b"beta".to_vec(), 0),
+                (3, b"gamma".to_vec(), 0),
+                (4, b"beta".to_vec(), 1),
+                (5, b"alpha".to_vec(), 1),
+                (6, b"gamma".to_vec(), 1),
+                (7, b"".to_vec(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn recycled_generation_reuses_its_byte_blocks() {
+        let mut active = Memtable::new(1, 1 << 30);
+        let value = vec![1_u8; 1000];
+        for index in 0..600_u64 {
+            insert(
+                &mut active,
+                format!("k{index}").as_bytes(),
+                index + 1,
+                &value,
+            );
+        }
+        let frozen = active.rollover(2).unwrap();
+        let blocks = frozen.generation.bytes.blocks.len();
+        assert!(blocks >= 2, "{blocks} blocks");
+        let first_block = frozen.generation.bytes.blocks[0].as_ptr();
+
+        let mut recycled = frozen.recycle(3).unwrap();
+        assert!(recycled.is_empty());
+        assert_eq!(recycled.generation.bytes.blocks.len(), blocks);
+        assert!(recycled.generation.bytes.blocks.iter().all(Vec::is_empty));
+        for index in 0..600_u64 {
+            insert(
+                &mut recycled,
+                format!("n{index}").as_bytes(),
+                1000 + index,
+                &value,
+            );
+        }
+        // The same blocks were filled again, in order, and no new one was needed.
+        assert_eq!(recycled.generation.bytes.blocks.len(), blocks);
+        assert_eq!(recycled.generation.bytes.blocks[0].as_ptr(), first_block);
+        assert!(recycled.get(b"k0").is_none());
+        assert_eq!(recycled.get(b"n599").unwrap().value, value.as_slice());
     }
 
     #[test]
