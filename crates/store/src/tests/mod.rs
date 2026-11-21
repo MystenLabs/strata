@@ -24,6 +24,7 @@ use crate::{
 
 mod garbage_log;
 mod submitted_batch_lsns;
+mod writer_cursor;
 
 const TEST_KEY_LEN: u64 = 6;
 const TEST_PAYLOAD_LEN: u64 = 9;
@@ -559,7 +560,7 @@ async fn store_wal_routes_payload_and_metadata_without_fake_lsm_rows() {
     // A shard drop is the same kind of RocksDB-only projection: it consumes global LSN 4 and is
     // recoverable from the store WAL, but it does not manufacture a blob key.
     store.drop_shard(STANDALONE_SHARD.id).unwrap();
-    assert_eq!(store.index().get_next_lsn().unwrap(), 5);
+    assert_eq!(store.next_lsn(), 5);
     assert_eq!(lsm.last_lsn().unwrap(), Some(3));
     store.sync().unwrap();
 
@@ -787,13 +788,8 @@ async fn relocation_compaction_reclaims_dead_destinations_and_reopens_current_by
     // drives compaction directly, so keep a store WAL open and mirror that one production step.
     // It is deliberately the *store* WAL; the relocation LSM has no private log.
     let checkpoint = store.index().get_store_checkpoint().unwrap();
-    let (mut store_wal, _, _, store_wal_sync_handles) = open_store_wal(
-        store.config(),
-        store.index(),
-        store.index().get_next_lsn().unwrap(),
-        checkpoint,
-    )
-    .unwrap();
+    let (mut store_wal, _, _, store_wal_sync_handles) =
+        open_store_wal(store.config(), store.index(), store.next_lsn(), checkpoint).unwrap();
 
     let segment_b = 99;
     let segment_c = 100;
@@ -1289,7 +1285,7 @@ async fn concurrent_logical_shard_puts_use_one_global_sequence() {
     assert_eq!(lsns.len(), 64);
     assert_eq!(lsns.first().copied(), Some(1));
     assert_eq!(lsns.last().copied(), Some(64));
-    assert_eq!(store.index().get_next_lsn().unwrap(), 65);
+    assert_eq!(store.next_lsn(), 65);
     for (shard_id, key, payload, _) in writes {
         assert_eq!(store.get_from_shard(shard_id, &key).unwrap(), Some(payload));
     }
@@ -1395,12 +1391,12 @@ async fn store_batch_buffers_ops_until_write_and_returns_global_lsns() {
         .put(20, key_b.clone(), Arc::<[u8]>::from(&b"payload-b"[..]))
         .set_blob_lifetime(key_a.clone(), 50)
         .tombstone(20, key_b.clone());
-    assert_eq!(store.index().get_next_lsn().unwrap(), 1);
+    assert_eq!(store.next_lsn(), 1);
 
     let result = batch.write().unwrap();
 
     assert_eq!(result.op_lsns(), &[1, 2, 3, 4]);
-    assert_eq!(store.index().get_next_lsn().unwrap(), 5);
+    assert_eq!(store.next_lsn(), 5);
     assert_eq!(
         store.get_from_shard(10, &key_a).unwrap(),
         Some(b"payload-a".to_vec())
@@ -1454,7 +1450,7 @@ async fn store_batch_can_mix_epoch_changes_with_blob_ops() {
     assert_eq!(store.epoch_at_lsn(1).unwrap(), Some(42));
     assert_eq!(store.epoch_at_lsn(2).unwrap(), Some(43));
     assert_eq!(store.index().get_epoch_change(2).unwrap(), Some(43));
-    assert_eq!(store.index().get_next_lsn().unwrap(), 4);
+    assert_eq!(store.next_lsn(), 4);
     assert_eq!(store.get(&key_a).unwrap(), Some(b"payload-a".to_vec()));
     assert_eq!(store.get(&key_b).unwrap(), Some(b"payload-b".to_vec()));
 
@@ -1749,7 +1745,7 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
     let put_lsn = store.store.put(41, &key, b"old generation").unwrap();
     let record_ref = lsm_blob(&store, shard, &key).record_ref;
     let drop_lsn = put_lsn + 1;
-    assert_eq!(store.index().get_next_lsn().unwrap(), drop_lsn);
+    assert_eq!(store.next_lsn(), drop_lsn);
 
     store.store.drop_shard(41).unwrap();
 
@@ -1761,7 +1757,7 @@ async fn drop_shard_retires_mixed_ingest_bytes_without_tombstones() {
         })
     );
     assert!(store.store.get_from_shard(41, &key).is_err());
-    assert_eq!(store.index().get_next_lsn().unwrap(), drop_lsn + 1);
+    assert_eq!(store.next_lsn(), drop_lsn + 1);
     assert!(store.index().get_committed_lsn().unwrap() < drop_lsn);
     store.sync().unwrap();
     assert_eq!(store.index().get_committed_lsn().unwrap(), drop_lsn);
@@ -2035,7 +2031,7 @@ async fn new_store_records_starting_epoch_as_lsn_zero_genesis() {
     assert_eq!(store.epoch_at_lsn(0).unwrap(), Some(42));
     assert_eq!(store.epoch_at_lsn(1).unwrap(), Some(42));
     assert_eq!(store.index().get_epoch_change(0).unwrap(), Some(42));
-    assert_eq!(store.index().get_next_lsn().unwrap(), 1);
+    assert_eq!(store.next_lsn(), 1);
     assert_eq!(store.index().get_committed_lsn().unwrap(), 0);
     assert_eq!(
         store.index().get_shard_info(0).unwrap(),
@@ -2071,7 +2067,7 @@ async fn increment_epoch_consumes_lsn_and_is_metadata_durable() {
 
     assert_eq!(store.increment_epoch().unwrap(), (43, 1));
     assert_eq!(store.current_epoch().unwrap(), 43);
-    assert_eq!(store.index().get_next_lsn().unwrap(), 2);
+    assert_eq!(store.next_lsn(), 2);
     assert_eq!(store.index().get_epoch_change(1).unwrap(), Some(43));
     assert_eq!(store.put(&key, b"payload").unwrap(), 2);
 
@@ -2666,6 +2662,15 @@ async fn metrics_track_seal_backpressure_waits() {
         sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
         active_segment_state,
+        next_lsn: index.get_next_lsn().unwrap(),
+        index_next_lsn: index.get_next_lsn().unwrap(),
+        visible_next_lsn: Arc::new(std::sync::atomic::AtomicU64::new(
+            index.get_next_lsn().unwrap(),
+        )),
+        cursor: crate::writer_cursor::WriterCursor::open(crate::writer_cursor::writer_cursor_path(
+            &cfg,
+        ))
+        .unwrap(),
         durable_offset: 0,
         active_allocation_records: 0,
         active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),
@@ -2724,14 +2729,14 @@ async fn set_blob_lifetime_missing_or_tombstoned_blob_records_metadata() {
 
     assert_eq!(store.extend(&missing, 50).unwrap(), Some(1));
     assert_eq!(store.get(&missing).unwrap(), None);
-    assert_eq!(store.index().get_next_lsn().unwrap(), 2);
+    assert_eq!(store.next_lsn(), 2);
 
     store.put(&tombstoned, b"payload").unwrap();
     store.tombstone(&tombstoned).unwrap();
 
     assert_eq!(store.extend(&tombstoned, 50).unwrap(), Some(4));
     assert_eq!(store.get(&tombstoned).unwrap(), None);
-    assert_eq!(store.index().get_next_lsn().unwrap(), 5);
+    assert_eq!(store.next_lsn(), 5);
 }
 
 #[tokio::test]
@@ -2945,8 +2950,7 @@ async fn sync_advances_durable_offset_after_segment_fsync() {
     store.put(&key, b"payload").unwrap();
 
     let unsynced = store
-        .index()
-        .get_segment_state(FIRST_SEGMENT_ID)
+        .committed_segment_state(FIRST_SEGMENT_ID)
         .unwrap()
         .unwrap();
     assert_eq!(unsynced.durable_offset, 0);
@@ -2986,8 +2990,7 @@ async fn put_after_sync_preserves_durable_offset() {
     store.put(&key_2, b"payload-b").unwrap();
 
     let after_put = store
-        .index()
-        .get_segment_state(FIRST_SEGMENT_ID)
+        .committed_segment_state(FIRST_SEGMENT_ID)
         .unwrap()
         .unwrap();
     assert_eq!(after_put.durable_offset, synced.durable_offset);
@@ -3028,8 +3031,7 @@ async fn recovery_truncates_partial_tail() {
         store.put(&key, b"payload").unwrap();
         store.index().flush_wal(true).unwrap();
         valid_len = store
-            .index()
-            .get_segment_state(FIRST_SEGMENT_ID)
+            .committed_segment_state(FIRST_SEGMENT_ID)
             .unwrap()
             .unwrap()
             .write_offset;
@@ -3071,7 +3073,7 @@ async fn recovery_removes_epoch_changes_after_rolled_back_blob_lsn() {
     assert_eq!(store.current_epoch().unwrap(), 42);
     assert_eq!(store.epoch_at_lsn(2).unwrap(), Some(42));
     assert_eq!(store.index().get_epoch_change(2).unwrap(), None);
-    assert_eq!(store.index().get_next_lsn().unwrap(), 1);
+    assert_eq!(store.next_lsn(), 1);
 }
 
 #[tokio::test]
@@ -4435,7 +4437,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
         .unwrap()
         .join()
         .unwrap();
-    let next_lsn_before_publish = store.index().get_next_lsn().unwrap();
+    let next_lsn_before_publish = store.next_lsn();
     let published_lsn_before_publish = store.published_lsn().unwrap();
     let checkpoint_before_publish = store.index().get_store_checkpoint().unwrap();
 
@@ -4445,10 +4447,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     assert_eq!(published.skipped_records, Vec::new());
     assert_eq!(published.output_segments.len(), 1);
     assert_eq!(published.published_records.len(), 1);
-    assert_eq!(
-        store.index().get_next_lsn().unwrap(),
-        next_lsn_before_publish
-    );
+    assert_eq!(store.next_lsn(), next_lsn_before_publish);
     assert_eq!(store.published_lsn().unwrap(), published_lsn_before_publish);
     assert_eq!(
         store.index().get_store_checkpoint().unwrap(),
@@ -4582,7 +4581,7 @@ async fn gc_publish_maps_surviving_copied_record_to_output_segment() {
     let snapshot = store
         .store
         .live_snapshots
-        .pin(store.index().get_next_lsn().unwrap().saturating_sub(1));
+        .pin(store.next_lsn().saturating_sub(1));
     let prepared_delete = store.prepare_gc_plan(&planner).unwrap().unwrap();
     assert_eq!(prepared_delete.plan.scenario, GcScenario::EmptyDelete);
     assert_eq!(
@@ -5540,15 +5539,15 @@ async fn put_assigns_monotonic_lsn_across_reopen() {
         assert_eq!(lsm_blob_ref(&store, &key_1).segment_id, 1);
         assert_eq!(lsm_blob_ref(&store, &key_2).segment_id, 2);
         assert_eq!(lsm_blob(&store, STANDALONE_SHARD, &key_2).head_lsn, 2);
-        assert_eq!(store.index().get_next_lsn().unwrap(), 3);
+        assert_eq!(store.next_lsn(), 3);
     }
 
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
     let lsn_3 = store.put(&key_3, b"x").unwrap();
 
     assert_eq!(lsn_3, 3);
-    assert_eq!(store.index().get_next_lsn().unwrap(), 4);
-    let active_state = store.index().get_segment_state(2).unwrap().unwrap();
+    assert_eq!(store.next_lsn(), 4);
+    let active_state = store.committed_segment_state(2).unwrap().unwrap();
     assert_eq!(active_state.min_lsn, Some(2));
     assert_eq!(active_state.max_lsn, Some(3));
 }
@@ -5561,13 +5560,13 @@ async fn recovery_rolls_back_unpublished_ops_missing_from_store_wal() {
     {
         let store = try_open_standalone_store(cfg.clone(), StrataStoreMetrics::default()).unwrap();
         assert_eq!(store.put(&key, b"payload-a").unwrap(), 1);
-        assert_eq!(store.index().get_next_lsn().unwrap(), 2);
+        assert_eq!(store.next_lsn(), 2);
     }
 
     std::fs::remove_file(Wal::path(cfg.namespace_dir().join("wal"), 1)).unwrap();
 
     let store = try_open_standalone_store(cfg, StrataStoreMetrics::default()).unwrap();
-    assert_eq!(store.index().get_next_lsn().unwrap(), 1);
+    assert_eq!(store.next_lsn(), 1);
     assert_eq!(store.get(&key).unwrap(), None);
     assert_eq!(store.put(&key, b"payload-b").unwrap(), 1);
     assert_eq!(store.get(&key).unwrap(), Some(b"payload-b".to_vec()));
@@ -5972,6 +5971,15 @@ async fn segment_pressure_syncs_active_segment_without_rollover() {
         sync_and_commit_in_flight: None,
         pending_sync_requests: Vec::new(),
         active_segment_state,
+        next_lsn: index.get_next_lsn().unwrap(),
+        index_next_lsn: index.get_next_lsn().unwrap(),
+        visible_next_lsn: Arc::new(std::sync::atomic::AtomicU64::new(
+            index.get_next_lsn().unwrap(),
+        )),
+        cursor: crate::writer_cursor::WriterCursor::open(crate::writer_cursor::writer_cursor_path(
+            &cfg,
+        ))
+        .unwrap(),
         durable_offset: 0,
         active_allocation_records: 0,
         active_allocation_tracker: Arc::new(SegmentAllocationTracker::default()),

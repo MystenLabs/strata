@@ -1,13 +1,15 @@
 //! Foreground batch commit path: batch preparation, segment append, and the
 //! atomic index metadata commit.
 //! One writer thread, one LSN sequence: prepare_batch reserves a contiguous range, so a batch's ops can never interleave with another writer's.
-//! Fixed publication order — segment bytes → store WAL → LSM memtable → RocksDB batch — and the RocksDB batch is the commit point.
+//! Fixed publication order — segment bytes → store WAL → LSM memtable → writer frontier — and the frontier update is the commit point.
+//! For an ordinary group that update is one write to the writer cursor; a group that also rolls a segment, changes the epoch or
+//! records a caller's LSN key writes one RocksDB batch instead (see `writer_cursor`).
 //! Committed ≠ durable: when the caller gets its LSN back, the write is visible and ordered, but only a later sync (or the periodic durability publish) makes it crash-proof. Callers needing durability gate on published_lsn() >= lsn
 //!
 //! This is a *group* commit path. The writer loop, on picking up one Batch command, greedily
 //! drains every further Batch already sitting in the queue (up to the grouped-operation and
 //! grouped-payload caps in mod.rs) and hands the whole vector here. The point is amortization:
-//! N waiting callers cost one store-WAL append, one blob-LSM write, and one RocksDB batch —
+//! N waiting callers cost one store-WAL append, one blob-LSM write, and one frontier update —
 //! instead of N of each — while each caller still gets its own response, its own LSNs, and its
 //! own metrics.
 //!
@@ -30,7 +32,7 @@ use core_types::{Epoch, ShardId, ShardKey, StrataLsn, encoded_record_len};
 use crate::{
     BatchOp, BatchWriteRequest, BatchWriteResult, Error, PendingRollover, PreparedBatch,
     PreparedBatchOp, Result, StoreWriteProfile, WriteCoordinator, metrics::PutMetric,
-    profile_phase, wal::WalEntry, wal_format::StoreWalMutation,
+    profile_phase, wal::WalEntry, wal_format::StoreWalMutation, writer_cursor::WriterCursorRecord,
 };
 
 impl WriteCoordinator {
@@ -71,7 +73,8 @@ impl WriteCoordinator {
     ///
     /// Phase 3 — the commit point. Pending rollovers are taken (a roll staged in phase 2 commits
     /// exactly once, atomically with the records that already reference the new segment) and
-    /// commit_write_group writes the single RocksDB batch. Success makes every LSN in the group
+    /// commit_write_group advances the writer's frontier: one cursor write, or one RocksDB batch
+    /// when the group needs the index. Success makes every LSN in the group
     /// visible at once; failure is fatal exactly like phase 2, because the WAL and LSM now hold
     /// state the index refused to acknowledge.
     ///
@@ -125,7 +128,7 @@ impl WriteCoordinator {
                 || {
                     let batch_next_lsn = match next_lsn {
                         Some(next_lsn) => next_lsn,
-                        None => self.index.get_next_lsn()?,
+                        None => self.next_lsn,
                     };
                     let batch_epoch = match next_lsn {
                         Some(_) => current_epoch,
@@ -583,69 +586,99 @@ impl WriteCoordinator {
         std::mem::take(&mut self.pending_rollovers)
     }
 
-    /// Commits the index side of a group of prepared batches.
+    /// Commits a group of prepared batches: the point at which their LSNs become visible.
     ///
-    /// This assembles one atomic RocksDB write:
+    /// A group of ordinary puts, lifetime updates and deletes changes two facts, both owned by the
+    /// writer: `next_lsn = last committed lsn + 1` and the active segment's extent. Those go to
+    /// the writer cursor (see `writer_cursor`) and never enter the index's write queue, where
+    /// they would wait behind whatever batch a background thread is writing.
     ///
-    /// 1. Any pending rollover rows are part of the batch i.e. old segments flipped to `Sealing` state
-    ///    and new segments are registered and published at LSN.
+    /// A group that needs the index assembles one atomic RocksDB write, as every group used to:
+    ///
+    /// 1. Any pending rollover rows i.e. old segments flipped to `Sealing` state and new segments
+    ///    registered and published at LSN. A rollover during this write stages its metadata in
+    ///    `self.pending_rollovers`, so the active segment change commits atomically with the
+    ///    records that reference it.
     /// 2. For epoch change, the `epoch_changes[lsn]` history row and the `current_epoch` pointer.
-    /// 3. The updated active segment state row but only if op actually wrote payload bytes
-    /// 4. `next_lsn = last committed lsn + 1`
-    /// 5. Any opaque caller batch keys mapped to their batch's last LSN. These are submission
+    /// 3. Any opaque caller batch keys mapped to their batch's last LSN. These are submission
     ///    records, not durability markers; recovery removes them if their writes are discarded.
+    /// 4. The active segment's state row and `next_lsn`, always as a pair.
     ///
-    /// A rollover during this write stages its metadata in `self.pending_rollovers`, so the active
-    /// segment change commits atomically with the records that reference it.
-    ///
-    /// Two details are easy to miss. The active-segment row is written only when some op actually
-    /// appended payload bytes (`wrote_payload`) — a group of pure metadata ops (epoch changes,
-    /// tombstones, lifetimes) must not churn the segment row, and in particular must not
-    /// re-publish min/max LSN bounds that did not move. And the batch is written *without* sync:
-    /// this is the commit point for visibility and ordering, not for durability — per the module
-    /// doc, crash-proofness arrives later via the pressure-driven durability publish, and callers
-    /// that need it gate on published_lsn. One batch for the whole group also means the group is
-    /// all-or-nothing at the metadata level: either every caller's LSNs exist in the index or
-    /// none do.
+    /// Neither form syncs: this is the commit point for visibility and ordering, not for
+    /// durability. Crash-proofness arrives later via the pressure-driven durability publish,
+    /// which also writes the two writer rows, and callers that need it gate on published_lsn.
+    /// Either way the group is all-or-nothing: every caller's LSNs become visible or none do.
     fn commit_write_group<'a>(
-        &self,
+        &mut self,
         pending_rollovers: &[PendingRollover],
         prepared_batches: impl IntoIterator<Item = (&'a PreparedBatch, Option<&'a Vec<u8>>)>,
         next_lsn: StrataLsn,
     ) -> Result<()> {
-        let mut batch = self.index.batch();
-        for rollover in pending_rollovers {
-            rollover.apply_batch(&self.index, &mut batch)?;
-        }
-
-        let mut wrote_payload = false;
-        for (prepared, lsn_key) in prepared_batches {
-            if let Some(key) = lsn_key {
-                let last_lsn = prepared.result.last_lsn().expect("nonempty prepared batch");
-                batch.insert_batch(self.index.submitted_batch_lsns(), [(key, last_lsn)])?;
+        let prepared_batches = prepared_batches.into_iter().collect::<Vec<_>>();
+        let needs_index_batch = !pending_rollovers.is_empty()
+            || prepared_batches.iter().any(|(prepared, lsn_key)| {
+                lsn_key.is_some()
+                    || prepared
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op, PreparedBatchOp::EpochChange { .. }))
+            });
+        if needs_index_batch {
+            let mut batch = self.index.batch();
+            for rollover in pending_rollovers {
+                rollover.apply_batch(&self.index, &mut batch)?;
             }
-            for op in &prepared.ops {
-                match op {
-                    PreparedBatchOp::Put { .. } => {
-                        wrote_payload = true;
-                    }
-                    PreparedBatchOp::Lifecycle { .. }
-                    | PreparedBatchOp::Tombstone { .. }
-                    | PreparedBatchOp::DeleteKey { .. } => {}
-                    PreparedBatchOp::EpochChange { lsn, epoch } => {
-                        self.index
-                            .put_epoch_change_batch(&mut batch, *lsn, *epoch)?;
-                        self.index.put_current_epoch_batch(&mut batch, *epoch)?;
+            for (prepared, lsn_key) in &prepared_batches {
+                if let Some(key) = lsn_key {
+                    let last_lsn = prepared.result.last_lsn().expect("nonempty prepared batch");
+                    batch.insert_batch(self.index.submitted_batch_lsns(), [(*key, last_lsn)])?;
+                }
+                for op in &prepared.ops {
+                    match op {
+                        PreparedBatchOp::Put { .. }
+                        | PreparedBatchOp::Lifecycle { .. }
+                        | PreparedBatchOp::Tombstone { .. }
+                        | PreparedBatchOp::DeleteKey { .. } => {}
+                        PreparedBatchOp::EpochChange { lsn, epoch } => {
+                            self.index
+                                .put_epoch_change_batch(&mut batch, *lsn, *epoch)?;
+                            self.index.put_current_epoch_batch(&mut batch, *epoch)?;
+                        }
                     }
                 }
             }
+            self.put_writer_frontier_batch(&mut batch, next_lsn)?;
+            batch.write()?;
+            self.index_next_lsn = next_lsn;
         }
-        if wrote_payload {
-            self.index
-                .put_segment_state_batch(&mut batch, &self.active_segment_state)?;
-        }
-        self.index.put_next_lsn_batch(&mut batch, next_lsn)?;
-        batch.write()?;
+        self.advance_next_lsn(next_lsn)
+    }
+
+    /// Adds the writer's two rows to an index batch: the active segment's state and `NextLsn`.
+    /// They are only ever written together, because recovery reads the segment row as the extent
+    /// that `NextLsn` accounts for.
+    pub(crate) fn put_writer_frontier_batch(
+        &self,
+        batch: &mut index::port::map::IndexBatch,
+        next_lsn: StrataLsn,
+    ) -> Result<()> {
+        self.index
+            .put_segment_state_batch(batch, &self.active_segment_state)?;
+        self.index.put_next_lsn_batch(batch, next_lsn)?;
+        Ok(())
+    }
+
+    /// Advances the writer's frontier: in memory, in the cursor file, and for other threads. A
+    /// commit that needed the index has already written the index rows and `index_next_lsn`.
+    pub(crate) fn advance_next_lsn(&mut self, next_lsn: StrataLsn) -> Result<()> {
+        self.next_lsn = next_lsn;
+        self.cursor.write(&WriterCursorRecord::new(
+            self.index_next_lsn,
+            next_lsn,
+            &self.active_segment_state,
+        ))?;
+        self.visible_next_lsn
+            .store(next_lsn, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

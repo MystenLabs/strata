@@ -275,6 +275,8 @@ pub(crate) struct GcExecutor {
     pub(crate) relocation_cache: Arc<RelocationCache>,
     /// Highest relocation activation covered by a completed RocksDB WAL sync.
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
+    /// The foreground writer's first unassigned LSN, published after each commit.
+    pub(crate) visible_next_lsn: Arc<AtomicU64>,
     /// Snapshot pins consulted before deleting a relocated source segment.
     pub(crate) live_snapshots: LiveSnapshots,
     /// Wakes the blob compactor so it can heal freshly activated relocations.
@@ -308,6 +310,7 @@ impl StrataStore {
             relocations: Arc::clone(&self.relocations),
             relocation_cache: Arc::clone(&self.relocation_cache),
             durable_relocation_lsn: Arc::clone(&self.durable_relocation_lsn),
+            visible_next_lsn: Arc::clone(&self.visible_next_lsn),
             live_snapshots: self.live_snapshots.clone(),
             lsm_compact_tx: self
                 .lsm_compact_tx

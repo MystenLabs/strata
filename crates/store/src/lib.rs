@@ -12,10 +12,14 @@
 //!   -> store writer assigns the next store-global LSN
 //!   -> append segment bytes and a routed store-WAL entry
 //!   -> pass (LSN, keyed mutation) to the unlogged LSM
-//!   -> commit an atomic index batch:
-//!        segment_states[(store, segment_id)].write_offset = end_of_record
-//!        store_state[(store, NextLsn)] = lsn + 1
-//!   -> return to caller only after the batch commits
+//!   -> advance the writer's frontier (writer cursor file; see `writer_cursor`):
+//!        active segment write_offset = end_of_record
+//!        next LSN = lsn + 1
+//!      a commit that also rolls a segment, changes the epoch or records an LSN key writes
+//!      one atomic index batch instead, and every durability publication writes the rows
+//!        segment_states[(store, segment_id)].write_offset
+//!        store_state[(store, NextLsn)]
+//!   -> return to caller only after the frontier has advanced
 //! ```
 //!
 //! Epoch path:
@@ -144,6 +148,7 @@ mod store;
 mod wal;
 mod wal_format;
 mod writer;
+mod writer_cursor;
 
 use std::{
     num::NonZeroUsize,
@@ -316,6 +321,8 @@ pub struct StrataStore {
     /// `relocation::RelocationActivations`.
     pub(crate) relocation_activations: Arc<relocation::RelocationActivations>,
     pub(crate) durable_relocation_lsn: Arc<AtomicU64>,
+    /// The writer's first unassigned LSN, published after each commit.
+    pub(crate) visible_next_lsn: Arc<AtomicU64>,
     pub(crate) gc_claims: Arc<GcSourceClaims>,
     pub(crate) gc_concurrency: Arc<GcConcurrencyController>,
     pub(crate) gc_io_limiter: Arc<GcIoLimiter>,
@@ -424,6 +431,14 @@ struct WriteCoordinator {
     sync_and_commit_in_flight: Option<StrataLsn>,
     pending_sync_requests: Vec<PendingSyncRequest>,
     active_segment_state: SegmentState,
+    /// The first unassigned LSN. The writer owns it; the index's `NextLsn` row is only as new as
+    /// the writer's last index batch (see `writer_cursor`).
+    next_lsn: StrataLsn,
+    /// The value the index's `NextLsn` row holds.
+    index_next_lsn: StrataLsn,
+    /// `next_lsn`, published for other threads after each commit.
+    visible_next_lsn: Arc<AtomicU64>,
+    cursor: writer_cursor::WriterCursor,
     durable_offset: u64,
     active_allocation_records: u64,
     active_allocation_tracker: Arc<SegmentAllocationTracker>,

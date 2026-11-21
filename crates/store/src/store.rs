@@ -324,6 +324,37 @@ impl StrataStore {
         Ok(true)
     }
 
+    /// The first LSN the writer has not assigned: every operation below it is visible.
+    ///
+    /// Read this rather than the index's `NextLsn` row, which while the store is open is only
+    /// as new as the writer's last index batch.
+    pub fn next_lsn(&self) -> StrataLsn {
+        self.visible_next_lsn
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A segment's state as the writer last committed it: the index row, brought up to the
+    /// writer cursor when the cursor describes this segment. Open applies the same overlay
+    /// before recovery reads the row.
+    #[cfg(test)]
+    pub(crate) fn committed_segment_state(
+        &self,
+        segment_id: core_types::SegmentId,
+    ) -> Result<Option<core_types::SegmentState>> {
+        let Some(mut state) = self.index.get_segment_state(segment_id)? else {
+            return Ok(None);
+        };
+        let cursor = crate::writer_cursor::WriterCursor::read(
+            &crate::writer_cursor::writer_cursor_path(&self.config),
+        )?;
+        if let Some(record) = cursor.filter(|record| record.segment_id == segment_id) {
+            state.write_offset = record.write_offset;
+            state.min_lsn = record.min_lsn;
+            state.max_lsn = record.max_lsn;
+        }
+        Ok(Some(state))
+    }
+
     /// Every operation with `lsn <= published_lsn` survives a crash. This is the value callers
     /// (e.g. the Walrus event cursor) gate on before acknowledging work as done.
     pub fn published_lsn(&self) -> Result<StrataLsn> {
